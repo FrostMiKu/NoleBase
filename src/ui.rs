@@ -469,7 +469,7 @@ fn draw_preview(f: &mut Frame, app: &App) {
     let h = (area.height * 4 / 5).max(10);
     let rect = centered(area, w, h);
     f.render_widget(Clear, rect);
-    let lines: Vec<Line> = p.lines.iter().map(|s| Line::raw(s.clone())).collect();
+    let lines = crate::markdown::to_lines(&p.source);
     let para = Paragraph::new(lines)
         .scroll((p.scroll, 0))
         .wrap(Wrap { trim: false })
@@ -639,5 +639,33 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_string(&terminal).replace(' ', "");
         assert!(s.contains("记录点什么"), "placeholder missing");
+    }
+
+    #[test]
+    fn preview_modal_renders_markdown() {
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        let mut app = App::new(st).unwrap();
+
+        let md = "# Heading\n\nSome **bold** text and `code`.\n\n- one\n- two";
+        app.mode = Mode::Preview;
+        app.preview = Some(crate::app::Preview {
+            title: "Test".into(),
+            source: md.into(),
+            scroll: 0,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal);
+
+        // Markdown flows through the renderer into the modal as visible text.
+        assert!(s.contains("Heading"), "heading text missing");
+        assert!(s.contains("bold"), "bold text missing");
+        assert!(s.contains("code"), "inline code text missing");
+        assert!(s.contains("one"), "first list item missing");
+        assert!(s.contains("•"), "bullet marker missing");
     }
 }

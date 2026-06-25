@@ -40,7 +40,8 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub struct Preview {
     pub title: String,
-    pub lines: Vec<String>,
+    /// Raw markdown source rendered (as styled markdown) in the preview modal.
+    pub source: String,
     pub scroll: u16,
 }
 
@@ -337,10 +338,9 @@ impl App {
             }
             Action::View => {
                 if let Some(m) = self.message_clone(id) {
-                    let lines = m.body.split('\n').map(String::from).collect();
                     self.preview = Some(Preview {
                         title: format!("Message {}", m.created_at.format("%Y-%m-%d %H:%M")),
-                        lines,
+                        source: m.body.clone(),
                         scroll: 0,
                     });
                     self.mode = Mode::Preview;
@@ -512,10 +512,9 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Preview".into());
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        let lines = text.split('\n').map(String::from).collect();
         self.preview = Some(Preview {
             title,
-            lines,
+            source: text,
             scroll: 0,
         });
         self.mode = Mode::Preview;

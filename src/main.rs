@@ -1,6 +1,7 @@
 //! Entry point: terminal lifecycle, event loop, and `$EDITOR` integration.
 
 mod app;
+mod markdown;
 mod model;
 mod storage;
 mod ui;
