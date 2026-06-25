@@ -63,6 +63,17 @@ enum CursorMove {
     LineEnd,
 }
 
+/// A chat-removing operation recorded so `u` can reverse it.
+#[derive(Debug, Clone)]
+enum UndoOp {
+    Delete(Message),
+    Move {
+        msg: Message,
+        target: PathBuf,
+        appended: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Input box not focused; message shortcuts are active.
@@ -89,6 +100,8 @@ pub enum Mode {
     Todo,
     /// Full-text content search across messages and note files.
     Search,
+    /// Keybinding reference overlay.
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +155,10 @@ pub struct App {
     pub search_index: usize,
     /// Clickable rows in the search panel, rebuilt each frame.
     pub search_hitboxes: Vec<SearchHitbox>,
+    /// Stack of recent chat-removing operations reversible with `u`.
+    undo_stack: Vec<UndoOp>,
+    /// Vertical scroll of the help overlay.
+    pub help_scroll: u16,
     pub status: String,
 }
 
@@ -178,6 +195,8 @@ impl App {
             search_results: Vec::new(),
             search_index: 0,
             search_hitboxes: Vec::new(),
+            undo_stack: Vec::new(),
+            help_scroll: 0,
             status: String::new(),
         })
     }
@@ -223,6 +242,12 @@ impl App {
         self.search_results.clear();
         self.search_index = 0;
         self.mode = Mode::Search;
+    }
+
+    /// Open the keybinding reference overlay.
+    pub fn open_help(&mut self) {
+        self.help_scroll = 0;
+        self.mode = Mode::Help;
     }
 
     /// Recompute `search_results` for the current query: matching chat messages
@@ -309,6 +334,7 @@ impl App {
             Mode::FileDelete => self.handle_file_delete(key),
             Mode::Todo => self.handle_todo(key),
             Mode::Search => self.handle_search(key),
+            Mode::Help => self.handle_help(key),
         }
     }
 
@@ -378,6 +404,7 @@ impl App {
                         | Mode::FileDelete
                         | Mode::Todo
                         | Mode::Search
+                        | Mode::Help
                 ) {
                     self.mode = Mode::Insert;
                 }
@@ -595,6 +622,14 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.open_search();
+                None
+            }
+            KeyCode::Char('u') => {
+                self.undo();
+                None
+            }
+            KeyCode::Char('?') => {
+                self.open_help();
                 None
             }
             KeyCode::Char('n') => self.act(Action::New),
@@ -832,6 +867,32 @@ impl App {
         }
     }
 
+    fn handle_help(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::PageDown => {
+                self.help_scroll = self.help_scroll.saturating_add(8);
+                None
+            }
+            KeyCode::PageUp => {
+                self.help_scroll = self.help_scroll.saturating_sub(8);
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.messages.is_empty() {
             return;
@@ -851,7 +912,12 @@ impl App {
             Action::Todo => {
                 if let Some(m) = self.message_clone(id) {
                     match self.storage.move_to_todo(&m) {
-                        Ok(()) => {
+                        Ok(appended) => {
+                            self.record_undo(UndoOp::Move {
+                                msg: m,
+                                target: self.storage.todo_path.clone(),
+                                appended,
+                            });
                             self.set_status("Moved to TODO.md".to_string());
                             self.reload();
                         }
@@ -872,7 +938,12 @@ impl App {
                 // a fixed target (ARCHIVE.md) — no extra storage method needed.
                 if let Some(m) = self.message_clone(id) {
                     match self.storage.move_to_markdown(&self.storage.archive_path, &m) {
-                        Ok(()) => {
+                        Ok(appended) => {
+                            self.record_undo(UndoOp::Move {
+                                msg: m,
+                                target: self.storage.archive_path.clone(),
+                                appended,
+                            });
                             self.set_status("Archived to ARCHIVE.md".to_string());
                             self.reload();
                         }
@@ -980,8 +1051,12 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(id) = self.pending_id.take() {
+                    let msg = self.message_clone(&id);
                     match self.storage.remove_message_by_id(&id) {
                         Ok(true) => {
+                            if let Some(m) = msg {
+                                self.record_undo(UndoOp::Delete(m));
+                            }
                             self.set_status("Deleted");
                             self.reload();
                         }
@@ -1047,7 +1122,12 @@ impl App {
             return;
         };
         match self.storage.move_to_markdown(path, &m) {
-            Ok(()) => {
+            Ok(appended) => {
+                self.record_undo(UndoOp::Move {
+                    msg: m,
+                    target: path.to_path_buf(),
+                    appended,
+                });
                 self.set_status(format!(
                     "Moved to {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
@@ -1097,6 +1177,55 @@ impl App {
 
     fn set_status(&mut self, s: impl Into<String>) {
         self.status = s.into();
+    }
+
+    /// Record a chat-removing operation for `u` to reverse (capped stack).
+    fn record_undo(&mut self, op: UndoOp) {
+        const CAP: usize = 50;
+        if self.undo_stack.len() >= CAP {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(op);
+    }
+
+    /// Reverse the most recent chat-removing operation.
+    fn undo(&mut self) {
+        let Some(op) = self.undo_stack.pop() else {
+            self.set_status("Nothing to undo");
+            return;
+        };
+        let status = match op {
+            UndoOp::Delete(msg) => match self.storage.restore_message_to_chat(&msg) {
+                Ok(()) => "Undid delete".to_string(),
+                Err(e) => format!("Undo error: {e}"),
+            },
+            UndoOp::Move {
+                msg,
+                target,
+                appended,
+            } => match self.storage.restore_message_to_chat(&msg) {
+                Ok(()) => {
+                    let name = target
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let cleaned = self
+                        .storage
+                        .remove_first_occurrence(&target, &appended)
+                        .unwrap_or(false);
+                    if cleaned {
+                        format!("Undid move to {name}")
+                    } else {
+                        format!("Undid move (couldn't tidy {name})")
+                    }
+                }
+                Err(e) => format!("Undo error: {e}"),
+            },
+        };
+        self.set_status(status);
+        self.reload();
+        self.selected = self.messages.len().saturating_sub(1);
+        self.scroll = u32::MAX as u16;
     }
 }
 
@@ -1240,6 +1369,49 @@ mod tests {
     }
 
     #[test]
+    fn undo_delete_restores_message() {
+        let (mut app, _dir) = make_app();
+        let m = app.storage.append_chat_message("oops").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        // delete via 'd' then confirm 'y'.
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::ConfirmDelete);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.messages.is_empty());
+
+        // 'u' restores it with the same id.
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].body, "oops");
+        assert_eq!(app.messages[0].id, m.id);
+
+        // A second 'u' has nothing to undo.
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn undo_move_restores_chat_and_cleans_target() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("file me").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.messages.is_empty(), "archived out of chat");
+        let before = std::fs::read_to_string(&app.storage.archive_path).unwrap();
+        assert!(before.contains("file me"));
+
+        // 'u' brings it back to chat AND removes the filed copy.
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].body, "file me");
+        let after = std::fs::read_to_string(&app.storage.archive_path).unwrap();
+        assert!(!after.contains("file me"), "filed copy should be removed on undo");
+    }
+
+    #[test]
     fn todo_panel_toggles_task() {
         let (mut app, _dir) = make_app();
         // Seed a task by moving a message to TODO.md.
@@ -1299,6 +1471,21 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Search);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn help_overlay_opens_and_closes() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.help_scroll, 0);
+        // Scrolling advances the offset.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 1);
+        // '?' closes it (Esc works too).
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
     }
 

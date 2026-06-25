@@ -118,12 +118,13 @@ impl Storage {
     }
 
     /// Append a message to `TODO.md` as a markdown task, then remove it from
-    /// the chat. Append happens first so a failure cannot lose data.
-    pub fn move_to_todo(&self, msg: &Message) -> Result<()> {
-        append_todo_task(&self.todo_path, msg)?;
+    /// the chat. Append happens first so a failure cannot lose data. Returns
+    /// the bytes appended to `TODO.md` (used by undo).
+    pub fn move_to_todo(&self, msg: &Message) -> Result<String> {
+        let content = append_todo_task(&self.todo_path, msg)?;
         let removed = self.remove_message_by_id(&msg.id)?;
         debug_assert!(removed, "moved message not found in chat after append");
-        Ok(())
+        Ok(content)
     }
 
     /// Parse the `- [ ]` / `- [x]` tasks out of `TODO.md`, in order.
@@ -210,13 +211,36 @@ impl Storage {
     }
 
     /// Append a message to a target markdown file under the root, then remove
-    /// it from the chat. Append happens first.
-    pub fn move_to_markdown(&self, target: &Path, msg: &Message) -> Result<()> {
+    /// it from the chat. Append happens first. Returns the bytes appended to
+    /// the target (used by undo).
+    pub fn move_to_markdown(&self, target: &Path, msg: &Message) -> Result<String> {
         let safe = self.validate_target(target)?;
-        append_markdown_section(&safe, msg)?;
+        let content = append_markdown_section(&safe, msg)?;
         let removed = self.remove_message_by_id(&msg.id)?;
         debug_assert!(removed, "moved message not found in chat after append");
+        Ok(content)
+    }
+
+    /// Re-insert a previously removed message block into `CHAT.md` (used by
+    /// undo). Keeps the original id and timestamp.
+    pub fn restore_message_to_chat(&self, msg: &Message) -> Result<()> {
+        append_text(&self.chat_path, &render_block(msg))?;
         Ok(())
+    }
+
+    /// Remove the first occurrence of `needle` from `path`. Returns `true` if
+    /// found and removed. Used by undo to clean up a filed copy.
+    pub fn remove_first_occurrence(&self, path: &Path, needle: &str) -> Result<bool> {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        if let Some(idx) = text.find(needle) {
+            let mut out = String::with_capacity(text.len() - needle.len());
+            out.push_str(&text[..idx]);
+            out.push_str(&text[idx + needle.len()..]);
+            fs::write(path, out)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Create a new markdown file from a user-entered name, returning its path.
@@ -401,7 +425,7 @@ fn find_block_range(text: &str, id: &str) -> Option<(usize, usize)> {
     Some((open_start, close_end))
 }
 
-fn append_todo_task(todo_path: &Path, msg: &Message) -> Result<()> {
+fn append_todo_task(todo_path: &Path, msg: &Message) -> Result<String> {
     let mut content = String::new();
     content.push('\n');
     let mut lines = msg.body.lines();
@@ -414,7 +438,7 @@ fn append_todo_task(todo_path: &Path, msg: &Message) -> Result<()> {
         content.push_str(&format!("      {cont}\n"));
     }
     append_text(todo_path, &content)?;
-    Ok(())
+    Ok(content)
 }
 
 /// If `line` is a `- [ ]` / `- [x]` task, return `(checked, body_text)`.
@@ -447,7 +471,7 @@ fn flip_task_line(line: &str) -> Option<String> {
     Some(s)
 }
 
-fn append_markdown_section(path: &Path, msg: &Message) -> Result<()> {
+fn append_markdown_section(path: &Path, msg: &Message) -> Result<String> {
     let ts = msg.created_at.format("%Y-%m-%d %H:%M");
     let mut content = String::new();
     content.push_str(&format!("\n## {ts}\n\n"));
@@ -456,7 +480,7 @@ fn append_markdown_section(path: &Path, msg: &Message) -> Result<()> {
         content.push('\n');
     }
     append_text(path, &content)?;
-    Ok(())
+    Ok(content)
 }
 
 fn append_text(path: &Path, content: &str) -> Result<()> {
@@ -672,6 +696,28 @@ mod tests {
     fn delete_file_rejects_outside_root() {
         let (_dir, st) = fresh();
         assert!(st.delete_file(Path::new("/etc/hosts")).is_err());
+    }
+
+    #[test]
+    fn restore_message_and_remove_first_occurrence() {
+        let (_dir, st) = fresh();
+        let m = st.append_chat_message("hello").unwrap();
+        assert!(st.remove_message_by_id(&m.id).unwrap());
+        assert!(st.load_messages().unwrap().is_empty());
+
+        // Restore re-inserts the block with the original id.
+        st.restore_message_to_chat(&m).unwrap();
+        let msgs = st.load_messages().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, m.id);
+        assert_eq!(msgs[0].body, "hello");
+
+        // remove_first_occurrence on a file.
+        let p = st.create_named_file("X").unwrap();
+        fs::write(&p, "keep\nNEEDLE here\nmore\n").unwrap();
+        assert!(st.remove_first_occurrence(&p, "NEEDLE here").unwrap());
+        assert!(!fs::read_to_string(&p).unwrap().contains("NEEDLE"));
+        assert!(!st.remove_first_occurrence(&p, "nope").unwrap());
     }
 
     #[test]

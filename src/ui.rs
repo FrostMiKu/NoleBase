@@ -44,6 +44,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::Todo => draw_todo(f, app),
         Mode::Search => draw_search(f, app),
+        Mode::Help => draw_help(f, app),
         Mode::Normal | Mode::Insert => {}
     }
 }
@@ -353,6 +354,97 @@ fn draw_search(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn help_lines() -> Vec<Line<'static>> {
+    let head = |s: &str| {
+        Line::from(vec![Span::styled(
+            s.to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )])
+    };
+    let blank = || Line::raw("");
+    let row = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {desc}")),
+        ])
+    };
+    vec![
+        head("Navigation"),
+        row("j k  ↑ ↓", "Select message"),
+        row("g / G", "Jump to top / bottom"),
+        row("PageUp / PageDown", "Scroll"),
+        row("i / Enter", "Insert mode (compose)"),
+        row("Tab", "Toggle insert / normal"),
+        blank(),
+        head("Message actions (on selected)"),
+        row("t", "Add to TODO.md"),
+        row("m", "Move into an existing file"),
+        row("a", "Archive to ARCHIVE.md"),
+        row("n", "Move into a new file"),
+        row("v", "View as markdown"),
+        row("e", "Edit CHAT.md in $EDITOR"),
+        row("d", "Delete (asks y/N)"),
+        row("u", "Undo last t / m / a / n / d"),
+        blank(),
+        head("Panels"),
+        row("f", "File browser"),
+        row("T", "Todos panel"),
+        row("/", "Search messages + files"),
+        row("?", "This help"),
+        blank(),
+        head("Insert mode"),
+        row("Enter", "Newline"),
+        row("Ctrl/Alt+Enter", "Send message"),
+        row("← → ↑ ↓  Home/End", "Move cursor"),
+        row("Backspace / Delete", "Edit at cursor"),
+        row("Ctrl+C", "Clear (quit if empty)"),
+        blank(),
+        head("File browser"),
+        row("↑↓ Enter/v e", "navigate · preview · edit"),
+        row("r d /", "rename · delete · filter"),
+        row("(in filter)", "type · ↑↓ · Enter opens"),
+        blank(),
+        head("Todos"),
+        row("↑↓  Enter/Space/x", "select · toggle  (or click)"),
+        blank(),
+        head("Search"),
+        row("type ↑↓ Enter", "filter · navigate · open"),
+        blank(),
+        head("Preview"),
+        row("↑↓  PageUp/Down", "scroll"),
+        blank(),
+        row("Esc / q", "Back / quit"),
+    ]
+}
+
+fn draw_help(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let w = (area.width * 4 / 5).clamp(54, 92);
+    let h = (area.height * 4 / 5)
+        .max(12)
+        .min(area.height.saturating_sub(2));
+    let rect = centered(area, w, h);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Help  (↑↓ scroll · Esc close)");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let lines = help_lines();
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    if (app.help_scroll as usize) > max_scroll {
+        app.help_scroll = max_scroll as u16;
+    }
+    let para = Paragraph::new(lines).scroll((app.help_scroll, 0));
+    f.render_widget(para, inner);
+}
+
 /// Bottom footer: `Note <path> [MODE]` (and status) on the left, keybinding
 /// hints on the right — i.e. the hints sit in the bottom-right corner.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -367,12 +459,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ),
         _ => Span::raw(""),
     };
-    let path = app.storage.chat_path.to_string_lossy();
+    // let path = app.storage.chat_path.to_string_lossy();
     let mut left = vec![
         // Span::styled(" Note ", Style::default().add_modifier(Modifier::BOLD)),
         mode,
-        Span::raw(" "),
-        Span::raw(path.to_string()),
+        // Span::raw(" "),
+        // Span::raw(path.to_string()),
     ];
     if !app.status.is_empty() {
         left.push(Span::raw("  "));
@@ -387,7 +479,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match app.mode {
         Mode::Insert => "Tab/Esc → normal mode",
         Mode::Normal => {
-            "t todo · m move · a arch · T todos · / search · n new · v view · e edit · d del · f files · i insert"
+            "t todo · m move · a arch · T todos · / search · u undo · ? help · n new · v view · e edit · d del · f files · i insert"
         }
         Mode::FileList => "↑↓ select · Enter/v preview · e edit · Esc close",
         _ => "",
