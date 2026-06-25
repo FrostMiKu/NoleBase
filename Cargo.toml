@@ -1,0 +1,26 @@
+[package]
+name = "note"
+version = "0.1.0"
+edition = "2021"
+description = "A chat-style terminal note app"
+license = "MIT"
+
+[[bin]]
+name = "note"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
