@@ -29,6 +29,7 @@ const CLOSE_MARKER: &str = "<!-- /note-msg -->";
 
 const CHAT_FILE: &str = "CHAT.md";
 const TODO_FILE: &str = "TODO.md";
+const ARCHIVE_FILE: &str = "ARCHIVE.md";
 
 /// Filesystem locations backing the notes.
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ pub struct Storage {
     pub root: PathBuf,
     pub chat_path: PathBuf,
     pub todo_path: PathBuf,
+    pub archive_path: PathBuf,
 }
 
 impl Storage {
@@ -52,6 +54,7 @@ impl Storage {
         Ok(Self {
             chat_path: root.join(CHAT_FILE),
             todo_path: root.join(TODO_FILE),
+            archive_path: root.join(ARCHIVE_FILE),
             root,
         })
     }
@@ -65,6 +68,9 @@ impl Storage {
         }
         if !self.todo_path.exists() {
             fs::write(&self.todo_path, "# TODO\n\n")?;
+        }
+        if !self.archive_path.exists() {
+            fs::write(&self.archive_path, "# Archive\n\n")?;
         }
         Ok(())
     }
@@ -138,6 +144,29 @@ impl Storage {
             fs::write(&path, format!("# {}\n\n", stem(&file_name)))?;
         }
         Ok(path)
+    }
+
+    /// Rename a managed `.md` file to `new_name` (normalized), returning the
+    /// new path. Refuses to overwrite an existing file.
+    pub fn rename_file(&self, from: &Path, new_name: &str) -> Result<PathBuf> {
+        let from = self.validate_target(from)?;
+        let name = normalize_new_name(new_name)?;
+        let to = self.root.join(&name);
+        if to == from {
+            return Ok(to);
+        }
+        if to.exists() {
+            bail!("a file named {name} already exists");
+        }
+        fs::rename(&from, &to)?;
+        Ok(to)
+    }
+
+    /// Delete a managed `.md` file. The path must resolve inside the root.
+    pub fn delete_file(&self, path: &Path) -> Result<()> {
+        let path = self.validate_target(path)?;
+        fs::remove_file(&path)?;
+        Ok(())
     }
 
     /// List `.md` files in the root, excluding `CHAT.md`, sorted by name.
@@ -440,6 +469,48 @@ mod tests {
     }
 
     #[test]
+    fn rename_file_moves_and_renames() {
+        let (_dir, st) = fresh();
+        let from = st.create_named_file("old").unwrap();
+        let to = st.rename_file(&from, "new name").unwrap();
+        assert_eq!(to.file_name().unwrap(), "new name.md");
+        assert!(!from.exists());
+        assert!(to.exists());
+        let names: Vec<String> = st
+            .list_markdown_files()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .collect();
+        assert!(names.contains(&"new name.md".to_string()));
+        assert!(!names.contains(&"old.md".to_string()));
+    }
+
+    #[test]
+    fn rename_file_rejects_existing_target() {
+        let (_dir, st) = fresh();
+        let a = st.create_named_file("a").unwrap();
+        st.create_named_file("b").unwrap();
+        assert!(st.rename_file(&a, "b").is_err());
+        // Original is untouched on failure.
+        assert!(a.exists());
+    }
+
+    #[test]
+    fn delete_file_removes() {
+        let (_dir, st) = fresh();
+        let p = st.create_named_file("goner").unwrap();
+        st.delete_file(&p).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn delete_file_rejects_outside_root() {
+        let (_dir, st) = fresh();
+        assert!(st.delete_file(Path::new("/etc/hosts")).is_err());
+    }
+
+    #[test]
     fn normalize_rejects_traversal() {
         assert!(normalize_new_name("../etc").is_err());
         assert!(normalize_new_name("a/b").is_err());
@@ -463,6 +534,13 @@ mod tests {
         assert!(names.contains(&"alpha.md".to_string()));
         assert!(names.contains(&"TODO.md".to_string()));
         assert!(!names.iter().any(|n| n == "CHAT.md"));
+    }
+
+    #[test]
+    fn ensure_files_creates_archive() {
+        let (_dir, st) = fresh();
+        assert!(st.archive_path.exists());
+        assert_eq!(st.archive_path.file_name().unwrap(), "ARCHIVE.md");
     }
 
     #[test]

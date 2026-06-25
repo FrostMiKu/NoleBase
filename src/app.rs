@@ -11,6 +11,23 @@ fn point_in_rect(col: u16, row: u16, area: ratatui::layout::Rect) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
+/// Case-insensitive subsequence match (true "fuzzy"). Empty needle matches all.
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let needle: Vec<char> = needle.to_lowercase().chars().collect();
+    let mut hi = 0;
+    for &n in &needle {
+        match hay[hi..].iter().position(|&h| h == n) {
+            Some(pos) => hi += pos + 1,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// A request from the app to the terminal driver (which owns the TUI lifecycle).
 #[derive(Debug)]
 pub enum Command {
@@ -19,7 +36,18 @@ pub enum Command {
     Edit(PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Direction of cursor movement within the input buffer.
+#[derive(Debug, Clone, Copy)]
+enum CursorMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Input box not focused; message shortcuts are active.
     Normal,
@@ -35,6 +63,12 @@ pub enum Mode {
     Preview,
     /// Browsing the file list (floating popup).
     FileList,
+    /// Typing a fuzzy filter inside the file-list popup.
+    FileSearch,
+    /// Typing a new name to rename the selected file.
+    FileRename,
+    /// Confirming deletion of a file.
+    FileDelete,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +83,11 @@ pub struct App {
     pub storage: Storage,
     pub messages: Vec<Message>,
     pub input: String,
+    /// Insertion point in `input`, as a char index.
+    pub input_cursor: usize,
     pub mode: Mode,
+    /// Mode to return to when the preview modal closes (set when preview opens).
+    pub preview_return: Mode,
     pub selected: usize,
     pub scroll: u16,
     pub target_files: Vec<PathBuf>,
@@ -64,6 +102,14 @@ pub struct App {
     pub file_hitboxes: Vec<crate::model::FileHitbox>,
     /// Files listed in the file-list popup (`~/.note/*.md`, excluding CHAT.md).
     pub sidebar_files: Vec<PathBuf>,
+    /// Full (unfiltered) file listing; `sidebar_files` is the filtered view.
+    pub all_files: Vec<PathBuf>,
+    /// Fuzzy filter text typed in `FileSearch` mode.
+    pub file_query: String,
+    /// Buffer for `FileRename` mode.
+    pub rename_input: String,
+    /// Target file for `FileRename` / `FileDelete`.
+    pub pending_file: Option<PathBuf>,
     pub sidebar_index: usize,
     pub status: String,
 }
@@ -76,7 +122,9 @@ impl App {
             storage,
             messages,
             input: String::new(),
+            input_cursor: 0,
             mode: Mode::Insert,
+            preview_return: Mode::Normal,
             selected,
             scroll: u32::MAX as u16, // start at the bottom
             target_files: Vec::new(),
@@ -87,6 +135,10 @@ impl App {
             hitboxes: Vec::new(),
             file_hitboxes: Vec::new(),
             sidebar_files: Vec::new(),
+            all_files: Vec::new(),
+            file_query: String::new(),
+            rename_input: String::new(),
+            pending_file: None,
             sidebar_index: 0,
             status: String::new(),
         })
@@ -102,11 +154,29 @@ impl App {
 
     /// Open the file-list popup, refreshing the listing from disk.
     pub fn open_file_list(&mut self) {
-        self.sidebar_files = self.storage.list_markdown_files().unwrap_or_default();
-        if self.sidebar_index >= self.sidebar_files.len() {
-            self.sidebar_index = 0;
-        }
+        self.all_files = self.storage.list_markdown_files().unwrap_or_default();
+        self.file_query.clear();
+        self.sidebar_index = 0;
+        self.refresh_file_filter();
         self.mode = Mode::FileList;
+    }
+
+    /// Recompute `sidebar_files` from `all_files` and the current `file_query`,
+    /// keeping `sidebar_index` in range.
+    fn refresh_file_filter(&mut self) {
+        let q = self.file_query.clone();
+        self.sidebar_files = self
+            .all_files
+            .iter()
+            .filter(|p| {
+                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                fuzzy_match(name, &q)
+            })
+            .cloned()
+            .collect();
+        if self.sidebar_index >= self.sidebar_files.len() {
+            self.sidebar_index = self.sidebar_files.len().saturating_sub(1);
+        }
     }
 
     pub fn selected_id(&self) -> Option<&str> {
@@ -123,6 +193,9 @@ impl App {
             Mode::ConfirmDelete => self.handle_confirm_delete(key),
             Mode::Preview => self.handle_preview(key),
             Mode::FileList => self.handle_file_list(key),
+            Mode::FileSearch => self.handle_file_search(key),
+            Mode::FileRename => self.handle_file_rename(key),
+            Mode::FileDelete => self.handle_file_delete(key),
         }
     }
 
@@ -165,6 +238,9 @@ impl App {
                         | Mode::SelectTarget
                         | Mode::NewFile
                         | Mode::FileList
+                        | Mode::FileSearch
+                        | Mode::FileRename
+                        | Mode::FileDelete
                 ) {
                     self.mode = Mode::Insert;
                 }
@@ -186,7 +262,7 @@ impl App {
                 None
             }
             KeyCode::Enter => {
-                self.input.push('\n');
+                self.insert_char('\n');
                 None
             }
             KeyCode::Tab | KeyCode::Esc => {
@@ -194,11 +270,39 @@ impl App {
                 None
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                self.delete_backward();
+                None
+            }
+            KeyCode::Delete => {
+                self.delete_forward();
+                None
+            }
+            KeyCode::Left => {
+                self.move_cursor(CursorMove::Left);
+                None
+            }
+            KeyCode::Right => {
+                self.move_cursor(CursorMove::Right);
+                None
+            }
+            KeyCode::Up => {
+                self.move_cursor(CursorMove::Up);
+                None
+            }
+            KeyCode::Down => {
+                self.move_cursor(CursorMove::Down);
+                None
+            }
+            KeyCode::Home => {
+                self.move_cursor(CursorMove::LineStart);
+                None
+            }
+            KeyCode::End => {
+                self.move_cursor(CursorMove::LineEnd);
                 None
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                self.input.push(c);
+                self.insert_char(c);
                 None
             }
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
@@ -206,10 +310,103 @@ impl App {
                     Some(Command::Quit)
                 } else {
                     self.input.clear();
+                    self.input_cursor = 0;
                     None
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Byte offset of the `char_idx`-th char in `s` (or `s.len()` past the end).
+    fn char_to_byte(s: &str, char_idx: usize) -> usize {
+        s.char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or_else(|| s.len())
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let b = Self::char_to_byte(&self.input, self.input_cursor);
+        self.input.insert(b, c);
+        self.input_cursor += 1;
+    }
+
+    fn delete_backward(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let prev = Self::char_to_byte(&self.input, self.input_cursor - 1);
+        let cur = Self::char_to_byte(&self.input, self.input_cursor);
+        self.input.replace_range(prev..cur, "");
+        self.input_cursor -= 1;
+    }
+
+    fn delete_forward(&mut self) {
+        let total = self.input.chars().count();
+        if self.input_cursor >= total {
+            return;
+        }
+        let cur = Self::char_to_byte(&self.input, self.input_cursor);
+        let next = Self::char_to_byte(&self.input, self.input_cursor + 1);
+        self.input.replace_range(cur..next, "");
+    }
+
+    fn move_cursor(&mut self, m: CursorMove) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let total = chars.len();
+        let i = self.input_cursor;
+        // Index just after the '\n' that starts the current line (or 0).
+        let line_start = {
+            let mut j = i;
+            while j > 0 && chars[j - 1] != '\n' {
+                j -= 1;
+            }
+            j
+        };
+        match m {
+            CursorMove::Left => self.input_cursor = i.saturating_sub(1),
+            CursorMove::Right => self.input_cursor = (i + 1).min(total),
+            CursorMove::LineStart => self.input_cursor = line_start,
+            CursorMove::LineEnd => {
+                let mut j = i;
+                while j < total && chars[j] != '\n' {
+                    j += 1;
+                }
+                self.input_cursor = j;
+            }
+            CursorMove::Up | CursorMove::Down => {
+                let col = i - line_start;
+                let target_line_start = if matches!(m, CursorMove::Up) {
+                    if line_start == 0 {
+                        return; // already on the first line
+                    }
+                    // Step back over the '\n', then to the previous line start.
+                    let mut j = line_start - 1;
+                    while j > 0 && chars[j - 1] != '\n' {
+                        j -= 1;
+                    }
+                    j
+                } else {
+                    // Advance to the next '\n'; the next line starts after it.
+                    let mut j = i;
+                    while j < total && chars[j] != '\n' {
+                        j += 1;
+                    }
+                    if j >= total {
+                        return; // already on the last line
+                    }
+                    j + 1
+                };
+                let target_line_end = {
+                    let mut j = target_line_start;
+                    while j < total && chars[j] != '\n' {
+                        j += 1;
+                    }
+                    j
+                };
+                self.input_cursor = (target_line_start + col).min(target_line_end);
+            }
         }
     }
 
@@ -254,6 +451,7 @@ impl App {
             }
             KeyCode::Char('t') => self.act(Action::Todo),
             KeyCode::Char('m') => self.act(Action::Move),
+            KeyCode::Char('a') => self.act(Action::Archive),
             KeyCode::Char('n') => self.act(Action::New),
             KeyCode::Char('v') => self.act(Action::View),
             KeyCode::Char('e') => self.act(Action::Edit),
@@ -291,6 +489,136 @@ impl App {
                 .get(self.sidebar_index)
                 .cloned()
                 .map(Command::Edit),
+            KeyCode::Char('/') => {
+                self.file_query.clear();
+                self.refresh_file_filter();
+                self.mode = Mode::FileSearch;
+                None
+            }
+            KeyCode::Char('r') => {
+                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
+                    self.rename_input = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.pending_file = Some(path);
+                    self.mode = Mode::FileRename;
+                }
+                None
+            }
+            KeyCode::Char('d') => {
+                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
+                    self.pending_file = Some(path);
+                    self.mode = Mode::FileDelete;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_file_search(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            // Esc cancels the search (clears the filter); results stay live, so
+            // arrows navigate them and Enter opens the highlighted one.
+            KeyCode::Esc => {
+                self.file_query.clear();
+                self.refresh_file_filter();
+                self.mode = Mode::FileList;
+                None
+            }
+            // Arrow keys only (j/k are valid filter characters).
+            KeyCode::Down => {
+                if self.sidebar_index + 1 < self.sidebar_files.len() {
+                    self.sidebar_index += 1;
+                }
+                None
+            }
+            KeyCode::Up => {
+                if self.sidebar_index > 0 {
+                    self.sidebar_index -= 1;
+                }
+                None
+            }
+            KeyCode::Enter => {
+                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
+                    self.open_file_preview(&path);
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                self.file_query.pop();
+                self.refresh_file_filter();
+                None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.file_query.push(c);
+                self.refresh_file_filter();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_file_rename(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.pending_file = None;
+                self.mode = Mode::FileList;
+                None
+            }
+            KeyCode::Enter => {
+                if let Some(from) = self.pending_file.take() {
+                    let name = self.rename_input.clone();
+                    match self.storage.rename_file(&from, &name) {
+                        Ok(_) => {
+                            self.set_status(format!("Renamed to {name}"));
+                            self.all_files = self.storage.list_markdown_files().unwrap_or_default();
+                            self.refresh_file_filter();
+                        }
+                        Err(e) => self.set_status(format!("Error: {e}")),
+                    }
+                }
+                self.mode = Mode::FileList;
+                None
+            }
+            KeyCode::Backspace => {
+                self.rename_input.pop();
+                None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.rename_input.push(c);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_file_delete(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(path) = self.pending_file.take() {
+                    match self.storage.delete_file(&path) {
+                        Ok(()) => {
+                            self.set_status(format!(
+                                "Deleted {}",
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                            self.all_files = self.storage.list_markdown_files().unwrap_or_default();
+                            self.refresh_file_filter();
+                        }
+                        Err(e) => self.set_status(format!("Error: {e}")),
+                    }
+                }
+                self.mode = Mode::FileList;
+                None
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.pending_file = None;
+                self.mode = Mode::FileList;
+                None
+            }
             _ => None,
         }
     }
@@ -330,6 +658,20 @@ impl App {
                 self.mode = Mode::SelectTarget;
                 None
             }
+            Action::Archive => {
+                // Same append-section + remove-from-chat path as Move, just with
+                // a fixed target (ARCHIVE.md) — no extra storage method needed.
+                if let Some(m) = self.message_clone(id) {
+                    match self.storage.move_to_markdown(&self.storage.archive_path, &m) {
+                        Ok(()) => {
+                            self.set_status("Archived to ARCHIVE.md".to_string());
+                            self.reload();
+                        }
+                        Err(e) => self.set_status(format!("Error: {e}")),
+                    }
+                }
+                None
+            }
             Action::New => {
                 self.pending_id = Some(id.to_string());
                 self.new_file_input.clear();
@@ -343,6 +685,7 @@ impl App {
                         source: m.body.clone(),
                         scroll: 0,
                     });
+                    self.preview_return = self.mode;
                     self.mode = Mode::Preview;
                 }
                 None
@@ -451,13 +794,13 @@ impl App {
 
     fn handle_preview(&mut self, key: KeyEvent) -> Option<Command> {
         let Some(p) = self.preview.as_mut() else {
-            self.mode = Mode::Insert;
+            self.mode = self.preview_return;
             return None;
         };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.preview = None;
-                self.mode = Mode::Insert;
+                self.mode = self.preview_return;
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -517,6 +860,7 @@ impl App {
             source: text,
             scroll: 0,
         });
+        self.preview_return = self.mode;
         self.mode = Mode::Preview;
     }
 
@@ -532,6 +876,7 @@ impl App {
         match self.storage.append_chat_message(body) {
             Ok(_) => {
                 self.input.clear();
+                self.input_cursor = 0;
                 self.reload();
                 self.selected = self.messages.len().saturating_sub(1);
                 self.scroll = u32::MAX as u16; // jump to bottom
@@ -566,6 +911,7 @@ mod tests {
         let (mut app, _dir) = make_app();
         app.mode = Mode::Insert;
         app.input = "hi".to_string();
+        app.input_cursor = app.input.chars().count();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.input, "hi\n", "bare Enter should insert a newline");
         assert_eq!(app.messages.len(), 0, "bare Enter must not send");
@@ -606,5 +952,171 @@ mod tests {
         // Esc closes the popup.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn preview_from_normal_returns_to_normal() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("hello").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        // 'v' views the selected message.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Preview);
+        // Esc returns to Normal (previously it wrongly went to Insert).
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn preview_from_filelist_returns_to_filelist() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileList);
+        // Preview the selected file.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Preview);
+        // Esc returns to the file list, not Insert.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileList);
+    }
+
+    #[test]
+    fn insert_types_at_cursor_not_append() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Insert;
+        app.input = "ab".to_string();
+        app.input_cursor = 1; // between 'a' and 'b'
+        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(app.input, "aXb");
+        assert_eq!(app.input_cursor, 2);
+    }
+
+    #[test]
+    fn backspace_deletes_before_cursor() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Insert;
+        app.input = "abc".to_string();
+        app.input_cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)); // cursor -> 2
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)); // drop 'b'
+        assert_eq!(app.input, "ac");
+        assert_eq!(app.input_cursor, 1);
+    }
+
+    #[test]
+    fn cursor_up_preserves_column() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Insert;
+        app.input = "abcd\nef".to_string();
+        app.input_cursor = 7; // end of line 2 (col 2)
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        // Line 1 ("abcd") is long enough; col 2 → index 2.
+        assert_eq!(app.input_cursor, 2);
+    }
+
+    #[test]
+    fn archive_moves_message_to_archive_file() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("to be archived").unwrap();
+        app.reload();
+        assert_eq!(app.messages.len(), 1);
+        app.mode = Mode::Normal;
+        // 'a' archives the selected message (reuses the move-to-markdown path).
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.messages.is_empty(), "message should leave the chat");
+        let body = std::fs::read_to_string(&app.storage.archive_path).unwrap();
+        assert!(body.contains("to be archived"), "message should land in ARCHIVE.md");
+    }
+
+    fn file_index(app: &App, stem: &str) -> usize {
+        app.sidebar_files
+            .iter()
+            .position(|p| p.file_stem().and_then(|s| s.to_str()) == Some(stem))
+            .unwrap()
+    }
+
+    #[test]
+    fn fuzzy_filter_narrows_file_list() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let total = app.sidebar_files.len();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileSearch);
+        for c in "work".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Only Work.md matches the subsequence "work".
+        assert_eq!(app.sidebar_files.len(), 1);
+        assert!(app.sidebar_files.len() < total);
+        assert_eq!(
+            app.sidebar_files[0]
+                .file_stem()
+                .and_then(|s| s.to_str()),
+            Some("Work")
+        );
+    }
+
+    #[test]
+    fn file_search_navigates_and_previews_result() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileSearch);
+        // Arrows move the selection within the live results.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        // Enter opens (previews) the highlighted result.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Preview);
+        // Esc returns to the search, then a second Esc cancels it.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileSearch);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileList);
+        assert!(app.file_query.is_empty());
+    }
+
+    #[test]
+    fn rename_file_via_picker() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.sidebar_index = file_index(&app, "Work");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileRename);
+        assert_eq!(app.rename_input, "Work");
+        app.rename_input.clear();
+        for c in "Renamed".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileList);
+        assert!(app
+            .all_files
+            .iter()
+            .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("Renamed.md")));
+        assert!(!app
+            .all_files
+            .iter()
+            .any(|p| p.file_stem().and_then(|s| s.to_str()) == Some("Work")));
+    }
+
+    #[test]
+    fn delete_file_via_picker() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.sidebar_index = file_index(&app, "Ideas");
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileDelete);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::FileList);
+        assert!(!app
+            .all_files
+            .iter()
+            .any(|p| p.file_stem().and_then(|s| s.to_str()) == Some("Ideas")));
     }
 }

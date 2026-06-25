@@ -16,6 +16,7 @@ pub struct Message {
 pub enum Action {
     Todo,
     Move,
+    Archive,
     New,
     View,
     Edit,
@@ -28,6 +29,7 @@ impl Action {
         match self {
             Action::Todo => "todo",
             Action::Move => "move",
+            Action::Archive => "archive",
             Action::New => "new",
             Action::View => "view",
             Action::Edit => "edit",
@@ -40,6 +42,7 @@ impl Action {
         &[
             Action::Todo,
             Action::Move,
+            Action::Archive,
             Action::New,
             Action::View,
             Action::Edit,
