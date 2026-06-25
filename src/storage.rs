@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 
-use crate::model::Message;
+use crate::model::{Message, TodoItem};
 
 const OPEN_PREFIX: &str = "<!-- note-msg";
 const OPEN_SUFFIX: &str = "-->";
@@ -124,6 +124,57 @@ impl Storage {
         let removed = self.remove_message_by_id(&msg.id)?;
         debug_assert!(removed, "moved message not found in chat after append");
         Ok(())
+    }
+
+    /// Parse the `- [ ]` / `- [x]` tasks out of `TODO.md`, in order.
+    /// Continuation lines fold into the preceding task's text.
+    pub fn load_todo_tasks(&self) -> Vec<TodoItem> {
+        let text = fs::read_to_string(&self.todo_path).unwrap_or_default();
+        let mut items: Vec<TodoItem> = Vec::new();
+        for line in text.lines() {
+            if let Some((checked, body)) = parse_task_line(line) {
+                items.push(TodoItem {
+                    checked,
+                    text: body.to_string(),
+                });
+            } else if !line.trim().is_empty() {
+                // A non-blank line that isn't a task belongs to the task above.
+                if let Some(item) = items.last_mut() {
+                    item.text.push('\n');
+                    item.text.push_str(line.trim());
+                }
+            }
+        }
+        items
+    }
+
+    /// Flip the completion state of the `index`-th task in `TODO.md`.
+    /// Returns `true` if a task at that index was toggled.
+    pub fn toggle_todo_task(&self, index: usize) -> Result<bool> {
+        let text = fs::read_to_string(&self.todo_path).unwrap_or_default();
+        let mut out = String::with_capacity(text.len());
+        let mut count = 0usize;
+        let mut toggled = false;
+        for line in text.split_inclusive('\n') {
+            let is_task = parse_task_line(line.trim_end_matches('\n')).is_some();
+            if is_task && count == index {
+                if let Some(flip) = flip_task_line(line) {
+                    out.push_str(&flip);
+                    toggled = true;
+                } else {
+                    out.push_str(line);
+                }
+            } else {
+                out.push_str(line);
+            }
+            if is_task {
+                count += 1;
+            }
+        }
+        if toggled {
+            fs::write(&self.todo_path, out)?;
+        }
+        Ok(toggled)
     }
 
     /// Append a message to a target markdown file under the root, then remove
@@ -334,6 +385,36 @@ fn append_todo_task(todo_path: &Path, msg: &Message) -> Result<()> {
     Ok(())
 }
 
+/// If `line` is a `- [ ]` / `- [x]` task, return `(checked, body_text)`.
+fn parse_task_line(line: &str) -> Option<(bool, &str)> {
+    let after_bullet = line.trim_start().strip_prefix("- ")?;
+    let (checked, rest) = if let Some(r) = after_bullet.strip_prefix("[ ]") {
+        (false, r)
+    } else if let Some(r) = after_bullet.strip_prefix("[x]") {
+        (true, r)
+    } else if let Some(r) = after_bullet.strip_prefix("[X]") {
+        (true, r)
+    } else {
+        return None;
+    };
+    Some((checked, rest.trim_start()))
+}
+
+/// Return `line` with its first `- [ ]`/`- [x]` checkbox flipped.
+fn flip_task_line(line: &str) -> Option<String> {
+    let (idx, was_checked) = if let Some(i) = line.find("[ ]") {
+        (i, false)
+    } else if let Some(i) = line.find("[x]").or_else(|| line.find("[X]")) {
+        (i, true)
+    } else {
+        return None;
+    };
+    let mut s = line.to_string();
+    let new = if was_checked { "[ ]" } else { "[x]" };
+    s.replace_range(idx..idx + 3, new);
+    Some(s)
+}
+
 fn append_markdown_section(path: &Path, msg: &Message) -> Result<()> {
     let ts = msg.created_at.format("%Y-%m-%d %H:%M");
     let mut content = String::new();
@@ -442,6 +523,37 @@ mod tests {
         assert!(todo.contains("- [ ] buy milk"));
         assert!(todo.contains("      second line"));
         assert!(st.load_messages().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_and_toggle_todo_tasks() {
+        let (_dir, st) = fresh();
+        st.append_chat_message("first").unwrap();
+        st.append_chat_message("second").unwrap();
+        // move_to_todo consumes the message; append fresh ones for each task.
+        let m1 = st.append_chat_message("buy milk").unwrap();
+        let m2 = st.append_chat_message("write docs").unwrap();
+        st.move_to_todo(&m1).unwrap();
+        st.move_to_todo(&m2).unwrap();
+
+        let items = st.load_todo_tasks();
+        assert_eq!(items.len(), 2);
+        assert!(!items[0].checked);
+        assert_eq!(items[0].text, "buy milk");
+        assert_eq!(items[1].text, "write docs");
+
+        // Toggle the first task on, then back off.
+        assert!(st.toggle_todo_task(0).unwrap());
+        let on = st.load_todo_tasks();
+        assert!(on[0].checked);
+        assert!(!on[1].checked, "other tasks untouched");
+
+        assert!(st.toggle_todo_task(0).unwrap());
+        let off = st.load_todo_tasks();
+        assert!(!off[0].checked);
+
+        // Out-of-range index toggles nothing.
+        assert!(!st.toggle_todo_task(99).unwrap());
     }
 
     #[test]

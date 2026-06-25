@@ -9,7 +9,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Mode};
-use crate::model::{Action, ButtonHitbox, FileHitbox};
+use crate::model::{Action, ButtonHitbox, FileHitbox, TodoHitbox};
 
 const TIME_FMT: &str = "%H:%M";
 
@@ -17,6 +17,7 @@ const TIME_FMT: &str = "%H:%M";
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hitboxes.clear();
     app.file_hitboxes.clear();
+    app.todo_hitboxes.clear();
 
     let area = f.area();
     let chunks = Layout::default()
@@ -40,6 +41,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::FileList | Mode::FileSearch | Mode::FileRename | Mode::FileDelete => {
             draw_file_list(f, app)
         }
+        Mode::Todo => draw_todo(f, app),
         Mode::Normal | Mode::Insert => {}
     }
 }
@@ -181,6 +183,79 @@ fn draw_file_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, rect);
 }
 
+fn draw_todo(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let w = (area.width / 2).clamp(40, 70);
+    let count = app.todo_items.len() as u16;
+    let h = count
+        .saturating_add(4)
+        .min(area.height.saturating_sub(4))
+        .max(7);
+    let rect = centered(area, w, h);
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Todos  (↑↓ · Enter/click toggle · Esc)");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    if app.todo_items.is_empty() {
+        f.render_widget(
+            Paragraph::new("No todos yet. Press `t` on a message to add one.")
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .todo_items
+        .iter()
+        .map(|item| {
+            let checkbox = if item.checked { "[x]" } else { "[ ]" };
+            let box_style = if item.checked {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let text_style = if item.checked {
+                Style::default().add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                Style::default()
+            };
+            // Fold any continuation lines onto a single display line.
+            let text = item.text.replace('\n', " ");
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{checkbox} "), box_style),
+                Span::styled(text, text_style),
+            ]))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+    let mut state = ListState::default();
+    state.select(Some(app.todo_index));
+    f.render_stateful_widget(list, inner, &mut state);
+
+    // One clickable row per visible task.
+    for i in 0..app.todo_items.len() {
+        let row = inner.y + i as u16;
+        if row < inner.y + inner.height {
+            app.todo_hitboxes.push(TodoHitbox {
+                index: i,
+                area: Rect {
+                    x: inner.x,
+                    y: row,
+                    width: inner.width,
+                    height: 1,
+                },
+            });
+        }
+    }
+}
+
 /// Bottom footer: `Note <path> [MODE]` (and status) on the left, keybinding
 /// hints on the right — i.e. the hints sit in the bottom-right corner.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -215,7 +290,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match app.mode {
         Mode::Insert => "Tab/Esc → normal mode",
         Mode::Normal => {
-            "t todo · m move · a arch · n new · v view · e edit · d del · f files · i insert"
+            "t todo · m move · a arch · T todos · n new · v view · e edit · d del · f files · i insert"
         }
         Mode::FileList => "↑↓ select · Enter/v preview · e edit · Esc close",
         _ => "",
@@ -839,5 +914,24 @@ mod tests {
         let s = buffer_string(&terminal).replace(' ', "");
         assert!(s.contains("Pressitoinsert"), "normal-mode hint missing from title");
         assert!(!s.contains('❯'), "stale ❯ prompt should be gone");
+    }
+
+    #[test]
+    fn todo_panel_renders_task_and_hitbox() {
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        let m = st.append_chat_message("buy milk").unwrap();
+        st.move_to_todo(&m).unwrap();
+        let mut app = App::new(st).unwrap();
+        app.open_todo();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal);
+        assert!(s.contains("[ ]"), "unchecked checkbox should render");
+        assert!(s.contains("buy milk"), "task text should render");
+        assert_eq!(app.todo_hitboxes.len(), 1, "task row should be clickable");
     }
 }

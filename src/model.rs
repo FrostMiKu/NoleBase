@@ -65,3 +65,18 @@ pub struct FileHitbox {
     pub path: std::path::PathBuf,
     pub area: Rect,
 }
+
+/// A `- [ ]` / `- [x]` task parsed from `TODO.md`.
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub checked: bool,
+    pub text: String,
+}
+
+/// A recorded screen rectangle for a clickable todo row (its index into the
+/// task list), rebuilt each frame.
+#[derive(Debug, Clone)]
+pub struct TodoHitbox {
+    pub index: usize,
+    pub area: Rect,
+}

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::model::{Action, Message};
+use crate::model::{Action, Message, TodoHitbox, TodoItem};
 use crate::storage::Storage;
 
 fn point_in_rect(col: u16, row: u16, area: ratatui::layout::Rect) -> bool {
@@ -69,6 +69,8 @@ pub enum Mode {
     FileRename,
     /// Confirming deletion of a file.
     FileDelete,
+    /// Browsing and toggling the TODO.md task list.
+    Todo,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,11 @@ pub struct App {
     /// Target file for `FileRename` / `FileDelete`.
     pub pending_file: Option<PathBuf>,
     pub sidebar_index: usize,
+    /// Tasks parsed from TODO.md, shown in `Mode::Todo`.
+    pub todo_items: Vec<TodoItem>,
+    pub todo_index: usize,
+    /// Clickable rows in the todo panel, rebuilt each frame.
+    pub todo_hitboxes: Vec<TodoHitbox>,
     pub status: String,
 }
 
@@ -140,6 +147,9 @@ impl App {
             rename_input: String::new(),
             pending_file: None,
             sidebar_index: 0,
+            todo_items: Vec::new(),
+            todo_index: 0,
+            todo_hitboxes: Vec::new(),
             status: String::new(),
         })
     }
@@ -159,6 +169,24 @@ impl App {
         self.sidebar_index = 0;
         self.refresh_file_filter();
         self.mode = Mode::FileList;
+    }
+
+    /// Open the TODO.md task panel, reloading tasks from disk.
+    pub fn open_todo(&mut self) {
+        self.todo_items = self.storage.load_todo_tasks();
+        if self.todo_index >= self.todo_items.len() {
+            self.todo_index = self.todo_items.len().saturating_sub(1);
+        }
+        self.mode = Mode::Todo;
+    }
+
+    /// Flip the `index`-th task's completion state and refresh the panel.
+    fn toggle_todo(&mut self, index: usize) {
+        match self.storage.toggle_todo_task(index) {
+            Ok(true) => self.todo_items = self.storage.load_todo_tasks(),
+            Ok(false) => self.set_status("No such task"),
+            Err(e) => self.set_status(format!("Error: {e}")),
+        }
     }
 
     /// Recompute `sidebar_files` from `all_files` and the current `file_query`,
@@ -196,6 +224,7 @@ impl App {
             Mode::FileSearch => self.handle_file_search(key),
             Mode::FileRename => self.handle_file_rename(key),
             Mode::FileDelete => self.handle_file_delete(key),
+            Mode::Todo => self.handle_todo(key),
         }
     }
 
@@ -210,6 +239,17 @@ impl App {
                 None
             }
             MouseEventKind::Down(_) => {
+                // A clicked todo row toggles that task.
+                let todo_hit = self
+                    .todo_hitboxes
+                    .iter()
+                    .find(|h| point_in_rect(ev.column, ev.row, h.area))
+                    .map(|h| h.index);
+                if let Some(index) = todo_hit {
+                    self.todo_index = index;
+                    self.toggle_todo(index);
+                    return None;
+                }
                 // A clicked file row previews that file.
                 let file_hit = self
                     .file_hitboxes
@@ -241,6 +281,7 @@ impl App {
                         | Mode::FileSearch
                         | Mode::FileRename
                         | Mode::FileDelete
+                        | Mode::Todo
                 ) {
                     self.mode = Mode::Insert;
                 }
@@ -452,6 +493,10 @@ impl App {
             KeyCode::Char('t') => self.act(Action::Todo),
             KeyCode::Char('m') => self.act(Action::Move),
             KeyCode::Char('a') => self.act(Action::Archive),
+            KeyCode::Char('T') => {
+                self.open_todo();
+                None
+            }
             KeyCode::Char('n') => self.act(Action::New),
             KeyCode::Char('v') => self.act(Action::View),
             KeyCode::Char('e') => self.act(Action::Edit),
@@ -617,6 +662,33 @@ impl App {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.pending_file = None;
                 self.mode = Mode::FileList;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_todo(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('T') => {
+                self.mode = Mode::Normal;
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.todo_index + 1 < self.todo_items.len() {
+                    self.todo_index += 1;
+                }
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.todo_index > 0 {
+                    self.todo_index -= 1;
+                }
+                None
+            }
+            // Toggle the highlighted task (Enter / Space / x).
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
+                self.toggle_todo(self.todo_index);
                 None
             }
             _ => None,
@@ -1028,6 +1100,32 @@ mod tests {
         assert!(app.messages.is_empty(), "message should leave the chat");
         let body = std::fs::read_to_string(&app.storage.archive_path).unwrap();
         assert!(body.contains("to be archived"), "message should land in ARCHIVE.md");
+    }
+
+    #[test]
+    fn todo_panel_toggles_task() {
+        let (mut app, _dir) = make_app();
+        // Seed a task by moving a message to TODO.md.
+        let m = app.storage.append_chat_message("buy milk").unwrap();
+        app.storage.move_to_todo(&m).unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+
+        // 'T' opens the todo panel.
+        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Todo);
+        assert_eq!(app.todo_items.len(), 1);
+        assert!(!app.todo_items[0].checked);
+
+        // Enter toggles it on, then off again.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.todo_items[0].checked);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.todo_items[0].checked);
+
+        // Esc closes the panel.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     fn file_index(app: &App, stem: &str) -> usize {
