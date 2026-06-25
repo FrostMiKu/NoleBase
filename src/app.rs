@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::model::{Action, Message, TodoHitbox, TodoItem};
+use crate::model::{Action, Message, SearchHit, SearchHitbox, TodoHitbox, TodoItem};
 use crate::storage::Storage;
 
 fn point_in_rect(col: u16, row: u16, area: ratatui::layout::Rect) -> bool {
@@ -26,6 +26,22 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
         }
     }
     true
+}
+
+/// First non-blank line of `body` containing `query_lower` (case-insensitive),
+/// falling back to the first non-blank line — used to preview a search match.
+fn best_line(body: &str, query_lower: &str) -> String {
+    for line in body.lines() {
+        let t = line.trim();
+        if !t.is_empty() && t.to_lowercase().contains(query_lower) {
+            return t.to_string();
+        }
+    }
+    body.lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// A request from the app to the terminal driver (which owns the TUI lifecycle).
@@ -71,6 +87,8 @@ pub enum Mode {
     FileDelete,
     /// Browsing and toggling the TODO.md task list.
     Todo,
+    /// Full-text content search across messages and note files.
+    Search,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +136,12 @@ pub struct App {
     pub todo_index: usize,
     /// Clickable rows in the todo panel, rebuilt each frame.
     pub todo_hitboxes: Vec<TodoHitbox>,
+    /// Full-text search state.
+    pub search_query: String,
+    pub search_results: Vec<SearchHit>,
+    pub search_index: usize,
+    /// Clickable rows in the search panel, rebuilt each frame.
+    pub search_hitboxes: Vec<SearchHitbox>,
     pub status: String,
 }
 
@@ -150,6 +174,10 @@ impl App {
             todo_items: Vec::new(),
             todo_index: 0,
             todo_hitboxes: Vec::new(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_index: 0,
+            search_hitboxes: Vec::new(),
             status: String::new(),
         })
     }
@@ -189,6 +217,61 @@ impl App {
         }
     }
 
+    /// Open the content-search panel with an empty query.
+    pub fn open_search(&mut self) {
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_index = 0;
+        self.mode = Mode::Search;
+    }
+
+    /// Recompute `search_results` for the current query: matching chat messages
+    /// first, then matching lines across note files.
+    fn recompute_search(&mut self) {
+        let q = self.search_query.trim().to_lowercase();
+        let mut results: Vec<SearchHit> = Vec::new();
+        if !q.is_empty() {
+            for m in &self.messages {
+                if m.body.to_lowercase().contains(&q) {
+                    results.push(SearchHit::Message {
+                        id: m.id.clone(),
+                        text: best_line(&m.body, &q),
+                    });
+                }
+            }
+            results.extend(self.storage.search_file_lines(&q));
+        }
+        self.search_results = results;
+        if self.search_index >= self.search_results.len() {
+            self.search_index = self.search_results.len().saturating_sub(1);
+        }
+    }
+
+    /// Open the `index`-th search result in the preview modal (Esc returns to
+    /// the search panel).
+    fn jump_to_search_result(&mut self, index: usize) {
+        let Some(hit) = self.search_results.get(index).cloned() else {
+            return;
+        };
+        match hit {
+            SearchHit::Message { id, .. } => {
+                if let Some(m) = self.message_clone(&id) {
+                    self.preview = Some(Preview {
+                        title: format!("Message {}", m.created_at.format("%Y-%m-%d %H:%M")),
+                        source: m.body.clone(),
+                        scroll: 0,
+                    });
+                    self.preview_return = Mode::Search;
+                    self.mode = Mode::Preview;
+                }
+            }
+            SearchHit::FileLine { path, .. } => {
+                // open_file_preview records preview_return = Search itself.
+                self.open_file_preview(&path);
+            }
+        }
+    }
+
     /// Recompute `sidebar_files` from `all_files` and the current `file_query`,
     /// keeping `sidebar_index` in range.
     fn refresh_file_filter(&mut self) {
@@ -225,6 +308,7 @@ impl App {
             Mode::FileRename => self.handle_file_rename(key),
             Mode::FileDelete => self.handle_file_delete(key),
             Mode::Todo => self.handle_todo(key),
+            Mode::Search => self.handle_search(key),
         }
     }
 
@@ -239,6 +323,17 @@ impl App {
                 None
             }
             MouseEventKind::Down(_) => {
+                // A clicked search result opens it.
+                let search_hit = self
+                    .search_hitboxes
+                    .iter()
+                    .find(|h| point_in_rect(ev.column, ev.row, h.area))
+                    .map(|h| h.index);
+                if let Some(index) = search_hit {
+                    self.search_index = index;
+                    self.jump_to_search_result(index);
+                    return None;
+                }
                 // A clicked todo row toggles that task.
                 let todo_hit = self
                     .todo_hitboxes
@@ -282,6 +377,7 @@ impl App {
                         | Mode::FileRename
                         | Mode::FileDelete
                         | Mode::Todo
+                        | Mode::Search
                 ) {
                     self.mode = Mode::Insert;
                 }
@@ -497,6 +593,10 @@ impl App {
                 self.open_todo();
                 None
             }
+            KeyCode::Char('/') => {
+                self.open_search();
+                None
+            }
             KeyCode::Char('n') => self.act(Action::New),
             KeyCode::Char('v') => self.act(Action::View),
             KeyCode::Char('e') => self.act(Action::Edit),
@@ -689,6 +789,43 @@ impl App {
             // Toggle the highlighted task (Enter / Space / x).
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
                 self.toggle_todo(self.todo_index);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_search(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                None
+            }
+            // Arrow keys only (letters are query input).
+            KeyCode::Down => {
+                if self.search_index + 1 < self.search_results.len() {
+                    self.search_index += 1;
+                }
+                None
+            }
+            KeyCode::Up => {
+                if self.search_index > 0 {
+                    self.search_index -= 1;
+                }
+                None
+            }
+            KeyCode::Enter => {
+                self.jump_to_search_result(self.search_index);
+                None
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.recompute_search();
+                None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.push(c);
+                self.recompute_search();
                 None
             }
             _ => None,
@@ -1124,6 +1261,43 @@ mod tests {
         assert!(!app.todo_items[0].checked);
 
         // Esc closes the panel.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn search_finds_message_and_file_and_jumps() {
+        let (mut app, _dir) = make_app();
+        app.storage
+            .append_chat_message("remember to rust the bike")
+            .unwrap();
+        app.reload();
+        std::fs::write(
+            app.storage.root.join("Work.md"),
+            "# Work\n\ndeep rust notes\n",
+        )
+        .unwrap();
+
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Search);
+        for c in "rust".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app
+            .search_results
+            .iter()
+            .any(|h| matches!(h, SearchHit::Message { .. })));
+        assert!(app
+            .search_results
+            .iter()
+            .any(|h| matches!(h, SearchHit::FileLine { .. })));
+
+        // Enter opens a result; Esc returns to the search, then closes it.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Preview);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Search);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
     }

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 
-use crate::model::{Message, TodoItem};
+use crate::model::{Message, SearchHit, TodoItem};
 
 const OPEN_PREFIX: &str = "<!-- note-msg";
 const OPEN_SUFFIX: &str = "-->";
@@ -175,6 +175,38 @@ impl Storage {
             fs::write(&self.todo_path, out)?;
         }
         Ok(toggled)
+    }
+
+    /// Case-insensitive substring search across every managed `.md` file
+    /// (excluding `CHAT.md`, whose content is searched as messages). One hit
+    /// per matching non-blank line. Capped to keep the result list bounded.
+    pub fn search_file_lines(&self, query: &str) -> Vec<SearchHit> {
+        let q = query.to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        const CAP: usize = 200;
+        let mut out: Vec<SearchHit> = Vec::new();
+        for path in self.list_markdown_files().unwrap_or_default() {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            for (i, line) in text.lines().enumerate() {
+                if line.to_lowercase().contains(&q) {
+                    let t = line.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    out.push(SearchHit::FileLine {
+                        path: path.clone(),
+                        line_no: i + 1,
+                        text: t.to_string(),
+                    });
+                    if out.len() >= CAP {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Append a message to a target markdown file under the root, then remove
@@ -554,6 +586,26 @@ mod tests {
 
         // Out-of-range index toggles nothing.
         assert!(!st.toggle_todo_task(99).unwrap());
+    }
+
+    #[test]
+    fn search_file_lines_finds_matches_case_insensitively() {
+        let (_dir, st) = fresh();
+        st.create_named_file("Project").unwrap();
+        let p = st.root.join("Project.md");
+        fs::write(&p, "# Project\n\nA note about Rust speed\n\nunrelated\n").unwrap();
+
+        let hits = st.search_file_lines("rust");
+        assert!(hits.iter().any(|h| matches!(h,
+            SearchHit::FileLine { text, .. } if text.to_lowercase().contains("rust"))));
+        // Case-insensitive.
+        let hi = st.search_file_lines("RUST");
+        assert!(!hi.is_empty());
+        // Empty query returns nothing.
+        assert!(st.search_file_lines("").is_empty());
+        // Skips CHAT.md (no markers leak into results).
+        assert!(hits.iter().all(|h| !matches!(h,
+            SearchHit::FileLine { path, .. } if path.file_name().unwrap() == "CHAT.md")));
     }
 
     #[test]

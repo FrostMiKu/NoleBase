@@ -9,7 +9,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Mode};
-use crate::model::{Action, ButtonHitbox, FileHitbox, TodoHitbox};
+use crate::model::{Action, ButtonHitbox, FileHitbox, SearchHit, SearchHitbox, TodoHitbox};
 
 const TIME_FMT: &str = "%H:%M";
 
@@ -18,6 +18,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hitboxes.clear();
     app.file_hitboxes.clear();
     app.todo_hitboxes.clear();
+    app.search_hitboxes.clear();
 
     let area = f.area();
     let chunks = Layout::default()
@@ -42,6 +43,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_file_list(f, app)
         }
         Mode::Todo => draw_todo(f, app),
+        Mode::Search => draw_search(f, app),
         Mode::Normal | Mode::Insert => {}
     }
 }
@@ -256,6 +258,101 @@ fn draw_todo(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn draw_search(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let w = (area.width * 3 / 4).clamp(50, 90);
+    // Fixed height regardless of result count; the list scrolls internally.
+    let h = (area.height * 3 / 5)
+        .max(7)
+        .min(area.height.saturating_sub(4));
+    let rect = centered(area, w, h);
+    f.render_widget(Clear, rect);
+
+    let title = if app.search_results.is_empty() {
+        "Search  (type to search · Esc close)".to_string()
+    } else {
+        format!(
+            "Search  ({} matches · ↑↓ · Enter open · Esc)",
+            app.search_results.len()
+        )
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Query input row + results list.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let prompt = "/ ";
+    let prompt_w = prompt.width();
+    let line = Line::from(vec![
+        Span::styled(prompt.to_string(), Style::default().fg(Color::Green)),
+        Span::raw(app.search_query.as_str()),
+    ]);
+    f.render_widget(Paragraph::new(line), chunks[0]);
+    let cx = chunks[0].x + prompt_w as u16 + UnicodeWidthStr::width(app.search_query.as_str()) as u16;
+    f.set_cursor_position((cx, chunks[0].y));
+
+    if app.search_results.is_empty() {
+        if !app.search_query.is_empty() {
+            f.render_widget(
+                Paragraph::new("No matches.").alignment(Alignment::Center),
+                chunks[1],
+            );
+        }
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .search_results
+        .iter()
+        .map(|hit| match hit {
+            SearchHit::Message { text, .. } => ListItem::new(Line::from(vec![
+                Span::styled("• ", Style::default().fg(Color::Cyan)),
+                Span::raw(text.clone()),
+            ])),
+            SearchHit::FileLine {
+                path, line_no, text, ..
+            } => {
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{name}:{line_no} "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(text.clone()),
+                ]))
+            }
+        })
+        .collect();
+    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+    let mut state = ListState::default();
+    state.select(Some(app.search_index));
+    f.render_stateful_widget(list, chunks[1], &mut state);
+
+    // Register hitboxes for the visible window only. The list scrolls to keep
+    // `search_index` in view; ratatui updates `state.offset` during render, so
+    // map each visible result to its actual screen row.
+    let list_area = chunks[1];
+    let start = state.offset();
+    let end = (start + list_area.height as usize).min(app.search_results.len());
+    for i in start..end {
+        let row = list_area.y + (i - start) as u16;
+        app.search_hitboxes.push(SearchHitbox {
+            index: i,
+            area: Rect {
+                x: list_area.x,
+                y: row,
+                width: list_area.width,
+                height: 1,
+            },
+        });
+    }
+}
+
 /// Bottom footer: `Note <path> [MODE]` (and status) on the left, keybinding
 /// hints on the right — i.e. the hints sit in the bottom-right corner.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -290,7 +387,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match app.mode {
         Mode::Insert => "Tab/Esc → normal mode",
         Mode::Normal => {
-            "t todo · m move · a arch · T todos · n new · v view · e edit · d del · f files · i insert"
+            "t todo · m move · a arch · T todos · / search · n new · v view · e edit · d del · f files · i insert"
         }
         Mode::FileList => "↑↓ select · Enter/v preview · e edit · Esc close",
         _ => "",
@@ -933,5 +1030,28 @@ mod tests {
         assert!(s.contains("[ ]"), "unchecked checkbox should render");
         assert!(s.contains("buy milk"), "task text should render");
         assert_eq!(app.todo_hitboxes.len(), 1, "task row should be clickable");
+    }
+
+    #[test]
+    fn search_panel_renders_results_and_hitbox() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        st.append_chat_message("findme in chat").unwrap();
+        std::fs::write(st.root.join("Work.md"), "# Work\n\nfindme in file\n").unwrap();
+        let mut app = App::new(st).unwrap();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "findme".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal);
+        assert!(s.contains("findme"), "match text should render");
+        assert!(!app.search_hitboxes.is_empty(), "result rows should be clickable");
     }
 }

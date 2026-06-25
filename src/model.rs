@@ -80,3 +80,23 @@ pub struct TodoHitbox {
     pub index: usize,
     pub area: Rect,
 }
+
+/// One content-search match.
+#[derive(Debug, Clone)]
+pub enum SearchHit {
+    /// A chat message whose body matched.
+    Message { id: String, text: String },
+    /// A matching line in a `.md` file.
+    FileLine {
+        path: std::path::PathBuf,
+        line_no: usize,
+        text: String,
+    },
+}
+
+/// A recorded screen rectangle for a clickable search result row.
+#[derive(Debug, Clone)]
+pub struct SearchHitbox {
+    pub index: usize,
+    pub area: Rect,
+}
