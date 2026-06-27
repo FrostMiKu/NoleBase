@@ -39,6 +39,45 @@ pub fn to_lines(source: &str) -> Vec<Line<'static>> {
     r.finish()
 }
 
+/// Parse a single line's inline markdown (`**bold**`, `*italic*`, `` `code` ``,
+/// `~~strike~~`) into styled spans. Block elements are not interpreted — their
+/// text passes through plain — so this suits the width-constrained chat cards
+/// (full block rendering lives in the preview modal).
+pub fn inline_spans(text: &str) -> Vec<Span<'static>> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(text, opts);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    let mut stack: Vec<Style> = Vec::new();
+    for event in parser {
+        match event {
+            Event::Text(s) => spans.push(Span::styled(s.to_string(), style)),
+            Event::Code(s) => spans.push(Span::styled(s.to_string(), CODE_INLINE)),
+            Event::Start(Tag::Strong) => {
+                stack.push(style);
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            Event::Start(Tag::Emphasis) => {
+                stack.push(style);
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            Event::Start(Tag::Strikethrough) => {
+                stack.push(style);
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            Event::End(TagEnd::Strong) | Event::End(TagEnd::Emphasis) | Event::End(TagEnd::Strikethrough) => {
+                if let Some(prev) = stack.pop() {
+                    style = prev;
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => spans.push(Span::raw(" ".to_string())),
+            _ => {}
+        }
+    }
+    spans
+}
+
 #[derive(Default)]
 struct Renderer {
     /// Completed output lines.
@@ -588,6 +627,20 @@ mod tests {
         let l = to_lines("just words");
         assert_eq!(l.len(), 1);
         assert_eq!(text_of(&l[0]), "just words");
+    }
+
+    #[test]
+    fn inline_spans_parses_emphasis_and_code() {
+        let s = inline_spans("a **b** `c`");
+        let text: String = s.iter().map(|x| x.content.as_ref()).collect();
+        assert!(text.contains('a') && text.contains('b') && text.contains('c'));
+        assert!(!text.contains("**"), "bold markers should be parsed away");
+        assert!(!text.contains('`'), "code backticks should be parsed away");
+
+        let bold = s.iter().find(|x| x.content.contains('b')).unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let code = s.iter().find(|x| x.content.contains('c')).unwrap();
+        assert_eq!(code.style.fg, Some(Color::Yellow));
     }
 
     #[test]

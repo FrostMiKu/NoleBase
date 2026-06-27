@@ -44,6 +44,105 @@ fn best_line(body: &str, query_lower: &str) -> String {
         .to_string()
 }
 
+// --- cursor-editing primitives (shared by the compose box and the message
+// editor; operate on an arbitrary buffer + char-index cursor) ---
+
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or_else(|| s.len())
+}
+
+fn insert_char(buf: &mut String, cursor: &mut usize, c: char) {
+    let b = char_to_byte(buf, *cursor);
+    buf.insert(b, c);
+    *cursor += 1;
+}
+
+fn delete_backward(buf: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let prev = char_to_byte(buf, *cursor - 1);
+    let cur = char_to_byte(buf, *cursor);
+    buf.replace_range(prev..cur, "");
+    *cursor -= 1;
+}
+
+fn delete_forward(buf: &mut String, cursor: &mut usize) {
+    let total = buf.chars().count();
+    if *cursor >= total {
+        return;
+    }
+    let cur = char_to_byte(buf, *cursor);
+    let next = char_to_byte(buf, *cursor + 1);
+    buf.replace_range(cur..next, "");
+}
+
+/// Insert `s` at the cursor, advancing it by the number of chars inserted.
+fn paste_into(buf: &mut String, cursor: &mut usize, s: &str) {
+    let n = s.chars().count();
+    let b = char_to_byte(buf, *cursor);
+    buf.insert_str(b, s);
+    *cursor += n;
+}
+
+fn move_cursor(buf: &str, cursor: usize, m: CursorMove) -> usize {
+    let chars: Vec<char> = buf.chars().collect();
+    let total = chars.len();
+    let i = cursor;
+    let line_start = {
+        let mut j = i;
+        while j > 0 && chars[j - 1] != '\n' {
+            j -= 1;
+        }
+        j
+    };
+    match m {
+        CursorMove::Left => i.saturating_sub(1),
+        CursorMove::Right => (i + 1).min(total),
+        CursorMove::LineStart => line_start,
+        CursorMove::LineEnd => {
+            let mut j = i;
+            while j < total && chars[j] != '\n' {
+                j += 1;
+            }
+            j
+        }
+        CursorMove::Up | CursorMove::Down => {
+            let col = i - line_start;
+            let target_line_start = if matches!(m, CursorMove::Up) {
+                if line_start == 0 {
+                    return i; // already on the first line
+                }
+                let mut j = line_start - 1;
+                while j > 0 && chars[j - 1] != '\n' {
+                    j -= 1;
+                }
+                j
+            } else {
+                let mut j = i;
+                while j < total && chars[j] != '\n' {
+                    j += 1;
+                }
+                if j >= total {
+                    return i; // already on the last line
+                }
+                j + 1
+            };
+            let target_line_end = {
+                let mut j = target_line_start;
+                while j < total && chars[j] != '\n' {
+                    j += 1;
+                }
+                j
+            };
+            (target_line_start + col).min(target_line_end)
+        }
+    }
+}
+
 /// A request from the app to the terminal driver (which owns the TUI lifecycle).
 #[derive(Debug)]
 pub enum Command {
@@ -72,6 +171,8 @@ enum UndoOp {
         target: PathBuf,
         appended: String,
     },
+    /// Body edit: holds the pre-edit message so undo restores the old body.
+    Edit(Message),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +203,8 @@ pub enum Mode {
     Search,
     /// Keybinding reference overlay.
     Help,
+    /// Editing a single message's body in-app.
+    EditMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +262,10 @@ pub struct App {
     undo_stack: Vec<UndoOp>,
     /// Vertical scroll of the help overlay.
     pub help_scroll: u16,
+    /// In-app single-message editor state.
+    pub edit_input: String,
+    pub edit_cursor: usize,
+    pub edit_id: String,
     pub status: String,
 }
 
@@ -197,6 +304,9 @@ impl App {
             search_hitboxes: Vec::new(),
             undo_stack: Vec::new(),
             help_scroll: 0,
+            edit_input: String::new(),
+            edit_cursor: 0,
+            edit_id: String::new(),
             status: String::new(),
         })
     }
@@ -335,6 +445,7 @@ impl App {
             Mode::Todo => self.handle_todo(key),
             Mode::Search => self.handle_search(key),
             Mode::Help => self.handle_help(key),
+            Mode::EditMessage => self.handle_editmessage(key),
         }
     }
 
@@ -405,6 +516,7 @@ impl App {
                         | Mode::Todo
                         | Mode::Search
                         | Mode::Help
+                        | Mode::EditMessage
                 ) {
                     self.mode = Mode::Insert;
                 }
@@ -483,94 +595,30 @@ impl App {
     }
 
     /// Byte offset of the `char_idx`-th char in `s` (or `s.len()` past the end).
-    fn char_to_byte(s: &str, char_idx: usize) -> usize {
-        s.char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or_else(|| s.len())
-    }
-
     fn insert_char(&mut self, c: char) {
-        let b = Self::char_to_byte(&self.input, self.input_cursor);
-        self.input.insert(b, c);
-        self.input_cursor += 1;
+        insert_char(&mut self.input, &mut self.input_cursor, c);
     }
 
     fn delete_backward(&mut self) {
-        if self.input_cursor == 0 {
-            return;
-        }
-        let prev = Self::char_to_byte(&self.input, self.input_cursor - 1);
-        let cur = Self::char_to_byte(&self.input, self.input_cursor);
-        self.input.replace_range(prev..cur, "");
-        self.input_cursor -= 1;
+        delete_backward(&mut self.input, &mut self.input_cursor);
     }
 
     fn delete_forward(&mut self) {
-        let total = self.input.chars().count();
-        if self.input_cursor >= total {
-            return;
-        }
-        let cur = Self::char_to_byte(&self.input, self.input_cursor);
-        let next = Self::char_to_byte(&self.input, self.input_cursor + 1);
-        self.input.replace_range(cur..next, "");
+        delete_forward(&mut self.input, &mut self.input_cursor);
     }
 
     fn move_cursor(&mut self, m: CursorMove) {
-        let chars: Vec<char> = self.input.chars().collect();
-        let total = chars.len();
-        let i = self.input_cursor;
-        // Index just after the '\n' that starts the current line (or 0).
-        let line_start = {
-            let mut j = i;
-            while j > 0 && chars[j - 1] != '\n' {
-                j -= 1;
-            }
-            j
-        };
-        match m {
-            CursorMove::Left => self.input_cursor = i.saturating_sub(1),
-            CursorMove::Right => self.input_cursor = (i + 1).min(total),
-            CursorMove::LineStart => self.input_cursor = line_start,
-            CursorMove::LineEnd => {
-                let mut j = i;
-                while j < total && chars[j] != '\n' {
-                    j += 1;
-                }
-                self.input_cursor = j;
-            }
-            CursorMove::Up | CursorMove::Down => {
-                let col = i - line_start;
-                let target_line_start = if matches!(m, CursorMove::Up) {
-                    if line_start == 0 {
-                        return; // already on the first line
-                    }
-                    // Step back over the '\n', then to the previous line start.
-                    let mut j = line_start - 1;
-                    while j > 0 && chars[j - 1] != '\n' {
-                        j -= 1;
-                    }
-                    j
-                } else {
-                    // Advance to the next '\n'; the next line starts after it.
-                    let mut j = i;
-                    while j < total && chars[j] != '\n' {
-                        j += 1;
-                    }
-                    if j >= total {
-                        return; // already on the last line
-                    }
-                    j + 1
-                };
-                let target_line_end = {
-                    let mut j = target_line_start;
-                    while j < total && chars[j] != '\n' {
-                        j += 1;
-                    }
-                    j
-                };
-                self.input_cursor = (target_line_start + col).min(target_line_end);
-            }
+        self.input_cursor = move_cursor(&self.input, self.input_cursor, m);
+    }
+
+    /// Insert pasted text at the cursor (used for bracketed-paste events).
+    /// Normalizes CRLF/CR to LF. Only acts in text-entry modes.
+    pub fn handle_paste(&mut self, s: &str) {
+        let text = s.replace("\r\n", "\n").replace('\r', "\n");
+        match self.mode {
+            Mode::Insert => paste_into(&mut self.input, &mut self.input_cursor, &text),
+            Mode::EditMessage => paste_into(&mut self.edit_input, &mut self.edit_cursor, &text),
+            _ => {}
         }
     }
 
@@ -893,6 +941,88 @@ impl App {
         }
     }
 
+    fn handle_editmessage(&mut self, key: KeyEvent) -> Option<Command> {
+        let mods = key.modifiers;
+        let send_mods = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        match key.code {
+            KeyCode::Enter if mods.intersects(send_mods) => {
+                self.save_edit();
+                None
+            }
+            KeyCode::Enter => {
+                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
+                None
+            }
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                None
+            }
+            KeyCode::Backspace => {
+                delete_backward(&mut self.edit_input, &mut self.edit_cursor);
+                None
+            }
+            KeyCode::Delete => {
+                delete_forward(&mut self.edit_input, &mut self.edit_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Left);
+                None
+            }
+            KeyCode::Right => {
+                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Right);
+                None
+            }
+            KeyCode::Up => {
+                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Up);
+                None
+            }
+            KeyCode::Down => {
+                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Down);
+                None
+            }
+            KeyCode::Home => {
+                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::LineStart);
+                None
+            }
+            KeyCode::End => {
+                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::LineEnd);
+                None
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.edit_input, &mut self.edit_cursor, c);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Save the in-app edit: record undo (old body), rewrite the block.
+    fn save_edit(&mut self) {
+        let Some(m) = self.message_clone(&self.edit_id) else {
+            self.set_status("Message not found");
+            self.mode = Mode::Normal;
+            return;
+        };
+        let old = m.clone();
+        let mut updated = m;
+        updated.body = self.edit_input.clone();
+        match self.storage.replace_message(&updated) {
+            Ok(true) => {
+                self.record_undo(UndoOp::Edit(old));
+                self.set_status("Saved");
+                self.reload();
+                if let Some(idx) = self.messages.iter().position(|x| x.id == self.edit_id) {
+                    self.selected = idx;
+                }
+                self.scroll = u32::MAX as u16;
+            }
+            Ok(false) => self.set_status("Message not found"),
+            Err(e) => self.set_status(format!("Error: {e}")),
+        }
+        self.mode = Mode::Normal;
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.messages.is_empty() {
             return;
@@ -970,7 +1100,17 @@ impl App {
                 }
                 None
             }
-            Action::Edit => Some(Command::Edit(self.storage.chat_path.clone())),
+            Action::Edit => {
+                // Open the in-app single-message editor (avoids editing the
+                // whole CHAT.md and risking the note-msg block markers).
+                if let Some(m) = self.message_clone(id) {
+                    self.edit_id = m.id.clone();
+                    self.edit_input = m.body.clone();
+                    self.edit_cursor = self.edit_input.chars().count();
+                    self.mode = Mode::EditMessage;
+                }
+                None
+            }
             Action::Delete => {
                 self.pending_id = Some(id.to_string());
                 self.mode = Mode::ConfirmDelete;
@@ -1221,6 +1361,11 @@ impl App {
                 }
                 Err(e) => format!("Undo error: {e}"),
             },
+            UndoOp::Edit(msg) => match self.storage.replace_message(&msg) {
+                Ok(true) => "Undid edit".to_string(),
+                Ok(false) => "Undid edit (message gone)".to_string(),
+                Err(e) => format!("Undo error: {e}"),
+            },
         };
         self.set_status(status);
         self.reload();
@@ -1268,6 +1413,35 @@ mod tests {
         app.input = "again".to_string();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert_eq!(app.messages.len(), 2);
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_and_normalizes_newlines() {
+        let (mut app, _dir) = make_app();
+        app.mode = Mode::Insert;
+        app.input = "ab".to_string();
+        app.input_cursor = 1; // between 'a' and 'b'
+        // CRLF must become a single LF.
+        app.handle_paste("X\r\nY");
+        assert_eq!(app.input, "aX\nYb");
+        assert_eq!(app.input_cursor, 4);
+    }
+
+    #[test]
+    fn paste_works_in_editor_and_is_ignored_in_command_modes() {
+        let (mut app, _dir) = make_app();
+        // EditMessage accepts paste at the cursor.
+        app.mode = Mode::EditMessage;
+        app.edit_id = "x".into();
+        app.edit_input = "ab".to_string();
+        app.edit_cursor = 2;
+        app.handle_paste("Z");
+        assert_eq!(app.edit_input, "abZ");
+
+        // Normal mode ignores paste.
+        app.mode = Mode::Normal;
+        app.handle_paste("ignored");
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -1487,6 +1661,49 @@ mod tests {
         // '?' closes it (Esc works too).
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn edit_message_saves_and_undo_restores() {
+        let (mut app, _dir) = make_app();
+        let m = app.storage.append_chat_message("hello").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        // 'e' opens the in-app editor seeded with the body.
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::EditMessage);
+        assert_eq!(app.edit_input, "hello");
+
+        // Replace the body.
+        app.edit_input.clear();
+        app.edit_cursor = 0;
+        for c in "world".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Ctrl+Enter saves.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].body, "world");
+        assert_eq!(app.messages[0].id, m.id, "id preserved");
+
+        // 'u' restores the pre-edit body.
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.messages[0].body, "hello");
+    }
+
+    #[test]
+    fn edit_message_esc_cancels_without_saving() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("keep").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.edit_input.clear();
+        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.messages[0].body, "keep", "cancel must not save edits");
     }
 
     fn file_index(app: &App, stem: &str) -> usize {

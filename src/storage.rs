@@ -243,6 +243,25 @@ impl Storage {
         }
     }
 
+    /// Rewrite the block for `msg.id` with `msg`'s current body, preserving the
+    /// id and timestamp. Returns `false` if no block matches. Used by in-app
+    /// message editing (and undo of an edit).
+    pub fn replace_message(&self, msg: &Message) -> Result<bool> {
+        let text = fs::read_to_string(&self.chat_path).unwrap_or_default();
+        let Some((start, mut end)) = find_block_range(&text, &msg.id) else {
+            return Ok(false);
+        };
+        if text[end..].starts_with('\n') {
+            end += 1;
+        }
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..start]);
+        out.push_str(&render_block(msg));
+        out.push_str(&text[end..]);
+        fs::write(&self.chat_path, out)?;
+        Ok(true)
+    }
+
     /// Create a new markdown file from a user-entered name, returning its path.
     pub fn create_named_file(&self, name: &str) -> Result<PathBuf> {
         let file_name = normalize_new_name(name)?;
@@ -718,6 +737,32 @@ mod tests {
         assert!(st.remove_first_occurrence(&p, "NEEDLE here").unwrap());
         assert!(!fs::read_to_string(&p).unwrap().contains("NEEDLE"));
         assert!(!st.remove_first_occurrence(&p, "nope").unwrap());
+    }
+
+    #[test]
+    fn replace_message_updates_body_preserving_id() {
+        let (_dir, st) = fresh();
+        let m = st.append_chat_message("original").unwrap();
+        let _other = st.append_chat_message("keep me").unwrap();
+
+        let mut updated = m.clone();
+        updated.body = "edited body".to_string();
+        assert!(st.replace_message(&updated).unwrap());
+
+        let msgs = st.load_messages().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let got = msgs.iter().find(|x| x.id == m.id).unwrap();
+        assert_eq!(got.body, "edited body");
+        assert_eq!(got.created_at, m.created_at, "timestamp preserved");
+        assert!(msgs.iter().any(|x| x.body == "keep me"), "others untouched");
+
+        // Unknown id is a no-op.
+        let unknown = Message {
+            id: "nope".to_string(),
+            created_at: m.created_at,
+            body: "x".to_string(),
+        };
+        assert!(!st.replace_message(&unknown).unwrap());
     }
 
     #[test]

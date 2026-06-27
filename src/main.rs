@@ -113,9 +113,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
                 }
             }
             Event::Paste(text) => {
-                if app.mode == app::Mode::Insert {
-                    app.input.push_str(&text);
-                }
+                app.handle_paste(&text);
             }
             Event::Resize(_, _) => {}
             Event::FocusGained | Event::FocusLost => {}

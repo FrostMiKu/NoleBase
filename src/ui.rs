@@ -45,6 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Todo => draw_todo(f, app),
         Mode::Search => draw_search(f, app),
         Mode::Help => draw_help(f, app),
+        Mode::EditMessage => draw_edit_message(f, app),
         Mode::Normal | Mode::Insert => {}
     }
 }
@@ -387,7 +388,7 @@ fn help_lines() -> Vec<Line<'static>> {
         row("a", "Archive to ARCHIVE.md"),
         row("n", "Move into a new file"),
         row("v", "View as markdown"),
-        row("e", "Edit CHAT.md in $EDITOR"),
+        row("e", "Edit message (in-app)"),
         row("d", "Delete (asks y/N)"),
         row("u", "Undo last t / m / a / n / d"),
         blank(),
@@ -443,6 +444,67 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     }
     let para = Paragraph::new(lines).scroll((app.help_scroll, 0));
     f.render_widget(para, inner);
+}
+
+fn draw_edit_message(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let h = (area.height * 3 / 5)
+        .max(7)
+        .min(area.height.saturating_sub(4));
+    let w = (area.width * 4 / 5).clamp(50, 92);
+    let rect = centered(area, w, h);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Edit message  (Ctrl/Alt+Enter save · Esc cancel)");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let lines: Vec<Line> = if app.edit_input.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            "(empty — Ctrl/Alt+Enter to save)",
+            Style::default().fg(Color::DarkGray),
+        )])]
+    } else {
+        app.edit_input
+            .split('\n')
+            .map(|seg| Line::from(Span::raw(seg.to_string())))
+            .collect()
+    };
+
+    // Wrap-aware cursor placement, mirroring the compose box.
+    let logical: Vec<&str> = app.edit_input.split('\n').collect();
+    let width = inner.width as usize;
+    let line_widths: Vec<usize> = logical.iter().map(|s| UnicodeWidthStr::width(*s)).collect();
+    let total_rows: usize = line_widths
+        .iter()
+        .map(|&w| wrapped_row_count(w, width))
+        .sum();
+    let (cur_line, cur_col) = cursor_row_col(&app.edit_input, app.edit_cursor);
+    let rows_before: usize = line_widths[..cur_line]
+        .iter()
+        .map(|&w| wrapped_row_count(w, width))
+        .sum();
+    let row_offset = if width == 0 { 0 } else { cur_col / width };
+    let cursor_wrapped_row = rows_before + row_offset;
+
+    let text_h = inner.height as usize;
+    let scroll = if total_rows <= text_h {
+        0
+    } else {
+        let lo = cursor_wrapped_row.saturating_sub(text_h.saturating_sub(1));
+        let hi = total_rows - text_h;
+        lo.min(hi) as u16
+    };
+
+    let para = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+
+    let cy = inner.y + (cursor_wrapped_row.saturating_sub(scroll as usize)) as u16;
+    let cx = inner.x + (if width == 0 { 0 } else { cur_col % width }) as u16;
+    f.set_cursor_position((cx, cy));
 }
 
 /// Bottom footer: `Note <path> [MODE]` (and status) on the left, keybinding
@@ -532,27 +594,31 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
         let prefix = format!("{time}  ");
         let prefix_w = prefix.width();
         let budget = width.saturating_sub(prefix_w).max(1);
-        let body_style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
 
-        // Wrap the full body (respecting explicit newlines) to the card width.
-        for (i, seg) in wrap_to_width(&m.body, budget).into_iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)),
-                    Span::styled(seg, body_style),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(prefix_w)),
-                    Span::styled(seg, body_style),
-                ]));
+        // Render the body with inline markdown (bold/italic/code/strike). Each
+        // explicit newline is kept as a hard line break; long lines wrap by
+        // display width so CJK glyphs align.
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, line) in m.body.split('\n').enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("\n".to_string()));
             }
+            spans.extend(crate::markdown::inline_spans(line));
+        }
+        if selected {
+            // Highlight the whole selected card body.
+            for s in &mut spans {
+                s.style = s.style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            }
+        }
+
+        let prefix_span = Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray));
+        let indent = Span::raw(" ".repeat(prefix_w));
+        for (i, row_spans) in wrap_spans_to_width(&spans, budget).into_iter().enumerate() {
+            let mut line_spans: Vec<Span<'static>> = Vec::with_capacity(row_spans.len() + 1);
+            line_spans.push(if i == 0 { prefix_span.clone() } else { indent.clone() });
+            line_spans.extend(row_spans);
+            lines.push(Line::from(line_spans));
         }
 
         // Buttons row (indented to align with the body text).
@@ -725,7 +791,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         f.set_cursor_position((cx, cy));
     }
 
-    // --- Counts row ---
+    // --- Counts row: counts left, newline/send hint right (when focused) ---
     let line_count = if app.input.is_empty() {
         0
     } else {
@@ -733,10 +799,28 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     };
     let char_count = app.input.chars().count();
     let count = format!("{line_count} lines · {char_count} chars");
+
+    let hint = if focused {
+        "Enter newline · Ctrl/Alt+Enter send"
+    } else {
+        ""
+    };
+    let hint_w = hint.width() as u16;
+    let tb = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(hint_w)])
+        .split(chunks[1]);
     f.render_widget(
         Paragraph::new(count).style(Style::default().fg(Color::DarkGray)),
-        chunks[1],
+        tb[0],
     );
+    if !hint.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+                .alignment(Alignment::Right),
+            tb[1],
+        );
+    }
 }
 
 /// Number of wrapped screen rows a logical line of `line_width` display columns
@@ -861,33 +945,43 @@ fn draw_preview(f: &mut Frame, app: &App) {
     f.render_widget(para, rect);
 }
 
-/// Truncate a string to fit `width` display columns, appending "…" if cut.
-/// Greedy char-width wrap of `s` to `width` display columns, preserving
-/// explicit newlines as their own (possibly empty) output lines.
-fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for logical in s.split('\n') {
-        if logical.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut cur = String::new();
-        let mut cur_w = 0usize;
-        for c in logical.chars() {
-            let cw = c.width().unwrap_or(1);
-            if cur_w + cw > width && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                cur_w = 0;
+/// Greedy display-width wrap of styled spans to `width` columns, preserving
+/// explicit `'\n'` chars as hard line breaks and coalescing adjacent same-style
+/// characters into one span. Each output element is one wrapped row of spans.
+fn wrap_spans_to_width(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut row_w: usize = 0;
+    for span in spans {
+        let style = span.style;
+        for c in span.content.chars() {
+            if c == '\n' {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+                continue;
             }
-            cur.push(c);
-            cur_w += cw;
+            let cw = c.width().unwrap_or(1);
+            if width > 0 && row_w + cw > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+            }
+            let coalesced = match row.last_mut() {
+                Some(last) if last.style == style => {
+                    last.content.to_mut().push(c);
+                    true
+                }
+                _ => false,
+            };
+            if !coalesced {
+                row.push(Span::styled(c.to_string(), style));
+            }
+            row_w += cw;
         }
-        out.push(cur);
     }
-    if out.is_empty() {
-        out.push(String::new());
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(std::mem::take(&mut row));
     }
-    out
+    rows
 }
 
 #[cfg(test)]
@@ -1049,6 +1143,20 @@ mod tests {
     }
 
     #[test]
+    fn input_shows_send_hint_when_focused() {
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        let mut app = App::new(st).unwrap();
+        app.mode = Mode::Insert;
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal).replace(' ', "");
+        assert!(s.contains("Ctrl/Alt+Entersend"), "send hint should show when focused");
+    }
+
+    #[test]
     fn input_placeholder_when_empty() {
         let dir = tempdir().unwrap();
         let st = Storage::new(dir.path()).unwrap();
@@ -1145,5 +1253,43 @@ mod tests {
         let s = buffer_string(&terminal);
         assert!(s.contains("findme"), "match text should render");
         assert!(!app.search_hitboxes.is_empty(), "result rows should be clickable");
+    }
+
+    #[test]
+    fn card_renders_inline_markdown() {
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        st.append_chat_message("this is **bold** and `code`").unwrap();
+        let mut app = App::new(st).unwrap();
+        app.mode = Mode::Normal;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal);
+        assert!(s.contains("bold"), "bold text shows");
+        assert!(s.contains("code"), "code text shows");
+        assert!(!s.contains("**"), "markdown markers should be parsed away");
+        assert!(!s.contains('`'), "code backticks should be parsed away");
+    }
+
+    #[test]
+    fn edit_dialog_renders_body() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        st.append_chat_message("editable text here").unwrap();
+        let mut app = App::new(st).unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal);
+        assert!(s.contains("Edit message"), "editor title missing");
+        assert!(s.contains("editable text here"), "body should render");
     }
 }
