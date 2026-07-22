@@ -13,7 +13,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,6 +34,10 @@ fn enter_tui() -> Result<()> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
+        // Request the kitty keyboard protocol on supporting terminals so that
+        // Shift+Enter / modified keys are reported distinctly (ignored by
+        // terminals that don't implement it).
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
     Ok(())
 }
@@ -40,6 +45,7 @@ fn enter_tui() -> Result<()> {
 fn leave_tui() -> Result<()> {
     execute!(
         io::stdout(),
+        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
@@ -59,7 +65,7 @@ impl Drop for TerminalGuard {
 
 /// Suspend the TUI, open `path` in `$EDITOR`/`$VISUAL` (fallback `vi`),
 /// then resume the TUI. Inheriting stdio lets the editor take over the tty.
-fn run_editor(path: &std::path::Path) -> Result<()> {
+fn run_editor(path: &std::path::Path, terminal: &mut Tui) -> Result<()> {
     leave_tui()?;
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
@@ -70,8 +76,10 @@ fn run_editor(path: &std::path::Path) -> Result<()> {
     let args = parts;
 
     let status = ProcCommand::new(program).args(args).arg(path).status();
-    let _guard = TerminalGuard; // ensure re-entry even on error
+    // Always re-enter the TUI and force a full redraw: the screen was under the
+    // editor's control, so ratatui's diff buffer is otherwise stale.
     enter_tui()?;
+    terminal.clear()?;
     match status {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => anyhow::bail!("editor exited with status {s}"),
@@ -79,13 +87,13 @@ fn run_editor(path: &std::path::Path) -> Result<()> {
     }
 }
 
-fn handle_command(cmd: Option<Command>, app: &mut App) -> Result<bool> {
+fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Result<bool> {
     match cmd {
         Some(Command::Quit) => Ok(true),
         Some(Command::Edit(path)) => {
-            // run_editor re-enters the TUI itself; errors propagate and the
-            // outer guard restores the terminal.
-            if let Err(e) = run_editor(&path) {
+            // run_editor re-enters the TUI itself; the outer guard in main
+            // restores the terminal if anything here panics.
+            if let Err(e) = run_editor(&path, terminal) {
                 app.status = format!("Editor error: {e}");
             }
             app.reload();
@@ -102,13 +110,15 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
             continue;
         }
         match event::read()? {
-            Event::Key(key) => {
-                if handle_command(app.handle_key(key), app)? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if handle_command(app.handle_key(key), app, terminal)? {
                     break;
                 }
             }
+            // Ignore key release/repeat events (kitty protocol).
+            Event::Key(_) => {}
             Event::Mouse(mouse) => {
-                if handle_command(app.handle_mouse(mouse), app)? {
+                if handle_command(app.handle_mouse(mouse), app, terminal)? {
                     break;
                 }
             }

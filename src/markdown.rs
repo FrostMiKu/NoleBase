@@ -172,13 +172,11 @@ impl Renderer {
                     ii.checkbox = Some(checked);
                 }
             }
-            Event::Html(s) | Event::InlineHtml(s) => {
-                if !self.code_block {
-                    if self.table.is_some() {
-                        self.cur_cell.push(Span::raw(s.to_string()));
-                    } else {
-                        self.cur.push(Span::raw(s.to_string()));
-                    }
+            Event::Html(s) | Event::InlineHtml(s) if !self.code_block => {
+                if self.table.is_some() {
+                    self.cur_cell.push(Span::raw(s.to_string()));
+                } else {
+                    self.cur.push(Span::raw(s.to_string()));
                 }
             }
             // Footnotes and anything else are rendered as nothing.

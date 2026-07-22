@@ -205,6 +205,8 @@ pub enum Mode {
     Help,
     /// Editing a single message's body in-app.
     EditMessage,
+    /// Asking before discarding unsaved message edits.
+    ConfirmDiscardEdit,
 }
 
 #[derive(Debug, Clone)]
@@ -446,6 +448,7 @@ impl App {
             Mode::Search => self.handle_search(key),
             Mode::Help => self.handle_help(key),
             Mode::EditMessage => self.handle_editmessage(key),
+            Mode::ConfirmDiscardEdit => self.handle_confirm_discard_edit(key),
         }
     }
 
@@ -517,6 +520,7 @@ impl App {
                         | Mode::Search
                         | Mode::Help
                         | Mode::EditMessage
+                        | Mode::ConfirmDiscardEdit
                 ) {
                     self.mode = Mode::Insert;
                 }
@@ -528,17 +532,19 @@ impl App {
 
     fn handle_insert(&mut self, key: KeyEvent) -> Option<Command> {
         let mods = key.modifiers;
-        let send_mods = KeyModifiers::CONTROL | KeyModifiers::ALT;
         match key.code {
-            // Modifier-bearing Enter sends; bare Enter inserts a newline.
-            // (Ctrl+J arrives as a bare Enter in raw mode, so it behaves as a
-            // newline here — consistent with the plain Enter key.)
-            KeyCode::Enter if mods.intersects(send_mods) => {
-                self.send_message();
+            // Enter sends. Enter with Shift/Ctrl/Alt inserts a newline —
+            // Shift+Enter is the usual chat convention; Ctrl/Alt+Enter are
+            // reliable fallbacks, since many terminals don't distinguish
+            // Shift+Enter from a bare Enter.
+            KeyCode::Enter
+                if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert_char('\n');
                 None
             }
             KeyCode::Enter => {
-                self.insert_char('\n');
+                self.send_message();
                 None
             }
             KeyCode::Tab | KeyCode::Esc => {
@@ -575,6 +581,12 @@ impl App {
             }
             KeyCode::End => {
                 self.move_cursor(CursorMove::LineEnd);
+                None
+            }
+            // Ctrl+J (the raw LF byte) inserts a newline — a reliable fallback
+            // for terminals that don't distinguish Shift+Enter from Enter.
+            KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
+                self.insert_char('\n');
                 None
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
@@ -915,6 +927,25 @@ impl App {
         }
     }
 
+    fn edit_has_changes(&self) -> bool {
+        self.message_clone(&self.edit_id)
+            .is_none_or(|message| message.body != self.edit_input)
+    }
+
+    fn handle_confirm_discard_edit(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                None
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.mode = Mode::EditMessage;
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn handle_help(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -943,18 +974,29 @@ impl App {
 
     fn handle_editmessage(&mut self, key: KeyEvent) -> Option<Command> {
         let mods = key.modifiers;
-        let send_mods = KeyModifiers::CONTROL | KeyModifiers::ALT;
         match key.code {
-            KeyCode::Enter if mods.intersects(send_mods) => {
-                self.save_edit();
+            // Enter saves (mirrors the compose box: Enter commits). Enter with
+            // any modifier, or Ctrl+J, inserts a newline instead.
+            KeyCode::Enter
+                if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
                 None
             }
             KeyCode::Enter => {
+                self.save_edit();
+                None
+            }
+            KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
                 insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
                 None
             }
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
+                if self.edit_has_changes() {
+                    self.mode = Mode::ConfirmDiscardEdit;
+                } else {
+                    self.mode = Mode::Normal;
+                }
                 None
             }
             KeyCode::Backspace => {
@@ -1390,29 +1432,37 @@ mod tests {
     }
 
     #[test]
-    fn bare_enter_inserts_newline_in_insert_mode() {
+    fn bare_enter_sends_in_insert_mode() {
         let (mut app, _dir) = make_app();
         app.mode = Mode::Insert;
         app.input = "hi".to_string();
         app.input_cursor = app.input.chars().count();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.input, "hi\n", "bare Enter should insert a newline");
-        assert_eq!(app.messages.len(), 0, "bare Enter must not send");
+        assert!(app.input.is_empty(), "bare Enter should send (clear input)");
+        assert_eq!(app.messages.len(), 1);
     }
 
     #[test]
-    fn modifier_enter_sends_message() {
+    fn modifier_enter_inserts_newline() {
         let (mut app, _dir) = make_app();
         app.mode = Mode::Insert;
         app.input = "hi".to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
-        assert!(app.input.is_empty(), "Alt+Enter should send");
-        assert_eq!(app.messages.len(), 1);
+        app.input_cursor = app.input.chars().count();
 
-        // Ctrl+Enter also sends.
-        app.input = "again".to_string();
+        // Shift+Enter inserts a newline (the requested behaviour).
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.input, "hi\n", "Shift+Enter should insert a newline");
+        assert_eq!(app.messages.len(), 0, "Shift+Enter must not send");
+
+        // Ctrl/Alt+Enter also insert a newline (reliable fallbacks).
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
-        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.input, "hi\n\n\n");
+        assert_eq!(app.messages.len(), 0);
+
+        // Ctrl+J (the LF byte) inserts a newline too.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "hi\n\n\n\n");
     }
 
     #[test]
@@ -1680,8 +1730,8 @@ mod tests {
         for c in "world".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        // Ctrl+Enter saves.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        // Enter saves.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].body, "world");
@@ -1693,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_message_esc_cancels_without_saving() {
+    fn edit_message_esc_requires_confirmation_before_discarding() {
         let (mut app, _dir) = make_app();
         app.storage.append_chat_message("keep").unwrap();
         app.reload();
@@ -1702,8 +1752,63 @@ mod tests {
         app.edit_input.clear();
         app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::ConfirmDiscardEdit);
+        assert_eq!(app.messages[0].body, "keep", "prompt must not save edits");
+
+        // Esc from the prompt keeps the buffer and returns to editing.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::EditMessage);
+        assert_eq!(app.edit_input, "X");
+
+        // Confirming the second prompt discards the edit.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.messages[0].body, "keep", "cancel must not save edits");
+    }
+
+    #[test]
+    fn edit_message_esc_closes_immediately_when_unchanged() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("keep").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn edit_message_discard_confirmation_n_keeps_editing() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("keep").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::EditMessage);
+        assert_eq!(app.edit_input, "keep!");
+    }
+
+    #[test]
+    fn edit_message_newline_keys_dont_save() {
+        let (mut app, _dir) = make_app();
+        app.storage.append_chat_message("hi").unwrap();
+        app.reload();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.edit_cursor = app.edit_input.chars().count();
+        // Shift+Enter and Ctrl+J insert newlines without saving.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::EditMessage, "must not have saved");
+        assert_eq!(app.edit_input, "hi\n\n");
     }
 
     fn file_index(app: &App, stem: &str) -> usize {

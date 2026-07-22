@@ -46,6 +46,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Search => draw_search(f, app),
         Mode::Help => draw_help(f, app),
         Mode::EditMessage => draw_edit_message(f, app),
+        Mode::ConfirmDiscardEdit => {
+            draw_edit_message(f, app);
+            draw_confirm_discard_edit(f);
+        }
         Mode::Normal | Mode::Insert => {}
     }
 }
@@ -399,11 +403,16 @@ fn help_lines() -> Vec<Line<'static>> {
         row("?", "This help"),
         blank(),
         head("Insert mode"),
-        row("Enter", "Newline"),
-        row("Ctrl/Alt+Enter", "Send message"),
+        row("Enter", "Send message"),
+        row("Shift+Enter / Ctrl+J", "Newline"),
         row("← → ↑ ↓  Home/End", "Move cursor"),
         row("Backspace / Delete", "Edit at cursor"),
         row("Ctrl+C", "Clear (quit if empty)"),
+        blank(),
+        head("Edit message"),
+        row("Enter", "Save"),
+        row("Shift+Enter / Ctrl+J", "Newline"),
+        row("Esc", "Cancel (confirm if changed)"),
         blank(),
         head("File browser"),
         row("↑↓ Enter/v e", "navigate · preview · edit"),
@@ -456,7 +465,7 @@ fn draw_edit_message(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Edit message  (Ctrl/Alt+Enter save · Esc cancel)");
+        .title("Edit message  (Enter save · Shift+Enter/Ctrl+J newline · Esc cancel)");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -485,7 +494,7 @@ fn draw_edit_message(f: &mut Frame, app: &mut App) {
         .iter()
         .map(|&w| wrapped_row_count(w, width))
         .sum();
-    let row_offset = if width == 0 { 0 } else { cur_col / width };
+    let row_offset = cur_col.checked_div(width).unwrap_or(0);
     let cursor_wrapped_row = rows_before + row_offset;
 
     let text_h = inner.height as usize;
@@ -503,8 +512,24 @@ fn draw_edit_message(f: &mut Frame, app: &mut App) {
     f.render_widget(para, inner);
 
     let cy = inner.y + (cursor_wrapped_row.saturating_sub(scroll as usize)) as u16;
-    let cx = inner.x + (if width == 0 { 0 } else { cur_col % width }) as u16;
-    f.set_cursor_position((cx, cy));
+    let cx = inner.x + cur_col.checked_rem(width).unwrap_or(0) as u16;
+    if matches!(app.mode, Mode::EditMessage) {
+        f.set_cursor_position((cx, cy));
+    }
+}
+
+fn draw_confirm_discard_edit(f: &mut Frame) {
+    let area = f.area();
+    let rect = centered(area, 54, 3);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new("Discard unsaved changes?  [y/N]")
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Unsaved changes"),
+        );
+    f.render_widget(para, rect);
 }
 
 /// Bottom footer: `Note <path> [MODE]` (and status) on the left, keybinding
@@ -629,45 +654,48 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::raw(""));
     }
 
-    // Resolve effective scroll (u32::MAX means "stick to bottom").
-    let total = lines.len() as u16;
-    let view_h = inner.height;
+    // Resolve effective scroll. Work in usize so very long content doesn't
+    // truncate the line count, then cap to u16 (ratatui's Paragraph scroll is
+    // u16). The persisted `app.scroll` value u16::MAX means "stick to bottom".
+    let total = lines.len();
+    let view_h = inner.height as usize;
     let max_scroll = total.saturating_sub(view_h);
-    let scroll = if app.scroll > max_scroll {
+    let cap = u16::MAX as usize;
+    let mut scroll = (if app.scroll as usize > max_scroll {
         max_scroll
     } else {
-        app.scroll
-    };
-    app.scroll = scroll; // clamp persisted value
+        app.scroll as usize
+    })
+    .min(cap);
 
     // Keep the selected card (and its buttons) visible.
     if let Some(&first) = card_first.get(app.selected) {
-        let first = first as u16;
-        let btn = button_lines[app.selected] as u16;
-        if first < app.scroll {
-            app.scroll = first;
-        } else if btn >= app.scroll + view_h {
-            app.scroll = btn.saturating_sub(view_h.saturating_sub(1));
+        let btn = button_lines[app.selected];
+        if first < scroll {
+            scroll = first.min(cap);
+        } else if btn >= scroll + view_h {
+            scroll = btn.saturating_sub(view_h.saturating_sub(1)).min(cap);
         }
     }
-    let scroll = app.scroll;
+    app.scroll = scroll as u16;
 
-    // Record button hitboxes for visible cards.
+    // Record button hitboxes for cards whose button row is on screen. Skip
+    // out-of-view cards by bounds check (never subtract with underflow).
     for (idx, m) in app.messages.iter().enumerate() {
         let Some(&btn) = button_lines.get(idx) else {
             continue;
         };
-        let abs_row = inner.y + btn as u16 - scroll;
-        if abs_row < inner.y || abs_row >= inner.y + inner.height {
+        if btn < scroll || btn >= scroll + view_h {
             continue;
         }
+        let abs_row = inner.y + (btn - scroll) as u16;
         // Buttons are indented by the timestamp prefix width to align with the
         // body text; click targets must start at the same column.
         let prefix_w = format!("{}  ", m.created_at.format(TIME_FMT)).width() as u16;
         register_buttons(&mut app.hitboxes, &m.id, inner.x + prefix_w, abs_row);
     }
 
-    let para = Paragraph::new(lines).scroll((scroll, 0));
+    let para = Paragraph::new(lines).scroll((scroll as u16, 0));
     f.render_widget(para, inner);
 }
 
@@ -768,7 +796,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|&w| wrapped_row_count(w, width))
         .sum();
-    let row_offset = if width == 0 { 0 } else { cur_col / width };
+    let row_offset = cur_col.checked_div(width).unwrap_or(0);
     let cursor_wrapped_row = rows_before + row_offset;
 
     let text_h = text_area.height as usize;
@@ -801,7 +829,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let count = format!("{line_count} lines · {char_count} chars");
 
     let hint = if focused {
-        "Enter newline · Ctrl/Alt+Enter send"
+        "Enter send · Shift+Enter/Ctrl+J newline"
     } else {
         ""
     };
@@ -1153,7 +1181,29 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let s = buffer_string(&terminal).replace(' ', "");
-        assert!(s.contains("Ctrl/Alt+Entersend"), "send hint should show when focused");
+        assert!(s.contains("Entersend"), "send hint should show when focused");
+        assert!(s.contains("Ctrl+Jnewline"), "newline hint should show when focused");
+    }
+
+    #[test]
+    fn many_messages_render_without_underflow() {
+        // Regression: with enough messages that the selected (last) one is below
+        // the viewport, scroll goes non-zero and earlier cards sit above it.
+        // Their button rows (index < scroll) used to cause a subtraction
+        // overflow (panic) when computing hitbox positions.
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        for i in 0..50 {
+            st.append_chat_message(&format!("message number {i}")).unwrap();
+        }
+        let mut app = App::new(st).unwrap();
+        app.mode = Mode::Normal;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // On-screen cards still register clickable buttons.
+        assert!(!app.hitboxes.is_empty());
     }
 
     #[test]
@@ -1291,5 +1341,30 @@ mod tests {
         let s = buffer_string(&terminal);
         assert!(s.contains("Edit message"), "editor title missing");
         assert!(s.contains("editable text here"), "body should render");
+    }
+
+    #[test]
+    fn unsaved_edit_confirmation_renders() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempdir().unwrap();
+        let st = Storage::new(dir.path()).unwrap();
+        st.ensure_files().unwrap();
+        st.append_chat_message("original").unwrap();
+        let mut app = App::new(st).unwrap();
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let s = buffer_string(&terminal);
+
+        assert!(s.contains("Unsaved changes"), "confirmation title missing");
+        assert!(
+            s.contains("Discard unsaved changes?"),
+            "confirmation prompt missing"
+        );
     }
 }
