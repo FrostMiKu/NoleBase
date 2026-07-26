@@ -39,43 +39,94 @@ pub fn to_lines(source: &str) -> Vec<Line<'static>> {
     r.finish()
 }
 
-/// Parse a single line's inline markdown (`**bold**`, `*italic*`, `` `code` ``,
-/// `~~strike~~`) into styled spans. Block elements are not interpreted — their
-/// text passes through plain — so this suits the width-constrained chat cards
-/// (full block rendering lives in the preview modal).
-pub fn inline_spans(text: &str) -> Vec<Span<'static>> {
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(text, opts);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut style = Style::default();
-    let mut stack: Vec<Style> = Vec::new();
-    for event in parser {
-        match event {
-            Event::Text(s) => spans.push(Span::styled(s.to_string(), style)),
-            Event::Code(s) => spans.push(Span::styled(s.to_string(), CODE_INLINE)),
-            Event::Start(Tag::Strong) => {
-                stack.push(style);
-                style = style.add_modifier(Modifier::BOLD);
+/// Map a one-based source line to its first terminal row after Markdown
+/// rendering and width-based wrapping.
+pub fn rendered_row_for_source_line(source: &str, line_no: usize, width: usize) -> usize {
+    let rendered = to_lines(source);
+    if rendered.is_empty() {
+        return 0;
+    }
+
+    let source_lines: Vec<&str> = source.lines().collect();
+    let source_index = line_no
+        .saturating_sub(1)
+        .min(source_lines.len().saturating_sub(1));
+    let target_key = normalized_rendered_text(&to_lines(
+        source_lines.get(source_index).copied().unwrap_or(""),
+    ));
+    let expected = source_index
+        .saturating_mul(rendered.len())
+        .checked_div(source_lines.len().max(1))
+        .unwrap_or(0)
+        .min(rendered.len().saturating_sub(1));
+
+    let target_index = if target_key.is_empty() {
+        expected
+    } else {
+        rendered
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let key = normalized_line_text(line);
+                (!key.is_empty() && (key.contains(&target_key) || target_key.contains(&key)))
+                    .then_some(index)
+            })
+            .min_by_key(|index| index.abs_diff(expected))
+            .unwrap_or(expected)
+    };
+
+    rendered[..target_index]
+        .iter()
+        .map(|line| {
+            let display_width: usize = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            if display_width == 0 || width == 0 {
+                1
+            } else {
+                display_width.div_ceil(width)
             }
-            Event::Start(Tag::Emphasis) => {
-                stack.push(style);
-                style = style.add_modifier(Modifier::ITALIC);
+        })
+        .sum()
+}
+
+fn normalized_rendered_text(lines: &[Line<'_>]) -> String {
+    let text = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_search_text(&text)
+}
+
+fn normalized_line_text(line: &Line<'_>) -> String {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("");
+    normalize_search_text(&text)
+}
+
+fn normalize_search_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character.is_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
             }
-            Event::Start(Tag::Strikethrough) => {
-                stack.push(style);
-                style = style.add_modifier(Modifier::CROSSED_OUT);
-            }
-            Event::End(TagEnd::Strong) | Event::End(TagEnd::Emphasis) | Event::End(TagEnd::Strikethrough) => {
-                if let Some(prev) = stack.pop() {
-                    style = prev;
-                }
-            }
-            Event::SoftBreak | Event::HardBreak => spans.push(Span::raw(" ".to_string())),
-            _ => {}
+            normalized.extend(character.to_lowercase());
+            pending_space = false;
+        } else {
+            pending_space = true;
         }
     }
-    spans
+    normalized
 }
 
 #[derive(Default)]
@@ -333,11 +384,7 @@ impl Renderer {
         if self.out.is_empty() || !self.list_stack.is_empty() {
             return;
         }
-        let blank = self
-            .out
-            .last()
-            .map(|l| l.spans.is_empty())
-            .unwrap_or(true);
+        let blank = self.out.last().map(|l| l.spans.is_empty()).unwrap_or(true);
         if !blank {
             self.out.push(Line::default());
         }
@@ -553,7 +600,11 @@ mod tests {
     }
 
     fn joined(lines: &[Line]) -> String {
-        lines.iter().map(|l| text_of(l)).collect::<Vec<_>>().join("\n")
+        lines
+            .iter()
+            .map(|l| text_of(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -628,25 +679,29 @@ mod tests {
     }
 
     #[test]
-    fn inline_spans_parses_emphasis_and_code() {
-        let s = inline_spans("a **b** `c`");
-        let text: String = s.iter().map(|x| x.content.as_ref()).collect();
-        assert!(text.contains('a') && text.contains('b') && text.contains('c'));
-        assert!(!text.contains("**"), "bold markers should be parsed away");
-        assert!(!text.contains('`'), "code backticks should be parsed away");
-
-        let bold = s.iter().find(|x| x.content.contains('b')).unwrap();
-        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
-        let code = s.iter().find(|x| x.content.contains('c')).unwrap();
-        assert_eq!(code.style.fg, Some(Color::Yellow));
-    }
-
-    #[test]
     fn blocks_are_separated_by_blank_lines() {
         let l = to_lines("first\n\nsecond");
         // paragraph, blank, paragraph.
         assert_eq!(l.len(), 3);
         assert!(l[1].spans.is_empty());
+    }
+
+    #[test]
+    fn source_lines_map_to_rendered_rows() {
+        assert_eq!(
+            rendered_row_for_source_line("# Heading\n\nintro\n\nneedle", 5, 80),
+            4
+        );
+        assert_eq!(
+            rendered_row_for_source_line("abcdefghij\nneedle", 2, 5),
+            2,
+            "wrapped rows before the match must count toward scrolling"
+        );
+        assert_eq!(
+            rendered_row_for_source_line("| Name |\n| --- |\n| needle |", 3, 80),
+            3,
+            "table borders must not shift the matched row"
+        );
     }
 
     #[test]
@@ -710,6 +765,9 @@ mod tests {
             .map(|x| UnicodeWidthStr::width(text_of(x).as_str()))
             .collect();
         let w = widths[0];
-        assert!(widths.iter().all(|ww| *ww == w), "uneven widths: {widths:?}");
+        assert!(
+            widths.iter().all(|ww| *ww == w),
+            "uneven widths: {widths:?}"
+        );
     }
 }

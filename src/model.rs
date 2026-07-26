@@ -1,5 +1,8 @@
 //! Core data model: messages, actions, and button hitboxes.
 
+use std::path::PathBuf;
+use std::time::SystemTime;
+
 use chrono::{DateTime, Local};
 use ratatui::layout::Rect;
 
@@ -44,7 +47,6 @@ impl Action {
             Action::Move,
             Action::Archive,
             Action::New,
-            Action::View,
             Action::Edit,
             Action::Delete,
         ]
@@ -59,10 +61,17 @@ pub struct ButtonHitbox {
     pub area: Rect,
 }
 
+/// A managed markdown file shown in the persistent file list.
+#[derive(Debug, Clone)]
+pub struct NoteFile {
+    pub path: PathBuf,
+    pub modified: SystemTime,
+}
+
 /// A recorded screen rectangle for a clickable file row in the sidebar.
 #[derive(Debug, Clone)]
 pub struct FileHitbox {
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     pub area: Rect,
 }
 

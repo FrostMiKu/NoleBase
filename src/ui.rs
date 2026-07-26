@@ -1,715 +1,573 @@
-//! Terminal rendering: chat layout, message cards, buttons, and modals.
+//! Terminal rendering for the full-width workspace.
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use chrono::{DateTime, Local};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{block::Padding, Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
-
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Mode};
+use crate::app::{App, CenterView, FilesContext, Focus, LayoutSnapshot, Overlay};
 use crate::model::{Action, ButtonHitbox, FileHitbox, SearchHit, SearchHitbox, TodoHitbox};
 
 const TIME_FMT: &str = "%H:%M";
+const WIDE_BREAKPOINT: u16 = 170;
+const FILES_WIDTH: u16 = 30;
+const TODO_WIDTH: u16 = 36;
+const CENTER_MAX_WIDTH: u16 = 120;
+const PANEL_PADDING: u16 = 1;
+const MESSAGE_PADDING_X: usize = 1;
 
-/// Render the whole app. Rebuilds hitboxes for the current frame.
-pub fn draw(f: &mut Frame, app: &mut App) {
+/// Render one frame and rebuild all geometry consumed by mouse handling.
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.layout = LayoutSnapshot::default();
+    clear_hitboxes(app);
+
+    let root = frame.area();
+    let (body, footer) = body_and_footer(root);
+    let file_input_modal = matches!(
+        app.files_context,
+        FilesContext::NewTarget | FilesContext::Rename
+    );
+    let interactive = app.overlay.is_none() && !file_input_modal;
+
+    if root.width >= WIDE_BREAKPOINT {
+        draw_wide_workspace(frame, app, body, interactive);
+    } else {
+        draw_narrow_workspace(frame, app, body, interactive);
+    }
+    draw_footer(frame, app, footer);
+
+    if let Some(overlay) = app.overlay {
+        // Background widgets may still be visible, but an overlay owns all input.
+        // Keeping no base hitboxes makes that ownership explicit to mouse code.
+        clear_hitboxes(app);
+        let area = draw_overlay(frame, app, root, overlay);
+        app.layout.overlay = non_empty(area);
+    } else if file_input_modal {
+        clear_hitboxes(app);
+        let area = draw_file_input_modal(frame, app, root);
+        app.layout.overlay = non_empty(area);
+    }
+}
+
+fn clear_hitboxes(app: &mut App) {
     app.hitboxes.clear();
     app.file_hitboxes.clear();
     app.todo_hitboxes.clear();
     app.search_hitboxes.clear();
+}
 
-    let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(4),    // messages
-            Constraint::Length(8), // input (Weibo-style compose box)
-            Constraint::Length(1), // footer: header + hints (bottom)
-        ])
-        .split(area);
+fn body_and_footer(area: Rect) -> (Rect, Rect) {
+    if area.height == 0 {
+        return (area, Rect::new(area.x, area.y, area.width, 0));
+    }
+    (
+        Rect::new(area.x, area.y, area.width, area.height - 1),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    )
+}
 
-    draw_messages(f, app, chunks[0]);
-    draw_input(f, app, chunks[1]);
-    draw_footer(f, app, chunks[2]);
+fn draw_wide_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
+    let files = Rect::new(body.x, body.y, FILES_WIDTH.min(body.width), body.height);
+    let todo_width = TODO_WIDTH.min(body.width.saturating_sub(files.width));
+    let todo = Rect::new(
+        body.x + body.width.saturating_sub(todo_width),
+        body.y,
+        todo_width,
+        body.height,
+    );
+    let center_region = Rect::new(
+        files.x + files.width,
+        body.y,
+        body.width
+            .saturating_sub(files.width)
+            .saturating_sub(todo.width),
+        body.height,
+    );
+    app.layout.files = non_empty(files);
+    app.layout.center = non_empty(center_region);
+    app.layout.todo = non_empty(todo);
 
-    match app.mode {
-        Mode::SelectTarget => draw_select_target(f, app),
-        Mode::NewFile => draw_new_file(f, app),
-        Mode::ConfirmDelete => draw_confirm_delete(f, app),
-        Mode::Preview => draw_preview(f, app),
-        Mode::FileList | Mode::FileSearch | Mode::FileRename | Mode::FileDelete => {
-            draw_file_list(f, app)
-        }
-        Mode::Todo => draw_todo(f, app),
-        Mode::Search => draw_search(f, app),
-        Mode::Help => draw_help(f, app),
-        Mode::EditMessage => draw_edit_message(f, app),
-        Mode::ConfirmDiscardEdit => {
-            draw_edit_message(f, app);
-            draw_confirm_discard_edit(f);
-        }
-        Mode::Normal | Mode::Insert => {}
+    draw_files(frame, app, files, interactive);
+    draw_center(frame, app, center_region, interactive);
+    draw_todo(frame, app, todo, interactive);
+}
+
+fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
+    if app.focus == Focus::Files || app.files_context != FilesContext::Browse {
+        app.layout.files = non_empty(body);
+        draw_files(frame, app, body, interactive);
+    } else if app.focus == Focus::Todo {
+        app.layout.todo = non_empty(body);
+        draw_todo(frame, app, body, interactive);
+    } else {
+        app.layout.center = non_empty(body);
+        draw_center(frame, app, body, interactive);
     }
 }
 
-fn draw_file_list(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let w = (area.width / 2).clamp(40, 70);
-    let count = app.sidebar_files.len() as u16;
-    let has_input = matches!(app.mode, Mode::FileSearch);
-    let extra = if has_input { 3 } else { 0 };
-    let h = count
-        .saturating_add(4 + extra)
-        .min(area.height.saturating_sub(4))
-        .max(7);
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
+fn center_content_axis(area: Rect) -> Rect {
+    let width = area.width.min(CENTER_MAX_WIDTH);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y,
+        width,
+        area.height,
+    )
+}
 
-    let title = match app.mode {
-        Mode::FileSearch => "Files  (type to filter · ↑↓ select · Enter open · Esc cancel)",
-        _ => "Files  (e edit · r rename · d delete · / search · Esc close)",
+fn non_empty(area: Rect) -> Option<Rect> {
+    (area.width > 0 && area.height > 0).then_some(area)
+}
+
+fn inset_horizontal(area: Rect, padding: u16) -> Rect {
+    let left = padding.min(area.width);
+    let right = padding.min(area.width.saturating_sub(left));
+    Rect::new(
+        area.x.saturating_add(left),
+        area.y,
+        area.width.saturating_sub(left).saturating_sub(right),
+        area.height,
+    )
+}
+
+fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let focused = app.focus == Focus::Files;
+    let title = match app.files_context {
+        FilesContext::Browse => " Files ",
+        FilesContext::Search => " Files · search ",
+        FilesContext::MoveTarget => " Files · move to ",
+        FilesContext::NewTarget => " Files · new ",
+        FilesContext::Rename => " Files · rename ",
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(title)
+        .border_style(focus_border(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    // Optional input row (search / rename) sits above the list.
-    let list_area = if has_input {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(inner);
-        let prompt = "/ ";
-        let buf = app.file_query.as_str();
-        let prompt_w = prompt.width();
-        let line = Line::from(vec![
-            Span::styled(prompt.to_string(), Style::default().fg(Color::Green)),
-            Span::raw(buf.to_string()),
-        ]);
-        f.render_widget(Paragraph::new(line), chunks[0]);
-        // Place the terminal cursor at the end of the buffer.
-        let cx = chunks[0].x + prompt_w as u16 + UnicodeWidthStr::width(buf) as u16;
-        let cy = chunks[0].y;
-        f.set_cursor_position((cx, cy));
-        chunks[1]
-    } else {
-        inner
+    let (input_area, list_area) = match app.files_context {
+        FilesContext::Search if inner.height > 0 => (
+            Some(Rect::new(inner.x, inner.y, inner.width, 1)),
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                inner.height.saturating_sub(1),
+            ),
+        ),
+        _ => (None, inner),
     };
 
-    if app.sidebar_files.is_empty() {
-        let hint = if app.file_query.is_empty() {
-            "No files yet. Move a message with `m` or `n` first."
-        } else {
-            "No files match."
+    if let Some(input_area) = input_area {
+        let (prompt, value) = match app.files_context {
+            FilesContext::Search => ("/ ", app.file_query.as_str()),
+            _ => ("", ""),
         };
-        f.render_widget(
-            Paragraph::new(hint).alignment(Alignment::Center),
+        draw_single_line_input(
+            frame,
+            input_area,
+            prompt,
+            value,
+            value.chars().count(),
+            focused && interactive,
+        );
+    }
+
+    if list_area.width == 0 || list_area.height == 0 {
+        return;
+    }
+
+    let visible_indices = app.visible_file_indices();
+    if visible_indices.is_empty() {
+        let message = if app.files_context == FilesContext::Search && !app.file_query.is_empty() {
+            "No matching files"
+        } else {
+            "No files yet"
+        };
+        frame.render_widget(
+            Paragraph::new(message).alignment(Alignment::Center),
             list_area,
-        );
-    } else {
-        let items: Vec<ListItem> = app
-            .sidebar_files
-            .iter()
-            .map(|p| {
-                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                ListItem::new(name.to_string())
-            })
-            .collect();
-        let list = List::new(items).highlight_style(
-            Style::default()
-                .bg(Color::Green)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        );
-        let mut state = ListState::default();
-        state.select(Some(app.sidebar_index));
-        f.render_stateful_widget(list, list_area, &mut state);
-
-        // Clickable rows are only relevant while browsing (not while typing a
-        // query/name or confirming a delete).
-        if matches!(app.mode, Mode::FileList) {
-            for (i, path) in app.sidebar_files.iter().enumerate() {
-                let row = list_area.y + i as u16;
-                if row < list_area.y + list_area.height {
-                    app.file_hitboxes.push(FileHitbox {
-                        path: path.clone(),
-                        area: Rect {
-                            x: list_area.x,
-                            y: row,
-                            width: list_area.width,
-                            height: 1,
-                        },
-                    });
-                }
-            }
-        }
-    }
-
-    if matches!(app.mode, Mode::FileDelete) {
-        draw_file_delete_confirm(f, app, area);
-    }
-    if matches!(app.mode, Mode::FileRename) {
-        draw_file_rename(f, app, area);
-    }
-}
-
-fn draw_file_rename(f: &mut Frame, app: &App, area: Rect) {
-    let rect = centered(area, 50, 3);
-    f.render_widget(Clear, rect);
-    let prompt = "→ ";
-    let prompt_w = prompt.width();
-    let buf = app.rename_input.as_str();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Rename file  (Enter rename · Esc cancel)");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    let line = Line::from(vec![
-        Span::styled(prompt.to_string(), Style::default().fg(Color::Green)),
-        Span::raw(buf.to_string()),
-    ]);
-    f.render_widget(Paragraph::new(line), inner);
-    let cx = inner.x + prompt_w as u16 + UnicodeWidthStr::width(buf) as u16;
-    let cy = inner.y;
-    f.set_cursor_position((cx, cy));
-}
-
-fn draw_file_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
-    let name = app
-        .pending_file
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let rect = centered(area, 50, 3);
-    f.render_widget(Clear, rect);
-    let para = Paragraph::new(format!("Delete {name}?  [y/N]"))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Delete file"));
-    f.render_widget(para, rect);
-}
-
-fn draw_todo(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let w = (area.width / 2).clamp(40, 70);
-    let count = app.todo_items.len() as u16;
-    let h = count
-        .saturating_add(4)
-        .min(area.height.saturating_sub(4))
-        .max(7);
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Todos  (↑↓ · Enter/click toggle · Esc)");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    if app.todo_items.is_empty() {
-        f.render_widget(
-            Paragraph::new("No todos yet. Press `t` on a message to add one.")
-                .alignment(Alignment::Center),
-            inner,
         );
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .todo_items
+    // File order comes from App/Storage and is recent-first. Each two-line row
+    // reads like a compact conversation: name first, timestamp beneath it.
+    let slots = usize::from(list_area.height.div_ceil(2));
+    let selected_position = visible_indices
         .iter()
-        .map(|item| {
-            let checkbox = if item.checked { "[x]" } else { "[ ]" };
-            let box_style = if item.checked {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            let text_style = if item.checked {
-                Style::default().add_modifier(Modifier::CROSSED_OUT)
-            } else {
-                Style::default()
-            };
-            // Fold any continuation lines onto a single display line.
-            let text = item.text.replace('\n', " ");
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{checkbox} "), box_style),
-                Span::styled(text, text_style),
-            ]))
-        })
-        .collect();
-    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
-    let mut state = ListState::default();
-    state.select(Some(app.todo_index));
-    f.render_stateful_widget(list, inner, &mut state);
+        .position(|index| *index == app.file_index)
+        .unwrap_or(0);
+    let start = selected_position
+        .saturating_sub(slots.saturating_sub(1))
+        .min(visible_indices.len().saturating_sub(slots));
 
-    // One clickable row per visible task.
-    for i in 0..app.todo_items.len() {
-        let row = inner.y + i as u16;
-        if row < inner.y + inner.height {
-            app.todo_hitboxes.push(TodoHitbox {
-                index: i,
-                area: Rect {
-                    x: inner.x,
-                    y: row,
-                    width: inner.width,
-                    height: 1,
-                },
+    for (slot, absolute_index) in visible_indices
+        .iter()
+        .copied()
+        .skip(start)
+        .take(slots)
+        .enumerate()
+    {
+        let Some(file) = app.note_files.get(absolute_index) else {
+            continue;
+        };
+        let y = list_area.y.saturating_add((slot as u16).saturating_mul(2));
+        if y >= list_area.y.saturating_add(list_area.height) {
+            break;
+        }
+        let row_height = 2.min(list_area.y + list_area.height - y);
+        let selected = absolute_index == app.file_index;
+        let row_style = if selected && focused {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let name = file
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {name}"), row_style))),
+            Rect::new(list_area.x, y, list_area.width, 1),
+        );
+        if row_height > 1 {
+            let modified: DateTime<Local> = file.modified.into();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {}", modified.format("%m-%d %H:%M")),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                Rect::new(list_area.x, y + 1, list_area.width, 1),
+            );
+        }
+        if interactive {
+            app.file_hitboxes.push(FileHitbox {
+                path: file.path.clone(),
+                area: Rect::new(list_area.x, y, list_area.width, row_height),
             });
         }
     }
 }
 
-fn draw_search(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let w = (area.width * 3 / 4).clamp(50, 90);
-    // Fixed height regardless of result count; the list scrolls internally.
-    let h = (area.height * 3 / 5)
-        .max(7)
-        .min(area.height.saturating_sub(4));
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
+fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let focused = app.focus == Focus::Todo;
+    let done = app.todo_items.iter().filter(|item| item.checked).count();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(format!(" Todo {done}/{} ", app.todo_items.len()))
+        .border_style(focus_border(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let title = if app.search_results.is_empty() {
-        "Search  (type to search · Esc close)".to_string()
-    } else {
-        format!(
-            "Search  ({} matches · ↑↓ · Enter open · Esc)",
-            app.search_results.len()
-        )
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    // Query input row + results list.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-
-    let prompt = "/ ";
-    let prompt_w = prompt.width();
-    let line = Line::from(vec![
-        Span::styled(prompt.to_string(), Style::default().fg(Color::Green)),
-        Span::raw(app.search_query.as_str()),
-    ]);
-    f.render_widget(Paragraph::new(line), chunks[0]);
-    let cx = chunks[0].x + prompt_w as u16 + UnicodeWidthStr::width(app.search_query.as_str()) as u16;
-    f.set_cursor_position((cx, chunks[0].y));
-
-    if app.search_results.is_empty() {
-        if !app.search_query.is_empty() {
-            f.render_widget(
-                Paragraph::new("No matches.").alignment(Alignment::Center),
-                chunks[1],
-            );
-        }
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.todo_items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No todos yet").alignment(Alignment::Center),
+            inner,
+        );
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .search_results
+    let visible_indices = app.visible_todo_indices();
+    let selected = app.todo_index.min(app.todo_items.len().saturating_sub(1));
+    let selected_position = visible_indices
         .iter()
-        .map(|hit| match hit {
-            SearchHit::Message { text, .. } => ListItem::new(Line::from(vec![
-                Span::styled("• ", Style::default().fg(Color::Cyan)),
-                Span::raw(text.clone()),
-            ])),
-            SearchHit::FileLine {
-                path, line_no, text, ..
-            } => {
-                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{name}:{line_no} "),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw(text.clone()),
-                ]))
-            }
+        .position(|index| *index == selected)
+        .unwrap_or(0);
+    let text_width = inner.width.saturating_sub(4).max(1) as usize;
+    let item_heights: Vec<usize> = visible_indices
+        .iter()
+        .filter_map(|index| app.todo_items.get(*index))
+        .map(|item| {
+            wrap_spans_to_width(&[Span::raw(item.text.replace('\n', " "))], text_width).len()
         })
         .collect();
-    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
-    let mut state = ListState::default();
-    state.select(Some(app.search_index));
-    f.render_stateful_widget(list, chunks[1], &mut state);
-
-    // Register hitboxes for the visible window only. The list scrolls to keep
-    // `search_index` in view; ratatui updates `state.offset` during render, so
-    // map each visible result to its actual screen row.
-    let list_area = chunks[1];
-    let start = state.offset();
-    let end = (start + list_area.height as usize).min(app.search_results.len());
-    for i in start..end {
-        let row = list_area.y + (i - start) as u16;
-        app.search_hitboxes.push(SearchHitbox {
-            index: i,
-            area: Rect {
-                x: list_area.x,
-                y: row,
-                width: list_area.width,
-                height: 1,
-            },
-        });
-    }
-}
-
-fn help_lines() -> Vec<Line<'static>> {
-    let head = |s: &str| {
-        Line::from(vec![Span::styled(
-            s.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )])
-    };
-    let blank = || Line::raw("");
-    let row = |key: &str, desc: &str| {
-        Line::from(vec![
-            Span::styled(
-                format!(" {key} "),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {desc}")),
-        ])
-    };
-    vec![
-        head("Navigation"),
-        row("j k  ↑ ↓", "Select message"),
-        row("g / G", "Jump to top / bottom"),
-        row("PageUp / PageDown", "Scroll"),
-        row("i / Enter", "Insert mode (compose)"),
-        row("Tab", "Toggle insert / normal"),
-        blank(),
-        head("Message actions (on selected)"),
-        row("t", "Add to TODO.md"),
-        row("m", "Move into an existing file"),
-        row("a", "Archive to ARCHIVE.md"),
-        row("n", "Move into a new file"),
-        row("v", "View as markdown"),
-        row("e", "Edit message (in-app)"),
-        row("d", "Delete (asks y/N)"),
-        row("u", "Undo last t / m / a / n / d"),
-        blank(),
-        head("Panels"),
-        row("f", "File browser"),
-        row("T", "Todos panel"),
-        row("/", "Search messages + files"),
-        row("?", "This help"),
-        blank(),
-        head("Insert mode"),
-        row("Enter", "Send message"),
-        row("Shift+Enter / Ctrl+J", "Newline"),
-        row("← → ↑ ↓  Home/End", "Move cursor"),
-        row("Backspace / Delete", "Edit at cursor"),
-        row("Ctrl+C", "Clear (quit if empty)"),
-        blank(),
-        head("Edit message"),
-        row("Enter", "Save"),
-        row("Shift+Enter / Ctrl+J", "Newline"),
-        row("Esc", "Cancel (confirm if changed)"),
-        blank(),
-        head("File browser"),
-        row("↑↓ Enter/v e", "navigate · preview · edit"),
-        row("r d /", "rename · delete · filter"),
-        row("(in filter)", "type · ↑↓ · Enter opens"),
-        blank(),
-        head("Todos"),
-        row("↑↓  Enter/Space/x", "select · toggle  (or click)"),
-        blank(),
-        head("Search"),
-        row("type ↑↓ Enter", "filter · navigate · open"),
-        blank(),
-        head("Preview"),
-        row("↑↓  PageUp/Down", "scroll"),
-        blank(),
-        row("Esc / q", "Back / quit"),
-    ]
-}
-
-fn draw_help(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let w = (area.width * 4 / 5).clamp(54, 92);
-    let h = (area.height * 4 / 5)
-        .max(12)
-        .min(area.height.saturating_sub(2));
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Help  (↑↓ scroll · Esc close)");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let lines = help_lines();
-    let max_scroll = lines.len().saturating_sub(inner.height as usize);
-    if (app.help_scroll as usize) > max_scroll {
-        app.help_scroll = max_scroll as u16;
-    }
-    let para = Paragraph::new(lines).scroll((app.help_scroll, 0));
-    f.render_widget(para, inner);
-}
-
-fn draw_edit_message(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    let h = (area.height * 3 / 5)
-        .max(7)
-        .min(area.height.saturating_sub(4));
-    let w = (area.width * 4 / 5).clamp(50, 92);
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Edit message  (Enter save · Shift+Enter/Ctrl+J newline · Esc cancel)");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let lines: Vec<Line> = if app.edit_input.is_empty() {
-        vec![Line::from(vec![Span::styled(
-            "(empty — Ctrl/Alt+Enter to save)",
-            Style::default().fg(Color::DarkGray),
-        )])]
-    } else {
-        app.edit_input
-            .split('\n')
-            .map(|seg| Line::from(Span::raw(seg.to_string())))
-            .collect()
-    };
-
-    // Wrap-aware cursor placement, mirroring the compose box.
-    let logical: Vec<&str> = app.edit_input.split('\n').collect();
-    let width = inner.width as usize;
-    let line_widths: Vec<usize> = logical.iter().map(|s| UnicodeWidthStr::width(*s)).collect();
-    let total_rows: usize = line_widths
-        .iter()
-        .map(|&w| wrapped_row_count(w, width))
-        .sum();
-    let (cur_line, cur_col) = cursor_row_col(&app.edit_input, app.edit_cursor);
-    let rows_before: usize = line_widths[..cur_line]
-        .iter()
-        .map(|&w| wrapped_row_count(w, width))
-        .sum();
-    let row_offset = cur_col.checked_div(width).unwrap_or(0);
-    let cursor_wrapped_row = rows_before + row_offset;
-
-    let text_h = inner.height as usize;
-    let scroll = if total_rows <= text_h {
-        0
-    } else {
-        let lo = cursor_wrapped_row.saturating_sub(text_h.saturating_sub(1));
-        let hi = total_rows - text_h;
-        lo.min(hi) as u16
-    };
-
-    let para = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
-
-    let cy = inner.y + (cursor_wrapped_row.saturating_sub(scroll as usize)) as u16;
-    let cx = inner.x + cur_col.checked_rem(width).unwrap_or(0) as u16;
-    if matches!(app.mode, Mode::EditMessage) {
-        f.set_cursor_position((cx, cy));
-    }
-}
-
-fn draw_confirm_discard_edit(f: &mut Frame) {
-    let area = f.area();
-    let rect = centered(area, 54, 3);
-    f.render_widget(Clear, rect);
-    let para = Paragraph::new("Discard unsaved changes?  [y/N]")
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Unsaved changes"),
-        );
-    f.render_widget(para, rect);
-}
-
-/// Bottom footer: `Note <path> [MODE]` (and status) on the left, keybinding
-/// hints on the right — i.e. the hints sit in the bottom-right corner.
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let mode = match app.mode {
-        Mode::Insert => Span::styled(
-            " INSERT ",
-            Style::default().bg(Color::Green).fg(Color::Black),
-        ),
-        Mode::Normal => Span::styled(
-            " NORMAL ",
-            Style::default().bg(Color::Blue).fg(Color::Black),
-        ),
-        _ => Span::raw(""),
-    };
-    // let path = app.storage.chat_path.to_string_lossy();
-    let mut left = vec![
-        // Span::styled(" Note ", Style::default().add_modifier(Modifier::BOLD)),
-        mode,
-        // Span::raw(" "),
-        // Span::raw(path.to_string()),
-    ];
-    if !app.status.is_empty() {
-        left.push(Span::raw("  "));
-        left.push(Span::styled(
-            &app.status,
-            Style::default().fg(Color::Yellow),
-        ));
+    let mut start = selected_position;
+    let mut used = item_heights[selected_position];
+    while start > 0 && used + item_heights[start - 1] <= inner.height as usize {
+        start -= 1;
+        used += item_heights[start];
     }
 
-    // The newline/send hint lives in the input toolbar, so the footer avoids
-    // repeating it.
-    let hint = match app.mode {
-        Mode::Insert => "Tab/Esc → normal mode",
-        Mode::Normal => {
-            "t todo · m move · a arch · T todos · / search · u undo · ? help · n new · v view · e edit · d del · f files · i insert"
+    let mut y = inner.y;
+    for index in visible_indices.iter().copied().skip(start) {
+        if y >= inner.y.saturating_add(inner.height) {
+            break;
         }
-        Mode::FileList => "↑↓ select · Enter/v preview · e edit · Esc close",
-        _ => "",
-    };
-
-    let hint_w = hint.width() as u16;
-    let tb = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(hint_w)])
-        .split(area);
-    f.render_widget(Paragraph::new(Line::from(left)), tb[0]);
-    if !hint.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
-                .alignment(Alignment::Right),
-            tb[1],
+        let Some(item) = app.todo_items.get(index) else {
+            continue;
+        };
+        let checked = if item.checked { "[x]" } else { "[ ]" };
+        let marker_style = if item.checked {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let mut text_style = if item.checked {
+            Style::default().add_modifier(Modifier::CROSSED_OUT)
+        } else {
+            Style::default()
+        };
+        if focused && index == selected {
+            text_style = text_style.bg(Color::DarkGray);
+        }
+        let wrapped = wrap_spans_to_width(
+            &[Span::styled(item.text.replace('\n', " "), text_style)],
+            text_width,
         );
+        let visible_height =
+            (wrapped.len() as u16).min(inner.y.saturating_add(inner.height).saturating_sub(y));
+        for (row, mut spans) in wrapped
+            .into_iter()
+            .take(visible_height as usize)
+            .enumerate()
+        {
+            let mut line = if row == 0 {
+                vec![Span::styled(format!("{checked} "), marker_style)]
+            } else {
+                vec![Span::raw("    ")]
+            };
+            line.append(&mut spans);
+            frame.render_widget(
+                Paragraph::new(Line::from(line)).style(text_style),
+                Rect::new(inner.x, y + row as u16, inner.width, 1),
+            );
+        }
+        let item_area = Rect::new(inner.x, y, inner.width, visible_height);
+        if interactive {
+            app.todo_hitboxes.push(TodoHitbox {
+                index,
+                area: item_area,
+            });
+        }
+        y = y.saturating_add(visible_height);
     }
 }
 
-fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Chat ");
-    f.render_widget(block, area);
+fn focus_border(focused: bool) -> Style {
+    Style::default().fg(if focused {
+        Color::Green
+    } else {
+        Color::DarkGray
+    })
+}
 
+fn draw_center(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    let content = center_content_axis(area);
+    match app.center_view {
+        CenterView::Chat => draw_chat(frame, app, area, content, interactive),
+        CenterView::Document => draw_document(frame, app, content),
+        CenterView::Search => draw_search(frame, app, content, interactive),
+        CenterView::MessageEdit => draw_message_edit(frame, app, content, interactive),
+    }
+}
+
+fn draw_chat(frame: &mut Frame, app: &mut App, surface: Rect, content: Rect, interactive: bool) {
+    if surface.width == 0 || surface.height == 0 {
+        return;
+    }
+    let content = inset_horizontal(content, 2);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "Chat",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(content.x, content.y, content.width, 1),
+    );
+
+    let compose = compose_rect(content);
+    app.layout.compose = non_empty(compose);
+
+    let message_top = content.y.saturating_add(2).min(content.y + content.height);
+    let message_bottom = compose.y.saturating_sub(1).min(content.y + content.height);
+    let message_view = Rect::new(
+        content.x,
+        message_top,
+        content.width,
+        message_bottom.saturating_sub(message_top),
+    );
+    draw_messages(frame, app, message_view, interactive);
+
+    if compose.width > 0 && compose.height > 0 {
+        frame.render_widget(Clear, compose);
+        draw_compose(frame, app, compose, interactive);
+    }
+}
+
+fn compose_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = if area.width > 4 {
+        area.width.saturating_sub(4).min(CENTER_MAX_WIDTH)
+    } else {
+        area.width
+    };
+    let desired_height = if area.height >= 14 { 7 } else { 5 };
+    let height = desired_height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let bottom_margin = u16::from(area.height > height);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height + bottom_margin));
+    Rect::new(x, y, width, height)
+}
+
+fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     if app.messages.is_empty() {
-        let hint = Paragraph::new("No notes yet.").alignment(Alignment::Center);
-        f.render_widget(hint, area);
+        frame.render_widget(
+            Paragraph::new("No notes yet").alignment(Alignment::Center),
+            area,
+        );
         return;
     }
 
-    // Inner content area (account for the top border).
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(1),
-    };
-    let width = inner.width as usize;
+    let width = area.width as usize;
+    let mut lines = Vec::new();
+    let mut card_first = Vec::with_capacity(app.messages.len());
+    let mut button_lines = Vec::with_capacity(app.messages.len());
+    let mut button_starts = Vec::with_capacity(app.messages.len());
 
-    // Build the full content. Each card = wrapped body lines + button row + blank.
-    let mut lines: Vec<Line> = Vec::new();
-    let mut card_first: Vec<usize> = Vec::with_capacity(app.messages.len());
-    let mut button_lines: Vec<usize> = Vec::with_capacity(app.messages.len());
-
-    for (idx, m) in app.messages.iter().enumerate() {
+    for (index, message) in app.messages.iter().enumerate() {
         card_first.push(lines.len());
-        let selected = Some(idx) == Some(app.selected);
-
-        let time = m.created_at.format(TIME_FMT).to_string();
-        let prefix = format!("{time}  ");
-        let prefix_w = prefix.width();
-        let budget = width.saturating_sub(prefix_w).max(1);
-
-        // Render the body with inline markdown (bold/italic/code/strike). Each
-        // explicit newline is kept as a hard line break; long lines wrap by
-        // display width so CJK glyphs align.
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for (i, line) in m.body.split('\n').enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("\n".to_string()));
+        let selected = index == app.selected;
+        let card_style = Style::default().bg(if selected {
+            Color::Indexed(238)
+        } else {
+            Color::Indexed(235)
+        });
+        let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
+        let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
+        lines.push(line_with_background(Vec::new(), width, card_style));
+        let prefix = format!("{}  ", message.created_at.format(TIME_FMT));
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let body_width = content_width.saturating_sub(prefix_width).max(1);
+        let markdown_lines = crate::markdown::to_lines(&message.body);
+        let mut card_row = 0;
+        for markdown_line in markdown_lines {
+            let wrapped_rows = wrap_spans_to_width(&markdown_line.spans, body_width);
+            for wrapped in wrapped_rows {
+                let mut spans = Vec::with_capacity(wrapped.len() + 3);
+                spans.push(Span::raw(" ".repeat(horizontal_padding)));
+                spans.push(if card_row == 0 {
+                    Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray))
+                } else {
+                    Span::raw(" ".repeat(prefix_width))
+                });
+                spans.extend(wrapped);
+                lines.push(line_with_background(spans, width, card_style));
+                card_row += 1;
             }
-            spans.extend(crate::markdown::inline_spans(line));
         }
-        if selected {
-            // Highlight the whole selected card body.
-            for s in &mut spans {
-                s.style = s.style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            }
+        if card_row == 0 {
+            lines.push(line_with_background(
+                vec![
+                    Span::raw(" ".repeat(horizontal_padding)),
+                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                ],
+                width,
+                card_style,
+            ));
         }
-
-        let prefix_span = Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray));
-        let indent = Span::raw(" ".repeat(prefix_w));
-        for (i, row_spans) in wrap_spans_to_width(&spans, budget).into_iter().enumerate() {
-            let mut line_spans: Vec<Span<'static>> = Vec::with_capacity(row_spans.len() + 1);
-            line_spans.push(if i == 0 { prefix_span.clone() } else { indent.clone() });
-            line_spans.extend(row_spans);
-            lines.push(Line::from(line_spans));
-        }
-
-        // Buttons row (indented to align with the body text).
+        lines.push(line_with_background(Vec::new(), width, card_style));
+        let button_width = action_buttons_width();
+        let button_start = horizontal_padding + content_width.saturating_sub(button_width);
         button_lines.push(lines.len());
-        lines.push(render_button_line(selected, prefix_w));
-
-        // Blank separator.
-        lines.push(Line::raw(""));
+        button_starts.push(button_start);
+        let mut button_spans = vec![Span::raw(" ".repeat(button_start))];
+        button_spans.extend(render_button_line(selected).spans);
+        lines.push(line_with_background(button_spans, width, card_style));
+        lines.push(line_with_background(Vec::new(), width, card_style));
+        lines.push(Line::default());
     }
 
-    // Resolve effective scroll. Work in usize so very long content doesn't
-    // truncate the line count, then cap to u16 (ratatui's Paragraph scroll is
-    // u16). The persisted `app.scroll` value u16::MAX means "stick to bottom".
     let total = lines.len();
-    let view_h = inner.height as usize;
-    let max_scroll = total.saturating_sub(view_h);
-    let cap = u16::MAX as usize;
-    let mut scroll = (if app.scroll as usize > max_scroll {
-        max_scroll
-    } else {
-        app.scroll as usize
-    })
-    .min(cap);
-
-    // Keep the selected card (and its buttons) visible.
-    if let Some(&first) = card_first.get(app.selected) {
-        let btn = button_lines[app.selected];
+    let view_height = area.height as usize;
+    let max_scroll = total.saturating_sub(view_height);
+    let mut scroll = (app.scroll as usize).min(max_scroll).min(u16::MAX as usize);
+    if let (Some(first), Some(button)) = (
+        card_first.get(app.selected).copied(),
+        button_lines.get(app.selected).copied(),
+    ) {
         if first < scroll {
-            scroll = first.min(cap);
-        } else if btn >= scroll + view_h {
-            scroll = btn.saturating_sub(view_h.saturating_sub(1)).min(cap);
+            scroll = first;
+        } else if button >= scroll.saturating_add(view_height) {
+            scroll = button.saturating_sub(view_height.saturating_sub(1));
         }
     }
+    scroll = scroll.min(max_scroll).min(u16::MAX as usize);
     app.scroll = scroll as u16;
 
-    // Record button hitboxes for cards whose button row is on screen. Skip
-    // out-of-view cards by bounds check (never subtract with underflow).
-    for (idx, m) in app.messages.iter().enumerate() {
-        let Some(&btn) = button_lines.get(idx) else {
-            continue;
-        };
-        if btn < scroll || btn >= scroll + view_h {
-            continue;
+    if interactive {
+        for (index, message) in app.messages.iter().enumerate() {
+            let Some(button_line) = button_lines.get(index).copied() else {
+                continue;
+            };
+            let Some(button_start) = button_starts.get(index).copied() else {
+                continue;
+            };
+            if button_line < scroll || button_line >= scroll.saturating_add(view_height) {
+                continue;
+            }
+            let y = area.y + (button_line - scroll) as u16;
+            register_buttons_clipped(
+                &mut app.hitboxes,
+                &message.id,
+                area.x.saturating_add(button_start as u16),
+                y,
+                area,
+            );
         }
-        let abs_row = inner.y + (btn - scroll) as u16;
-        // Buttons are indented by the timestamp prefix width to align with the
-        // body text; click targets must start at the same column.
-        let prefix_w = format!("{}  ", m.created_at.format(TIME_FMT)).width() as u16;
-        register_buttons(&mut app.hitboxes, &m.id, inner.x + prefix_w, abs_row);
     }
 
-    let para = Paragraph::new(lines).scroll((scroll as u16, 0));
-    f.render_widget(para, inner);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
 }
 
-/// Build the button row, returning it as a Line.
-fn render_button_line(selected: bool, indent: usize) -> Line<'static> {
-    let mut spans: Vec<Span> = Vec::new();
-    // Indent so the first button lines up under the body text (after the
-    // timestamp prefix), not at the card's left edge.
-    spans.push(Span::raw(" ".repeat(indent)));
-    for (i, action) in Action::all().iter().enumerate() {
-        if i > 0 {
+fn action_buttons_width() -> usize {
+    Action::all()
+        .iter()
+        .map(|action| action.label().width() + 2)
+        .sum::<usize>()
+        + Action::all().len().saturating_sub(1)
+}
+
+fn render_button_line(selected: bool) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, action) in Action::all().iter().enumerate() {
+        if index > 0 {
             spans.push(Span::raw(" "));
         }
-        let label = format!("[{}]", action.label());
         let style = if selected {
             Style::default()
                 .fg(Color::Black)
@@ -718,653 +576,1150 @@ fn render_button_line(selected: bool, indent: usize) -> Line<'static> {
         } else {
             Style::default().fg(Color::Cyan)
         };
-        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(format!("[{}]", action.label()), style));
     }
     Line::from(spans)
 }
 
-/// Push hitboxes for each button on a given row.
-fn register_buttons(hitboxes: &mut Vec<ButtonHitbox>, id: &str, x0: u16, y: u16) {
-    let mut x = x0;
-    for (i, action) in Action::all().iter().enumerate() {
-        if i > 0 {
-            x += 1; // separating space
+fn line_with_background(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    style: Style,
+) -> Line<'static> {
+    for span in &mut spans {
+        span.style = style.patch(span.style);
+    }
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), style));
+    }
+    Line::from(spans)
+}
+
+fn register_buttons_clipped(
+    hitboxes: &mut Vec<ButtonHitbox>,
+    message_id: &str,
+    start_x: u16,
+    y: u16,
+    viewport: Rect,
+) {
+    if y < viewport.y || y >= viewport.y.saturating_add(viewport.height) {
+        return;
+    }
+    let right = viewport.x.saturating_add(viewport.width);
+    let mut x = start_x;
+    for (index, action) in Action::all().iter().enumerate() {
+        if index > 0 {
+            x = x.saturating_add(1);
         }
-        let label = action.label();
-        let width = label.len() as u16 + 2; // brackets
-        hitboxes.push(ButtonHitbox {
-            message_id: id.to_string(),
-            action: *action,
-            area: Rect {
-                x,
-                y,
-                width,
-                height: 1,
-            },
-        });
-        x += width;
-    }
-}
-
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let focused = matches!(app.mode, Mode::Insert);
-    let border_color = if focused { Color::Green } else { Color::DarkGray };
-    let title = if focused {
-        " Compose "
-    } else {
-        " Press i to insert "
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Split the compose box into a text area and a counts row.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-
-    let text_area = chunks[0];
-    let width = text_area.width as usize;
-
-    // One Line per '\n' segment (placeholder when empty).
-    let lines: Vec<Line> = if app.input.is_empty() {
-        vec![Line::from(vec![Span::styled(
-            "Write something…",
-            Style::default().fg(Color::DarkGray),
-        )])]
-    } else {
-        app.input
-            .split('\n')
-            .map(|seg| Line::from(Span::raw(seg.to_string())))
-            .collect()
-    };
-
-    // Cursor → wrapped (row, col) so we can keep it on screen and place the
-    // terminal cursor. Wrap matches `Paragraph` (char-based, one cell/column).
-    let logical: Vec<&str> = app.input.split('\n').collect();
-    let line_widths: Vec<usize> = logical.iter().map(|s| UnicodeWidthStr::width(*s)).collect();
-    let total_rows: usize = line_widths
-        .iter()
-        .map(|&w| wrapped_row_count(w, width))
-        .sum();
-    let (cur_line, cur_col) = cursor_row_col(&app.input, app.input_cursor);
-    let rows_before: usize = line_widths[..cur_line]
-        .iter()
-        .map(|&w| wrapped_row_count(w, width))
-        .sum();
-    let row_offset = cur_col.checked_div(width).unwrap_or(0);
-    let cursor_wrapped_row = rows_before + row_offset;
-
-    let text_h = text_area.height as usize;
-    let scroll = if total_rows <= text_h {
-        0
-    } else {
-        let lo = cursor_wrapped_row.saturating_sub(text_h.saturating_sub(1));
-        let hi = total_rows - text_h;
-        lo.min(hi) as u16
-    };
-
-    let para = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, text_area);
-
-    if focused {
-        let cy = text_area.y + (cursor_wrapped_row.saturating_sub(scroll as usize)) as u16;
-        let cx = text_area.x + (if width == 0 { 0 } else { cur_col % width }) as u16;
-        f.set_cursor_position((cx, cy));
-    }
-
-    // --- Counts row: counts left, newline/send hint right (when focused) ---
-    let line_count = if app.input.is_empty() {
-        0
-    } else {
-        app.input.split('\n').count()
-    };
-    let char_count = app.input.chars().count();
-    let count = format!("{line_count} lines · {char_count} chars");
-
-    let hint = if focused {
-        "Enter send · Shift+Enter/Ctrl+J newline"
-    } else {
-        ""
-    };
-    let hint_w = hint.width() as u16;
-    let tb = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(hint_w)])
-        .split(chunks[1]);
-    f.render_widget(
-        Paragraph::new(count).style(Style::default().fg(Color::DarkGray)),
-        tb[0],
-    );
-    if !hint.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
-                .alignment(Alignment::Right),
-            tb[1],
-        );
-    }
-}
-
-/// Number of wrapped screen rows a logical line of `line_width` display columns
-/// occupies in an area `area_w` columns wide.
-fn wrapped_row_count(line_width: usize, area_w: usize) -> usize {
-    if area_w == 0 || line_width == 0 {
-        return 1;
-    }
-    line_width.div_ceil(area_w)
-}
-
-/// `(logical line index, display-column offset)` of the cursor within `input`.
-fn cursor_row_col(input: &str, cursor: usize) -> (usize, usize) {
-    let mut line = 0;
-    let mut col = 0;
-    for (i, c) in input.chars().enumerate() {
-        if i == cursor {
+        let width = action.label().width() as u16 + 2;
+        let clipped_x = x.max(viewport.x);
+        let clipped_right = x.saturating_add(width).min(right);
+        if clipped_x < clipped_right {
+            hitboxes.push(ButtonHitbox {
+                message_id: message_id.to_string(),
+                action: *action,
+                area: Rect::new(clipped_x, y, clipped_right - clipped_x, 1),
+            });
+        }
+        x = x.saturating_add(width);
+        if x >= right {
             break;
         }
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += c.width().unwrap_or(1);
-        }
     }
-    (line, col)
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let pop = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(pop[1])[1]
-}
-
-fn draw_select_target(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let w = (area.width / 2).clamp(40, 70);
-    let h = (app.target_files.len() as u16 + 4).min(area.height.saturating_sub(4));
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
-    let items: Vec<ListItem> = app
-        .target_files
-        .iter()
-        .map(|p| {
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            ListItem::new(name)
+fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
+    let focused = app.focus == Focus::Compose;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(if focused {
+            " Compose "
+        } else {
+            " Compose · i "
         })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Move to file  (↑↓ select · Enter move · v preview · Esc cancel)"),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-    let mut state = ListState::default();
-    state.select(Some(app.target_index));
-    f.render_stateful_widget(list, rect, &mut state);
-}
+        .border_style(focus_border(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-fn draw_new_file(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let rect = centered(area, 50, 3);
-    f.render_widget(Clear, rect);
-    let para = Paragraph::new(format!("{}_", app.new_file_input)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("New file name  (Enter create+move · Esc cancel)"),
+    let (text_area, toolbar) = split_last_row(inner);
+    draw_multiline_input(
+        frame,
+        text_area,
+        &app.input,
+        app.input_cursor,
+        "Write something…",
+        focused && interactive,
     );
-    f.render_widget(para, rect);
+
+    if toolbar.height > 0 {
+        let lines = if app.input.is_empty() {
+            0
+        } else {
+            app.input.lines().count().max(1)
+        };
+        let count = format!("{lines}l · {}c", app.input.chars().count());
+        let hint = if focused && toolbar.width >= 47 {
+            "Enter send · Ctrl+J newline"
+        } else if focused && toolbar.width >= 25 {
+            "Enter send"
+        } else {
+            ""
+        };
+        draw_left_right_line(frame, toolbar, &count, hint, Color::DarkGray);
+    }
 }
 
-fn draw_confirm_delete(f: &mut Frame, _app: &App) {
-    let area = f.area();
-    let rect = centered(area, 40, 3);
-    f.render_widget(Clear, rect);
-    let para = Paragraph::new("Delete this message?  [y/N]")
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Delete"));
-    f.render_widget(para, rect);
-}
-
-fn draw_preview(f: &mut Frame, app: &App) {
-    let Some(p) = app.preview.as_ref() else {
+fn draw_document(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(document) = app.document.as_mut() else {
+        frame.render_widget(
+            Paragraph::new("No document").alignment(Alignment::Center),
+            area,
+        );
         return;
     };
-    let area = f.area();
-    let w = (area.width * 4 / 5).max(50);
-    let h = (area.height * 4 / 5).max(10);
-    let rect = centered(area, w, h);
-    f.render_widget(Clear, rect);
-    let lines = crate::markdown::to_lines(&p.source);
-    let para = Paragraph::new(lines)
-        .scroll((p.scroll, 0))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("{}  (↑↓ scroll · Esc close)", p.title)),
-        );
-    f.render_widget(para, rect);
+    let content = inset_horizontal(area, 2);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    let header = Rect::new(content.x, content.y, content.width, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                document.title.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Esc back", Style::default().fg(Color::DarkGray)),
+        ])),
+        header,
+    );
+    let document_area = Rect::new(
+        content.x,
+        content.y.saturating_add(2),
+        content.width,
+        content.height.saturating_sub(2),
+    );
+    if let Some(target_line) = document.target_line.take() {
+        document.scroll = crate::markdown::rendered_row_for_source_line(
+            &document.source,
+            target_line,
+            document_area.width as usize,
+        )
+        .min(u16::MAX as usize) as u16;
+    }
+    let lines = crate::markdown::to_lines(&document.source);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((document.scroll, 0))
+            .wrap(Wrap { trim: false }),
+        document_area,
+    );
 }
 
-/// Greedy display-width wrap of styled spans to `width` columns, preserving
-/// explicit `'\n'` chars as hard line breaks and coalescing adjacent same-style
-/// characters into one span. Each output element is one wrapped row of spans.
+fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let content = inset_horizontal(area, 2);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    let input_width = if content.width > 4 {
+        content.width.saturating_sub(4).min(72)
+    } else {
+        content.width
+    };
+    let input_height = 3.min(content.height);
+    let input_box = Rect::new(
+        content.x + content.width.saturating_sub(input_width) / 2,
+        content.y,
+        input_width,
+        input_height,
+    );
+    let input_style = Style::default().bg(Color::Indexed(235));
+    if input_height >= 3 {
+        frame.render_widget(Clear, input_box);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .title(format!(" Searcher · {} ", app.search_results.len()))
+            .style(input_style)
+            .border_style(focus_border(app.focus == Focus::Center));
+        let input = block.inner(input_box);
+        frame.render_widget(block, input_box);
+        draw_single_line_input(
+            frame,
+            input,
+            "/ ",
+            &app.search_query,
+            app.search_query.chars().count(),
+            app.focus == Focus::Center && interactive,
+        );
+    } else {
+        draw_single_line_input(
+            frame,
+            input_box,
+            "/ ",
+            &app.search_query,
+            app.search_query.chars().count(),
+            app.focus == Focus::Center && interactive,
+        );
+    }
+
+    let results_y = input_box
+        .y
+        .saturating_add(input_box.height)
+        .saturating_add(1);
+    let results = Rect::new(
+        content.x,
+        results_y,
+        content.width,
+        content
+            .y
+            .saturating_add(content.height)
+            .saturating_sub(results_y),
+    );
+    if results.height == 0 {
+        return;
+    }
+    if app.search_results.is_empty() {
+        if !app.search_query.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No matches").alignment(Alignment::Center),
+                results,
+            );
+        }
+        return;
+    }
+
+    let visible = results.height as usize;
+    let selected = app
+        .search_index
+        .min(app.search_results.len().saturating_sub(1));
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(app.search_results.len().saturating_sub(visible));
+    for (row, (index, hit)) in app
+        .search_results
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let spans = match hit {
+            SearchHit::Message { text, .. } => vec![
+                Span::styled("• ", Style::default().fg(Color::Cyan)),
+                Span::raw(text.clone()),
+            ],
+            SearchHit::FileLine {
+                path,
+                line_no,
+                text,
+            } => {
+                let name = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?");
+                vec![
+                    Span::styled(
+                        format!("{name}:{line_no} "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(text.clone()),
+                ]
+            }
+        };
+        let style = if index == selected {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        let row_area = Rect::new(results.x, results.y + row as u16, results.width, 1);
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(style), row_area);
+        if interactive {
+            app.search_hitboxes.push(SearchHitbox {
+                index,
+                area: row_area,
+            });
+        }
+    }
+}
+
+fn draw_message_edit(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(" Edit message · Enter save · Esc cancel ")
+        .border_style(focus_border(true));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_multiline_input(
+        frame,
+        inner,
+        &app.edit_input,
+        app.edit_cursor,
+        "(empty)",
+        interactive && app.focus == Focus::Center,
+    );
+}
+
+fn draw_single_line_input(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &str,
+    value: &str,
+    cursor: usize,
+    show_cursor: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prompt.to_string(), Style::default().fg(Color::Green)),
+            Span::raw(value.to_string()),
+        ])),
+        area,
+    );
+    if show_cursor {
+        let cursor_byte = char_to_byte(value, cursor.min(value.chars().count()));
+        let column = UnicodeWidthStr::width(prompt) + UnicodeWidthStr::width(&value[..cursor_byte]);
+        let x = area.x + (column as u16).min(area.width.saturating_sub(1));
+        frame.set_cursor_position((x, area.y));
+    }
+}
+
+fn draw_multiline_input(
+    frame: &mut Frame,
+    area: Rect,
+    value: &str,
+    cursor: usize,
+    placeholder: &str,
+    show_cursor: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines: Vec<Line> = if value.is_empty() {
+        vec![Line::from(Span::styled(
+            placeholder.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        value
+            .split('\n')
+            .map(|line| Line::from(Span::raw(line.to_string())))
+            .collect()
+    };
+    let width = area.width as usize;
+    let logical_widths: Vec<usize> = value.split('\n').map(UnicodeWidthStr::width).collect();
+    let total_rows: usize = logical_widths
+        .iter()
+        .map(|line_width| wrapped_row_count(*line_width, width))
+        .sum();
+    let (cursor_line, cursor_column) = cursor_row_col(value, cursor);
+    let cursor_line = cursor_line.min(logical_widths.len().saturating_sub(1));
+    let rows_before: usize = logical_widths[..cursor_line]
+        .iter()
+        .map(|line_width| wrapped_row_count(*line_width, width))
+        .sum();
+    let wrapped_cursor_row = rows_before + cursor_column / width.max(1);
+    let viewport_height = area.height as usize;
+    let scroll = if total_rows <= viewport_height {
+        0
+    } else {
+        wrapped_cursor_row
+            .saturating_sub(viewport_height.saturating_sub(1))
+            .min(total_rows.saturating_sub(viewport_height))
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    if show_cursor {
+        let x = area.x + (cursor_column % width.max(1)) as u16;
+        let visible_row = wrapped_cursor_row.saturating_sub(scroll);
+        let y = area.y + (visible_row as u16).min(area.height.saturating_sub(1));
+        frame.set_cursor_position((x.min(area.x + area.width - 1), y));
+    }
+}
+
+fn split_last_row(area: Rect) -> (Rect, Rect) {
+    if area.height < 2 {
+        return (area, Rect::new(area.x, area.y + area.height, area.width, 0));
+    }
+    (
+        Rect::new(area.x, area.y, area.width, area.height - 1),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    )
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mode = match (app.focus, app.center_view, app.files_context) {
+        (Focus::Files, _, FilesContext::Search) => " FILES/SEARCH ",
+        (Focus::Files, _, FilesContext::MoveTarget) => " FILES/MOVE ",
+        (Focus::Files, _, FilesContext::NewTarget) => " FILES/NEW ",
+        (Focus::Files, _, FilesContext::Rename) => " FILES/RENAME ",
+        (Focus::Files, _, _) => " FILES ",
+        (Focus::Todo, _, _) => " TODO ",
+        (_, CenterView::Document, _) => " DOCUMENT ",
+        (_, CenterView::Search, _) => " SEARCH ",
+        (_, CenterView::MessageEdit, _) => " EDIT ",
+        (Focus::Compose, CenterView::Chat, _) => " COMPOSE ",
+        _ => " CHAT ",
+    };
+    let mode_style = Style::default().bg(Color::Blue).fg(Color::Black);
+    frame.render_widget(Paragraph::new(Span::styled(mode, mode_style)), area);
+
+    let hint = footer_hint(app, area.width);
+    let mode_width = mode.width() as u16;
+    let available_status = area
+        .width
+        .saturating_sub(mode_width)
+        .saturating_sub(hint.width() as u16)
+        .saturating_sub(u16::from(!hint.is_empty()));
+    if !app.status.is_empty() && available_status > 2 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", app.status),
+                Style::default().fg(Color::Yellow),
+            )),
+            Rect::new(area.x + mode_width, area.y, available_status, area.height),
+        );
+    }
+    if !hint.is_empty() {
+        let width = (hint.width() as u16).min(area.width);
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+                .alignment(Alignment::Right),
+            Rect::new(area.x + area.width - width, area.y, width, area.height),
+        );
+    }
+}
+
+fn footer_hint(app: &App, width: u16) -> &'static str {
+    if width < 28 {
+        return "";
+    }
+    if width < 55 {
+        return match app.focus {
+            Focus::Compose => "Esc chat",
+            Focus::Files => "Esc back · Enter open",
+            Focus::Todo => "Esc back · Enter toggle",
+            Focus::Center => "? help",
+        };
+    }
+    match (app.focus, app.center_view) {
+        (Focus::Compose, CenterView::Chat) => "Enter send · Ctrl+J newline · Esc chat",
+        (Focus::Files, _) => "↑↓ select · Enter open · / filter · Esc back",
+        (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
+        (_, CenterView::Chat) if width >= 95 => "i compose · f files · T todo · / search · ? help",
+        (_, CenterView::Document)
+            if app.document.as_ref().is_some_and(|document| {
+                matches!(document.kind, crate::app::DocumentKind::File(_))
+            }) =>
+        {
+            "↑↓ scroll · e editor · Esc back"
+        }
+        (_, CenterView::Document) => "↑↓ scroll · e edit message · Esc back",
+        (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
+        (_, CenterView::MessageEdit) => "Enter save · Ctrl+J newline · Esc cancel",
+        _ => "f files · T todo · ? help",
+    }
+}
+
+fn draw_left_right_line(frame: &mut Frame, area: Rect, left: &str, right: &str, color: Color) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(left.to_string(), Style::default().fg(color))),
+        area,
+    );
+    if !right.is_empty() {
+        let width = (right.width() as u16).min(area.width);
+        frame.render_widget(
+            Paragraph::new(Span::styled(right.to_string(), Style::default().fg(color)))
+                .alignment(Alignment::Right),
+            Rect::new(area.x + area.width - width, area.y, width, 1),
+        );
+    }
+}
+
+fn draw_file_input_modal(frame: &mut Frame, app: &App, root: Rect) -> Rect {
+    let area = centered_rect(root, 56.min(root.width), 5.min(root.height));
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let (title, prompt, value, cursor) = match app.files_context {
+        FilesContext::NewTarget => (
+            " New file · Enter create · Esc cancel ",
+            "Name  ",
+            app.new_file_input.as_str(),
+            app.new_file_cursor,
+        ),
+        FilesContext::Rename => (
+            " Rename file · Enter save · Esc cancel ",
+            "Name  ",
+            app.rename_input.as_str(),
+            app.rename_cursor,
+        ),
+        _ => return Rect::new(area.x, area.y, 0, 0),
+    };
+    frame.render_widget(Clear, area);
+    let modal_style = Style::default().bg(Color::Indexed(235));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::uniform(1))
+        .title(title)
+        .style(modal_style)
+        .border_style(focus_border(true));
+    let input = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new("").style(modal_style), input);
+    draw_single_line_input(frame, input, prompt, value, cursor, true);
+    area
+}
+
+fn draw_overlay(frame: &mut Frame, app: &mut App, root: Rect, overlay: Overlay) -> Rect {
+    match overlay {
+        Overlay::Help => draw_help(frame, app, root),
+        Overlay::ConfirmDeleteMessage => draw_confirmation(
+            frame,
+            root,
+            " Delete message ",
+            "Delete this message? [y/N]",
+        ),
+        Overlay::ConfirmDeleteFile => {
+            let name = app
+                .pending_file
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "this file".to_string());
+            draw_confirmation(
+                frame,
+                root,
+                " Delete file ",
+                &format!("Delete {name}? [y/N]"),
+            )
+        }
+        Overlay::ConfirmDiscardEdit => draw_confirmation(
+            frame,
+            root,
+            " Unsaved changes ",
+            "Discard unsaved changes? [y/N]",
+        ),
+    }
+}
+
+fn draw_confirmation(frame: &mut Frame, root: Rect, title: &str, message: &str) -> Rect {
+    let area = centered_rect(root, 56.min(root.width), 3.min(root.height));
+    if area.width > 0 && area.height > 0 {
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(message.to_string())
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .padding(Padding::horizontal(PANEL_PADDING))
+                        .title(title.to_string()),
+                ),
+            area,
+        );
+    }
+    area
+}
+
+fn draw_help(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
+    let width = root.width.saturating_sub(2).min(92).max(root.width.min(1));
+    let height = root
+        .height
+        .saturating_sub(2)
+        .min(30)
+        .max(root.height.min(1));
+    let area = centered_rect(root, width, height);
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(" Help · ↑↓ scroll · Esc close ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = help_lines();
+    let maximum = lines.len().saturating_sub(inner.height as usize);
+    app.help_scroll = (app.help_scroll as usize).min(maximum) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((app.help_scroll, 0)), inner);
+    area
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let heading = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let key = |keys: &str, description: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {keys:<16}"),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(description.to_string()),
+        ])
+    };
+    vec![
+        heading("Workspace"),
+        key("f / T", "focus Files / Todo"),
+        key("Tab / Esc", "return to center"),
+        key("?", "open this help"),
+        Line::default(),
+        heading("Chat"),
+        key("i / Enter", "focus Compose"),
+        key("j k / ↑ ↓", "select message"),
+        key("t m a n", "todo · move · archive · new file"),
+        key("v e d", "view · edit · delete"),
+        key("/ / u", "search · undo"),
+        Line::default(),
+        heading("Compose / editor"),
+        key("Enter", "send / save"),
+        key("Ctrl+J", "insert newline"),
+        key("Esc", "leave / cancel"),
+        Line::default(),
+        heading("Files"),
+        key("j k / ↑ ↓", "select"),
+        key("Enter / e", "open / external editor"),
+        key("/ r d", "filter · rename · delete"),
+        Line::default(),
+        heading("Todo / document"),
+        key("Enter / Space", "toggle todo"),
+        key("j k / PgUp/Dn", "scroll document"),
+    ]
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn wrapped_row_count(line_width: usize, area_width: usize) -> usize {
+    if line_width == 0 || area_width == 0 {
+        1
+    } else {
+        line_width.div_ceil(area_width)
+    }
+}
+
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+fn cursor_row_col(input: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut column = 0;
+    for (index, character) in input.chars().enumerate() {
+        if index == cursor {
+            break;
+        }
+        if character == '\n' {
+            line += 1;
+            column = 0;
+        } else {
+            column += character.width().unwrap_or(1);
+        }
+    }
+    (line, column)
+}
+
+/// Greedy display-width wrapping that keeps span styles and explicit newlines.
 fn wrap_spans_to_width(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
-    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut rows = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
-    let mut row_w: usize = 0;
+    let mut row_width = 0;
     for span in spans {
-        let style = span.style;
-        for c in span.content.chars() {
-            if c == '\n' {
+        for character in span.content.chars() {
+            if character == '\n' {
                 rows.push(std::mem::take(&mut row));
-                row_w = 0;
+                row_width = 0;
                 continue;
             }
-            let cw = c.width().unwrap_or(1);
-            if width > 0 && row_w + cw > width && !row.is_empty() {
+            let character_width = character.width().unwrap_or(1);
+            if width > 0 && row_width + character_width > width && !row.is_empty() {
                 rows.push(std::mem::take(&mut row));
-                row_w = 0;
+                row_width = 0;
             }
-            let coalesced = match row.last_mut() {
-                Some(last) if last.style == style => {
-                    last.content.to_mut().push(c);
-                    true
-                }
-                _ => false,
-            };
-            if !coalesced {
-                row.push(Span::styled(c.to_string(), style));
+            if let Some(last) = row.last_mut().filter(|last| last.style == span.style) {
+                last.content.to_mut().push(character);
+            } else {
+                row.push(Span::styled(character.to_string(), span.style));
             }
-            row_w += cw;
+            row_width += character_width;
         }
     }
     if !row.is_empty() || rows.is_empty() {
-        rows.push(std::mem::take(&mut row));
+        rows.push(row);
     }
     rows
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::storage::Storage;
+    use std::fs;
+
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use tempfile::tempdir;
 
-    /// Flatten a rendered TestBackend buffer into a readable string.
+    use super::*;
+    use crate::app::{Document, DocumentKind, DocumentReturn};
+    use crate::model::TodoItem;
+    use crate::storage::Storage;
+
+    fn make_app() -> (App, tempfile::TempDir) {
+        let directory = tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        (App::new(storage).unwrap(), directory)
+    }
+
+    fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+    }
+
     fn buffer_string(terminal: &Terminal<TestBackend>) -> String {
-        let buf = terminal.backend().buffer();
-        let area = buf.area();
-        let mut s = String::new();
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        let mut output = String::new();
         for y in 0..area.height {
             for x in 0..area.width {
-                s.push_str(buf[(x, y)].symbol());
+                output.push_str(buffer[(x, y)].symbol());
             }
-            s.push('\n');
+            output.push('\n');
         }
-        s
+        output
+    }
+
+    fn contains(outer: Rect, inner: Rect) -> bool {
+        inner.x >= outer.x
+            && inner.y >= outer.y
+            && inner.x.saturating_add(inner.width) <= outer.x.saturating_add(outer.width)
+            && inner.y.saturating_add(inner.height) <= outer.y.saturating_add(outer.height)
     }
 
     #[test]
-    fn chat_renders_full_multiline_body() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.append_chat_message("alpha\nbeta\ngamma").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal;
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-
-        // The full multi-line body must render (not just the first line).
-        for word in ["alpha", "beta", "gamma"] {
-            assert!(s.contains(word), "{word} missing from chat render");
+    fn narrow_center_surface_fills_body_while_content_axis_is_capped() {
+        for width in [60, 80, 120, 169] {
+            let (mut app, _directory) = make_app();
+            app.focus = Focus::Center;
+            let terminal = render(&mut app, width, 24);
+            let center = app.layout.center.expect("center surface");
+            assert_eq!(center, Rect::new(0, 0, width, 23), "width {width}");
+            let content = center_content_axis(center);
+            assert_eq!(content.width, width.min(CENTER_MAX_WIDTH), "width {width}");
+            assert_eq!(
+                content.x,
+                width.saturating_sub(content.width) / 2,
+                "width {width}"
+            );
+            assert!(app.layout.files.is_none());
+            assert!(app.layout.todo.is_none());
+            assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+            assert!(buffer_string(&terminal).contains("Chat"));
         }
-        // Each word on its own line.
-        let a = s.lines().find(|l| l.contains("alpha"));
-        let b = s.lines().find(|l| l.contains("beta"));
-        let c = s.lines().find(|l| l.contains("gamma"));
-        assert_ne!(a, b, "alpha/beta must be on distinct lines");
-        assert_ne!(b, c, "beta/gamma must be on distinct lines");
-        // Buttons still present and registered.
-        assert!(s.contains("[todo]"), "buttons missing");
-        assert!(!app.hitboxes.is_empty(), "button hitboxes missing");
     }
 
     #[test]
-    fn buttons_align_with_body_content() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.append_chat_message("hello world").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal;
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer();
-        let area = buf.area();
-
-        // Column where "hello" starts (body) vs where "[todo]" starts (buttons).
-        let mut hello_x = None;
-        let mut todo_x = None;
-        for y in 0..area.height {
-            let row: String = (0..area.width)
-                .map(|x| buf[(x, y)].symbol().to_string())
-                .collect();
-            if hello_x.is_none() {
-                if let Some(i) = row.find("hello") {
-                    hello_x = Some(i);
-                }
-            }
-            if todo_x.is_none() {
-                if let Some(i) = row.find("[todo]") {
-                    todo_x = Some(i);
-                }
-            }
+    fn wide_layout_uses_terminal_edges_and_center_content_axis() {
+        for width in [170, 171, 220] {
+            let (mut app, _directory) = make_app();
+            app.focus = Focus::Center;
+            render(&mut app, width, 24);
+            let files = app.layout.files.unwrap();
+            let center = app.layout.center.unwrap();
+            let todo = app.layout.todo.unwrap();
+            assert_eq!(files, Rect::new(0, 0, 30, 23), "width {width}");
+            assert_eq!(todo.width, 36, "width {width}");
+            assert_eq!(todo.x + todo.width, width, "width {width}");
+            let region_width = width - FILES_WIDTH - TODO_WIDTH;
+            assert_eq!(center, Rect::new(FILES_WIDTH, 0, region_width, 23));
+            let content = center_content_axis(center);
+            assert_eq!(content.width, region_width.min(CENTER_MAX_WIDTH));
+            assert_eq!(
+                content.x,
+                FILES_WIDTH + region_width.saturating_sub(content.width) / 2,
+                "width {width}"
+            );
         }
-        let hello_x = hello_x.expect("body text rendered");
-        let todo_x = todo_x.expect("button row rendered");
+    }
+
+    #[test]
+    fn footer_uses_full_terminal_width() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.status = "saved-at-left".to_string();
+        let terminal = render(&mut app, 220, 12);
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..220)
+            .map(|x| buffer[(x, 11)].symbol().to_string())
+            .collect();
+        assert!(footer.starts_with(" CHAT "));
+        assert!(footer.contains("saved-at-left"));
+        assert!(footer.trim_end().ends_with("? help"));
+    }
+
+    #[test]
+    fn narrow_files_and_todo_each_use_the_full_body_without_duplicates() {
+        let (mut app, directory) = make_app();
+        fs::write(directory.path().join("Work.md"), "work").unwrap();
+        app.reload_files();
+        app.focus = Focus::Files;
+        let terminal = render(&mut app, 80, 18);
+        assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 17)));
+        assert!(app.layout.center.is_none());
+        assert!(app.layout.todo.is_none());
+        assert_eq!(buffer_string(&terminal).matches("Files").count(), 1);
+        assert!(!app.file_hitboxes.is_empty());
+        assert!(app
+            .file_hitboxes
+            .iter()
+            .all(|hitbox| contains(app.layout.files.unwrap(), hitbox.area)));
+
+        app.focus = Focus::Todo;
+        app.todo_items = vec![TodoItem {
+            checked: false,
+            text: "buy milk".to_string(),
+        }];
+        let terminal = render(&mut app, 60, 18);
+        assert_eq!(app.layout.todo, Some(Rect::new(0, 0, 60, 17)));
+        assert!(app.layout.files.is_none());
+        assert!(app.layout.center.is_none());
+        let screen = buffer_string(&terminal);
+        assert_eq!(screen.matches("Todo").count(), 1);
+        assert!(screen.contains("buy milk"));
+        assert_eq!(app.todo_hitboxes.len(), 1);
+    }
+
+    #[test]
+    fn file_name_inputs_render_as_modals_while_search_stays_inline() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.files_context = FilesContext::NewTarget;
+        app.new_file_input = "Project".to_string();
+        app.new_file_cursor = app.new_file_input.chars().count();
+        let terminal = render(&mut app, 80, 16);
+        assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 15)));
+        assert!(app.layout.center.is_none());
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("New file · Enter create"));
+        assert!(screen.contains("Name  Project"));
+        assert!(app.layout.overlay.is_some());
+        assert!(app.file_hitboxes.is_empty());
+        let modal = app.layout.overlay.unwrap();
         assert_eq!(
-            hello_x, todo_x,
-            "button row must start at the same column as the body text"
+            terminal.backend().buffer()[(modal.x + 1, modal.y + 1)].bg,
+            Color::Indexed(235),
+            "modal padding should have an opaque background"
         );
+
+        app.files_context = FilesContext::Rename;
+        app.rename_input = "Renamed".to_string();
+        app.rename_cursor = app.rename_input.chars().count();
+        let terminal = render(&mut app, 80, 16);
+        assert!(buffer_string(&terminal).contains("Name  Renamed"));
+        assert!(app.layout.overlay.is_some());
+
+        app.files_context = FilesContext::Search;
+        app.file_query = "work".to_string();
+        let terminal = render(&mut app, 80, 16);
+        assert!(buffer_string(&terminal).contains("/ work"));
+        assert!(app.layout.overlay.is_none());
     }
 
     #[test]
-    fn file_list_popup_shows_files() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.create_named_file("Work").unwrap();
-        st.create_named_file("Ideas").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.open_file_list(); // mode -> FileList, populates sidebar_files
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-
-        assert!(s.contains("Files"), "popup title missing");
-        assert!(s.contains("TODO"), "TODO missing from popup");
-        assert!(s.contains("Work"), "Work missing from popup");
-        assert!(s.contains("Ideas"), "Ideas missing from popup");
-
-        // File rows must register clickable hitboxes.
-        assert!(!app.file_hitboxes.is_empty(), "no file hitboxes registered");
-        assert!(
-            app.file_hitboxes
-                .iter()
-                .any(|h| h.path.file_name().unwrap() == "Work.md"),
-            "Work.md hitbox missing"
-        );
-    }
-
-    #[test]
-    fn input_renders_multiple_lines() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let mut app = App::new(st).unwrap();
-        // Two segments fit in the input box; both must be visible on distinct
-        // lines (no glyph collapse).
-        app.input = "alpha\nbeta".to_string();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-        let alpha_line = s.lines().find(|l| l.contains("alpha"));
-        let beta_line = s.lines().find(|l| l.contains("beta"));
-        assert!(alpha_line.is_some(), "alpha line missing");
-        assert!(beta_line.is_some(), "beta line missing");
-        assert_ne!(alpha_line, beta_line, "segments must be on distinct lines");
-    }
-
-    #[test]
-    fn input_toolbar_shows_counts() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let mut app = App::new(st).unwrap();
-        app.input = "ab\ncd".to_string(); // 2 lines, 5 chars (incl. '\n')
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        // Wide-char trailing cells render as spaces in the flattened buffer,
-        // so compare against a space-normalized view.
-        let s = buffer_string(&terminal).replace(' ', "");
-        assert!(s.contains("2lines"), "line count missing");
-        assert!(s.contains("5chars"), "char count missing");
-    }
-
-    #[test]
-    fn input_shows_send_hint_when_focused() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Insert;
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal).replace(' ', "");
-        assert!(s.contains("Entersend"), "send hint should show when focused");
-        assert!(s.contains("Ctrl+Jnewline"), "newline hint should show when focused");
-    }
-
-    #[test]
-    fn many_messages_render_without_underflow() {
-        // Regression: with enough messages that the selected (last) one is below
-        // the viewport, scroll goes non-zero and earlier cards sit above it.
-        // Their button rows (index < scroll) used to cause a subtraction
-        // overflow (panic) when computing hitbox positions.
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        for i in 0..50 {
-            st.append_chat_message(&format!("message number {i}")).unwrap();
-        }
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal;
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        // On-screen cards still register clickable buttons.
-        assert!(!app.hitboxes.is_empty());
-    }
-
-    #[test]
-    fn input_placeholder_when_empty() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let mut app = App::new(st).unwrap();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal).replace(' ', "");
-        assert!(s.contains("Writesomething"), "placeholder missing");
-    }
-
-    #[test]
-    fn preview_modal_renders_markdown() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let mut app = App::new(st).unwrap();
-
-        let md = "# Heading\n\nSome **bold** text and `code`.\n\n- one\n- two";
-        app.mode = Mode::Preview;
-        app.preview = Some(crate::app::Preview {
-            title: "Test".into(),
-            source: md.into(),
+    fn narrow_center_renders_each_center_view_in_place() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.center_view = CenterView::Document;
+        app.document = Some(Document {
+            kind: DocumentKind::Message("id".to_string()),
+            title: "Preview".to_string(),
+            source: "# Heading".to_string(),
             scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
         });
+        let terminal = render(&mut app, 80, 18);
+        assert!(buffer_string(&terminal).contains("Heading"));
 
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-
-        // Markdown flows through the renderer into the modal as visible text.
-        assert!(s.contains("Heading"), "heading text missing");
-        assert!(s.contains("bold"), "bold text missing");
-        assert!(s.contains("code"), "inline code text missing");
-        assert!(s.contains("one"), "first list item missing");
-        assert!(s.contains("•"), "bullet marker missing");
-    }
-
-    #[test]
-    fn input_border_title_shows_hint() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal; // unfocused → border title carries the hint
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        // Wide CJK glyphs leave spacer cells when flattened, so strip spaces.
-        let s = buffer_string(&terminal).replace(' ', "");
-        assert!(s.contains("Pressitoinsert"), "normal-mode hint missing from title");
-        assert!(!s.contains('❯'), "stale ❯ prompt should be gone");
-    }
-
-    #[test]
-    fn todo_panel_renders_task_and_hitbox() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        let m = st.append_chat_message("buy milk").unwrap();
-        st.move_to_todo(&m).unwrap();
-        let mut app = App::new(st).unwrap();
-        app.open_todo();
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-        assert!(s.contains("[ ]"), "unchecked checkbox should render");
-        assert!(s.contains("buy milk"), "task text should render");
-        assert_eq!(app.todo_hitboxes.len(), 1, "task row should be clickable");
-    }
-
-    #[test]
-    fn search_panel_renders_results_and_hitbox() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.append_chat_message("findme in chat").unwrap();
-        std::fs::write(st.root.join("Work.md"), "# Work\n\nfindme in file\n").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        for c in "findme".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-        assert!(s.contains("findme"), "match text should render");
-        assert!(!app.search_hitboxes.is_empty(), "result rows should be clickable");
-    }
-
-    #[test]
-    fn card_renders_inline_markdown() {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.append_chat_message("this is **bold** and `code`").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal;
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-        assert!(s.contains("bold"), "bold text shows");
-        assert!(s.contains("code"), "code text shows");
-        assert!(!s.contains("**"), "markdown markers should be parsed away");
-        assert!(!s.contains('`'), "code backticks should be parsed away");
-    }
-
-    #[test]
-    fn edit_dialog_renders_body() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.append_chat_message("editable text here").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-        assert!(s.contains("Edit message"), "editor title missing");
-        assert!(s.contains("editable text here"), "body should render");
-    }
-
-    #[test]
-    fn unsaved_edit_confirmation_renders() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.append_chat_message("original").unwrap();
-        let mut app = App::new(st).unwrap();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let s = buffer_string(&terminal);
-
-        assert!(s.contains("Unsaved changes"), "confirmation title missing");
-        assert!(
-            s.contains("Discard unsaved changes?"),
-            "confirmation prompt missing"
+        app.center_view = CenterView::Search;
+        app.search_query = "needle".to_string();
+        app.search_results = vec![SearchHit::Message {
+            id: "id".to_string(),
+            text: "needle result".to_string(),
+        }];
+        let terminal = render(&mut app, 80, 18);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Searcher · 1"));
+        assert!(screen.contains("needle result"));
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+        assert_ne!(
+            terminal.backend().buffer()[(4, 0)].symbol(),
+            " ",
+            "only the centered searcher should have a border"
         );
+        assert_eq!(app.search_hitboxes.len(), 1);
+
+        app.center_view = CenterView::MessageEdit;
+        app.edit_input = "editable".to_string();
+        app.edit_cursor = app.edit_input.chars().count();
+        let terminal = render(&mut app, 80, 18);
+        assert!(buffer_string(&terminal).contains("editable"));
+        assert!(app.layout.files.is_none());
+        assert!(app.layout.todo.is_none());
+    }
+
+    #[test]
+    fn chat_compose_and_button_hitboxes_stay_inside_visible_center_viewport() {
+        for width in [60, 80, 120, 169, 170, 171, 220] {
+            let (mut app, _directory) = make_app();
+            for index in 0..30 {
+                app.storage
+                    .append_chat_message(&format!("message {index}"))
+                    .unwrap();
+            }
+            app.reload();
+            app.selected = app.messages.len() - 1;
+            app.focus = Focus::Center;
+            app.scroll = u16::MAX;
+            render(&mut app, width, 24);
+            let center = app.layout.center.unwrap();
+            let compose = app.layout.compose.unwrap();
+            assert!(compose.width <= CENTER_MAX_WIDTH, "width {width}");
+            assert!(contains(center, compose), "width {width}");
+            assert!(!app.hitboxes.is_empty(), "width {width}");
+            for hitbox in &app.hitboxes {
+                assert!(contains(center, hitbox.area), "width {width}");
+                assert!(
+                    hitbox.area.y < compose.y.saturating_sub(1),
+                    "button behind compose at width {width}: {:?}",
+                    hitbox.area
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_records_geometry_and_disables_all_background_hitboxes() {
+        let (mut app, directory) = make_app();
+        fs::write(directory.path().join("Work.md"), "work").unwrap();
+        app.reload_files();
+        app.storage.append_chat_message("hello").unwrap();
+        app.reload();
+        app.todo_items = vec![TodoItem {
+            checked: false,
+            text: "task".to_string(),
+        }];
+        app.focus = Focus::Center;
+        app.overlay = Some(Overlay::Help);
+        render(&mut app, 220, 24);
+        assert!(app.layout.overlay.is_some());
+        assert!(app.hitboxes.is_empty());
+        assert!(app.file_hitboxes.is_empty());
+        assert!(app.todo_hitboxes.is_empty());
+        assert!(app.search_hitboxes.is_empty());
+    }
+
+    #[test]
+    fn tiny_terminals_and_requested_widths_do_not_panic() {
+        for (width, height) in [
+            (1, 1),
+            (2, 2),
+            (5, 3),
+            (20, 4),
+            (60, 8),
+            (80, 8),
+            (120, 8),
+            (169, 8),
+            (170, 8),
+            (171, 8),
+            (220, 8),
+        ] {
+            let (mut app, _directory) = make_app();
+            app.input = "wide 字\nsecond line".to_string();
+            app.input_cursor = app.input.chars().count();
+            render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn multiline_chat_and_compose_content_render() {
+        let (mut app, _directory) = make_app();
+        app.storage
+            .append_chat_message("alpha\nbeta **bold**")
+            .unwrap();
+        app.reload();
+        app.focus = Focus::Compose;
+        app.input = "first\nsecond".to_string();
+        app.input_cursor = app.input.chars().count();
+        let terminal = render(&mut app, 120, 24);
+        let screen = buffer_string(&terminal);
+        for expected in ["alpha", "beta bold", "first", "second", "[todo]"] {
+            assert!(screen.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn todo_items_wrap_and_keep_the_whole_item_clickable() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Todo;
+        app.todo_items = vec![TodoItem {
+            checked: false,
+            text: "a todo item whose content is deliberately longer than the panel".to_string(),
+        }];
+        let terminal = render(&mut app, 170, 18);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("a todo item whose content"));
+        assert!(screen.contains("longer"));
+        assert!(screen.contains("panel"));
+        assert_eq!(app.todo_hitboxes.len(), 1);
+        assert!(app.todo_hitboxes[0].area.height > 1);
+    }
+
+    #[test]
+    fn todo_display_groups_open_items_before_completed_items() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Todo;
+        app.todo_items = vec![
+            TodoItem {
+                checked: true,
+                text: "finished task".to_string(),
+            },
+            TodoItem {
+                checked: false,
+                text: "open task".to_string(),
+            },
+        ];
+        app.todo_index = 1;
+        let terminal = render(&mut app, 170, 18);
+        let screen = buffer_string(&terminal);
+        assert!(screen.find("open task") < screen.find("finished task"));
+        assert_eq!(
+            app.todo_hitboxes
+                .iter()
+                .map(|hitbox| hitbox.index)
+                .collect::<Vec<_>>(),
+            vec![1, 0],
+            "hitboxes must retain TODO.md source indices"
+        );
+    }
+
+    #[test]
+    fn chat_renders_block_markdown_on_colored_cards() {
+        let (mut app, _directory) = make_app();
+        app.storage
+            .append_chat_message("# Heading\n\n- first\n- second\n\n`code`")
+            .unwrap();
+        app.reload();
+        let terminal = render(&mut app, 170, 24);
+        let screen = buffer_string(&terminal);
+        for expected in ["Heading", "• first", "• second", "code"] {
+            assert!(screen.contains(expected), "missing {expected}");
+        }
+        assert!(!screen.contains("[view]"));
+        assert!(
+            app.hitboxes
+                .iter()
+                .all(|hitbox| hitbox.action != Action::View),
+            "Markdown messages no longer need a preview button"
+        );
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.content().iter().any(|cell| {
+                cell.symbol() == "H"
+                    && cell.modifier.contains(Modifier::BOLD)
+                    && cell.bg == Color::Indexed(238)
+            }),
+            "heading should retain Markdown emphasis on the selected card background"
+        );
+        let delete = app
+            .hitboxes
+            .iter()
+            .find(|hitbox| hitbox.action == Action::Delete)
+            .expect("delete button");
+        let center = app.layout.center.expect("center");
+        assert_eq!(
+            delete.area.x + delete.area.width,
+            center.x + center.width - 3,
+            "buttons should sit against the card's right padding"
+        );
+    }
+
+    #[test]
+    fn document_view_has_padding_without_an_outer_border() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.center_view = CenterView::Document;
+        app.document = Some(Document {
+            kind: DocumentKind::File(app.storage.archive_path.clone()),
+            title: "Archive".to_string(),
+            source: "# Heading\n\nintro\n\nneedle".to_string(),
+            scroll: 0,
+            target_line: Some(5),
+            return_to: DocumentReturn::Chat,
+        });
+        let terminal = render(&mut app, 80, 18);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert!(!buffer_string(&terminal).contains("┌"));
+        assert!(buffer_string(&terminal).contains("  Archive"));
+        assert_eq!(app.document.as_ref().unwrap().scroll, 4);
+        assert_eq!(app.document.as_ref().unwrap().target_line, None);
+        let first_document_row: String = (0..80)
+            .map(|x| buffer[(x, 2)].symbol().to_string())
+            .collect();
+        assert!(first_document_row.contains("needle"));
     }
 }

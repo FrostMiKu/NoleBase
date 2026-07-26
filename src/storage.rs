@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 
-use crate::model::{Message, SearchHit, TodoItem};
+use crate::model::{Message, NoteFile, SearchHit, TodoItem};
 
 const OPEN_PREFIX: &str = "<!-- note-msg";
 const OPEN_SUFFIX: &str = "-->";
@@ -189,7 +189,9 @@ impl Storage {
         const CAP: usize = 200;
         let mut out: Vec<SearchHit> = Vec::new();
         for path in self.list_markdown_files().unwrap_or_default() {
-            let text = fs::read_to_string(&path).unwrap_or_default();
+            let Ok(text) = self.read_note_file(&path) else {
+                continue;
+            };
             for (i, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&q) {
                     let t = line.trim();
@@ -263,72 +265,192 @@ impl Storage {
     }
 
     /// Create a new markdown file from a user-entered name, returning its path.
+    /// Existing filesystem entries are never overwritten.
     pub fn create_named_file(&self, name: &str) -> Result<PathBuf> {
         let file_name = normalize_new_name(name)?;
-        let path = self.root.join(&file_name);
-        if !path.exists() {
-            fs::write(&path, format!("# {}\n\n", stem(&file_name)))?;
+        if is_protected_note_name(Path::new(&file_name)) {
+            bail!("{file_name} is reserved and cannot be created");
         }
+
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating {}", self.root.display()))?;
+        let path = self.root.join(&file_name);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("creating new note file {}", path.display()))?;
+        file.write_all(format!("# {}\n\n", stem(&file_name)).as_bytes())?;
         Ok(path)
     }
 
-    /// Rename a managed `.md` file to `new_name` (normalized), returning the
-    /// new path. Refuses to overwrite an existing file.
+    /// Rename a managed markdown file to `new_name` (normalized), returning the
+    /// new path. Refuses protected names and never overwrites an existing entry.
     pub fn rename_file(&self, from: &Path, new_name: &str) -> Result<PathBuf> {
         let from = self.validate_target(from)?;
+        if is_protected_note_name(&from) {
+            bail!("{} is protected and cannot be renamed", from.display());
+        }
+
         let name = normalize_new_name(new_name)?;
+        if is_protected_note_name(Path::new(&name)) {
+            bail!("{name} is reserved and cannot be used as a rename target");
+        }
         let to = self.root.join(&name);
-        if to == from {
-            return Ok(to);
+        if to.file_name() == from.file_name() {
+            return Ok(from);
         }
-        if to.exists() {
-            bail!("a file named {name} already exists");
+        match fs::symlink_metadata(&to) {
+            Ok(_) => {
+                bail!("a file named {name} already exists");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", to.display()));
+            }
         }
-        fs::rename(&from, &to)?;
+        fs::rename(&from, &to)
+            .with_context(|| format!("renaming {} to {}", from.display(), to.display()))?;
         Ok(to)
     }
 
-    /// Delete a managed `.md` file. The path must resolve inside the root.
+    /// Delete a managed markdown file. Protected files cannot be deleted.
     pub fn delete_file(&self, path: &Path) -> Result<()> {
         let path = self.validate_target(path)?;
-        fs::remove_file(&path)?;
+        if is_protected_note_name(&path) {
+            bail!("{} is protected and cannot be deleted", path.display());
+        }
+        fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
         Ok(())
     }
 
-    /// List `.md` files in the root, excluding `CHAT.md`, sorted by name.
-    pub fn list_markdown_files(&self) -> Result<Vec<PathBuf>> {
+    /// Read a managed markdown file after applying the same path checks used by
+    /// mutating operations.
+    pub fn read_note_file(&self, path: &Path) -> Result<String> {
+        let path = self.validate_target(path)?;
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+    }
+
+    /// List managed markdown files by most recently modified, excluding CHAT.
+    /// Only direct, regular (non-symlink) children of the root are returned.
+    pub fn list_note_files(&self) -> Result<Vec<NoteFile>> {
         let mut files = Vec::new();
-        fs::create_dir_all(&self.root).ok();
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating {}", self.root.display()))?;
         for entry in fs::read_dir(&self.root)? {
             let Ok(entry) = entry else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md")
-                && path.file_name().and_then(|n| n.to_str()) != Some(CHAT_FILE)
-            {
-                files.push(path);
+            if is_markdown_path(&path) && !is_chat_note_name(&path) {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                files.push(NoteFile { path, modified });
             }
         }
-        files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        files.sort_by(|a, b| {
+            b.modified
+                .cmp(&a.modified)
+                .then_with(|| a.path.file_name().cmp(&b.path.file_name()))
+        });
         Ok(files)
     }
 
-    /// Ensure a target path resolves to a `.md` file inside the root.
+    /// List only the paths, preserving the sidebar's recent-first order.
+    pub fn list_markdown_files(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .list_note_files()?
+            .into_iter()
+            .map(|file| file.path)
+            .collect())
+    }
+
+    /// Ensure a target is a direct, regular markdown file under the root.
+    /// Existing targets are canonicalized in full; symlinks are always rejected.
     pub fn validate_target(&self, target: &Path) -> Result<PathBuf> {
-        let canonical_root = canonicalize_or(&self.root);
-        let parent_ok = target
-            .parent()
-            .map(|p| canonicalize_or(p) == canonical_root)
-            .unwrap_or(false);
-        let is_md = target.extension().and_then(|e| e.to_str()) == Some("md");
-        if !(parent_ok && is_md) {
-            bail!("target must be a .md file inside ~/.note");
+        if !is_markdown_path(target) {
+            bail!(
+                "target must have a .md or .markdown extension: {}",
+                target.display()
+            );
         }
-        Ok(target.to_path_buf())
+
+        let canonical_root = fs::canonicalize(&self.root)
+            .with_context(|| format!("resolving note root {}", self.root.display()))?;
+        match fs::symlink_metadata(target) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("symlink note targets are not allowed: {}", target.display());
+                }
+                if !metadata.file_type().is_file() {
+                    bail!("note target is not a regular file: {}", target.display());
+                }
+                let canonical_target = fs::canonicalize(target)
+                    .with_context(|| format!("resolving note target {}", target.display()))?;
+                if canonical_target.parent() != Some(canonical_root.as_path()) {
+                    bail!(
+                        "target must be a direct child of note root {}: {}",
+                        self.root.display(),
+                        target.display()
+                    );
+                }
+                Ok(canonical_target)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = target
+                    .parent()
+                    .context("note target has no parent directory")?;
+                let canonical_parent = fs::canonicalize(parent)
+                    .with_context(|| format!("resolving target parent {}", parent.display()))?;
+                if canonical_parent != canonical_root {
+                    bail!(
+                        "target must be a direct child of note root {}: {}",
+                        self.root.display(),
+                        target.display()
+                    );
+                }
+                Ok(target.to_path_buf())
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("checking note target {}", target.display()))
+            }
+        }
     }
 }
 
-fn canonicalize_or(p: &Path) -> PathBuf {
-    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
+}
+
+fn is_chat_note_name(path: &Path) -> bool {
+    is_markdown_path(path)
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("CHAT"))
+}
+
+fn is_protected_note_name(path: &Path) -> bool {
+    is_markdown_path(path)
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                ["CHAT", "TODO", "ARCHIVE"]
+                    .iter()
+                    .any(|protected| stem.eq_ignore_ascii_case(protected))
+            })
 }
 
 /// Normalize a user-entered file name: trim, require `.md`, reject traversal.
@@ -766,29 +888,177 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_traversal() {
+    fn normalize_rejects_traversal_and_preserves_markdown_extensions() {
         assert!(normalize_new_name("../etc").is_err());
         assert!(normalize_new_name("a/b").is_err());
         assert!(normalize_new_name("/abs").is_err());
         assert!(normalize_new_name("").is_err());
         assert_eq!(normalize_new_name("ok").unwrap(), "ok.md");
-        assert_eq!(normalize_new_name("ok.md").unwrap(), "ok.md");
+        assert_eq!(normalize_new_name("ok.MD").unwrap(), "ok.MD");
+        assert_eq!(normalize_new_name("ok.MarkDown").unwrap(), "ok.MarkDown");
     }
 
     #[test]
-    fn list_excludes_chat() {
+    fn create_accepts_case_insensitive_extensions_and_refuses_existing_entries() {
         let (_dir, st) = fresh();
-        st.create_named_file("alpha").unwrap();
-        st.create_named_file("beta").unwrap();
+        let upper = st.create_named_file("upper.MD").unwrap();
+        let long = st.create_named_file("long.MarkDown").unwrap();
+        assert!(upper.is_file());
+        assert!(long.is_file());
+
+        fs::write(&upper, "keep this").unwrap();
+        assert!(st.create_named_file("upper.MD").is_err());
+        assert_eq!(fs::read_to_string(&upper).unwrap(), "keep this");
+
+        let directory = st.root.join("directory.md");
+        fs::create_dir(&directory).unwrap();
+        assert!(st.create_named_file("directory.md").is_err());
+    }
+
+    #[test]
+    fn create_and_rename_reject_protected_names_case_insensitively() {
+        let (_dir, st) = fresh();
+        for name in [
+            "chat",
+            "Chat.MARKDOWN",
+            "todo.Md",
+            "TODO.markdown",
+            "archive",
+            "Archive.MD",
+        ] {
+            assert!(
+                st.create_named_file(name).is_err(),
+                "protected name was created: {name}"
+            );
+        }
+
+        let source = st.create_named_file("source").unwrap();
+        for name in ["chat.md", "TODO.MarkDown", "archive.MD"] {
+            assert!(
+                st.rename_file(&source, name).is_err(),
+                "protected rename target was accepted: {name}"
+            );
+            assert!(source.exists());
+        }
+    }
+
+    #[test]
+    fn rename_and_delete_reject_protected_source_files() {
+        let (_dir, st) = fresh();
+        for path in [&st.chat_path, &st.todo_path, &st.archive_path] {
+            assert!(st.rename_file(path, "ordinary.md").is_err());
+            assert!(st.delete_file(path).is_err());
+            assert!(path.exists());
+        }
+
+        let mixed_case = st.root.join("tOdO.MarkDown");
+        fs::write(&mixed_case, "protected").unwrap();
+        assert!(st.rename_file(&mixed_case, "ordinary.md").is_err());
+        assert!(st.delete_file(&mixed_case).is_err());
+        assert!(mixed_case.exists());
+    }
+
+    #[test]
+    fn rename_accepts_markdown_extensions_case_insensitively() {
+        let (_dir, st) = fresh();
+        let from = st.create_named_file("before.MARKDOWN").unwrap();
+        let to = st.rename_file(&from, "after.Md").unwrap();
+        assert_eq!(to.file_name().unwrap(), "after.Md");
+        assert!(to.is_file());
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn validate_and_read_accept_direct_case_insensitive_markdown_files() {
+        let (_dir, st) = fresh();
+        let path = st.root.join("Readable.MARKDOWN");
+        fs::write(&path, "hello").unwrap();
+
+        assert_eq!(
+            st.validate_target(&path).unwrap(),
+            fs::canonicalize(&path).unwrap()
+        );
+        assert_eq!(st.read_note_file(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn validate_rejects_nested_non_files_and_uses_configured_root_in_errors() {
+        let (_dir, st) = fresh();
+        let nested_dir = st.root.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+        let nested = nested_dir.join("note.md");
+        fs::write(&nested, "nested").unwrap();
+        assert!(st.validate_target(&nested).is_err());
+
+        let directory = st.root.join("directory.md");
+        fs::create_dir(&directory).unwrap();
+        assert!(st.validate_target(&directory).is_err());
+
+        let error = st.validate_target(Path::new("/outside.md")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(!message.contains("~/.note"));
+        assert!(message.contains(&st.root.display().to_string()));
+    }
+
+    #[test]
+    fn list_handles_extensions_case_insensitively_and_excludes_chat_and_non_files() {
+        let (_dir, st) = fresh();
+        fs::write(st.root.join("alpha.MD"), "alpha").unwrap();
+        fs::write(st.root.join("beta.MarkDown"), "beta").unwrap();
+        fs::write(st.root.join("cHaT.mArKdOwN"), "hidden").unwrap();
+        fs::write(st.root.join("plain.txt"), "plain").unwrap();
+        fs::create_dir(st.root.join("directory.md")).unwrap();
+
         let names: Vec<_> = st
             .list_markdown_files()
             .unwrap()
             .iter()
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
             .collect();
-        assert!(names.contains(&"alpha.md".to_string()));
+        assert!(names.contains(&"alpha.MD".to_string()));
+        assert!(names.contains(&"beta.MarkDown".to_string()));
         assert!(names.contains(&"TODO.md".to_string()));
-        assert!(!names.iter().any(|n| n == "CHAT.md"));
+        assert!(!names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("CHAT.md")));
+        assert!(!names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("CHAT.markdown")));
+        assert!(!names.contains(&"plain.txt".to_string()));
+        assert!(!names.contains(&"directory.md".to_string()));
+    }
+
+    #[test]
+    fn list_remains_recent_first() {
+        let (_dir, st) = fresh();
+        let older = st.create_named_file("older").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = st.create_named_file("newer").unwrap();
+
+        let files = st.list_markdown_files().unwrap();
+        let older_index = files.iter().position(|path| path == &older).unwrap();
+        let newer_index = files.iter().position(|path| path == &newer).unwrap();
+        assert!(newer_index < older_index);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_notes_are_rejected_and_excluded() {
+        use std::os::unix::fs::symlink;
+
+        let (_root_dir, st) = fresh();
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.md");
+        fs::write(&outside, "outside").unwrap();
+        let link = st.root.join("linked.MD");
+        symlink(&outside, &link).unwrap();
+
+        assert!(st.validate_target(&link).is_err());
+        assert!(st.read_note_file(&link).is_err());
+        assert!(st.rename_file(&link, "renamed.md").is_err());
+        assert!(st.delete_file(&link).is_err());
+        assert!(link.exists());
+        assert!(!st.list_markdown_files().unwrap().contains(&link));
     }
 
     #[test]

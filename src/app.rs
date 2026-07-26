@@ -2,157 +2,148 @@
 
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
-use crate::model::{Action, Message, SearchHit, SearchHitbox, TodoHitbox, TodoItem};
+use crate::model::{
+    Action, ButtonHitbox, FileHitbox, Message, NoteFile, SearchHit, SearchHitbox, TodoHitbox,
+    TodoItem,
+};
 use crate::storage::Storage;
 
-fn point_in_rect(col: u16, row: u16, area: ratatui::layout::Rect) -> bool {
-    col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
+fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
+    col >= area.x
+        && col < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
-/// Case-insensitive subsequence match (true "fuzzy"). Empty needle matches all.
+fn in_area(col: u16, row: u16, area: Option<Rect>) -> bool {
+    area.is_some_and(|area| point_in_rect(col, row, area))
+}
+
+/// Case-insensitive subsequence matching. An empty query matches every file.
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
     let hay: Vec<char> = haystack.to_lowercase().chars().collect();
     let needle: Vec<char> = needle.to_lowercase().chars().collect();
-    let mut hi = 0;
-    for &n in &needle {
-        match hay[hi..].iter().position(|&h| h == n) {
-            Some(pos) => hi += pos + 1,
-            None => return false,
-        }
+    let mut offset = 0;
+    for wanted in needle {
+        let Some(found) = hay[offset..]
+            .iter()
+            .position(|candidate| *candidate == wanted)
+        else {
+            return false;
+        };
+        offset += found + 1;
     }
     true
 }
 
-/// First non-blank line of `body` containing `query_lower` (case-insensitive),
-/// falling back to the first non-blank line — used to preview a search match.
 fn best_line(body: &str, query_lower: &str) -> String {
-    for line in body.lines() {
-        let t = line.trim();
-        if !t.is_empty() && t.to_lowercase().contains(query_lower) {
-            return t.to_string();
-        }
-    }
     body.lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.to_lowercase().contains(query_lower))
+        .or_else(|| body.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or("")
         .to_string()
 }
 
-// --- cursor-editing primitives (shared by the compose box and the message
-// editor; operate on an arbitrary buffer + char-index cursor) ---
-
-fn char_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or_else(|| s.len())
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
 }
 
-fn insert_char(buf: &mut String, cursor: &mut usize, c: char) {
-    let b = char_to_byte(buf, *cursor);
-    buf.insert(b, c);
+fn insert_char(buffer: &mut String, cursor: &mut usize, character: char) {
+    buffer.insert(char_to_byte(buffer, *cursor), character);
     *cursor += 1;
 }
 
-fn delete_backward(buf: &mut String, cursor: &mut usize) {
+fn delete_backward(buffer: &mut String, cursor: &mut usize) {
     if *cursor == 0 {
         return;
     }
-    let prev = char_to_byte(buf, *cursor - 1);
-    let cur = char_to_byte(buf, *cursor);
-    buf.replace_range(prev..cur, "");
+    let start = char_to_byte(buffer, *cursor - 1);
+    let end = char_to_byte(buffer, *cursor);
+    buffer.replace_range(start..end, "");
     *cursor -= 1;
 }
 
-fn delete_forward(buf: &mut String, cursor: &mut usize) {
-    let total = buf.chars().count();
-    if *cursor >= total {
+fn delete_forward(buffer: &mut String, cursor: &mut usize) {
+    if *cursor >= buffer.chars().count() {
         return;
     }
-    let cur = char_to_byte(buf, *cursor);
-    let next = char_to_byte(buf, *cursor + 1);
-    buf.replace_range(cur..next, "");
+    let start = char_to_byte(buffer, *cursor);
+    let end = char_to_byte(buffer, *cursor + 1);
+    buffer.replace_range(start..end, "");
 }
 
-/// Insert `s` at the cursor, advancing it by the number of chars inserted.
-fn paste_into(buf: &mut String, cursor: &mut usize, s: &str) {
-    let n = s.chars().count();
-    let b = char_to_byte(buf, *cursor);
-    buf.insert_str(b, s);
-    *cursor += n;
+fn paste_into(buffer: &mut String, cursor: &mut usize, text: &str) {
+    buffer.insert_str(char_to_byte(buffer, *cursor), text);
+    *cursor += text.chars().count();
 }
 
-fn move_cursor(buf: &str, cursor: usize, m: CursorMove) -> usize {
-    let chars: Vec<char> = buf.chars().collect();
+fn move_cursor(buffer: &str, cursor: usize, movement: CursorMove) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
     let total = chars.len();
-    let i = cursor;
-    let line_start = {
-        let mut j = i;
-        while j > 0 && chars[j - 1] != '\n' {
-            j -= 1;
-        }
-        j
-    };
-    match m {
-        CursorMove::Left => i.saturating_sub(1),
-        CursorMove::Right => (i + 1).min(total),
+    let mut line_start = cursor;
+    while line_start > 0 && chars[line_start - 1] != '\n' {
+        line_start -= 1;
+    }
+
+    match movement {
+        CursorMove::Left => cursor.saturating_sub(1),
+        CursorMove::Right => (cursor + 1).min(total),
         CursorMove::LineStart => line_start,
         CursorMove::LineEnd => {
-            let mut j = i;
-            while j < total && chars[j] != '\n' {
-                j += 1;
+            let mut end = cursor;
+            while end < total && chars[end] != '\n' {
+                end += 1;
             }
-            j
+            end
         }
         CursorMove::Up | CursorMove::Down => {
-            let col = i - line_start;
-            let target_line_start = if matches!(m, CursorMove::Up) {
+            let column = cursor - line_start;
+            let target_start = if movement == CursorMove::Up {
                 if line_start == 0 {
-                    return i; // already on the first line
+                    return cursor;
                 }
-                let mut j = line_start - 1;
-                while j > 0 && chars[j - 1] != '\n' {
-                    j -= 1;
+                let mut start = line_start - 1;
+                while start > 0 && chars[start - 1] != '\n' {
+                    start -= 1;
                 }
-                j
+                start
             } else {
-                let mut j = i;
-                while j < total && chars[j] != '\n' {
-                    j += 1;
+                let mut end = cursor;
+                while end < total && chars[end] != '\n' {
+                    end += 1;
                 }
-                if j >= total {
-                    return i; // already on the last line
+                if end == total {
+                    return cursor;
                 }
-                j + 1
+                end + 1
             };
-            let target_line_end = {
-                let mut j = target_line_start;
-                while j < total && chars[j] != '\n' {
-                    j += 1;
-                }
-                j
-            };
-            (target_line_start + col).min(target_line_end)
+            let mut target_end = target_start;
+            while target_end < total && chars[target_end] != '\n' {
+                target_end += 1;
+            }
+            (target_start + column).min(target_end)
         }
     }
 }
 
-/// A request from the app to the terminal driver (which owns the TUI lifecycle).
-#[derive(Debug)]
+/// A request for the terminal owner, which controls suspension and process exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Quit,
-    /// Suspend the TUI, open `path` in `$EDITOR`, then reload on return.
     Edit(PathBuf),
 }
 
-/// Direction of cursor movement within the input buffer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorMove {
     Left,
     Right,
@@ -162,385 +153,452 @@ enum CursorMove {
     LineEnd,
 }
 
-/// A chat-removing operation recorded so `u` can reverse it.
 #[derive(Debug, Clone)]
 enum UndoOp {
     Delete(Message),
     Move {
-        msg: Message,
+        message: Message,
         target: PathBuf,
         appended: String,
     },
-    /// Body edit: holds the pre-edit message so undo restores the old body.
     Edit(Message),
 }
 
+/// Keyboard focus is independent from the content shown in the center pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Input box not focused; message shortcuts are active.
-    Normal,
-    /// Input box focused; typing records a message.
-    Insert,
-    /// Choosing an existing markdown file to move into.
-    SelectTarget,
-    /// Entering a name for a new markdown file.
-    NewFile,
-    /// Asking before deleting a message.
-    ConfirmDelete,
-    /// Viewing a message body or file content.
-    Preview,
-    /// Browsing the file list (floating popup).
-    FileList,
-    /// Typing a fuzzy filter inside the file-list popup.
-    FileSearch,
-    /// Typing a new name to rename the selected file.
-    FileRename,
-    /// Confirming deletion of a file.
-    FileDelete,
-    /// Browsing and toggling the TODO.md task list.
+pub enum Focus {
+    Center,
+    Compose,
+    Files,
     Todo,
-    /// Full-text content search across messages and note files.
-    Search,
-    /// Keybinding reference overlay.
-    Help,
-    /// Editing a single message's body in-app.
-    EditMessage,
-    /// Asking before discarding unsaved message edits.
-    ConfirmDiscardEdit,
 }
 
-#[derive(Debug, Clone)]
-pub struct Preview {
+/// Content currently occupying the center pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CenterView {
+    Chat,
+    Document,
+    Search,
+    MessageEdit,
+}
+
+/// Interaction taking place inside the files pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesContext {
+    Browse,
+    Search,
+    MoveTarget,
+    NewTarget,
+    Rename,
+}
+
+/// Modal state. Removing an overlay exposes the unchanged state beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    ConfirmDeleteMessage,
+    ConfirmDeleteFile,
+    ConfirmDiscardEdit,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentKind {
+    File(PathBuf),
+    Message(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentReturn {
+    Chat,
+    Search,
+}
+
+/// A file or message rendered as markdown in the center pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Document {
+    pub kind: DocumentKind,
     pub title: String,
-    /// Raw markdown source rendered (as styled markdown) in the preview modal.
     pub source: String,
     pub scroll: u16,
+    /// One-based source line to reveal on the next render.
+    pub target_line: Option<usize>,
+    pub return_to: DocumentReturn,
+}
+
+/// Screen geometry recorded by the renderer after each layout pass.
+///
+/// Mouse wheel events use these rectangles instead of the keyboard focus, so a
+/// wheel over Files/Todo/Center always affects the pane under the pointer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutSnapshot {
+    pub files: Option<Rect>,
+    pub center: Option<Rect>,
+    pub compose: Option<Rect>,
+    pub todo: Option<Rect>,
+    pub overlay: Option<Rect>,
 }
 
 pub struct App {
     pub storage: Storage,
+
+    pub focus: Focus,
+    pub center_view: CenterView,
+    pub files_context: FilesContext,
+    pub overlay: Option<Overlay>,
+    pub document: Option<Document>,
+
     pub messages: Vec<Message>,
-    pub input: String,
-    /// Insertion point in `input`, as a char index.
-    pub input_cursor: usize,
-    pub mode: Mode,
-    /// Mode to return to when the preview modal closes (set when preview opens).
-    pub preview_return: Mode,
     pub selected: usize,
     pub scroll: u16,
-    pub target_files: Vec<PathBuf>,
-    pub target_index: usize,
-    pub new_file_input: String,
-    /// Pending message id for SelectTarget / NewFile / ConfirmDelete.
-    pub pending_id: Option<String>,
-    pub preview: Option<Preview>,
-    /// Rebuilt each frame by the renderer.
-    pub hitboxes: Vec<crate::model::ButtonHitbox>,
-    /// Clickable rows in the file-list popup.
-    pub file_hitboxes: Vec<crate::model::FileHitbox>,
-    /// Files listed in the file-list popup (`~/.note/*.md`, excluding CHAT.md).
-    pub sidebar_files: Vec<PathBuf>,
-    /// Full (unfiltered) file listing; `sidebar_files` is the filtered view.
-    pub all_files: Vec<PathBuf>,
-    /// Fuzzy filter text typed in `FileSearch` mode.
+
+    pub input: String,
+    /// Insertion point in `input`, as a character index.
+    pub input_cursor: usize,
+
+    /// The single source of truth for the files pane, sorted recent-first.
+    pub note_files: Vec<NoteFile>,
+    /// Absolute index into `note_files` (including while a filter is active).
+    pub file_index: usize,
+    /// Stable selection retained across file reloads and recent-first reordering.
+    pub selected_file: Option<PathBuf>,
     pub file_query: String,
-    /// Buffer for `FileRename` mode.
     pub rename_input: String,
-    /// Target file for `FileRename` / `FileDelete`.
+    pub rename_cursor: usize,
+    pub new_file_input: String,
+    pub new_file_cursor: usize,
+
+    /// Message being moved/created/deleted by a contextual interaction.
+    pub pending_id: Option<String>,
+    /// File awaiting rename or delete confirmation.
     pub pending_file: Option<PathBuf>,
-    pub sidebar_index: usize,
-    /// Tasks parsed from TODO.md, shown in `Mode::Todo`.
+
     pub todo_items: Vec<TodoItem>,
     pub todo_index: usize,
-    /// Clickable rows in the todo panel, rebuilt each frame.
-    pub todo_hitboxes: Vec<TodoHitbox>,
-    /// Full-text search state.
+
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
-    /// Clickable rows in the search panel, rebuilt each frame.
-    pub search_hitboxes: Vec<SearchHitbox>,
-    /// Stack of recent chat-removing operations reversible with `u`.
-    undo_stack: Vec<UndoOp>,
-    /// Vertical scroll of the help overlay.
-    pub help_scroll: u16,
-    /// In-app single-message editor state.
+
     pub edit_input: String,
     pub edit_cursor: usize,
     pub edit_id: String,
+
+    pub help_scroll: u16,
     pub status: String,
+    pub layout: LayoutSnapshot,
+
+    /// Rebuilt every frame by the renderer.
+    pub hitboxes: Vec<ButtonHitbox>,
+    pub file_hitboxes: Vec<FileHitbox>,
+    pub todo_hitboxes: Vec<TodoHitbox>,
+    pub search_hitboxes: Vec<SearchHitbox>,
+
+    undo_stack: Vec<UndoOp>,
 }
 
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
-        let messages = storage.load_messages().unwrap_or_default();
+        let messages = storage.load_messages()?;
         let selected = messages.len().saturating_sub(1);
+        let note_files = storage.list_note_files()?;
+        let selected_file = note_files.first().map(|file| file.path.clone());
+        let todo_items = storage.load_todo_tasks();
         Ok(Self {
             storage,
+            focus: Focus::Compose,
+            center_view: CenterView::Chat,
+            files_context: FilesContext::Browse,
+            overlay: None,
+            document: None,
             messages,
+            selected,
+            scroll: u16::MAX,
             input: String::new(),
             input_cursor: 0,
-            mode: Mode::Insert,
-            preview_return: Mode::Normal,
-            selected,
-            scroll: u32::MAX as u16, // start at the bottom
-            target_files: Vec::new(),
-            target_index: 0,
-            new_file_input: String::new(),
-            pending_id: None,
-            preview: None,
-            hitboxes: Vec::new(),
-            file_hitboxes: Vec::new(),
-            sidebar_files: Vec::new(),
-            all_files: Vec::new(),
+            note_files,
+            file_index: 0,
+            selected_file,
             file_query: String::new(),
             rename_input: String::new(),
+            rename_cursor: 0,
+            new_file_input: String::new(),
+            new_file_cursor: 0,
+            pending_id: None,
             pending_file: None,
-            sidebar_index: 0,
-            todo_items: Vec::new(),
+            todo_items,
             todo_index: 0,
-            todo_hitboxes: Vec::new(),
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
-            search_hitboxes: Vec::new(),
-            undo_stack: Vec::new(),
-            help_scroll: 0,
             edit_input: String::new(),
             edit_cursor: 0,
             edit_id: String::new(),
+            help_scroll: 0,
             status: String::new(),
+            layout: LayoutSnapshot::default(),
+            hitboxes: Vec::new(),
+            file_hitboxes: Vec::new(),
+            todo_hitboxes: Vec::new(),
+            search_hitboxes: Vec::new(),
+            undo_stack: Vec::new(),
         })
     }
 
-    /// Reload messages from disk (after external edits or mutations).
     pub fn reload(&mut self) {
-        self.messages = self.storage.load_messages().unwrap_or_default();
-        if self.selected >= self.messages.len() {
-            self.selected = self.messages.len().saturating_sub(1);
+        match self.storage.load_messages() {
+            Ok(messages) => {
+                self.messages = messages;
+                self.selected = self.selected.min(self.messages.len().saturating_sub(1));
+            }
+            Err(error) => self.set_status(format!("Reload error: {error}")),
         }
     }
 
-    /// Open the file-list popup, refreshing the listing from disk.
-    pub fn open_file_list(&mut self) {
-        self.all_files = self.storage.list_markdown_files().unwrap_or_default();
-        self.file_query.clear();
-        self.sidebar_index = 0;
-        self.refresh_file_filter();
-        self.mode = Mode::FileList;
+    pub fn reload_files(&mut self) {
+        let selected = self.selected_file.clone();
+        match self.storage.list_note_files() {
+            Ok(files) => self.note_files = files,
+            Err(error) => {
+                self.set_status(format!("Reload error: {error}"));
+                return;
+            }
+        }
+        self.file_index = selected
+            .as_ref()
+            .and_then(|path| self.note_files.iter().position(|file| &file.path == path))
+            .unwrap_or(0)
+            .min(self.note_files.len().saturating_sub(1));
+        self.sync_selected_file();
+        self.ensure_visible_file_selection();
     }
 
-    /// Open the TODO.md task panel, reloading tasks from disk.
-    pub fn open_todo(&mut self) {
+    pub fn reload_todos(&mut self) {
         self.todo_items = self.storage.load_todo_tasks();
-        if self.todo_index >= self.todo_items.len() {
-            self.todo_index = self.todo_items.len().saturating_sub(1);
-        }
-        self.mode = Mode::Todo;
+        self.todo_index = self.todo_index.min(self.todo_items.len().saturating_sub(1));
     }
 
-    /// Flip the `index`-th task's completion state and refresh the panel.
-    fn toggle_todo(&mut self, index: usize) {
-        match self.storage.toggle_todo_task(index) {
-            Ok(true) => self.todo_items = self.storage.load_todo_tasks(),
-            Ok(false) => self.set_status("No such task"),
-            Err(e) => self.set_status(format!("Error: {e}")),
+    /// Reload everything that may have changed while `$EDITOR` was running.
+    pub fn reload_workspace(&mut self) {
+        self.reload();
+        self.reload_files();
+        self.reload_todos();
+        if self.center_view == CenterView::Search {
+            self.recompute_search();
+        }
+        let document_path = self.document.as_ref().and_then(|document| {
+            if let DocumentKind::File(path) = &document.kind {
+                Some(path.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(path) = document_path {
+            match self.storage.read_note_file(&path) {
+                Ok(updated) => {
+                    if let Some(document) = self.document.as_mut() {
+                        document.source = updated;
+                    }
+                }
+                Err(error) => {
+                    self.document = None;
+                    self.center_view = CenterView::Chat;
+                    self.focus = Focus::Center;
+                    self.set_status(format!("Reload error: {error}"));
+                }
+            }
         }
     }
 
-    /// Open the content-search panel with an empty query.
+    /// Absolute indices into `note_files` that match the active file query.
+    pub fn visible_file_indices(&self) -> Vec<usize> {
+        self.note_files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let name = file
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                let is_system_file = ["CHAT", "TODO", "ARCHIVE"]
+                    .iter()
+                    .any(|system| name.eq_ignore_ascii_case(system));
+                (fuzzy_match(name, &self.file_query)
+                    && !(self.files_context == FilesContext::MoveTarget && is_system_file))
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    /// Original TODO.md indices in display order: open tasks first, completed
+    /// tasks second, with source order preserved inside each group.
+    pub fn visible_todo_indices(&self) -> Vec<usize> {
+        self.todo_items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (!item.checked).then_some(index))
+            .chain(
+                self.todo_items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| item.checked.then_some(index)),
+            )
+            .collect()
+    }
+
+    pub fn selected_id(&self) -> Option<&str> {
+        self.messages
+            .get(self.selected)
+            .map(|message| message.id.as_str())
+    }
+
+    pub fn open_files(&mut self) {
+        self.reload_files();
+        self.focus = Focus::Files;
+        if !matches!(
+            self.files_context,
+            FilesContext::MoveTarget | FilesContext::NewTarget | FilesContext::Rename
+        ) {
+            self.files_context = FilesContext::Browse;
+        }
+    }
+
+    pub fn open_todo(&mut self) {
+        self.reload_todos();
+        self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
+        self.focus = Focus::Todo;
+    }
+
     pub fn open_search(&mut self) {
         self.search_query.clear();
         self.search_results.clear();
         self.search_index = 0;
-        self.mode = Mode::Search;
+        self.center_view = CenterView::Search;
+        self.focus = Focus::Center;
     }
 
-    /// Open the keybinding reference overlay.
     pub fn open_help(&mut self) {
         self.help_scroll = 0;
-        self.mode = Mode::Help;
+        self.overlay = Some(Overlay::Help);
     }
 
-    /// Recompute `search_results` for the current query: matching chat messages
-    /// first, then matching lines across note files.
-    fn recompute_search(&mut self) {
-        let q = self.search_query.trim().to_lowercase();
-        let mut results: Vec<SearchHit> = Vec::new();
-        if !q.is_empty() {
-            for m in &self.messages {
-                if m.body.to_lowercase().contains(&q) {
-                    results.push(SearchHit::Message {
-                        id: m.id.clone(),
-                        text: best_line(&m.body, &q),
-                    });
-                }
-            }
-            results.extend(self.storage.search_file_lines(&q));
-        }
-        self.search_results = results;
-        if self.search_index >= self.search_results.len() {
-            self.search_index = self.search_results.len().saturating_sub(1);
-        }
-    }
-
-    /// Open the `index`-th search result in the preview modal (Esc returns to
-    /// the search panel).
-    fn jump_to_search_result(&mut self, index: usize) {
-        let Some(hit) = self.search_results.get(index).cloned() else {
-            return;
-        };
-        match hit {
-            SearchHit::Message { id, .. } => {
-                if let Some(m) = self.message_clone(&id) {
-                    self.preview = Some(Preview {
-                        title: format!("Message {}", m.created_at.format("%Y-%m-%d %H:%M")),
-                        source: m.body.clone(),
-                        scroll: 0,
-                    });
-                    self.preview_return = Mode::Search;
-                    self.mode = Mode::Preview;
-                }
-            }
-            SearchHit::FileLine { path, .. } => {
-                // open_file_preview records preview_return = Search itself.
-                self.open_file_preview(&path);
-            }
-        }
-    }
-
-    /// Recompute `sidebar_files` from `all_files` and the current `file_query`,
-    /// keeping `sidebar_index` in range.
-    fn refresh_file_filter(&mut self) {
-        let q = self.file_query.clone();
-        self.sidebar_files = self
-            .all_files
-            .iter()
-            .filter(|p| {
-                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                fuzzy_match(name, &q)
-            })
-            .cloned()
-            .collect();
-        if self.sidebar_index >= self.sidebar_files.len() {
-            self.sidebar_index = self.sidebar_files.len().saturating_sub(1);
-        }
-    }
-
-    pub fn selected_id(&self) -> Option<&str> {
-        self.messages.get(self.selected).map(|m| m.id.as_str())
-    }
-
-    /// Handle a keyboard event. Returns a terminal-level command if any.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
-        match self.mode {
-            Mode::Insert => self.handle_insert(key),
-            Mode::Normal => self.handle_normal(key),
-            Mode::SelectTarget => self.handle_select_target(key),
-            Mode::NewFile => self.handle_new_file(key),
-            Mode::ConfirmDelete => self.handle_confirm_delete(key),
-            Mode::Preview => self.handle_preview(key),
-            Mode::FileList => self.handle_file_list(key),
-            Mode::FileSearch => self.handle_file_search(key),
-            Mode::FileRename => self.handle_file_rename(key),
-            Mode::FileDelete => self.handle_file_delete(key),
-            Mode::Todo => self.handle_todo(key),
-            Mode::Search => self.handle_search(key),
-            Mode::Help => self.handle_help(key),
-            Mode::EditMessage => self.handle_editmessage(key),
-            Mode::ConfirmDiscardEdit => self.handle_confirm_discard_edit(key),
+        if self.overlay.is_some() {
+            return self.handle_overlay(key);
+        }
+
+        // Pane shortcuts are global outside text-entry contexts.
+        if !self.is_text_entry() {
+            match key.code {
+                KeyCode::Char('?') => {
+                    self.open_help();
+                    return None;
+                }
+                KeyCode::Char('f') => {
+                    self.open_files();
+                    return None;
+                }
+                KeyCode::Char('T') => {
+                    self.open_todo();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        match self.focus {
+            Focus::Compose => self.handle_compose(key),
+            Focus::Files => self.handle_files(key),
+            Focus::Todo => self.handle_todo(key),
+            Focus::Center => match self.center_view {
+                CenterView::Chat => self.handle_chat(key),
+                CenterView::Document => self.handle_document(key),
+                CenterView::Search => self.handle_search(key),
+                CenterView::MessageEdit => self.handle_message_edit(key),
+            },
         }
     }
 
-    pub fn handle_mouse(&mut self, ev: MouseEvent) -> Option<Command> {
-        match ev.kind {
+    /// Paste into whichever orthogonal state currently owns a text buffer.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.overlay.is_some() {
+            return;
+        }
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        match (self.focus, self.center_view, self.files_context) {
+            (Focus::Compose, CenterView::Chat, _) => {
+                paste_into(&mut self.input, &mut self.input_cursor, &text)
+            }
+            (Focus::Center, CenterView::MessageEdit, _) => {
+                paste_into(&mut self.edit_input, &mut self.edit_cursor, &text)
+            }
+            (Focus::Center, CenterView::Search, _) => {
+                self.search_query.push_str(&text);
+                self.recompute_search();
+            }
+            (Focus::Files, _, FilesContext::Search) => {
+                self.file_query.push_str(&text.replace('\n', ""));
+                self.ensure_visible_file_selection();
+            }
+            (Focus::Files, _, FilesContext::NewTarget) => {
+                paste_into(
+                    &mut self.new_file_input,
+                    &mut self.new_file_cursor,
+                    &text.replace('\n', ""),
+                );
+            }
+            (Focus::Files, _, FilesContext::Rename) => {
+                paste_into(
+                    &mut self.rename_input,
+                    &mut self.rename_cursor,
+                    &text.replace('\n', ""),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<Command> {
+        match event.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_add(1);
+                self.route_wheel(event.column, event.row, 1);
                 None
             }
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(1);
+                self.route_wheel(event.column, event.row, -1);
                 None
             }
-            MouseEventKind::Down(_) => {
-                // A clicked search result opens it.
-                let search_hit = self
-                    .search_hitboxes
-                    .iter()
-                    .find(|h| point_in_rect(ev.column, ev.row, h.area))
-                    .map(|h| h.index);
-                if let Some(index) = search_hit {
-                    self.search_index = index;
-                    self.jump_to_search_result(index);
-                    return None;
-                }
-                // A clicked todo row toggles that task.
-                let todo_hit = self
-                    .todo_hitboxes
-                    .iter()
-                    .find(|h| point_in_rect(ev.column, ev.row, h.area))
-                    .map(|h| h.index);
-                if let Some(index) = todo_hit {
-                    self.todo_index = index;
-                    self.toggle_todo(index);
-                    return None;
-                }
-                // A clicked file row previews that file.
-                let file_hit = self
-                    .file_hitboxes
-                    .iter()
-                    .find(|h| point_in_rect(ev.column, ev.row, h.area))
-                    .map(|h| h.path.clone());
-                if let Some(path) = file_hit {
-                    self.open_file_preview(&path);
-                    return None;
-                }
-                // Pull the matched button out of the immutable borrow before
-                // dispatching (which needs &mut self).
-                let hit = self
-                    .hitboxes
-                    .iter()
-                    .find(|h| point_in_rect(ev.column, ev.row, h.area))
-                    .map(|h| (h.message_id.clone(), h.action));
-                if let Some((id, action)) = hit {
-                    return self.dispatch_action(&id, action);
-                }
-                // Clicking outside any button/overlay returns to insert focus.
-                if !matches!(
-                    self.mode,
-                    Mode::Preview
-                        | Mode::ConfirmDelete
-                        | Mode::SelectTarget
-                        | Mode::NewFile
-                        | Mode::FileList
-                        | Mode::FileSearch
-                        | Mode::FileRename
-                        | Mode::FileDelete
-                        | Mode::Todo
-                        | Mode::Search
-                        | Mode::Help
-                        | Mode::EditMessage
-                        | Mode::ConfirmDiscardEdit
-                ) {
-                    self.mode = Mode::Insert;
-                }
-                None
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_left_click(event.column, event.row)
             }
+            // Right, middle, drag, move and button-up events are intentionally ignored.
             _ => None,
         }
     }
 
-    fn handle_insert(&mut self, key: KeyEvent) -> Option<Command> {
-        let mods = key.modifiers;
+    fn is_text_entry(&self) -> bool {
+        self.focus == Focus::Compose
+            || (self.focus == Focus::Center
+                && matches!(
+                    self.center_view,
+                    CenterView::Search | CenterView::MessageEdit
+                ))
+            || (self.focus == Focus::Files
+                && matches!(
+                    self.files_context,
+                    FilesContext::Search | FilesContext::NewTarget | FilesContext::Rename
+                ))
+    }
+
+    fn handle_compose(&mut self, key: KeyEvent) -> Option<Command> {
+        let modifiers = key.modifiers;
         match key.code {
-            // Enter sends. Enter with Shift/Ctrl/Alt inserts a newline —
-            // Shift+Enter is the usual chat convention; Ctrl/Alt+Enter are
-            // reliable fallbacks, since many terminals don't distinguish
-            // Shift+Enter from a bare Enter.
             KeyCode::Enter
-                if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ) =>
             {
-                self.insert_char('\n');
+                insert_char(&mut self.input, &mut self.input_cursor, '\n');
                 None
             }
             KeyCode::Enter => {
@@ -548,52 +606,28 @@ impl App {
                 None
             }
             KeyCode::Tab | KeyCode::Esc => {
-                self.mode = Mode::Normal;
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Backspace => {
-                self.delete_backward();
+                delete_backward(&mut self.input, &mut self.input_cursor);
                 None
             }
             KeyCode::Delete => {
-                self.delete_forward();
+                delete_forward(&mut self.input, &mut self.input_cursor);
                 None
             }
-            KeyCode::Left => {
-                self.move_cursor(CursorMove::Left);
+            KeyCode::Left => self.move_input_cursor(CursorMove::Left),
+            KeyCode::Right => self.move_input_cursor(CursorMove::Right),
+            KeyCode::Up => self.move_input_cursor(CursorMove::Up),
+            KeyCode::Down => self.move_input_cursor(CursorMove::Down),
+            KeyCode::Home => self.move_input_cursor(CursorMove::LineStart),
+            KeyCode::End => self.move_input_cursor(CursorMove::LineEnd),
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.input, &mut self.input_cursor, '\n');
                 None
             }
-            KeyCode::Right => {
-                self.move_cursor(CursorMove::Right);
-                None
-            }
-            KeyCode::Up => {
-                self.move_cursor(CursorMove::Up);
-                None
-            }
-            KeyCode::Down => {
-                self.move_cursor(CursorMove::Down);
-                None
-            }
-            KeyCode::Home => {
-                self.move_cursor(CursorMove::LineStart);
-                None
-            }
-            KeyCode::End => {
-                self.move_cursor(CursorMove::LineEnd);
-                None
-            }
-            // Ctrl+J (the raw LF byte) inserts a newline — a reliable fallback
-            // for terminals that don't distinguish Shift+Enter from Enter.
-            KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
-                self.insert_char('\n');
-                None
-            }
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
-                None
-            }
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.input.is_empty() {
                     Some(Command::Quit)
                 } else {
@@ -602,67 +636,41 @@ impl App {
                     None
                 }
             }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.input, &mut self.input_cursor, character);
+                None
+            }
             _ => None,
         }
     }
 
-    /// Byte offset of the `char_idx`-th char in `s` (or `s.len()` past the end).
-    fn insert_char(&mut self, c: char) {
-        insert_char(&mut self.input, &mut self.input_cursor, c);
+    fn move_input_cursor(&mut self, movement: CursorMove) -> Option<Command> {
+        self.input_cursor = move_cursor(&self.input, self.input_cursor, movement);
+        None
     }
 
-    fn delete_backward(&mut self) {
-        delete_backward(&mut self.input, &mut self.input_cursor);
-    }
-
-    fn delete_forward(&mut self) {
-        delete_forward(&mut self.input, &mut self.input_cursor);
-    }
-
-    fn move_cursor(&mut self, m: CursorMove) {
-        self.input_cursor = move_cursor(&self.input, self.input_cursor, m);
-    }
-
-    /// Insert pasted text at the cursor (used for bracketed-paste events).
-    /// Normalizes CRLF/CR to LF. Only acts in text-entry modes.
-    pub fn handle_paste(&mut self, s: &str) {
-        let text = s.replace("\r\n", "\n").replace('\r', "\n");
-        match self.mode {
-            Mode::Insert => paste_into(&mut self.input, &mut self.input_cursor, &text),
-            Mode::EditMessage => paste_into(&mut self.edit_input, &mut self.edit_cursor, &text),
-            _ => {}
-        }
-    }
-
-    fn handle_normal(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_chat(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Esc => Some(Command::Quit),
-            KeyCode::Tab => {
-                self.mode = Mode::Insert;
-                None
-            }
-            KeyCode::Char('f') => {
-                self.open_file_list();
-                None
-            }
-            KeyCode::Char('i') | KeyCode::Enter => {
-                self.mode = Mode::Insert;
+            KeyCode::Esc => None,
+            KeyCode::Char('q') => Some(Command::Quit),
+            KeyCode::Tab | KeyCode::Char('i') | KeyCode::Enter => {
+                self.focus = Focus::Compose;
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
+                self.move_message_selection(1);
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                None
-            }
-            KeyCode::Char('G') => {
-                self.selected = self.messages.len().saturating_sub(1);
+                self.move_message_selection(-1);
                 None
             }
             KeyCode::Char('g') => {
                 self.selected = 0;
+                None
+            }
+            KeyCode::Char('G') => {
+                self.selected = self.messages.len().saturating_sub(1);
                 None
             }
             KeyCode::PageDown => {
@@ -673,84 +681,77 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(5);
                 None
             }
-            KeyCode::Char('t') => self.act(Action::Todo),
-            KeyCode::Char('m') => self.act(Action::Move),
-            KeyCode::Char('a') => self.act(Action::Archive),
-            KeyCode::Char('T') => {
-                self.open_todo();
-                None
-            }
             KeyCode::Char('/') => {
                 self.open_search();
                 None
             }
-            KeyCode::Char('u') => {
-                self.undo();
-                None
-            }
-            KeyCode::Char('?') => {
-                self.open_help();
-                None
-            }
+            KeyCode::Char('t') => self.act(Action::Todo),
+            KeyCode::Char('m') => self.act(Action::Move),
+            KeyCode::Char('a') => self.act(Action::Archive),
             KeyCode::Char('n') => self.act(Action::New),
             KeyCode::Char('v') => self.act(Action::View),
             KeyCode::Char('e') => self.act(Action::Edit),
             KeyCode::Char('d') => self.act(Action::Delete),
+            KeyCode::Char('u') => {
+                self.undo();
+                None
+            }
             _ => None,
         }
     }
 
-    fn handle_file_list(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_files(&mut self, key: KeyEvent) -> Option<Command> {
+        match self.files_context {
+            FilesContext::Browse => self.handle_file_browse(key),
+            FilesContext::Search => self.handle_file_search(key),
+            FilesContext::MoveTarget => self.handle_move_target(key),
+            FilesContext::NewTarget => self.handle_new_target(key),
+            FilesContext::Rename => self.handle_rename(key),
+        }
+    }
+
+    fn handle_file_browse(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') | KeyCode::Char('f') => {
-                self.mode = Mode::Normal;
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => {
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.sidebar_index + 1 < self.sidebar_files.len() {
-                    self.sidebar_index += 1;
-                }
+                self.move_file_selection(1);
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.sidebar_index > 0 {
-                    self.sidebar_index -= 1;
-                }
+                self.move_file_selection(-1);
                 None
             }
             KeyCode::Enter | KeyCode::Char('v') => {
-                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
-                    self.open_file_preview(&path);
-                }
+                self.open_selected_file(DocumentReturn::Chat);
                 None
             }
-            KeyCode::Char('e') => self
-                .sidebar_files
-                .get(self.sidebar_index)
-                .cloned()
-                .map(Command::Edit),
+            KeyCode::Char('e') => self.selected_file.clone().map(Command::Edit),
             KeyCode::Char('/') => {
                 self.file_query.clear();
-                self.refresh_file_filter();
-                self.mode = Mode::FileSearch;
+                self.files_context = FilesContext::Search;
+                self.ensure_visible_file_selection();
                 None
             }
             KeyCode::Char('r') => {
-                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
+                if let Some(path) = self.selected_file.clone() {
                     self.rename_input = path
                         .file_stem()
-                        .and_then(|s| s.to_str())
+                        .and_then(|name| name.to_str())
                         .unwrap_or("")
                         .to_string();
+                    self.rename_cursor = self.rename_input.chars().count();
                     self.pending_file = Some(path);
-                    self.mode = Mode::FileRename;
+                    self.files_context = FilesContext::Rename;
                 }
                 None
             }
             KeyCode::Char('d') => {
-                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
+                if let Some(path) = self.selected_file.clone() {
                     self.pending_file = Some(path);
-                    self.mode = Mode::FileDelete;
+                    self.overlay = Some(Overlay::ConfirmDeleteFile);
                 }
                 None
             }
@@ -760,103 +761,166 @@ impl App {
 
     fn handle_file_search(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            // Esc cancels the search (clears the filter); results stay live, so
-            // arrows navigate them and Enter opens the highlighted one.
             KeyCode::Esc => {
                 self.file_query.clear();
-                self.refresh_file_filter();
-                self.mode = Mode::FileList;
+                self.files_context = FilesContext::Browse;
+                self.ensure_visible_file_selection();
                 None
             }
-            // Arrow keys only (j/k are valid filter characters).
             KeyCode::Down => {
-                if self.sidebar_index + 1 < self.sidebar_files.len() {
-                    self.sidebar_index += 1;
-                }
+                self.move_file_selection(1);
                 None
             }
             KeyCode::Up => {
-                if self.sidebar_index > 0 {
-                    self.sidebar_index -= 1;
-                }
+                self.move_file_selection(-1);
                 None
             }
             KeyCode::Enter => {
-                if let Some(path) = self.sidebar_files.get(self.sidebar_index).cloned() {
-                    self.open_file_preview(&path);
-                }
+                self.open_selected_file(DocumentReturn::Chat);
                 None
             }
             KeyCode::Backspace => {
                 self.file_query.pop();
-                self.refresh_file_filter();
+                self.ensure_visible_file_selection();
                 None
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.file_query.push(c);
-                self.refresh_file_filter();
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.file_query.push(character);
+                self.ensure_visible_file_selection();
                 None
             }
             _ => None,
         }
     }
 
-    fn handle_file_rename(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_move_target(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc => {
-                self.pending_file = None;
-                self.mode = Mode::FileList;
+                self.cancel_file_context();
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_file_selection(1);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_file_selection(-1);
                 None
             }
             KeyCode::Enter => {
-                if let Some(from) = self.pending_file.take() {
-                    let name = self.rename_input.clone();
-                    match self.storage.rename_file(&from, &name) {
-                        Ok(_) => {
-                            self.set_status(format!("Renamed to {name}"));
-                            self.all_files = self.storage.list_markdown_files().unwrap_or_default();
-                            self.refresh_file_filter();
-                        }
-                        Err(e) => self.set_status(format!("Error: {e}")),
-                    }
+                if let Some(path) = self.selected_file.clone() {
+                    self.perform_move_to(&path);
                 }
-                self.mode = Mode::FileList;
-                None
-            }
-            KeyCode::Backspace => {
-                self.rename_input.pop();
-                None
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.rename_input.push(c);
                 None
             }
             _ => None,
         }
     }
 
-    fn handle_file_delete(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_new_target(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(path) = self.pending_file.take() {
-                    match self.storage.delete_file(&path) {
-                        Ok(()) => {
-                            self.set_status(format!(
-                                "Deleted {}",
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ));
-                            self.all_files = self.storage.list_markdown_files().unwrap_or_default();
-                            self.refresh_file_filter();
-                        }
-                        Err(e) => self.set_status(format!("Error: {e}")),
-                    }
-                }
-                self.mode = Mode::FileList;
+            KeyCode::Esc => {
+                self.cancel_file_context();
                 None
             }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            KeyCode::Enter => {
+                let name = self.new_file_input.clone();
+                let Some(id) = self.pending_id.clone() else {
+                    self.cancel_file_context();
+                    return None;
+                };
+                match self.storage.create_named_file(&name) {
+                    Ok(path) => self.perform_move_to_id(&path, &id),
+                    Err(error) => self.set_status(format!("Error: {error}")),
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                delete_backward(&mut self.new_file_input, &mut self.new_file_cursor);
+                None
+            }
+            KeyCode::Delete => {
+                delete_forward(&mut self.new_file_input, &mut self.new_file_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.new_file_cursor = self.new_file_cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                self.new_file_cursor =
+                    (self.new_file_cursor + 1).min(self.new_file_input.chars().count());
+                None
+            }
+            KeyCode::Home => {
+                self.new_file_cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.new_file_cursor = self.new_file_input.chars().count();
+                None
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(
+                    &mut self.new_file_input,
+                    &mut self.new_file_cursor,
+                    character,
+                );
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_rename(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
                 self.pending_file = None;
-                self.mode = Mode::FileList;
+                self.files_context = FilesContext::Browse;
+                None
+            }
+            KeyCode::Enter => {
+                if let Some(from) = self.pending_file.clone() {
+                    match self.storage.rename_file(&from, &self.rename_input) {
+                        Ok(to) => {
+                            self.pending_file = None;
+                            self.selected_file = Some(to);
+                            self.set_status("Renamed");
+                            self.reload_files();
+                            self.files_context = FilesContext::Browse;
+                        }
+                        Err(error) => self.set_status(format!("Error: {error}")),
+                    }
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                delete_backward(&mut self.rename_input, &mut self.rename_cursor);
+                None
+            }
+            KeyCode::Delete => {
+                delete_forward(&mut self.rename_input, &mut self.rename_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.rename_cursor = self.rename_cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                self.rename_cursor =
+                    (self.rename_cursor + 1).min(self.rename_input.chars().count());
+                None
+            }
+            KeyCode::Home => {
+                self.rename_cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.rename_cursor = self.rename_input.chars().count();
+                None
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.rename_input, &mut self.rename_cursor, character);
                 None
             }
             _ => None,
@@ -865,23 +929,18 @@ impl App {
 
     fn handle_todo(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('T') => {
-                self.mode = Mode::Normal;
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.todo_index + 1 < self.todo_items.len() {
-                    self.todo_index += 1;
-                }
+                self.move_todo_selection(1);
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.todo_index > 0 {
-                    self.todo_index -= 1;
-                }
+                self.move_todo_selection(-1);
                 None
             }
-            // Toggle the highlighted task (Enter / Space / x).
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
                 self.toggle_todo(self.todo_index);
                 None
@@ -893,20 +952,15 @@ impl App {
     fn handle_search(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
+                self.center_view = CenterView::Chat;
                 None
             }
-            // Arrow keys only (letters are query input).
             KeyCode::Down => {
-                if self.search_index + 1 < self.search_results.len() {
-                    self.search_index += 1;
-                }
+                self.move_search_selection(1);
                 None
             }
             KeyCode::Up => {
-                if self.search_index > 0 {
-                    self.search_index -= 1;
-                }
+                self.move_search_selection(-1);
                 None
             }
             KeyCode::Enter => {
@@ -918,8 +972,8 @@ impl App {
                 self.recompute_search();
                 None
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search_query.push(c);
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.push(character);
                 self.recompute_search();
                 None
             }
@@ -927,29 +981,188 @@ impl App {
         }
     }
 
-    fn edit_has_changes(&self) -> bool {
-        self.message_clone(&self.edit_id)
-            .is_none_or(|message| message.body != self.edit_input)
-    }
-
-    fn handle_confirm_discard_edit(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_document(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.mode = Mode::Normal;
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.close_document();
                 None
             }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.mode = Mode::EditMessage;
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll_document(1);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll_document(-1);
+                None
+            }
+            KeyCode::PageDown => {
+                self.scroll_document(10);
+                None
+            }
+            KeyCode::PageUp => {
+                self.scroll_document(-10);
+                None
+            }
+            KeyCode::Char('e') => match self.document.as_ref().map(|doc| &doc.kind) {
+                Some(DocumentKind::File(path)) => Some(Command::Edit(path.clone())),
+                Some(DocumentKind::Message(id)) => {
+                    let id = id.clone();
+                    self.open_message_edit(&id);
+                    None
+                }
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn handle_message_edit(&mut self, key: KeyEvent) -> Option<Command> {
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Enter
+                if modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ) =>
+            {
+                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
+                None
+            }
+            KeyCode::Enter => {
+                self.save_edit();
+                None
+            }
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
+                None
+            }
+            KeyCode::Esc => {
+                if self.edit_has_changes() {
+                    self.overlay = Some(Overlay::ConfirmDiscardEdit);
+                } else {
+                    self.center_view = CenterView::Chat;
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                delete_backward(&mut self.edit_input, &mut self.edit_cursor);
+                None
+            }
+            KeyCode::Delete => {
+                delete_forward(&mut self.edit_input, &mut self.edit_cursor);
+                None
+            }
+            KeyCode::Left => self.move_edit_cursor(CursorMove::Left),
+            KeyCode::Right => self.move_edit_cursor(CursorMove::Right),
+            KeyCode::Up => self.move_edit_cursor(CursorMove::Up),
+            KeyCode::Down => self.move_edit_cursor(CursorMove::Down),
+            KeyCode::Home => self.move_edit_cursor(CursorMove::LineStart),
+            KeyCode::End => self.move_edit_cursor(CursorMove::LineEnd),
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.edit_input, &mut self.edit_cursor, character);
                 None
             }
             _ => None,
         }
     }
 
-    fn handle_help(&mut self, key: KeyEvent) -> Option<Command> {
+    fn move_edit_cursor(&mut self, movement: CursorMove) -> Option<Command> {
+        self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, movement);
+        None
+    }
+
+    fn handle_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        match self.overlay {
+            Some(Overlay::ConfirmDeleteMessage) => self.handle_delete_message_overlay(key),
+            Some(Overlay::ConfirmDeleteFile) => self.handle_delete_file_overlay(key),
+            Some(Overlay::ConfirmDiscardEdit) => self.handle_discard_overlay(key),
+            Some(Overlay::Help) => self.handle_help_overlay(key),
+            None => None,
+        }
+    }
+
+    fn handle_delete_message_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(id) = self.pending_id.take() {
+                    let message = self.message_clone(&id);
+                    match self.storage.remove_message_by_id(&id) {
+                        Ok(true) => {
+                            if let Some(message) = message {
+                                self.record_undo(UndoOp::Delete(message));
+                            }
+                            self.set_status("Deleted");
+                            self.reload();
+                        }
+                        Ok(false) => self.set_status("Message not found"),
+                        Err(error) => self.set_status(format!("Error: {error}")),
+                    }
+                }
+                self.overlay = None;
+                None
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.pending_id = None;
+                self.overlay = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_delete_file_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(path) = self.pending_file.take() {
+                    match self.storage.delete_file(&path) {
+                        Ok(()) => {
+                            self.set_status(format!(
+                                "Deleted {}",
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                            if self
+                                .document
+                                .as_ref()
+                                .is_some_and(|document| document.kind == DocumentKind::File(path))
+                            {
+                                self.document = None;
+                                self.center_view = CenterView::Chat;
+                            }
+                            self.reload_files();
+                        }
+                        Err(error) => self.set_status(format!("Error: {error}")),
+                    }
+                }
+                self.overlay = None;
+                None
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.pending_file = None;
+                self.overlay = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_discard_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.overlay = None;
+                self.center_view = CenterView::Chat;
+                None
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.overlay = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_help_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-                self.mode = Mode::Normal;
+                self.overlay = None;
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -972,108 +1185,358 @@ impl App {
         }
     }
 
-    fn handle_editmessage(&mut self, key: KeyEvent) -> Option<Command> {
-        let mods = key.modifiers;
-        match key.code {
-            // Enter saves (mirrors the compose box: Enter commits). Enter with
-            // any modifier, or Ctrl+J, inserts a newline instead.
-            KeyCode::Enter
-                if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+    fn route_wheel(&mut self, column: u16, row: u16, delta: i32) {
+        if let Some(overlay) = self.overlay {
+            if overlay == Overlay::Help
+                && (self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay))
             {
-                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
-                None
-            }
-            KeyCode::Enter => {
-                self.save_edit();
-                None
-            }
-            KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
-                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
-                None
-            }
-            KeyCode::Esc => {
-                if self.edit_has_changes() {
-                    self.mode = Mode::ConfirmDiscardEdit;
+                self.help_scroll = if delta > 0 {
+                    self.help_scroll.saturating_add(delta as u16)
                 } else {
-                    self.mode = Mode::Normal;
+                    self.help_scroll.saturating_sub(delta.unsigned_abs() as u16)
+                };
+            }
+            return;
+        }
+        if matches!(
+            self.files_context,
+            FilesContext::NewTarget | FilesContext::Rename
+        ) {
+            return;
+        }
+
+        if in_area(column, row, self.layout.files) {
+            self.move_file_selection(delta);
+        } else if in_area(column, row, self.layout.todo) {
+            self.move_todo_selection(delta);
+        } else if in_area(column, row, self.layout.center) {
+            match self.center_view {
+                CenterView::Chat => {
+                    self.scroll = if delta > 0 {
+                        self.scroll.saturating_add(delta as u16)
+                    } else {
+                        self.scroll.saturating_sub(delta.unsigned_abs() as u16)
+                    };
                 }
-                None
+                CenterView::Document => self.scroll_document(delta),
+                CenterView::Search => self.move_search_selection(delta),
+                CenterView::MessageEdit => {}
             }
-            KeyCode::Backspace => {
-                delete_backward(&mut self.edit_input, &mut self.edit_cursor);
-                None
-            }
-            KeyCode::Delete => {
-                delete_forward(&mut self.edit_input, &mut self.edit_cursor);
-                None
-            }
-            KeyCode::Left => {
-                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Left);
-                None
-            }
-            KeyCode::Right => {
-                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Right);
-                None
-            }
-            KeyCode::Up => {
-                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Up);
-                None
-            }
-            KeyCode::Down => {
-                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::Down);
-                None
-            }
-            KeyCode::Home => {
-                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::LineStart);
-                None
-            }
-            KeyCode::End => {
-                self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, CursorMove::LineEnd);
-                None
-            }
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                insert_char(&mut self.edit_input, &mut self.edit_cursor, c);
-                None
-            }
-            _ => None,
         }
     }
 
-    /// Save the in-app edit: record undo (old body), rewrite the block.
-    fn save_edit(&mut self) {
-        let Some(m) = self.message_clone(&self.edit_id) else {
-            self.set_status("Message not found");
-            self.mode = Mode::Normal;
+    fn handle_left_click(&mut self, column: u16, row: u16) -> Option<Command> {
+        if self.overlay.is_some()
+            || matches!(
+                self.files_context,
+                FilesContext::NewTarget | FilesContext::Rename
+            )
+        {
+            return None;
+        }
+
+        if self.center_view == CenterView::Search {
+            if let Some(index) = self
+                .search_hitboxes
+                .iter()
+                .find(|hitbox| point_in_rect(column, row, hitbox.area))
+                .map(|hitbox| hitbox.index)
+            {
+                self.search_index = index;
+                self.jump_to_search_result(index);
+                return None;
+            }
+        }
+
+        if let Some(index) = self
+            .todo_hitboxes
+            .iter()
+            .find(|hitbox| point_in_rect(column, row, hitbox.area))
+            .map(|hitbox| hitbox.index)
+        {
+            self.focus = Focus::Todo;
+            self.todo_index = index;
+            self.toggle_todo(index);
+            return None;
+        }
+
+        if let Some(path) = self
+            .file_hitboxes
+            .iter()
+            .find(|hitbox| point_in_rect(column, row, hitbox.area))
+            .map(|hitbox| hitbox.path.clone())
+        {
+            if let Some(index) = self.note_files.iter().position(|file| file.path == path) {
+                self.file_index = index;
+                self.sync_selected_file();
+                self.focus = Focus::Files;
+                match self.files_context {
+                    FilesContext::Browse | FilesContext::Search => {
+                        self.open_selected_file(DocumentReturn::Chat)
+                    }
+                    FilesContext::MoveTarget => self.perform_move_to(&path),
+                    FilesContext::NewTarget | FilesContext::Rename => {}
+                }
+            }
+            return None;
+        }
+
+        if self.center_view == CenterView::Chat {
+            if let Some((id, action)) = self
+                .hitboxes
+                .iter()
+                .find(|hitbox| point_in_rect(column, row, hitbox.area))
+                .map(|hitbox| (hitbox.message_id.clone(), hitbox.action))
+            {
+                return self.dispatch_action(&id, action);
+            }
+        }
+
+        if in_area(column, row, self.layout.compose) && self.center_view == CenterView::Chat {
+            self.focus = Focus::Compose;
+        } else if in_area(column, row, self.layout.files) {
+            self.focus = Focus::Files;
+        } else if in_area(column, row, self.layout.todo) {
+            self.focus = Focus::Todo;
+        } else if in_area(column, row, self.layout.center) {
+            self.focus = Focus::Center;
+        }
+        None
+    }
+
+    fn move_message_selection(&mut self, delta: i32) {
+        if !self.messages.is_empty() {
+            self.selected = (self.selected as i32 + delta)
+                .clamp(0, self.messages.len().saturating_sub(1) as i32)
+                as usize;
+        }
+    }
+
+    fn move_file_selection(&mut self, delta: i32) {
+        let visible = self.visible_file_indices();
+        if visible.is_empty() {
+            self.file_index = 0;
+            self.selected_file = None;
+            return;
+        }
+        let position = visible
+            .iter()
+            .position(|index| *index == self.file_index)
+            .unwrap_or(0);
+        let next = (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
+        self.file_index = visible[next];
+        self.sync_selected_file();
+    }
+
+    fn ensure_visible_file_selection(&mut self) {
+        let visible = self.visible_file_indices();
+        if visible.contains(&self.file_index) {
+            self.sync_selected_file();
+        } else if let Some(first) = visible.first() {
+            self.file_index = *first;
+            self.sync_selected_file();
+        } else {
+            self.selected_file = None;
+        }
+    }
+
+    fn sync_selected_file(&mut self) {
+        self.selected_file = self
+            .note_files
+            .get(self.file_index)
+            .map(|file| file.path.clone());
+    }
+
+    fn move_todo_selection(&mut self, delta: i32) {
+        let visible = self.visible_todo_indices();
+        if visible.is_empty() {
+            self.todo_index = 0;
+            return;
+        }
+        let position = visible
+            .iter()
+            .position(|index| *index == self.todo_index)
+            .unwrap_or(0);
+        let next = (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
+        self.todo_index = visible[next];
+    }
+
+    fn move_search_selection(&mut self, delta: i32) {
+        if !self.search_results.is_empty() {
+            self.search_index = (self.search_index as i32 + delta)
+                .clamp(0, self.search_results.len().saturating_sub(1) as i32)
+                as usize;
+        }
+    }
+
+    fn scroll_document(&mut self, delta: i32) {
+        if let Some(document) = self.document.as_mut() {
+            document.scroll = if delta > 0 {
+                document.scroll.saturating_add(delta as u16)
+            } else {
+                document.scroll.saturating_sub(delta.unsigned_abs() as u16)
+            };
+        }
+    }
+
+    fn toggle_todo(&mut self, index: usize) {
+        match self.storage.toggle_todo_task(index) {
+            Ok(true) => {
+                self.reload_todos();
+                self.reload_files();
+            }
+            Ok(false) => self.set_status("No such task"),
+            Err(error) => self.set_status(format!("Error: {error}")),
+        }
+    }
+
+    fn recompute_search(&mut self) {
+        let query = self.search_query.trim().to_lowercase();
+        let mut results = Vec::new();
+        if !query.is_empty() {
+            for message in &self.messages {
+                if message.body.to_lowercase().contains(&query) {
+                    results.push(SearchHit::Message {
+                        id: message.id.clone(),
+                        text: best_line(&message.body, &query),
+                    });
+                }
+            }
+            results.extend(self.storage.search_file_lines(&query));
+        }
+        self.search_results = results;
+        self.search_index = self
+            .search_index
+            .min(self.search_results.len().saturating_sub(1));
+    }
+
+    fn jump_to_search_result(&mut self, index: usize) {
+        let Some(hit) = self.search_results.get(index).cloned() else {
             return;
         };
-        let old = m.clone();
-        let mut updated = m;
+        match hit {
+            SearchHit::Message { id, .. } => {
+                self.open_message_document(&id, DocumentReturn::Search)
+            }
+            SearchHit::FileLine { path, line_no, .. } => {
+                self.open_file_document(&path, DocumentReturn::Search);
+                if let Some(document) = self.document.as_mut() {
+                    document.target_line = Some(line_no);
+                }
+            }
+        }
+    }
+
+    fn open_selected_file(&mut self, return_to: DocumentReturn) {
+        if let Some(path) = self.selected_file.clone() {
+            self.open_file_document(&path, return_to);
+        }
+    }
+
+    fn open_file_document(&mut self, path: &Path, return_to: DocumentReturn) {
+        match self.storage.read_note_file(path) {
+            Ok(source) => {
+                let title = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Document".to_string());
+                self.document = Some(Document {
+                    kind: DocumentKind::File(path.to_path_buf()),
+                    title,
+                    source,
+                    scroll: 0,
+                    target_line: None,
+                    return_to,
+                });
+                self.center_view = CenterView::Document;
+                self.focus = Focus::Center;
+            }
+            Err(error) => self.set_status(format!("Error: {error}")),
+        }
+    }
+
+    fn open_message_document(&mut self, id: &str, return_to: DocumentReturn) {
+        let Some(message) = self.message_clone(id) else {
+            return;
+        };
+        self.document = Some(Document {
+            kind: DocumentKind::Message(message.id),
+            title: format!("Message {}", message.created_at.format("%Y-%m-%d %H:%M")),
+            source: message.body,
+            scroll: 0,
+            target_line: None,
+            return_to,
+        });
+        self.center_view = CenterView::Document;
+        self.focus = Focus::Center;
+    }
+
+    fn close_document(&mut self) {
+        let Some(document) = self.document.take() else {
+            self.center_view = CenterView::Chat;
+            return;
+        };
+        match document.return_to {
+            DocumentReturn::Search => {
+                self.center_view = CenterView::Search;
+                self.focus = Focus::Center;
+            }
+            DocumentReturn::Chat => {
+                self.center_view = CenterView::Chat;
+                self.focus = if matches!(document.kind, DocumentKind::File(_)) {
+                    Focus::Files
+                } else {
+                    Focus::Center
+                };
+            }
+        }
+    }
+
+    fn open_message_edit(&mut self, id: &str) {
+        let Some(message) = self.message_clone(id) else {
+            return;
+        };
+        self.edit_id = message.id;
+        self.edit_input = message.body;
+        self.edit_cursor = self.edit_input.chars().count();
+        self.center_view = CenterView::MessageEdit;
+        self.focus = Focus::Center;
+    }
+
+    fn edit_has_changes(&self) -> bool {
+        self.message_clone(&self.edit_id)
+            .is_none_or(|message| message.body != self.edit_input)
+    }
+
+    fn save_edit(&mut self) {
+        let Some(message) = self.message_clone(&self.edit_id) else {
+            self.set_status("Message not found");
+            self.center_view = CenterView::Chat;
+            return;
+        };
+        let old = message.clone();
+        let mut updated = message;
         updated.body = self.edit_input.clone();
         match self.storage.replace_message(&updated) {
             Ok(true) => {
                 self.record_undo(UndoOp::Edit(old));
                 self.set_status("Saved");
                 self.reload();
-                if let Some(idx) = self.messages.iter().position(|x| x.id == self.edit_id) {
-                    self.selected = idx;
+                if let Some(index) = self
+                    .messages
+                    .iter()
+                    .position(|message| message.id == self.edit_id)
+                {
+                    self.selected = index;
                 }
-                self.scroll = u32::MAX as u16;
+                self.scroll = u16::MAX;
+                self.center_view = CenterView::Chat;
             }
             Ok(false) => self.set_status("Message not found"),
-            Err(e) => self.set_status(format!("Error: {e}")),
+            Err(error) => self.set_status(format!("Error: {error}")),
         }
-        self.mode = Mode::Normal;
     }
 
-    fn move_selection(&mut self, delta: i32) {
-        if self.messages.is_empty() {
-            return;
-        }
-        let next = self.selected as i32 + delta;
-        self.selected = next.clamp(0, (self.messages.len() - 1) as i32) as usize;
-    }
-
-    /// Apply an action to the currently selected message.
     fn act(&mut self, action: Action) -> Option<Command> {
         let id = self.selected_id()?.to_string();
         self.dispatch_action(&id, action)
@@ -1082,44 +1545,44 @@ impl App {
     fn dispatch_action(&mut self, id: &str, action: Action) -> Option<Command> {
         match action {
             Action::Todo => {
-                if let Some(m) = self.message_clone(id) {
-                    match self.storage.move_to_todo(&m) {
+                if let Some(message) = self.message_clone(id) {
+                    match self.storage.move_to_todo(&message) {
                         Ok(appended) => {
                             self.record_undo(UndoOp::Move {
-                                msg: m,
+                                message,
                                 target: self.storage.todo_path.clone(),
                                 appended,
                             });
-                            self.set_status("Moved to TODO.md".to_string());
-                            self.reload();
+                            self.set_status("Moved to TODO.md");
+                            self.reload_workspace();
                         }
-                        Err(e) => self.set_status(format!("Error: {e}")),
+                        Err(error) => self.set_status(format!("Error: {error}")),
                     }
                 }
                 None
             }
             Action::Move => {
                 self.pending_id = Some(id.to_string());
-                self.target_files = self.storage.list_markdown_files().unwrap_or_default();
-                self.target_index = 0;
-                self.mode = Mode::SelectTarget;
+                self.file_query.clear();
+                self.reload_files();
+                self.files_context = FilesContext::MoveTarget;
+                self.focus = Focus::Files;
                 None
             }
             Action::Archive => {
-                // Same append-section + remove-from-chat path as Move, just with
-                // a fixed target (ARCHIVE.md) — no extra storage method needed.
-                if let Some(m) = self.message_clone(id) {
-                    match self.storage.move_to_markdown(&self.storage.archive_path, &m) {
+                if let Some(message) = self.message_clone(id) {
+                    let target = self.storage.archive_path.clone();
+                    match self.storage.move_to_markdown(&target, &message) {
                         Ok(appended) => {
                             self.record_undo(UndoOp::Move {
-                                msg: m,
-                                target: self.storage.archive_path.clone(),
+                                message,
+                                target,
                                 appended,
                             });
-                            self.set_status("Archived to ARCHIVE.md".to_string());
-                            self.reload();
+                            self.set_status("Archived to ARCHIVE.md");
+                            self.reload_workspace();
                         }
-                        Err(e) => self.set_status(format!("Error: {e}")),
+                        Err(error) => self.set_status(format!("Error: {error}")),
                     }
                 }
                 None
@@ -1127,186 +1590,51 @@ impl App {
             Action::New => {
                 self.pending_id = Some(id.to_string());
                 self.new_file_input.clear();
-                self.mode = Mode::NewFile;
+                self.new_file_cursor = 0;
+                self.files_context = FilesContext::NewTarget;
+                self.focus = Focus::Files;
                 None
             }
             Action::View => {
-                if let Some(m) = self.message_clone(id) {
-                    self.preview = Some(Preview {
-                        title: format!("Message {}", m.created_at.format("%Y-%m-%d %H:%M")),
-                        source: m.body.clone(),
-                        scroll: 0,
-                    });
-                    self.preview_return = self.mode;
-                    self.mode = Mode::Preview;
-                }
+                self.open_message_document(id, DocumentReturn::Chat);
                 None
             }
             Action::Edit => {
-                // Open the in-app single-message editor (avoids editing the
-                // whole CHAT.md and risking the note-msg block markers).
-                if let Some(m) = self.message_clone(id) {
-                    self.edit_id = m.id.clone();
-                    self.edit_input = m.body.clone();
-                    self.edit_cursor = self.edit_input.chars().count();
-                    self.mode = Mode::EditMessage;
-                }
+                self.open_message_edit(id);
                 None
             }
             Action::Delete => {
                 self.pending_id = Some(id.to_string());
-                self.mode = Mode::ConfirmDelete;
+                self.overlay = Some(Overlay::ConfirmDeleteMessage);
                 None
             }
         }
     }
 
-    fn handle_select_target(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Insert;
-                self.pending_id = None;
-                None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.target_index > 0 {
-                    self.target_index -= 1;
-                }
-                None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.target_index + 1 < self.target_files.len() {
-                    self.target_index += 1;
-                }
-                None
-            }
-            KeyCode::Char('v') => {
-                // Preview the highlighted file instead of moving.
-                if let Some(path) = self.target_files.get(self.target_index).cloned() {
-                    self.open_file_preview(&path);
-                }
-                None
-            }
-            KeyCode::Enter => {
-                let Some(path) = self.target_files.get(self.target_index).cloned() else {
-                    self.mode = Mode::Insert;
-                    return None;
-                };
-                self.perform_move_to(&path);
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn handle_new_file(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Insert;
-                self.pending_id = None;
-                None
-            }
-            KeyCode::Enter => {
-                let name = self.new_file_input.clone();
-                if let Some(id) = self.pending_id.take() {
-                    match self.storage.create_named_file(&name) {
-                        Ok(path) => self.perform_move_to_id(&path, &id),
-                        Err(e) => self.set_status(format!("Error: {e}")),
-                    }
-                }
-                self.mode = Mode::Insert;
-                None
-            }
-            KeyCode::Backspace => {
-                self.new_file_input.pop();
-                None
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.new_file_input.push(c);
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn handle_confirm_delete(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(id) = self.pending_id.take() {
-                    let msg = self.message_clone(&id);
-                    match self.storage.remove_message_by_id(&id) {
-                        Ok(true) => {
-                            if let Some(m) = msg {
-                                self.record_undo(UndoOp::Delete(m));
-                            }
-                            self.set_status("Deleted");
-                            self.reload();
-                        }
-                        Ok(false) => self.set_status("Message not found"),
-                        Err(e) => self.set_status(format!("Error: {e}")),
-                    }
-                }
-                self.mode = Mode::Insert;
-                None
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.pending_id = None;
-                self.mode = Mode::Insert;
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn handle_preview(&mut self, key: KeyEvent) -> Option<Command> {
-        let Some(p) = self.preview.as_mut() else {
-            self.mode = self.preview_return;
-            return None;
-        };
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.preview = None;
-                self.mode = self.preview_return;
-                None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                p.scroll = p.scroll.saturating_add(1);
-                None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                p.scroll = p.scroll.saturating_sub(1);
-                None
-            }
-            KeyCode::PageDown => {
-                p.scroll = p.scroll.saturating_add(10);
-                None
-            }
-            KeyCode::PageUp => {
-                p.scroll = p.scroll.saturating_sub(10);
-                None
-            }
-            _ => None,
-        }
+    fn cancel_file_context(&mut self) {
+        self.pending_id = None;
+        self.pending_file = None;
+        self.files_context = FilesContext::Browse;
+        self.focus = Focus::Center;
     }
 
     fn perform_move_to(&mut self, path: &Path) {
-        let Some(id) = self.pending_id.take() else {
-            self.mode = Mode::Insert;
+        let Some(id) = self.pending_id.clone() else {
+            self.cancel_file_context();
             return;
         };
         self.perform_move_to_id(path, &id);
-        self.mode = Mode::Insert;
     }
 
     fn perform_move_to_id(&mut self, path: &Path, id: &str) {
-        let Some(m) = self.message_clone(id) else {
+        let Some(message) = self.message_clone(id) else {
             self.set_status("Message not found");
             return;
         };
-        match self.storage.move_to_markdown(path, &m) {
+        match self.storage.move_to_markdown(path, &message) {
             Ok(appended) => {
                 self.record_undo(UndoOp::Move {
-                    msg: m,
+                    message,
                     target: path.to_path_buf(),
                     appended,
                 });
@@ -1314,29 +1642,14 @@ impl App {
                     "Moved to {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ));
-                self.reload();
+                self.pending_id = None;
+                self.files_context = FilesContext::Browse;
+                self.focus = Focus::Center;
+                self.center_view = CenterView::Chat;
+                self.reload_workspace();
             }
-            Err(e) => self.set_status(format!("Error: {e}")),
+            Err(error) => self.set_status(format!("Error: {error}")),
         }
-    }
-
-    fn open_file_preview(&mut self, path: &Path) {
-        let title = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Preview".into());
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        self.preview = Some(Preview {
-            title,
-            source: text,
-            scroll: 0,
-        });
-        self.preview_return = self.mode;
-        self.mode = Mode::Preview;
-    }
-
-    fn message_clone(&self, id: &str) -> Option<Message> {
-        self.messages.iter().find(|m| m.id == id).cloned()
     }
 
     fn send_message(&mut self) {
@@ -1350,554 +1663,478 @@ impl App {
                 self.input_cursor = 0;
                 self.reload();
                 self.selected = self.messages.len().saturating_sub(1);
-                self.scroll = u32::MAX as u16; // jump to bottom
+                self.scroll = u16::MAX;
                 self.set_status("Saved");
             }
-            Err(e) => self.set_status(format!("Error: {e}")),
+            Err(error) => self.set_status(format!("Error: {error}")),
         }
     }
 
-    fn set_status(&mut self, s: impl Into<String>) {
-        self.status = s.into();
+    fn message_clone(&self, id: &str) -> Option<Message> {
+        self.messages
+            .iter()
+            .find(|message| message.id == id)
+            .cloned()
     }
 
-    /// Record a chat-removing operation for `u` to reverse (capped stack).
-    fn record_undo(&mut self, op: UndoOp) {
-        const CAP: usize = 50;
-        if self.undo_stack.len() >= CAP {
+    fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+    }
+
+    fn record_undo(&mut self, operation: UndoOp) {
+        const CAPACITY: usize = 50;
+        if self.undo_stack.len() == CAPACITY {
             self.undo_stack.remove(0);
         }
-        self.undo_stack.push(op);
+        self.undo_stack.push(operation);
     }
 
-    /// Reverse the most recent chat-removing operation.
     fn undo(&mut self) {
-        let Some(op) = self.undo_stack.pop() else {
+        let Some(operation) = self.undo_stack.pop() else {
             self.set_status("Nothing to undo");
             return;
         };
-        let status = match op {
-            UndoOp::Delete(msg) => match self.storage.restore_message_to_chat(&msg) {
+        let status = match operation {
+            UndoOp::Delete(message) => match self.storage.restore_message_to_chat(&message) {
                 Ok(()) => "Undid delete".to_string(),
-                Err(e) => format!("Undo error: {e}"),
+                Err(error) => format!("Undo error: {error}"),
             },
             UndoOp::Move {
-                msg,
+                message,
                 target,
                 appended,
-            } => match self.storage.restore_message_to_chat(&msg) {
+            } => match self.storage.restore_message_to_chat(&message) {
                 Ok(()) => {
                     let name = target
                         .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
+                        .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let cleaned = self
+                    if self
                         .storage
                         .remove_first_occurrence(&target, &appended)
-                        .unwrap_or(false);
-                    if cleaned {
+                        .unwrap_or(false)
+                    {
                         format!("Undid move to {name}")
                     } else {
                         format!("Undid move (couldn't tidy {name})")
                     }
                 }
-                Err(e) => format!("Undo error: {e}"),
+                Err(error) => format!("Undo error: {error}"),
             },
-            UndoOp::Edit(msg) => match self.storage.replace_message(&msg) {
+            UndoOp::Edit(message) => match self.storage.replace_message(&message) {
                 Ok(true) => "Undid edit".to_string(),
                 Ok(false) => "Undid edit (message gone)".to_string(),
-                Err(e) => format!("Undo error: {e}"),
+                Err(error) => format!("Undo error: {error}"),
             },
         };
         self.set_status(status);
-        self.reload();
+        self.reload_workspace();
         self.selected = self.messages.len().saturating_sub(1);
-        self.scroll = u32::MAX as u16;
+        self.scroll = u16::MAX;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
-    use tempfile::tempdir;
+    use std::fs;
 
     fn make_app() -> (App, tempfile::TempDir) {
-        let dir = tempdir().unwrap();
-        let st = Storage::new(dir.path()).unwrap();
-        st.ensure_files().unwrap();
-        st.create_named_file("Work").unwrap();
-        st.create_named_file("Ideas").unwrap();
-        (App::new(st).unwrap(), dir)
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        (App::new(storage).unwrap(), directory)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn add_message(app: &mut App, body: &str) {
+        app.storage.append_chat_message(body).unwrap();
+        app.reload();
+        app.selected = app.messages.len() - 1;
+        app.focus = Focus::Center;
     }
 
     #[test]
-    fn bare_enter_sends_in_insert_mode() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Insert;
-        app.input = "hi".to_string();
-        app.input_cursor = app.input.chars().count();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.input.is_empty(), "bare Enter should send (clear input)");
-        assert_eq!(app.messages.len(), 1);
+    fn starts_with_compose_focused_and_chat_in_center() {
+        let (app, _directory) = make_app();
+        assert_eq!(app.focus, Focus::Compose);
+        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.files_context, FilesContext::Browse);
+        assert_eq!(app.overlay, None);
     }
 
     #[test]
-    fn modifier_enter_inserts_newline() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Insert;
-        app.input = "hi".to_string();
-        app.input_cursor = app.input.chars().count();
-
-        // Shift+Enter inserts a newline (the requested behaviour).
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert_eq!(app.input, "hi\n", "Shift+Enter should insert a newline");
-        assert_eq!(app.messages.len(), 0, "Shift+Enter must not send");
-
-        // Ctrl/Alt+Enter also insert a newline (reliable fallbacks).
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
-        assert_eq!(app.input, "hi\n\n\n");
-        assert_eq!(app.messages.len(), 0);
-
-        // Ctrl+J (the LF byte) inserts a newline too.
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        assert_eq!(app.input, "hi\n\n\n\n");
-    }
-
-    #[test]
-    fn paste_inserts_at_cursor_and_normalizes_newlines() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Insert;
+    fn compose_paste_normalizes_newlines_at_character_cursor() {
+        let (mut app, _directory) = make_app();
         app.input = "ab".to_string();
-        app.input_cursor = 1; // between 'a' and 'b'
-        // CRLF must become a single LF.
-        app.handle_paste("X\r\nY");
-        assert_eq!(app.input, "aX\nYb");
-        assert_eq!(app.input_cursor, 4);
+        app.input_cursor = 1;
+        app.handle_paste("X\r\nY\rZ");
+        assert_eq!(app.input, "aX\nY\nZb");
+        assert_eq!(app.input_cursor, 6);
     }
 
     #[test]
-    fn paste_works_in_editor_and_is_ignored_in_command_modes() {
-        let (mut app, _dir) = make_app();
-        // EditMessage accepts paste at the cursor.
-        app.mode = Mode::EditMessage;
-        app.edit_id = "x".into();
-        app.edit_input = "ab".to_string();
-        app.edit_cursor = 2;
-        app.handle_paste("Z");
-        assert_eq!(app.edit_input, "abZ");
-
-        // Normal mode ignores paste.
-        app.mode = Mode::Normal;
-        app.handle_paste("ignored");
-        assert!(app.input.is_empty());
+    fn f_and_t_change_only_focus() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.center_view, CenterView::Chat);
+        app.handle_key(key(KeyCode::Char('T')));
+        assert_eq!(app.focus, Focus::Todo);
+        assert_eq!(app.center_view, CenterView::Chat);
     }
 
     #[test]
-    fn file_list_popup_navigation() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        // 'f' opens the file-list popup.
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileList);
-        // Files: Ideas.md, TODO.md, Work.md (sorted).
-        assert!(app.sidebar_files.len() >= 3);
-
-        // j/k move the selection.
-        let start = app.sidebar_index;
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_index, start + 1);
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_index, start);
-
-        // Esc closes the popup.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn preview_from_normal_returns_to_normal() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("hello").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        // 'v' views the selected message.
-        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Preview);
-        // Esc returns to Normal (previously it wrongly went to Insert).
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn preview_from_filelist_returns_to_filelist() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileList);
-        // Preview the selected file.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Preview);
-        // Esc returns to the file list, not Insert.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileList);
-    }
-
-    #[test]
-    fn insert_types_at_cursor_not_append() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Insert;
-        app.input = "ab".to_string();
-        app.input_cursor = 1; // between 'a' and 'b'
-        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
-        assert_eq!(app.input, "aXb");
-        assert_eq!(app.input_cursor, 2);
-    }
-
-    #[test]
-    fn backspace_deletes_before_cursor() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Insert;
-        app.input = "abc".to_string();
-        app.input_cursor = 3;
-        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)); // cursor -> 2
-        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)); // drop 'b'
-        assert_eq!(app.input, "ac");
-        assert_eq!(app.input_cursor, 1);
-    }
-
-    #[test]
-    fn cursor_up_preserves_column() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Insert;
-        app.input = "abcd\nef".to_string();
-        app.input_cursor = 7; // end of line 2 (col 2)
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        // Line 1 ("abcd") is long enough; col 2 → index 2.
-        assert_eq!(app.input_cursor, 2);
-    }
-
-    #[test]
-    fn archive_moves_message_to_archive_file() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("to be archived").unwrap();
-        app.reload();
-        assert_eq!(app.messages.len(), 1);
-        app.mode = Mode::Normal;
-        // 'a' archives the selected message (reuses the move-to-markdown path).
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(app.messages.is_empty(), "message should leave the chat");
-        let body = std::fs::read_to_string(&app.storage.archive_path).unwrap();
-        assert!(body.contains("to be archived"), "message should land in ARCHIVE.md");
-    }
-
-    #[test]
-    fn undo_delete_restores_message() {
-        let (mut app, _dir) = make_app();
-        let m = app.storage.append_chat_message("oops").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        // delete via 'd' then confirm 'y'.
-        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::ConfirmDelete);
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        assert!(app.messages.is_empty());
-
-        // 'u' restores it with the same id.
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.messages[0].body, "oops");
-        assert_eq!(app.messages[0].id, m.id);
-
-        // A second 'u' has nothing to undo.
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert_eq!(app.messages.len(), 1);
-    }
-
-    #[test]
-    fn undo_move_restores_chat_and_cleans_target() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("file me").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(app.messages.is_empty(), "archived out of chat");
-        let before = std::fs::read_to_string(&app.storage.archive_path).unwrap();
-        assert!(before.contains("file me"));
-
-        // 'u' brings it back to chat AND removes the filed copy.
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.messages[0].body, "file me");
-        let after = std::fs::read_to_string(&app.storage.archive_path).unwrap();
-        assert!(!after.contains("file me"), "filed copy should be removed on undo");
-    }
-
-    #[test]
-    fn todo_panel_toggles_task() {
-        let (mut app, _dir) = make_app();
-        // Seed a task by moving a message to TODO.md.
-        let m = app.storage.append_chat_message("buy milk").unwrap();
-        app.storage.move_to_todo(&m).unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-
-        // 'T' opens the todo panel.
-        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Todo);
-        assert_eq!(app.todo_items.len(), 1);
-        assert!(!app.todo_items[0].checked);
-
-        // Enter toggles it on, then off again.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.todo_items[0].checked);
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!app.todo_items[0].checked);
-
-        // Esc closes the panel.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn search_finds_message_and_file_and_jumps() {
-        let (mut app, _dir) = make_app();
-        app.storage
-            .append_chat_message("remember to rust the bike")
-            .unwrap();
-        app.reload();
-        std::fs::write(
-            app.storage.root.join("Work.md"),
-            "# Work\n\ndeep rust notes\n",
-        )
-        .unwrap();
-
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Search);
-        for c in "rust".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        assert!(app
-            .search_results
-            .iter()
-            .any(|h| matches!(h, SearchHit::Message { .. })));
-        assert!(app
-            .search_results
-            .iter()
-            .any(|h| matches!(h, SearchHit::FileLine { .. })));
-
-        // Enter opens a result; Esc returns to the search, then closes it.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Preview);
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Search);
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn help_overlay_opens_and_closes() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Help);
-        assert_eq!(app.help_scroll, 0);
-        // Scrolling advances the offset.
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.help_scroll, 1);
-        // '?' closes it (Esc works too).
-        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn edit_message_saves_and_undo_restores() {
-        let (mut app, _dir) = make_app();
-        let m = app.storage.append_chat_message("hello").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        // 'e' opens the in-app editor seeded with the body.
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::EditMessage);
-        assert_eq!(app.edit_input, "hello");
-
-        // Replace the body.
-        app.edit_input.clear();
-        app.edit_cursor = 0;
-        for c in "world".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        // Enter saves.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.messages[0].body, "world");
-        assert_eq!(app.messages[0].id, m.id, "id preserved");
-
-        // 'u' restores the pre-edit body.
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert_eq!(app.messages[0].body, "hello");
-    }
-
-    #[test]
-    fn edit_message_esc_requires_confirmation_before_discarding() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("keep").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.edit_input.clear();
-        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::ConfirmDiscardEdit);
-        assert_eq!(app.messages[0].body, "keep", "prompt must not save edits");
-
-        // Esc from the prompt keeps the buffer and returns to editing.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::EditMessage);
-        assert_eq!(app.edit_input, "X");
-
-        // Confirming the second prompt discards the edit.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.messages[0].body, "keep", "cancel must not save edits");
-    }
-
-    #[test]
-    fn edit_message_esc_closes_immediately_when_unchanged() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("keep").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        assert_eq!(app.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn edit_message_discard_confirmation_n_keeps_editing() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("keep").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-
-        assert_eq!(app.mode, Mode::EditMessage);
-        assert_eq!(app.edit_input, "keep!");
-    }
-
-    #[test]
-    fn edit_message_newline_keys_dont_save() {
-        let (mut app, _dir) = make_app();
-        app.storage.append_chat_message("hi").unwrap();
-        app.reload();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.edit_cursor = app.edit_input.chars().count();
-        // Shift+Enter and Ctrl+J insert newlines without saving.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        assert_eq!(app.mode, Mode::EditMessage, "must not have saved");
-        assert_eq!(app.edit_input, "hi\n\n");
-    }
-
-    fn file_index(app: &App, stem: &str) -> usize {
-        app.sidebar_files
-            .iter()
-            .position(|p| p.file_stem().and_then(|s| s.to_str()) == Some(stem))
-            .unwrap()
-    }
-
-    #[test]
-    fn fuzzy_filter_narrows_file_list() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        let total = app.sidebar_files.len();
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileSearch);
-        for c in "work".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        // Only Work.md matches the subsequence "work".
-        assert_eq!(app.sidebar_files.len(), 1);
-        assert!(app.sidebar_files.len() < total);
+    fn files_search_uses_note_files_without_duplicate_lists() {
+        let (mut app, directory) = make_app();
+        fs::write(directory.path().join("Work.md"), "work").unwrap();
+        fs::write(directory.path().join("Personal.md"), "personal").unwrap();
+        app.open_files();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.files_context, FilesContext::Search);
+        app.handle_key(key(KeyCode::Char('w')));
+        app.handle_key(key(KeyCode::Char('k')));
+        let visible = app.visible_file_indices();
+        assert_eq!(visible.len(), 1);
         assert_eq!(
-            app.sidebar_files[0]
+            app.note_files[visible[0]]
+                .path
                 .file_stem()
-                .and_then(|s| s.to_str()),
+                .and_then(|stem| stem.to_str()),
             Some("Work")
         );
     }
 
     #[test]
-    fn file_search_navigates_and_previews_result() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileSearch);
-        // Arrows move the selection within the live results.
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        // Enter opens (previews) the highlighted result.
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::Preview);
-        // Esc returns to the search, then a second Esc cancels it.
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileSearch);
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileList);
-        assert!(app.file_query.is_empty());
+    fn file_enter_opens_center_document_and_escape_returns_to_files() {
+        let (mut app, directory) = make_app();
+        let path = directory.path().join("Project.md");
+        fs::write(&path, "# Project\n").unwrap();
+        app.open_files();
+        app.selected_file = Some(path.clone());
+        app.file_index = app
+            .note_files
+            .iter()
+            .position(|file| file.path == path)
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Center);
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(path))
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.focus, Focus::Files);
     }
 
     #[test]
-    fn rename_file_via_picker() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        app.sidebar_index = file_index(&app, "Work");
-        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileRename);
-        assert_eq!(app.rename_input, "Work");
-        app.rename_input.clear();
-        for c in "Renamed".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileList);
-        assert!(app
-            .all_files
+    fn file_edit_returns_terminal_command() {
+        let (mut app, directory) = make_app();
+        let path = directory.path().join("Project.md");
+        fs::write(&path, "# Project\n").unwrap();
+        app.open_files();
+        app.file_index = app
+            .note_files
             .iter()
-            .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("Renamed.md")));
-        assert!(!app
-            .all_files
-            .iter()
-            .any(|p| p.file_stem().and_then(|s| s.to_str()) == Some("Work")));
+            .position(|file| file.path == path)
+            .unwrap();
+        app.sync_selected_file();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Some(Command::Edit(path))
+        );
     }
 
     #[test]
-    fn delete_file_via_picker() {
-        let (mut app, _dir) = make_app();
-        app.mode = Mode::Normal;
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        app.sidebar_index = file_index(&app, "Ideas");
-        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileDelete);
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        assert_eq!(app.mode, Mode::FileList);
-        assert!(!app
-            .all_files
+    fn move_and_new_are_file_contexts() {
+        let (mut app, _directory) = make_app();
+        add_message(&mut app, "file this");
+        app.handle_key(key(KeyCode::Char('m')));
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.files_context, FilesContext::MoveTarget);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.files_context, FilesContext::Browse);
+        assert_eq!(app.focus, Focus::Center);
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.files_context, FilesContext::NewTarget);
+    }
+
+    #[test]
+    fn file_rename_is_a_context_and_delete_is_an_overlay() {
+        let (mut app, directory) = make_app();
+        fs::write(directory.path().join("Old.md"), "old").unwrap();
+        app.open_files();
+        app.file_index = app
+            .note_files
             .iter()
-            .any(|p| p.file_stem().and_then(|s| s.to_str()) == Some("Ideas")));
+            .position(|file| file.path.ends_with("Old.md"))
+            .unwrap();
+        app.sync_selected_file();
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(app.files_context, FilesContext::Rename);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.overlay, Some(Overlay::ConfirmDeleteFile));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.focus, Focus::Files);
+    }
+
+    #[test]
+    fn search_and_message_edit_are_center_views() {
+        let (mut app, _directory) = make_app();
+        add_message(&mut app, "needle");
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.center_view, CenterView::Search);
+        app.handle_paste("needle");
+        assert_eq!(app.search_results.len(), 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| document.return_to),
+            Some(DocumentReturn::Search)
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.center_view, CenterView::Search);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.center_view, CenterView::MessageEdit);
+    }
+
+    #[test]
+    fn file_search_result_keeps_its_source_line_as_a_document_anchor() {
+        let (mut app, directory) = make_app();
+        let path = directory.path().join("Project.md");
+        fs::write(&path, "# Project\n\nintro\n\nunique needle\n").unwrap();
+        app.reload_files();
+        app.open_search();
+        app.handle_paste("unique needle");
+        assert_eq!(app.search_results.len(), 1);
+        app.handle_key(key(KeyCode::Enter));
+        let document = app.document.as_ref().expect("opened document");
+        assert_eq!(document.kind, DocumentKind::File(path));
+        assert_eq!(document.target_line, Some(5));
+        assert_eq!(document.return_to, DocumentReturn::Search);
+    }
+
+    #[test]
+    fn discard_overlay_preserves_editor_beneath_it() {
+        let (mut app, _directory) = make_app();
+        add_message(&mut app, "before");
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(key(KeyCode::Char('!')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, Some(Overlay::ConfirmDiscardEdit));
+        assert_eq!(app.center_view, CenterView::MessageEdit);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.center_view, CenterView::MessageEdit);
+    }
+
+    #[test]
+    fn help_overlay_restores_underlying_state() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Todo;
+        app.open_help();
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.focus, Focus::Todo);
+        assert_eq!(app.center_view, CenterView::Chat);
+    }
+
+    #[test]
+    fn wheel_routes_by_layout_coordinates_not_focus() {
+        let (mut app, _directory) = make_app();
+        app.todo_items = vec![
+            TodoItem {
+                checked: false,
+                text: "one".to_string(),
+            },
+            TodoItem {
+                checked: false,
+                text: "two".to_string(),
+            },
+        ];
+        app.layout.todo = Some(Rect::new(80, 0, 20, 20));
+        app.layout.center = Some(Rect::new(20, 0, 60, 20));
+        app.focus = Focus::Center;
+        app.scroll = 4;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 90,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.todo_index, 1);
+        assert_eq!(app.scroll, 4);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 30,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn todo_navigation_follows_grouped_display_order() {
+        let (mut app, _directory) = make_app();
+        app.todo_items = vec![
+            TodoItem {
+                checked: true,
+                text: "done first in file".to_string(),
+            },
+            TodoItem {
+                checked: false,
+                text: "open second in file".to_string(),
+            },
+            TodoItem {
+                checked: false,
+                text: "open third in file".to_string(),
+            },
+        ];
+        assert_eq!(app.visible_todo_indices(), vec![1, 2, 0]);
+        app.todo_index = 1;
+        app.move_todo_selection(1);
+        assert_eq!(app.todo_index, 2);
+        app.move_todo_selection(1);
+        assert_eq!(app.todo_index, 0);
+    }
+
+    #[test]
+    fn non_left_mouse_buttons_are_ignored() {
+        let (mut app, _directory) = make_app();
+        app.layout.files = Some(Rect::new(0, 0, 20, 20));
+        app.focus = Focus::Center;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Center);
+    }
+
+    #[test]
+    fn base_escape_does_not_quit_but_q_does() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Some(Command::Quit));
+    }
+
+    #[test]
+    fn clicking_a_file_opens_it_in_center() {
+        let (mut app, directory) = make_app();
+        let path = directory.path().join("Clicked.md");
+        fs::write(&path, "# Clicked\n").unwrap();
+        app.open_files();
+        app.file_hitboxes.push(FileHitbox {
+            path: path.clone(),
+            area: Rect::new(1, 1, 10, 2),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(app.focus, Focus::Center);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(path))
+        );
+    }
+
+    #[test]
+    fn move_targets_exclude_protected_files() {
+        let (mut app, directory) = make_app();
+        fs::write(directory.path().join("Work.md"), "# Work\n").unwrap();
+        add_message(&mut app, "file this");
+        app.handle_key(key(KeyCode::Char('m')));
+        let names: Vec<String> = app
+            .visible_file_indices()
+            .into_iter()
+            .filter_map(|index| {
+                app.note_files[index]
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(names, vec!["Work"]);
+    }
+
+    #[test]
+    fn rename_error_keeps_modal_context_for_retry() {
+        let (mut app, directory) = make_app();
+        fs::write(directory.path().join("Old.md"), "old").unwrap();
+        fs::write(directory.path().join("Taken.md"), "taken").unwrap();
+        app.open_files();
+        app.file_index = app
+            .note_files
+            .iter()
+            .position(|file| file.path.ends_with("Old.md"))
+            .unwrap();
+        app.sync_selected_file();
+        app.handle_key(key(KeyCode::Char('r')));
+        app.rename_input = "Taken".to_string();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.files_context, FilesContext::Rename);
+        assert!(app.pending_file.is_some());
+        assert!(app.status.starts_with("Error:"));
+    }
+
+    #[test]
+    fn file_name_modal_inputs_edit_at_the_character_cursor() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Files;
+        app.files_context = FilesContext::NewTarget;
+        app.new_file_input = "文件".to_string();
+        app.new_file_cursor = 2;
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('新')));
+        assert_eq!(app.new_file_input, "文新件");
+        assert_eq!(app.new_file_cursor, 2);
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.new_file_input, "文");
+        assert_eq!(app.new_file_cursor, 1);
+
+        app.files_context = FilesContext::Rename;
+        app.rename_input = "Report".to_string();
+        app.rename_cursor = app.rename_input.chars().count();
+        app.handle_key(key(KeyCode::Home));
+        app.handle_paste("New-");
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.rename_input, "New-Report2");
+        assert_eq!(app.rename_cursor, app.rename_input.chars().count());
+    }
+
+    #[test]
+    fn delete_overlay_and_undo_keep_business_behavior() {
+        let (mut app, _directory) = make_app();
+        add_message(&mut app, "remove me");
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.overlay, Some(Overlay::ConfirmDeleteMessage));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.messages.is_empty());
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].body, "remove me");
     }
 }

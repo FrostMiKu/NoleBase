@@ -96,7 +96,7 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
             if let Err(e) = run_editor(&path, terminal) {
                 app.status = format!("Editor error: {e}");
             }
-            app.reload();
+            app.reload_workspace();
             Ok(false)
         }
         None => Ok(false),
