@@ -8,6 +8,7 @@ mod ui;
 
 use std::io::{self, Stdout};
 use std::process::Command as ProcCommand;
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,12 +21,16 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::{App, Command};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+type WatchEvents = Receiver<notify::Result<notify::Event>>;
+
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn enter_tui() -> Result<()> {
     enable_raw_mode()?;
@@ -103,10 +108,52 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
     }
 }
 
-fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
+fn watch_workspace(path: &std::path::Path) -> Result<(RecommendedWatcher, WatchEvents)> {
+    let (sender, receiver) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })
+    .context("creating note directory watcher")?;
+    watcher
+        .watch(path, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", path.display()))?;
+    Ok((watcher, receiver))
+}
+
+fn process_workspace_events(events: &WatchEvents, app: &mut App) {
+    let mut changed = false;
+    let mut watcher_error = None;
+    for event in events.try_iter() {
+        match event {
+            Ok(event)
+                if matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                ) && event.paths.iter().any(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+                }) =>
+            {
+                changed = true;
+            }
+            Ok(_) => {}
+            Err(error) => watcher_error = Some(error),
+        }
+    }
+    if changed {
+        app.reload_workspace();
+    }
+    if let Some(error) = watcher_error {
+        app.status = format!("File watcher error: {error}");
+    }
+}
+
+fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Result<()> {
     loop {
+        process_workspace_events(workspace_events, app);
         terminal.draw(|f| ui::draw(f, app))?;
-        if !event::poll(Duration::from_millis(250))? {
+        if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
         match event::read()? {
@@ -126,7 +173,8 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
                 app.handle_paste(&text);
             }
             Event::Resize(_, _) => {}
-            Event::FocusGained | Event::FocusLost => {}
+            Event::FocusGained => app.reload_workspace(),
+            Event::FocusLost => {}
         }
     }
     Ok(())
@@ -145,6 +193,7 @@ fn main() -> Result<()> {
     let storage = resolve_storage()?;
     storage.ensure_files()?;
     let mut app = App::new(storage)?;
+    let (_watcher, workspace_events) = watch_workspace(&app.storage.root)?;
 
     enter_tui()?;
     let _guard = TerminalGuard;
@@ -152,6 +201,71 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    run(&mut terminal, &mut app).context("event loop failed")?;
+    run(&mut terminal, &mut app, &workspace_events).context("event loop failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use notify::event::ModifyKind;
+
+    use super::*;
+    use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
+
+    #[test]
+    fn markdown_change_events_reload_the_visible_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let document_path = directory.path().join("live.md");
+        fs::write(&document_path, "before").unwrap();
+
+        let mut app = App::new(storage).unwrap();
+        app.center_view = CenterView::Document;
+        app.document = Some(Document {
+            kind: DocumentKind::File(document_path.clone()),
+            title: "live".into(),
+            source: "before".into(),
+            scroll: 3,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+        });
+
+        app.storage.append_chat_message("external message").unwrap();
+        fs::write(&app.storage.todo_path, "# TODO\n\n- [ ] external task\n").unwrap();
+        fs::write(&document_path, "after").unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(document_path)
+            ))
+            .unwrap();
+        process_workspace_events(&receiver, &mut app);
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.todo_items.len(), 1);
+        assert_eq!(app.document.as_ref().unwrap().source, "after");
+        assert_eq!(app.document.as_ref().unwrap().scroll, 3);
+    }
+
+    #[test]
+    fn non_markdown_events_do_not_reload_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+        app.storage.append_chat_message("not loaded yet").unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(directory.path().join("editor.tmp"))))
+            .unwrap();
+        process_workspace_events(&receiver, &mut app);
+
+        assert!(app.messages.is_empty());
+    }
 }

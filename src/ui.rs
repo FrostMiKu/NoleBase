@@ -721,9 +721,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let lines = crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((document.scroll, 0))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).scroll((document.scroll, 0)),
         document_area,
     );
 }
@@ -1735,5 +1733,29 @@ mod tests {
             .map(|x| buffer[(x, 2)].symbol().to_string())
             .collect();
         assert!(first_document_row.contains("needle"));
+    }
+
+    #[test]
+    fn document_code_block_background_has_no_wrapped_gaps() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.center_view = CenterView::Document;
+        app.document = Some(Document {
+            kind: DocumentKind::File(app.storage.archive_path.clone()),
+            title: "Code".to_string(),
+            source: "```rust\nfn main() {\n    println!(\"hello\");\n}\n```".to_string(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+        });
+
+        let terminal = render(&mut app, 80, 20);
+        let buffer = terminal.backend().buffer();
+        let background = Color::Rgb(32, 36, 43);
+        let rows = (0..buffer.area().height)
+            .filter(|y| (0..buffer.area().width).any(|x| buffer[(x, *y)].bg == background))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 7);
+        assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
     }
 }

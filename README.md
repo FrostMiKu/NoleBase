@@ -62,7 +62,9 @@ full syntax rules live in the sibling MBDown workspace.
 
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
 opens that file in `$EDITOR` (then `$VISUAL`, then `vi`). Search and message
-editing also use Center instead of covering the workspace with a popup.
+editing also use Center instead of covering the workspace with a popup. External
+changes to Markdown files under the note directory are detected automatically;
+Chat, ToDo, Files, Search, and an open document refresh without restarting Note.
 
 ## Keybindings
 

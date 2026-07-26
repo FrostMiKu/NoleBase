@@ -345,10 +345,14 @@ impl App {
     }
 
     pub fn reload(&mut self) {
+        let selected_id = self.selected_id().map(str::to_owned);
         match self.storage.load_messages() {
             Ok(messages) => {
                 self.messages = messages;
-                self.selected = self.selected.min(self.messages.len().saturating_sub(1));
+                self.selected = selected_id
+                    .as_deref()
+                    .and_then(|id| self.messages.iter().position(|message| message.id == id))
+                    .unwrap_or_else(|| self.selected.min(self.messages.len().saturating_sub(1)));
             }
             Err(error) => self.set_status(format!("Reload error: {error}")),
         }
@@ -1764,6 +1768,24 @@ mod tests {
         assert_eq!(app.center_view, CenterView::Chat);
         assert_eq!(app.files_context, FilesContext::Browse);
         assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn reload_keeps_the_selected_message_by_id() {
+        let (mut app, _directory) = make_app();
+        let first = app.storage.append_chat_message("first").unwrap();
+        let second = app.storage.append_chat_message("second").unwrap();
+        app.reload();
+        app.selected = app
+            .messages
+            .iter()
+            .position(|message| message.id == second.id)
+            .unwrap();
+
+        app.storage.remove_message_by_id(&first.id).unwrap();
+        app.reload();
+
+        assert_eq!(app.selected_id(), Some(second.id.as_str()));
     }
 
     #[test]
