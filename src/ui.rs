@@ -473,7 +473,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         let prefix = format!("{}  ", message.created_at.format(TIME_FMT));
         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
         let body_width = content_width.saturating_sub(prefix_width).max(1);
-        let markdown_lines = crate::markdown::to_lines(&message.body);
+        let markdown_lines = crate::markdown::to_lines_at_width(&message.body, body_width);
         let mut card_row = 0;
         for markdown_line in markdown_lines {
             let wrapped_rows = wrap_spans_to_width(&markdown_line.spans, body_width);
@@ -719,7 +719,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .min(u16::MAX as usize) as u16;
     }
-    let lines = crate::markdown::to_lines(&document.source);
+    let lines = crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((document.scroll, 0))
@@ -1660,14 +1660,29 @@ mod tests {
     fn chat_renders_block_markdown_on_colored_cards() {
         let (mut app, _directory) = make_app();
         app.storage
-            .append_chat_message("# Heading\n\n- first\n- second\n\n`code`")
+            .append_chat_message(concat!(
+                "# Heading\n\n- first\n- second\n\n`code`\n\n",
+                "[columns gap=2]\n",
+                "[column]Left[/column]\n",
+                "[column]Right[/column]\n",
+                "[/columns]\n\n",
+                "[bg=196]colored[/bg]"
+            ))
             .unwrap();
         app.reload();
-        let terminal = render(&mut app, 170, 24);
+        let terminal = render(&mut app, 170, 40);
         let screen = buffer_string(&terminal);
+        let buffer = terminal.backend().buffer();
         for expected in ["Heading", "• first", "• second", "code"] {
             assert!(screen.contains(expected), "missing {expected}");
         }
+        assert!(screen
+            .lines()
+            .any(|line| line.contains("Left") && line.contains("Right")));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "c" && cell.bg == Color::Indexed(196)));
         assert!(!screen.contains("[view]"));
         assert!(
             app.hitboxes
@@ -1675,7 +1690,6 @@ mod tests {
                 .all(|hitbox| hitbox.action != Action::View),
             "Markdown messages no longer need a preview button"
         );
-        let buffer = terminal.backend().buffer();
         assert!(
             buffer.content().iter().any(|cell| {
                 cell.symbol() == "H"

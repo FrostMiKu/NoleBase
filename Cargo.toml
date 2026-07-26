@@ -12,7 +12,8 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
-pulldown-cmark = "0.13"
+mbdown = { path = "../mbterm/crates/mbdown" }
+mbtui = { path = "../mbterm/crates/mbtui" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"

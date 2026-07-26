@@ -38,6 +38,28 @@ Messages are stored in `CHAT.md` and shown as cards. Each card provides:
 Messages render Markdown directly in Chat. Press `v` when a dedicated document
 view is useful for scrolling through a long message.
 
+## Markup
+
+Chat cards and document views parse the shared MBDown language with `mbdown`,
+then render its AST directly to Ratatui with `mbtui`. There is no ANSI
+round-trip. In addition to CommonMark, notes may use restricted BBCode for
+terminal colors, backgrounds, boxes, and responsive columns:
+
+```text
+[box title="Status" width=full border=single bg=17]
+[color=bright-cyan]Ready[/color]
+[/box]
+
+[columns gap=2]
+[column width=1fr]Left[/column]
+[column width=2fr bg=#202830]Right[/column]
+[/columns]
+```
+
+Columns stack when the center pane is too narrow. Widths are Unicode terminal
+columns, and background colors fill the complete Box or column rectangle. The
+full syntax rules live in the sibling MBDown workspace.
+
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
 opens that file in `$EDITOR` (then `$VISUAL`, then `vi`). Search and message
 editing also use Center instead of covering the workspace with a popup.
@@ -133,6 +155,15 @@ Moves and deletes edit only the relevant block, preserving unrelated manual
 changes.
 
 ## Build and check
+
+The workspace expects `note` and the MBDown workspace to be
+sibling directories:
+
+```text
+Codes/
+  mbterm/
+  note/
+```
 
 ```bash
 cargo run -q
