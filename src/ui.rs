@@ -11,6 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, CenterView, FilesContext, Focus, LayoutSnapshot, Overlay};
 use crate::model::{Action, ButtonHitbox, FileHitbox, SearchHit, SearchHitbox, TodoHitbox};
 
+const DATE_FMT: &str = "%Y-%m-%d";
 const TIME_FMT: &str = "%H:%M";
 const WIDE_BREAKPOINT: u16 = 170;
 const FILES_WIDTH: u16 = 30;
@@ -227,12 +228,14 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         }
         let row_height = 2.min(list_area.y + list_area.height - y);
         let selected = absolute_index == app.file_index;
-        let row_style = if selected && focused {
+        let row_style = if selected {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(if focused {
+                    Color::DarkGray
+                } else {
+                    Color::Indexed(235)
+                })
                 .add_modifier(Modifier::BOLD)
-        } else if selected {
-            Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -242,16 +245,22 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             .and_then(|name| name.to_str())
             .unwrap_or("?");
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {name}"), row_style))),
+            Paragraph::new(Line::from(format!(" {name}"))).style(row_style),
             Rect::new(list_area.x, y, list_area.width, 1),
         );
         if row_height > 1 {
             let modified: DateTime<Local> = file.modified.into();
+            let modified_style = Style::default().fg(if selected {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            });
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {}", modified.format("%m-%d %H:%M")),
-                    Style::default().fg(Color::DarkGray),
-                ))),
+                    modified_style,
+                )))
+                .style(row_style),
                 Rect::new(list_area.x, y + 1, list_area.width, 1),
             );
         }
@@ -470,37 +479,36 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
         let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
         lines.push(line_with_background(Vec::new(), width, card_style));
-        let prefix = format!("{}  ", message.created_at.format(TIME_FMT));
-        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-        let body_width = content_width.saturating_sub(prefix_width).max(1);
+        let date = message.created_at.format(DATE_FMT).to_string();
+        let time = message.created_at.format(TIME_FMT).to_string();
+        let metadata_width = UnicodeWidthStr::width(date.as_str());
+        let column_gap = 2;
+        let body_width = content_width
+            .saturating_sub(metadata_width + column_gap)
+            .max(1);
         let markdown_lines = crate::markdown::to_lines_at_width(&message.body, body_width);
-        let mut card_row = 0;
+        let mut body_rows = Vec::new();
         for markdown_line in markdown_lines {
-            let wrapped_rows = wrap_spans_to_width(&markdown_line.spans, body_width);
-            for wrapped in wrapped_rows {
-                let mut spans = Vec::with_capacity(wrapped.len() + 3);
-                spans.push(Span::raw(" ".repeat(horizontal_padding)));
-                spans.push(if card_row == 0 {
-                    Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray))
-                } else {
-                    Span::raw(" ".repeat(prefix_width))
-                });
-                spans.extend(wrapped);
-                lines.push(line_with_background(spans, width, card_style));
-                card_row += 1;
+            body_rows.extend(wrap_spans_to_width(&markdown_line.spans, body_width));
+        }
+        for row in 0..body_rows.len().max(2) {
+            let metadata = match row {
+                0 => format!("{date:>metadata_width$}"),
+                1 => format!("{time:>metadata_width$}"),
+                _ => " ".repeat(metadata_width),
+            };
+            let mut spans = Vec::with_capacity(body_rows.get(row).map_or(3, |body| body.len() + 3));
+            spans.push(Span::raw(" ".repeat(horizontal_padding)));
+            spans.push(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::raw(" ".repeat(column_gap)));
+            if let Some(body) = body_rows.get(row) {
+                spans.extend(body.iter().cloned());
             }
+            lines.push(line_with_background(spans, width, card_style));
         }
-        if card_row == 0 {
-            lines.push(line_with_background(
-                vec![
-                    Span::raw(" ".repeat(horizontal_padding)),
-                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                ],
-                width,
-                card_style,
-            ));
+        if body_rows.len() >= 2 {
+            lines.push(line_with_background(Vec::new(), width, card_style));
         }
-        lines.push(line_with_background(Vec::new(), width, card_style));
         let button_width = action_buttons_width();
         let button_start = horizontal_padding + content_width.saturating_sub(button_width);
         button_lines.push(lines.len());
@@ -711,6 +719,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect) {
         content.width,
         content.height.saturating_sub(2),
     );
+    let lines = crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
     if let Some(target_line) = document.target_line.take() {
         document.scroll = crate::markdown::rendered_row_for_source_line(
             &document.source,
@@ -719,7 +728,8 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .min(u16::MAX as usize) as u16;
     }
-    let lines = crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
+    let max_scroll = lines.len().saturating_sub(document_area.height as usize);
+    document.scroll = (document.scroll as usize).min(max_scroll) as u16;
     frame.render_widget(
         Paragraph::new(lines).scroll((document.scroll, 0)),
         document_area,
@@ -1410,8 +1420,8 @@ mod tests {
 
     #[test]
     fn narrow_files_and_todo_each_use_the_full_body_without_duplicates() {
-        let (mut app, directory) = make_app();
-        fs::write(directory.path().join("Work.md"), "work").unwrap();
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
         app.reload_files();
         app.focus = Focus::Files;
         let terminal = render(&mut app, 80, 18);
@@ -1438,6 +1448,35 @@ mod tests {
         assert_eq!(screen.matches("Todo").count(), 1);
         assert!(screen.contains("buy milk"));
         assert_eq!(app.todo_hitboxes.len(), 1);
+    }
+
+    #[test]
+    fn selected_file_background_covers_name_and_modified_time_rows() {
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+        app.reload_files();
+        app.focus = Focus::Files;
+
+        let terminal = render(&mut app, 170, 18);
+        let selected_path = app.note_files[app.file_index].path.clone();
+        let selected_area = app
+            .file_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.path == selected_path)
+            .expect("selected file hitbox")
+            .area;
+        assert_eq!(selected_area.height, 2);
+        let buffer = terminal.backend().buffer();
+        for y in selected_area.y..selected_area.y + selected_area.height {
+            for x in selected_area.x..selected_area.x + selected_area.width {
+                assert_eq!(buffer[(x, y)].bg, Color::DarkGray);
+            }
+        }
+        assert_eq!(
+            buffer[(selected_area.x + 1, selected_area.y + 1)].fg,
+            Color::Gray,
+            "modified time must remain legible on the selected background"
+        );
     }
 
     #[test]
@@ -1551,8 +1590,8 @@ mod tests {
 
     #[test]
     fn overlay_records_geometry_and_disables_all_background_hitboxes() {
-        let (mut app, directory) = make_app();
-        fs::write(directory.path().join("Work.md"), "work").unwrap();
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
         app.reload_files();
         app.storage.append_chat_message("hello").unwrap();
         app.reload();
@@ -1668,8 +1707,29 @@ mod tests {
             ))
             .unwrap();
         app.reload();
+        let date = app.messages[0].created_at.format("%Y-%m-%d").to_string();
+        let time = app.messages[0].created_at.format("%H:%M").to_string();
         let terminal = render(&mut app, 170, 40);
         let screen = buffer_string(&terminal);
+        let screen_lines = screen.lines().collect::<Vec<_>>();
+        let date_row = screen_lines
+            .iter()
+            .position(|line| line.contains(&date))
+            .expect("missing message date");
+        let date_line = screen_lines[date_row];
+        let time_line = screen_lines
+            .get(date_row + 1)
+            .filter(|line| line.contains(&time))
+            .expect("message time should be directly below its date");
+        assert_eq!(
+            date_line.find(&date).unwrap() + date.len(),
+            time_line.rfind(&time).unwrap() + time.len(),
+            "date and time should share a right edge"
+        );
+        assert!(
+            date_line.find("Heading").unwrap() > date_line.find(&date).unwrap() + date.len(),
+            "message body should be left-aligned in the column after the timestamp"
+        );
         let buffer = terminal.backend().buffer();
         for expected in ["Heading", "• first", "• second", "code"] {
             assert!(screen.contains(expected), "missing {expected}");
@@ -1710,6 +1770,32 @@ mod tests {
     }
 
     #[test]
+    fn single_line_message_uses_the_time_row_as_button_spacing() {
+        let (mut app, _directory) = make_app();
+        app.storage.append_chat_message("one line").unwrap();
+        app.reload();
+        let date = app.messages[0].created_at.format(DATE_FMT).to_string();
+        let time = app.messages[0].created_at.format(TIME_FMT).to_string();
+
+        let terminal = render(&mut app, 170, 20);
+        let screen = buffer_string(&terminal);
+        let rows = screen.lines().collect::<Vec<_>>();
+        let date_row = rows
+            .iter()
+            .position(|line| line.contains(&date) && line.contains("one line"))
+            .expect("date and body row");
+        assert!(rows[date_row + 1].contains(&time));
+        let button_row = app
+            .hitboxes
+            .iter()
+            .find(|hitbox| hitbox.action == Action::Delete)
+            .expect("delete button")
+            .area
+            .y as usize;
+        assert_eq!(button_row, date_row + 2);
+    }
+
+    #[test]
     fn document_view_has_padding_without_an_outer_border() {
         let (mut app, _directory) = make_app();
         app.focus = Focus::Center;
@@ -1727,12 +1813,13 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert!(!buffer_string(&terminal).contains("┌"));
         assert!(buffer_string(&terminal).contains("  Archive"));
-        assert_eq!(app.document.as_ref().unwrap().scroll, 4);
+        assert_eq!(app.document.as_ref().unwrap().scroll, 0);
         assert_eq!(app.document.as_ref().unwrap().target_line, None);
         let first_document_row: String = (0..80)
             .map(|x| buffer[(x, 2)].symbol().to_string())
             .collect();
-        assert!(first_document_row.contains("needle"));
+        assert!(first_document_row.contains("Heading"));
+        assert!(buffer_string(&terminal).contains("needle"));
     }
 
     #[test]

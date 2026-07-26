@@ -1,6 +1,6 @@
 //! MBDown markup -> styled ratatui lines.
 //!
-//! MBDown owns the language and syntax tree. MBTUI owns Note's Ratatui layout.
+//! MBDown owns the language and syntax tree. MBTUI owns Nole's Ratatui layout.
 
 use std::sync::OnceLock;
 

@@ -1,4 +1,4 @@
-# note
+# nole
 
 A small terminal note app with a chat-style workflow. Capture text quickly, then
 move each message into ToDo, Archive, or a Markdown note without leaving the
@@ -20,9 +20,10 @@ popups:
   state.
 - **Compose** floats at the bottom of Chat on the same centered content axis.
 
-Files is a flat recent-files list, not a fake directory tree. Direct Markdown
-files under the note directory are sorted by last modification time, newest
-first. Pressing `f` focuses this list; it never opens a second file browser.
+Files is a flat recent-files list, not a fake directory tree. Direct `.md` and
+`.mb` files under the storage `data/` directory are sorted by last modification
+time, newest first. Pressing `f` focuses this list; it never opens a second file
+browser.
 
 ## Main workflow
 
@@ -63,8 +64,9 @@ full syntax rules live in the sibling MBDown workspace.
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
 opens that file in `$EDITOR` (then `$VISUAL`, then `vi`). Search and message
 editing also use Center instead of covering the workspace with a popup. External
-changes to Markdown files under the note directory are detected automatically;
-Chat, ToDo, Files, Search, and an open document refresh without restarting Note.
+changes to `.md` and `.mb` files under the note directory are detected
+automatically; Chat, ToDo, Files, Search, and an open document refresh without
+restarting Nole.
 
 ## Keybindings
 
@@ -128,29 +130,32 @@ pointer, and confirmations/Help block all interaction with the workspace below.
 
 ## Storage
 
-Data lives under `${NOTE_DIR}` when that environment variable is set, otherwise
-under `~/.note`:
+Data lives under `${NOLE_DIR}` when that environment variable is set, otherwise
+under `~/.nole`:
 
 ```text
-CHAT.md       # chat stream
-TODO.md       # tasks
-ARCHIVE.md    # archive
-<name>.md     # other notes
+CHAT.md        # chat stream
+TODO.md        # tasks
+ARCHIVE.md     # archive
+config/        # reserved for configuration
+data/          # flat note storage
+  <name>.md
+  <name>.mb
 ```
 
-`.md` and `.markdown` extensions are recognized case-insensitively. Only direct,
-regular files in the storage root are managed; symlinks, nested paths, and paths
-outside the root are rejected. `CHAT.md`, `TODO.md`, and `ARCHIVE.md` are
-protected from rename/delete, and protected names cannot be created. `CHAT.md`
-is excluded from Files; ToDo and Archive remain readable and externally
-editable.
+`.md` and `.mb` extensions are recognized case-insensitively. Files manages only
+direct, regular files in `data/`; symlinks, nested paths, and paths outside that
+directory are rejected. `CHAT.md`, `TODO.md`, and `ARCHIVE.md` stay at the
+storage root and are protected from rename/delete. On startup, ordinary `.md`
+and `.mb` files from the legacy root layout move into `data/`. Existing files in
+`data/` are never overwritten when a legacy name conflicts.
 
 `CHAT.md` stores each message in a hidden block:
 
 ```markdown
-<!-- note-msg id="…" created_at="2026-06-24T10:00:00+08:00" -->
+<!-- nole-msg id="…" created_at="2026-06-24T10:00:00+08:00" -->
 your message body
-<!-- /note-msg -->
+<!-- /nole-msg -->
 ```
 
 Moves and deletes edit only the relevant block, preserving unrelated manual
@@ -158,13 +163,13 @@ changes.
 
 ## Build and check
 
-The workspace expects `note` and the MBDown workspace to be
+The workspace expects `nole` and the MBDown workspace to be
 sibling directories:
 
 ```text
 Codes/
   mbterm/
-  note/
+  nole/
 ```
 
 ```bash

@@ -580,6 +580,10 @@ impl App {
         }
     }
 
+    pub fn handle_wheel(&mut self, column: u16, row: u16, delta: i32) {
+        self.route_wheel(column, row, delta);
+    }
+
     fn is_text_entry(&self) -> bool {
         self.focus == Focus::Compose
             || (self.focus == Focus::Center
@@ -1812,9 +1816,9 @@ mod tests {
 
     #[test]
     fn files_search_uses_note_files_without_duplicate_lists() {
-        let (mut app, directory) = make_app();
-        fs::write(directory.path().join("Work.md"), "work").unwrap();
-        fs::write(directory.path().join("Personal.md"), "personal").unwrap();
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+        fs::write(app.storage.data_dir.join("Personal.md"), "personal").unwrap();
         app.open_files();
         app.handle_key(key(KeyCode::Char('/')));
         assert_eq!(app.files_context, FilesContext::Search);
@@ -1833,8 +1837,8 @@ mod tests {
 
     #[test]
     fn file_enter_opens_center_document_and_escape_returns_to_files() {
-        let (mut app, directory) = make_app();
-        let path = directory.path().join("Project.md");
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n").unwrap();
         app.open_files();
         app.selected_file = Some(path.clone());
@@ -1857,8 +1861,8 @@ mod tests {
 
     #[test]
     fn file_edit_returns_terminal_command() {
-        let (mut app, directory) = make_app();
-        let path = directory.path().join("Project.md");
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n").unwrap();
         app.open_files();
         app.file_index = app
@@ -1891,8 +1895,8 @@ mod tests {
 
     #[test]
     fn file_rename_is_a_context_and_delete_is_an_overlay() {
-        let (mut app, directory) = make_app();
-        fs::write(directory.path().join("Old.md"), "old").unwrap();
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Old.md"), "old").unwrap();
         app.open_files();
         app.file_index = app
             .note_files
@@ -1934,8 +1938,8 @@ mod tests {
 
     #[test]
     fn file_search_result_keeps_its_source_line_as_a_document_anchor() {
-        let (mut app, directory) = make_app();
-        let path = directory.path().join("Project.md");
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n\nintro\n\nunique needle\n").unwrap();
         app.reload_files();
         app.open_search();
@@ -2058,8 +2062,8 @@ mod tests {
 
     #[test]
     fn clicking_a_file_opens_it_in_center() {
-        let (mut app, directory) = make_app();
-        let path = directory.path().join("Clicked.md");
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Clicked.md");
         fs::write(&path, "# Clicked\n").unwrap();
         app.open_files();
         app.file_hitboxes.push(FileHitbox {
@@ -2082,8 +2086,8 @@ mod tests {
 
     #[test]
     fn move_targets_exclude_protected_files() {
-        let (mut app, directory) = make_app();
-        fs::write(directory.path().join("Work.md"), "# Work\n").unwrap();
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Work.md"), "# Work\n").unwrap();
         add_message(&mut app, "file this");
         app.handle_key(key(KeyCode::Char('m')));
         let names: Vec<String> = app
@@ -2102,9 +2106,9 @@ mod tests {
 
     #[test]
     fn rename_error_keeps_modal_context_for_retry() {
-        let (mut app, directory) = make_app();
-        fs::write(directory.path().join("Old.md"), "old").unwrap();
-        fs::write(directory.path().join("Taken.md"), "taken").unwrap();
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Old.md"), "old").unwrap();
+        fs::write(app.storage.data_dir.join("Taken.md"), "taken").unwrap();
         app.open_files();
         app.file_index = app
             .note_files

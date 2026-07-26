@@ -1,13 +1,13 @@
-//! Markdown persistence for the note app.
+//! Markdown persistence for Nole.
 //!
 //! `CHAT.md` stores each message as a hidden HTML-comment block so that
 //! delete/move stay reliable even when pasted content contains blank lines or
 //! markdown:
 //!
 //! ```text
-//! <!-- note-msg id="<uuid>" created_at="<rfc3339>" -->
+//! <!-- nole-msg id="<uuid>" created_at="<rfc3339>" -->
 //! message body (may be multi-line)
-//! <!-- /note-msg -->
+//! <!-- /nole-msg -->
 //! ```
 //!
 //! Mutations are *surgical* (append a block, or remove the exact block for an
@@ -23,28 +23,32 @@ use chrono::{DateTime, Local};
 
 use crate::model::{Message, NoteFile, SearchHit, TodoItem};
 
-const OPEN_PREFIX: &str = "<!-- note-msg";
+const OPEN_PREFIX: &str = "<!-- nole-msg";
 const OPEN_SUFFIX: &str = "-->";
-const CLOSE_MARKER: &str = "<!-- /note-msg -->";
+const CLOSE_MARKER: &str = "<!-- /nole-msg -->";
 
 const CHAT_FILE: &str = "CHAT.md";
 const TODO_FILE: &str = "TODO.md";
 const ARCHIVE_FILE: &str = "ARCHIVE.md";
+const CONFIG_DIR: &str = "config";
+const DATA_DIR: &str = "data";
 
 /// Filesystem locations backing the notes.
 #[derive(Debug, Clone)]
 pub struct Storage {
     pub root: PathBuf,
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
     pub chat_path: PathBuf,
     pub todo_path: PathBuf,
     pub archive_path: PathBuf,
 }
 
 impl Storage {
-    /// Build a storage rooted at `~/.note`.
+    /// Build a storage rooted at `~/.nole`.
     pub fn default_root() -> Result<Self> {
         let home = dirs::home_dir().context("could not determine home directory")?;
-        let root = home.join(".note");
+        let root = home.join(".nole");
         Self::new(root)
     }
 
@@ -52,6 +56,8 @@ impl Storage {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         Ok(Self {
+            config_dir: root.join(CONFIG_DIR),
+            data_dir: root.join(DATA_DIR),
             chat_path: root.join(CHAT_FILE),
             todo_path: root.join(TODO_FILE),
             archive_path: root.join(ARCHIVE_FILE),
@@ -59,10 +65,14 @@ impl Storage {
         })
     }
 
-    /// Create the root directory and default files if they are missing.
+    /// Create the storage layout and default files, migrating legacy root notes.
     pub fn ensure_files(&self) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("creating {}", self.root.display()))?;
+        fs::create_dir_all(&self.config_dir)
+            .with_context(|| format!("creating {}", self.config_dir.display()))?;
+        fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating {}", self.data_dir.display()))?;
         if !self.chat_path.exists() {
             fs::write(&self.chat_path, "")?;
         }
@@ -71,6 +81,33 @@ impl Storage {
         }
         if !self.archive_path.exists() {
             fs::write(&self.archive_path, "# Archive\n\n")?;
+        }
+        self.migrate_legacy_root_notes()?;
+        Ok(())
+    }
+
+    fn migrate_legacy_root_notes(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if !is_note_path(&path) || is_protected_note_name(&path) {
+                continue;
+            }
+            let destination = self.data_dir.join(entry.file_name());
+            if destination.exists() {
+                continue;
+            }
+            fs::rename(&path, &destination).with_context(|| {
+                format!(
+                    "migrating legacy note {} to {}",
+                    path.display(),
+                    destination.display()
+                )
+            })?;
         }
         Ok(())
     }
@@ -178,9 +215,9 @@ impl Storage {
         Ok(toggled)
     }
 
-    /// Case-insensitive substring search across every managed `.md` file
-    /// (excluding `CHAT.md`, whose content is searched as messages). One hit
-    /// per matching non-blank line. Capped to keep the result list bounded.
+    /// Case-insensitive substring search across every managed `.md`/`.mb` file
+    /// in `data/`. One hit per matching non-blank line. Capped to keep the
+    /// result list bounded.
     pub fn search_file_lines(&self, query: &str) -> Vec<SearchHit> {
         let q = query.to_lowercase();
         if q.is_empty() {
@@ -212,9 +249,9 @@ impl Storage {
         out
     }
 
-    /// Append a message to a target markdown file under the root, then remove
-    /// it from the chat. Append happens first. Returns the bytes appended to
-    /// the target (used by undo).
+    /// Append a message to a managed data note or the root archive, then remove
+    /// it from chat. Append happens first. Returns the bytes appended to the
+    /// target (used by undo).
     pub fn move_to_markdown(&self, target: &Path, msg: &Message) -> Result<String> {
         let safe = self.validate_target(target)?;
         let content = append_markdown_section(&safe, msg)?;
@@ -264,7 +301,7 @@ impl Storage {
         Ok(true)
     }
 
-    /// Create a new markdown file from a user-entered name, returning its path.
+    /// Create a new note in `data/` from a user-entered name, returning its path.
     /// Existing filesystem entries are never overwritten.
     pub fn create_named_file(&self, name: &str) -> Result<PathBuf> {
         let file_name = normalize_new_name(name)?;
@@ -272,9 +309,9 @@ impl Storage {
             bail!("{file_name} is reserved and cannot be created");
         }
 
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("creating {}", self.root.display()))?;
-        let path = self.root.join(&file_name);
+        fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating {}", self.data_dir.display()))?;
+        let path = self.data_dir.join(&file_name);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -284,7 +321,7 @@ impl Storage {
         Ok(path)
     }
 
-    /// Rename a managed markdown file to `new_name` (normalized), returning the
+    /// Rename a managed data note to `new_name` (normalized), returning the
     /// new path. Refuses protected names and never overwrites an existing entry.
     pub fn rename_file(&self, from: &Path, new_name: &str) -> Result<PathBuf> {
         let from = self.validate_target(from)?;
@@ -296,7 +333,7 @@ impl Storage {
         if is_protected_note_name(Path::new(&name)) {
             bail!("{name} is reserved and cannot be used as a rename target");
         }
-        let to = self.root.join(&name);
+        let to = self.data_dir.join(&name);
         if to.file_name() == from.file_name() {
             return Ok(from);
         }
@@ -314,7 +351,7 @@ impl Storage {
         Ok(to)
     }
 
-    /// Delete a managed markdown file. Protected files cannot be deleted.
+    /// Delete a managed data note. Protected files cannot be deleted.
     pub fn delete_file(&self, path: &Path) -> Result<()> {
         let path = self.validate_target(path)?;
         if is_protected_note_name(&path) {
@@ -324,20 +361,19 @@ impl Storage {
         Ok(())
     }
 
-    /// Read a managed markdown file after applying the same path checks used by
+    /// Read a managed note after applying the same path checks used by
     /// mutating operations.
     pub fn read_note_file(&self, path: &Path) -> Result<String> {
         let path = self.validate_target(path)?;
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
     }
 
-    /// List managed markdown files by most recently modified, excluding CHAT.
-    /// Only direct, regular (non-symlink) children of the root are returned.
+    /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
     pub fn list_note_files(&self) -> Result<Vec<NoteFile>> {
         let mut files = Vec::new();
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("creating {}", self.root.display()))?;
-        for entry in fs::read_dir(&self.root)? {
+        fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating {}", self.data_dir.display()))?;
+        for entry in fs::read_dir(&self.data_dir)? {
             let Ok(entry) = entry else { continue };
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -347,7 +383,7 @@ impl Storage {
             }
 
             let path = entry.path();
-            if is_markdown_path(&path) && !is_chat_note_name(&path) {
+            if is_note_path(&path) {
                 let modified = entry
                     .metadata()
                     .and_then(|metadata| metadata.modified())
@@ -372,18 +408,21 @@ impl Storage {
             .collect())
     }
 
-    /// Ensure a target is a direct, regular markdown file under the root.
+    /// Ensure a target is a flat data note or one of the protected root files.
     /// Existing targets are canonicalized in full; symlinks are always rejected.
     pub fn validate_target(&self, target: &Path) -> Result<PathBuf> {
-        if !is_markdown_path(target) {
+        if !is_note_path(target) {
             bail!(
-                "target must have a .md or .markdown extension: {}",
+                "target must have a .md or .mb extension: {}",
                 target.display()
             );
         }
 
         let canonical_root = fs::canonicalize(&self.root)
             .with_context(|| format!("resolving note root {}", self.root.display()))?;
+        let canonical_data = fs::canonicalize(&self.data_dir).with_context(|| {
+            format!("resolving note data directory {}", self.data_dir.display())
+        })?;
         match fs::symlink_metadata(target) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
@@ -394,10 +433,14 @@ impl Storage {
                 }
                 let canonical_target = fs::canonicalize(target)
                     .with_context(|| format!("resolving note target {}", target.display()))?;
-                if canonical_target.parent() != Some(canonical_root.as_path()) {
+                let parent = canonical_target.parent();
+                let is_data_note = parent == Some(canonical_data.as_path());
+                let is_special = parent == Some(canonical_root.as_path())
+                    && is_protected_note_name(&canonical_target);
+                if !is_data_note && !is_special {
                     bail!(
-                        "target must be a direct child of note root {}: {}",
-                        self.root.display(),
+                        "target must be a direct child of {}: {}",
+                        self.data_dir.display(),
                         target.display()
                     );
                 }
@@ -409,10 +452,13 @@ impl Storage {
                     .context("note target has no parent directory")?;
                 let canonical_parent = fs::canonicalize(parent)
                     .with_context(|| format!("resolving target parent {}", parent.display()))?;
-                if canonical_parent != canonical_root {
+                let is_data_note = canonical_parent == canonical_data;
+                let is_special =
+                    canonical_parent == canonical_root && is_protected_note_name(target);
+                if !is_data_note && !is_special {
                     bail!(
-                        "target must be a direct child of note root {}: {}",
-                        self.root.display(),
+                        "target must be a direct child of {}: {}",
+                        self.data_dir.display(),
                         target.display()
                     );
                 }
@@ -425,24 +471,16 @@ impl Storage {
     }
 }
 
-fn is_markdown_path(path: &Path) -> bool {
+fn is_note_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
         })
 }
 
-fn is_chat_note_name(path: &Path) -> bool {
-    is_markdown_path(path)
-        && path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| stem.eq_ignore_ascii_case("CHAT"))
-}
-
 fn is_protected_note_name(path: &Path) -> bool {
-    is_markdown_path(path)
+    is_note_path(path)
         && path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -453,7 +491,7 @@ fn is_protected_note_name(path: &Path) -> bool {
             })
 }
 
-/// Normalize a user-entered file name: trim, require `.md`, reject traversal.
+/// Normalize a user-entered file name: trim, default to `.md`, reject traversal.
 pub fn normalize_new_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -466,7 +504,7 @@ pub fn normalize_new_name(name: &str) -> Result<String> {
         bail!("file name must not be absolute");
     }
     let lower = trimmed.to_ascii_lowercase();
-    if !(lower.ends_with(".md") || lower.ends_with(".markdown")) {
+    if !(lower.ends_with(".md") || lower.ends_with(".mb")) {
         Ok(format!("{trimmed}.md"))
     } else {
         Ok(trimmed.to_string())
@@ -484,7 +522,7 @@ fn stem(file_name: &str) -> &str {
 pub fn render_block(msg: &Message) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "<!-- note-msg id=\"{}\" created_at=\"{}\" -->\n",
+        "<!-- nole-msg id=\"{}\" created_at=\"{}\" -->\n",
         msg.id,
         msg.created_at.to_rfc3339()
     ));
@@ -554,7 +592,7 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
 
 /// Return the byte range `[start, end)` of the block for `id`, markers included.
 fn find_block_range(text: &str, id: &str) -> Option<(usize, usize)> {
-    let needle_open = format!("<!-- note-msg id=\"{id}\"");
+    let needle_open = format!("<!-- nole-msg id=\"{id}\"");
     let open_start = text.find(&needle_open)?;
     // End of the open marker line (including its newline).
     let after_open = &text[open_start..];
@@ -757,7 +795,7 @@ mod tests {
     fn search_file_lines_finds_matches_case_insensitively() {
         let (_dir, st) = fresh();
         st.create_named_file("Project").unwrap();
-        let p = st.root.join("Project.md");
+        let p = st.data_dir.join("Project.md");
         fs::write(&p, "# Project\n\nA note about Rust speed\n\nunrelated\n").unwrap();
 
         let hits = st.search_file_lines("rust");
@@ -888,29 +926,29 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_traversal_and_preserves_markdown_extensions() {
+    fn normalize_rejects_traversal_and_preserves_note_extensions() {
         assert!(normalize_new_name("../etc").is_err());
         assert!(normalize_new_name("a/b").is_err());
         assert!(normalize_new_name("/abs").is_err());
         assert!(normalize_new_name("").is_err());
         assert_eq!(normalize_new_name("ok").unwrap(), "ok.md");
         assert_eq!(normalize_new_name("ok.MD").unwrap(), "ok.MD");
-        assert_eq!(normalize_new_name("ok.MarkDown").unwrap(), "ok.MarkDown");
+        assert_eq!(normalize_new_name("ok.MB").unwrap(), "ok.MB");
     }
 
     #[test]
     fn create_accepts_case_insensitive_extensions_and_refuses_existing_entries() {
         let (_dir, st) = fresh();
         let upper = st.create_named_file("upper.MD").unwrap();
-        let long = st.create_named_file("long.MarkDown").unwrap();
+        let mb = st.create_named_file("long.MB").unwrap();
         assert!(upper.is_file());
-        assert!(long.is_file());
+        assert!(mb.is_file());
 
         fs::write(&upper, "keep this").unwrap();
         assert!(st.create_named_file("upper.MD").is_err());
         assert_eq!(fs::read_to_string(&upper).unwrap(), "keep this");
 
-        let directory = st.root.join("directory.md");
+        let directory = st.data_dir.join("directory.md");
         fs::create_dir(&directory).unwrap();
         assert!(st.create_named_file("directory.md").is_err());
     }
@@ -920,9 +958,9 @@ mod tests {
         let (_dir, st) = fresh();
         for name in [
             "chat",
-            "Chat.MARKDOWN",
+            "Chat.MB",
             "todo.Md",
-            "TODO.markdown",
+            "TODO.mb",
             "archive",
             "Archive.MD",
         ] {
@@ -933,7 +971,7 @@ mod tests {
         }
 
         let source = st.create_named_file("source").unwrap();
-        for name in ["chat.md", "TODO.MarkDown", "archive.MD"] {
+        for name in ["chat.md", "TODO.MB", "archive.MD"] {
             assert!(
                 st.rename_file(&source, name).is_err(),
                 "protected rename target was accepted: {name}"
@@ -951,7 +989,7 @@ mod tests {
             assert!(path.exists());
         }
 
-        let mixed_case = st.root.join("tOdO.MarkDown");
+        let mixed_case = st.root.join("tOdO.mB");
         fs::write(&mixed_case, "protected").unwrap();
         assert!(st.rename_file(&mixed_case, "ordinary.md").is_err());
         assert!(st.delete_file(&mixed_case).is_err());
@@ -959,9 +997,9 @@ mod tests {
     }
 
     #[test]
-    fn rename_accepts_markdown_extensions_case_insensitively() {
+    fn rename_accepts_note_extensions_case_insensitively() {
         let (_dir, st) = fresh();
-        let from = st.create_named_file("before.MARKDOWN").unwrap();
+        let from = st.create_named_file("before.MB").unwrap();
         let to = st.rename_file(&from, "after.Md").unwrap();
         assert_eq!(to.file_name().unwrap(), "after.Md");
         assert!(to.is_file());
@@ -969,9 +1007,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_and_read_accept_direct_case_insensitive_markdown_files() {
+    fn validate_and_read_accept_direct_case_insensitive_note_files() {
         let (_dir, st) = fresh();
-        let path = st.root.join("Readable.MARKDOWN");
+        let path = st.data_dir.join("Readable.MB");
         fs::write(&path, "hello").unwrap();
 
         assert_eq!(
@@ -984,30 +1022,30 @@ mod tests {
     #[test]
     fn validate_rejects_nested_non_files_and_uses_configured_root_in_errors() {
         let (_dir, st) = fresh();
-        let nested_dir = st.root.join("nested");
+        let nested_dir = st.data_dir.join("nested");
         fs::create_dir(&nested_dir).unwrap();
         let nested = nested_dir.join("note.md");
         fs::write(&nested, "nested").unwrap();
         assert!(st.validate_target(&nested).is_err());
 
-        let directory = st.root.join("directory.md");
+        let directory = st.data_dir.join("directory.md");
         fs::create_dir(&directory).unwrap();
         assert!(st.validate_target(&directory).is_err());
 
         let error = st.validate_target(Path::new("/outside.md")).unwrap_err();
         let message = format!("{error:#}");
-        assert!(!message.contains("~/.note"));
+        assert!(!message.contains("~/.nole"));
         assert!(message.contains(&st.root.display().to_string()));
     }
 
     #[test]
-    fn list_handles_extensions_case_insensitively_and_excludes_chat_and_non_files() {
+    fn list_reads_only_flat_md_and_mb_files_from_data() {
         let (_dir, st) = fresh();
-        fs::write(st.root.join("alpha.MD"), "alpha").unwrap();
-        fs::write(st.root.join("beta.MarkDown"), "beta").unwrap();
-        fs::write(st.root.join("cHaT.mArKdOwN"), "hidden").unwrap();
-        fs::write(st.root.join("plain.txt"), "plain").unwrap();
-        fs::create_dir(st.root.join("directory.md")).unwrap();
+        fs::write(st.data_dir.join("alpha.MD"), "alpha").unwrap();
+        fs::write(st.data_dir.join("beta.mB"), "beta").unwrap();
+        fs::write(st.root.join("root-note.md"), "hidden").unwrap();
+        fs::write(st.data_dir.join("plain.txt"), "plain").unwrap();
+        fs::create_dir(st.data_dir.join("directory.md")).unwrap();
 
         let names: Vec<_> = st
             .list_markdown_files()
@@ -1016,14 +1054,9 @@ mod tests {
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
             .collect();
         assert!(names.contains(&"alpha.MD".to_string()));
-        assert!(names.contains(&"beta.MarkDown".to_string()));
-        assert!(names.contains(&"TODO.md".to_string()));
-        assert!(!names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("CHAT.md")));
-        assert!(!names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("CHAT.markdown")));
+        assert!(names.contains(&"beta.mB".to_string()));
+        assert!(!names.contains(&"root-note.md".to_string()));
+        assert!(!names.contains(&"TODO.md".to_string()));
         assert!(!names.contains(&"plain.txt".to_string()));
         assert!(!names.contains(&"directory.md".to_string()));
     }
@@ -1050,7 +1083,7 @@ mod tests {
         let outside_dir = tempdir().unwrap();
         let outside = outside_dir.path().join("outside.md");
         fs::write(&outside, "outside").unwrap();
-        let link = st.root.join("linked.MD");
+        let link = st.data_dir.join("linked.MD");
         symlink(&outside, &link).unwrap();
 
         assert!(st.validate_target(&link).is_err());
@@ -1062,10 +1095,47 @@ mod tests {
     }
 
     #[test]
-    fn ensure_files_creates_archive() {
+    fn ensure_files_creates_structured_layout() {
         let (_dir, st) = fresh();
+        assert!(st.config_dir.is_dir());
+        assert!(st.data_dir.is_dir());
+        assert_eq!(st.chat_path.parent(), Some(st.root.as_path()));
+        assert_eq!(st.todo_path.parent(), Some(st.root.as_path()));
         assert!(st.archive_path.exists());
+        assert_eq!(st.archive_path.parent(), Some(st.root.as_path()));
         assert_eq!(st.archive_path.file_name().unwrap(), "ARCHIVE.md");
+    }
+
+    #[test]
+    fn ensure_files_migrates_legacy_root_notes_without_overwriting() {
+        let root_dir = tempdir().unwrap();
+        let st = Storage::new(root_dir.path()).unwrap();
+        fs::create_dir_all(&st.data_dir).unwrap();
+        fs::write(st.root.join("Legacy.md"), "legacy").unwrap();
+        fs::write(st.root.join("Game.MB"), "game").unwrap();
+        fs::write(st.root.join("Conflict.md"), "root copy").unwrap();
+        fs::write(st.data_dir.join("Conflict.md"), "data copy").unwrap();
+
+        st.ensure_files().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(st.data_dir.join("Legacy.md")).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            fs::read_to_string(st.data_dir.join("Game.MB")).unwrap(),
+            "game"
+        );
+        assert!(!st.root.join("Legacy.md").exists());
+        assert!(!st.root.join("Game.MB").exists());
+        assert_eq!(
+            fs::read_to_string(st.root.join("Conflict.md")).unwrap(),
+            "root copy"
+        );
+        assert_eq!(
+            fs::read_to_string(st.data_dir.join("Conflict.md")).unwrap(),
+            "data copy"
+        );
     }
 
     #[test]
@@ -1073,12 +1143,12 @@ mod tests {
         // Even if a user hand-edits content around blocks, removals must not
         // eat unrelated lines.
         let (_dir, st) = fresh();
-        let text = "free text at top\n<!-- note-msg id=\"abc\" created_at=\"2026-06-18T17:20:00+08:00\" -->\nbody\n<!-- /note-msg -->\ntrailing\n";
+        let text = "free text at top\n<!-- nole-msg id=\"abc\" created_at=\"2026-06-18T17:20:00+08:00\" -->\nbody\n<!-- /nole-msg -->\ntrailing\n";
         fs::write(&st.chat_path, text).unwrap();
         assert!(st.remove_message_by_id("abc").unwrap());
         let after = fs::read_to_string(&st.chat_path).unwrap();
         assert!(after.contains("free text at top"));
         assert!(after.contains("trailing"));
-        assert!(!after.contains("note-msg"));
+        assert!(!after.contains("nole-msg"));
     }
 }

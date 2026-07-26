@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    Event, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -31,6 +31,8 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const EVENT_BATCH_LIMIT: usize = 16_384;
+const MAX_WHEEL_DELTA_PER_FRAME: i32 = 3;
 
 fn enter_tui() -> Result<()> {
     enable_raw_mode()?;
@@ -113,9 +115,9 @@ fn watch_workspace(path: &std::path::Path) -> Result<(RecommendedWatcher, WatchE
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
     })
-    .context("creating note directory watcher")?;
+    .context("creating Nole directory watcher")?;
     watcher
-        .watch(path, RecursiveMode::NonRecursive)
+        .watch(path, RecursiveMode::Recursive)
         .with_context(|| format!("watching {}", path.display()))?;
     Ok((watcher, receiver))
 }
@@ -132,7 +134,10 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
                 ) && event.paths.iter().any(|path| {
                     path.extension()
                         .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+                        .is_some_and(|extension| {
+                            extension.eq_ignore_ascii_case("md")
+                                || extension.eq_ignore_ascii_case("mb")
+                        })
                 }) =>
             {
                 changed = true;
@@ -156,34 +161,74 @@ fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Res
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if handle_command(app.handle_key(key), app, terminal)? {
-                    break;
+        let mut events = vec![event::read()?];
+        while events.len() < EVENT_BATCH_LIMIT && event::poll(Duration::ZERO)? {
+            events.push(event::read()?);
+        }
+        let mut pending_wheel = None;
+        let mut quit = false;
+        for event in events {
+            if let Event::Mouse(mouse) = &event {
+                let mouse = *mouse;
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollDown => Some(1),
+                    MouseEventKind::ScrollUp => Some(-1),
+                    _ => None,
+                };
+                if let Some(delta) = delta {
+                    let (_, _, accumulated) =
+                        pending_wheel.get_or_insert((mouse.column, mouse.row, 0));
+                    *accumulated += delta;
+                    continue;
                 }
-            }
-            // Ignore key release/repeat events (kitty protocol).
-            Event::Key(_) => {}
-            Event::Mouse(mouse) => {
+                flush_wheel(&mut pending_wheel, app);
                 if handle_command(app.handle_mouse(mouse), app, terminal)? {
+                    quit = true;
                     break;
                 }
+                continue;
             }
-            Event::Paste(text) => {
-                app.handle_paste(&text);
+            flush_wheel(&mut pending_wheel, app);
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if handle_command(app.handle_key(key), app, terminal)? {
+                        quit = true;
+                        break;
+                    }
+                }
+                // Ignore key release/repeat events (kitty protocol).
+                Event::Key(_) => {}
+                Event::Mouse(_) => unreachable!("mouse events handled above"),
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                }
+                Event::Resize(_, _) => {}
+                Event::FocusGained => app.reload_workspace(),
+                Event::FocusLost => {}
             }
-            Event::Resize(_, _) => {}
-            Event::FocusGained => app.reload_workspace(),
-            Event::FocusLost => {}
+        }
+        flush_wheel(&mut pending_wheel, app);
+        if quit {
+            break;
         }
     }
     Ok(())
 }
 
+fn flush_wheel(pending: &mut Option<(u16, u16, i32)>, app: &mut App) {
+    if let Some((column, row, delta)) = pending.take() {
+        app.handle_wheel(
+            column,
+            row,
+            delta.clamp(-MAX_WHEEL_DELTA_PER_FRAME, MAX_WHEEL_DELTA_PER_FRAME),
+        );
+    }
+}
+
 fn resolve_storage() -> Result<storage::Storage> {
-    // NOTE_DIR overrides the default ~/.note location — handy for testing or
+    // NOLE_DIR overrides the default ~/.nole location - handy for testing or
     // keeping multiple notebooks without ever touching the real data dir.
-    match std::env::var("NOTE_DIR") {
+    match std::env::var("NOLE_DIR") {
         Ok(dir) if !dir.trim().is_empty() => storage::Storage::new(dir.trim()),
         _ => storage::Storage::default_root(),
     }
@@ -210,6 +255,7 @@ mod tests {
     use std::fs;
 
     use notify::event::ModifyKind;
+    use ratatui::layout::Rect;
 
     use super::*;
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
@@ -219,7 +265,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let document_path = directory.path().join("live.md");
+        let document_path = storage.data_dir.join("live.mb");
         fs::write(&document_path, "before").unwrap();
 
         let mut app = App::new(storage).unwrap();
@@ -267,5 +313,32 @@ mod tests {
         process_workspace_events(&receiver, &mut app);
 
         assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn queued_wheel_events_are_limited_to_one_frame_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+        app.focus = crate::app::Focus::Center;
+        app.center_view = CenterView::Document;
+        app.layout.center = Some(Rect::new(0, 0, 80, 20));
+        app.document = Some(Document {
+            kind: DocumentKind::File(directory.path().join("long.md")),
+            title: "long".into(),
+            source: "line\n".repeat(100),
+            scroll: 10,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+        });
+
+        let mut down = Some((10, 10, 200));
+        flush_wheel(&mut down, &mut app);
+        assert_eq!(app.document.as_ref().unwrap().scroll, 13);
+
+        let mut up = Some((10, 10, -200));
+        flush_wheel(&mut up, &mut app);
+        assert_eq!(app.document.as_ref().unwrap().scroll, 10);
     }
 }

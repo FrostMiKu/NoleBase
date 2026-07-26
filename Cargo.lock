@@ -588,8 +588,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "note"
-version = "0.1.0"
+name = "nole"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
