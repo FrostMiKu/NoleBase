@@ -1,5 +1,6 @@
 //! Application state and event handling.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -501,6 +502,66 @@ pub(crate) struct DocumentRenderCache {
     pub rendered: crate::markdown::RenderedMarkup,
 }
 
+const DOCUMENT_CACHE_CAPACITY: usize = 8;
+const DOCUMENT_CACHE_MAX_CELLS: usize = 4_000_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedDocumentRender {
+    kind: DocumentKind,
+    source: String,
+    render: DocumentRenderCache,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DocumentRenderLru {
+    entries: VecDeque<CachedDocumentRender>,
+}
+
+impl DocumentRenderLru {
+    fn insert(&mut self, kind: DocumentKind, source: String, render: DocumentRenderCache) {
+        self.remove(&kind);
+        self.entries.push_front(CachedDocumentRender {
+            kind,
+            source,
+            render,
+        });
+        while self.entries.len() > DOCUMENT_CACHE_CAPACITY
+            || (self.entries.len() > 1 && self.approximate_cells() > DOCUMENT_CACHE_MAX_CELLS)
+        {
+            self.entries.pop_back();
+        }
+    }
+
+    fn take(&mut self, kind: &DocumentKind, source: &str) -> Option<DocumentRenderCache> {
+        let index = self.entries.iter().position(|entry| &entry.kind == kind)?;
+        let entry = self.entries.remove(index)?;
+        (entry.source == source).then_some(entry.render)
+    }
+
+    fn remove(&mut self, kind: &DocumentKind) {
+        self.entries.retain(|entry| &entry.kind != kind);
+    }
+
+    fn retarget_file(&mut self, from: &Path, to: &Path) {
+        for entry in &mut self.entries {
+            if matches!(&entry.kind, DocumentKind::File(path) if path == from) {
+                entry.kind = DocumentKind::File(to.to_path_buf());
+            }
+        }
+    }
+
+    fn approximate_cells(&self) -> usize {
+        self.entries.iter().fold(0usize, |total, entry| {
+            total.saturating_add(
+                entry
+                    .render
+                    .width
+                    .saturating_mul(entry.render.rendered.lines.len()),
+            )
+        })
+    }
+}
+
 impl Document {
     pub(crate) fn replace_source(&mut self, source: String) {
         if self.source != source {
@@ -625,6 +686,7 @@ pub struct App {
     pub files_context: FilesContext,
     pub overlay: Option<Overlay>,
     pub document: Option<Document>,
+    document_render_lru: DocumentRenderLru,
 
     pub messages: Vec<Message>,
     pub(crate) daily_vlist: DailyVirtualList,
@@ -737,6 +799,7 @@ impl App {
             files_context: FilesContext::Browse,
             overlay: None,
             document: None,
+            document_render_lru: DocumentRenderLru::default(),
             messages,
             daily_vlist: DailyVirtualList::default(),
             selected,
@@ -894,6 +957,8 @@ impl App {
                     // until that mapping arrives or the task finishes.
                 }
                 Err(error) => {
+                    self.document_render_lru
+                        .remove(&DocumentKind::File(path.clone()));
                     self.document = None;
                     self.center_view = CenterView::Chat;
                     self.focus = Focus::Center;
@@ -1951,15 +2016,12 @@ impl App {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Document".to_string());
-                self.document = Some(Document {
-                    kind: DocumentKind::File(candidate.path.clone()),
+                self.show_document(
+                    DocumentKind::File(candidate.path.clone()),
                     title,
                     source,
-                    scroll: 0,
-                    target_line: None,
-                    return_to: DocumentReturn::Chat,
-                    render_cache: None,
-                });
+                    DocumentReturn::Chat,
+                );
                 self.center_view = CenterView::Document;
                 self.focus = Focus::Center;
                 self.overlay = None;
@@ -2374,6 +2436,7 @@ impl App {
     }
 
     fn retarget_open_document(&mut self, from: &Path, to: &Path) -> bool {
+        self.document_render_lru.retarget_file(from, to);
         let Some(document) = self.document.as_mut() else {
             return false;
         };
@@ -3192,6 +3255,8 @@ impl App {
                     };
                     match result {
                         Ok(()) => {
+                            self.document_render_lru
+                                .remove(&DocumentKind::File(path.clone()));
                             self.set_status(format!(
                                 "Deleted {}",
                                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -4047,6 +4112,8 @@ impl App {
         if let Some(date) = daily_date {
             match self.storage.restore_archived_daily(date) {
                 Ok(()) => {
+                    self.document_render_lru
+                        .remove(&DocumentKind::File(path.clone()));
                     if self
                         .document
                         .as_ref()
@@ -4088,15 +4155,12 @@ impl App {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Document".to_string());
-                self.document = Some(Document {
-                    kind: DocumentKind::File(path.to_path_buf()),
+                self.show_document(
+                    DocumentKind::File(path.to_path_buf()),
                     title,
                     source,
-                    scroll: 0,
-                    target_line: None,
                     return_to,
-                    render_cache: None,
-                });
+                );
                 self.center_view = CenterView::Document;
                 self.focus = Focus::Center;
             }
@@ -4122,32 +4186,62 @@ impl App {
         let Some(message) = self.message_clone(id) else {
             return;
         };
-        self.document = Some(Document {
-            kind: DocumentKind::Message(message.id),
-            title: format!("Daily {}", message.created_at.format("%Y-%m-%d")),
-            source: message.body,
-            scroll: 0,
-            target_line: None,
+        self.show_document(
+            DocumentKind::Message(message.id),
+            format!("Daily {}", message.created_at.format("%Y-%m-%d")),
+            message.body,
             return_to,
-            render_cache: None,
-        });
+        );
         self.center_view = CenterView::Document;
         self.focus = Focus::Center;
     }
 
+    fn show_document(
+        &mut self,
+        kind: DocumentKind,
+        title: String,
+        source: String,
+        return_to: DocumentReturn,
+    ) {
+        self.stash_current_document();
+        let render_cache = self.document_render_lru.take(&kind, &source);
+        self.document = Some(Document {
+            kind,
+            title,
+            source,
+            scroll: 0,
+            target_line: None,
+            return_to,
+            render_cache,
+        });
+    }
+
+    fn stash_current_document(&mut self) {
+        let Some(mut document) = self.document.take() else {
+            return;
+        };
+        if let Some(render) = document.render_cache.take() {
+            self.document_render_lru
+                .insert(document.kind, document.source, render);
+        }
+    }
+
     fn close_document(&mut self) {
-        let Some(document) = self.document.take() else {
+        let Some(document) = self.document.as_ref() else {
             self.center_view = CenterView::Chat;
             return;
         };
-        match document.return_to {
+        let return_to = document.return_to;
+        let kind = document.kind.clone();
+        self.stash_current_document();
+        match return_to {
             DocumentReturn::Search => {
                 self.center_view = CenterView::Search;
                 self.focus = Focus::Center;
             }
             DocumentReturn::Chat => {
                 self.center_view = CenterView::Chat;
-                self.focus = if matches!(document.kind, DocumentKind::File(_)) {
+                self.focus = if matches!(kind, DocumentKind::File(_)) {
                     Focus::Files
                 } else {
                     Focus::Center
@@ -5755,6 +5849,88 @@ mod tests {
         document.replace_source("updated".to_string());
         assert!(document.render_cache.is_none());
         assert!(document.ensure_rendered(100));
+    }
+
+    #[test]
+    fn reopening_a_document_restores_its_app_level_render_cache() {
+        let (mut app, _directory) = make_app();
+        let first = app.storage.data_dir.join("First.md");
+        let second = app.storage.data_dir.join("Second.md");
+        fs::write(&first, "```rust\nfn main() {}\n```".repeat(100)).unwrap();
+        fs::write(&second, "# Second").unwrap();
+
+        app.open_file_document(&first, DocumentReturn::Chat);
+        assert!(app.document.as_mut().unwrap().ensure_rendered(80));
+        app.open_file_document(&second, DocumentReturn::Chat);
+        assert_eq!(app.document_render_lru.entries.len(), 1);
+
+        app.open_file_document(&first, DocumentReturn::Chat);
+        let document = app.document.as_mut().unwrap();
+        assert!(document.render_cache.is_some());
+        assert!(!document.ensure_rendered(80));
+    }
+
+    #[test]
+    fn reopening_a_changed_document_rejects_the_stale_render_cache() {
+        let (mut app, _directory) = make_app();
+        let first = app.storage.data_dir.join("First.md");
+        let second = app.storage.data_dir.join("Second.md");
+        fs::write(&first, "old source").unwrap();
+        fs::write(&second, "second source").unwrap();
+
+        app.open_file_document(&first, DocumentReturn::Chat);
+        app.document.as_mut().unwrap().ensure_rendered(80);
+        app.open_file_document(&second, DocumentReturn::Chat);
+        fs::write(&first, "new source").unwrap();
+
+        app.open_file_document(&first, DocumentReturn::Chat);
+        assert!(app.document.as_ref().unwrap().render_cache.is_none());
+        assert_eq!(app.document.as_ref().unwrap().source, "new source");
+    }
+
+    #[test]
+    fn inactive_document_cache_follows_a_file_rename() {
+        let (mut app, _directory) = make_app();
+        let from = app.storage.data_dir.join("Before.md");
+        let to = app.storage.data_dir.join("After.md");
+        let other = app.storage.data_dir.join("Other.md");
+        fs::write(&from, "cached source").unwrap();
+        fs::write(&other, "other source").unwrap();
+
+        app.open_file_document(&from, DocumentReturn::Chat);
+        app.document.as_mut().unwrap().ensure_rendered(80);
+        app.open_file_document(&other, DocumentReturn::Chat);
+        fs::rename(&from, &to).unwrap();
+        assert!(!app.retarget_open_document(&from, &to));
+
+        app.open_file_document(&to, DocumentReturn::Chat);
+        assert!(!app.document.as_mut().unwrap().ensure_rendered(80));
+    }
+
+    #[test]
+    fn document_render_lru_evicts_the_oldest_entries() {
+        let (mut app, _directory) = make_app();
+        let paths = (0..DOCUMENT_CACHE_CAPACITY + 3)
+            .map(|index| {
+                let path = app.storage.data_dir.join(format!("Note{index}.md"));
+                fs::write(&path, format!("note {index}")).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+
+        for path in &paths {
+            app.open_file_document(path, DocumentReturn::Chat);
+            app.document.as_mut().unwrap().ensure_rendered(80);
+        }
+
+        assert_eq!(
+            app.document_render_lru.entries.len(),
+            DOCUMENT_CACHE_CAPACITY
+        );
+        assert!(app.document_render_lru.entries.iter().all(|entry| {
+            entry.kind != DocumentKind::File(paths[0].clone())
+                && entry.kind != DocumentKind::File(paths[1].clone())
+        }));
     }
 
     #[test]
