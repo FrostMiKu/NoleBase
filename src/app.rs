@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
+use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -17,8 +18,8 @@ use crate::agent::{
     AskUserKind, AskUserRequest, AskUserResponse, PermissionMode, TokenUsage,
 };
 use crate::model::{
-    Action, ButtonHitbox, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow,
-    LinkHitbox, LinkTarget, Message, NoteFile, SearchHit, SearchHitbox, TodoHitbox, TodoItem,
+    Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
+    FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TodoHitbox, TodoItem,
     WikiLinkCandidate, WikiLinkHitbox,
 };
 use crate::notification::NotificationService;
@@ -162,7 +163,6 @@ fn move_cursor(buffer: &str, cursor: usize, movement: CursorMove) -> usize {
 pub enum Command {
     Quit,
     Edit(PathBuf),
-    EditMessage { id: String, body: String },
     OpenLink(String),
 }
 
@@ -295,14 +295,13 @@ enum CursorMove {
 
 #[derive(Debug, Clone)]
 enum UndoOp {
-    Delete(Message),
-    Archive(Message),
+    Delete(DailyNote),
+    Archive(DailyNote),
     Move {
-        message: Message,
+        daily_note: DailyNote,
         target: PathBuf,
         appended: String,
     },
-    Edit(Message),
 }
 
 /// Keyboard focus is independent from the content shown in the center pane.
@@ -318,7 +317,7 @@ pub enum Focus {
 /// Content currently occupying the center pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CenterView {
-    Chat,
+    Daily,
     Document,
     Search,
     DocumentSearch,
@@ -337,7 +336,7 @@ pub enum FilesContext {
 /// Modal state. Removing an overlay exposes the unchanged state beneath it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
-    ConfirmDeleteMessage,
+    ConfirmDeleteDaily,
     ConfirmDeleteFile,
     Help,
     AiPrompt,
@@ -347,7 +346,6 @@ pub enum Overlay {
     /// A caller-provided command dialog. Its mode and purpose live in
     /// [`DialogState`], allowing new command-style interactions without
     /// adding another overlay variant.
-    #[allow(dead_code)]
     Dialog,
 }
 
@@ -368,7 +366,7 @@ pub enum DialogMode {
 /// purpose controls the result that is sent to the owning subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogPurpose {
-    DeleteMessage,
+    DeleteDaily,
     DeleteFile,
     AgentPrompt,
     AgentApproval,
@@ -474,16 +472,16 @@ pub enum DialogResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentKind {
     File(PathBuf),
-    Message(String),
+    Daily(NaiveDate),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentReturn {
-    Chat,
+    Daily,
     Search,
 }
 
-/// A file or message rendered as markdown in the center pane.
+/// A regular or daily note rendered as Markdown in the center pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub kind: DocumentKind,
@@ -621,11 +619,12 @@ pub enum AgentPanelEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DailyCardRenderCache {
     pub width: usize,
-    pub id: String,
-    pub date: String,
+    pub date: NaiveDate,
+    pub date_label: String,
     pub body: String,
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::markdown::RenderedLink>,
+    pub images: Vec<mbtui::ImagePlacement>,
     pub button_line: usize,
     pub button_start: usize,
 }
@@ -636,11 +635,12 @@ pub(crate) struct AgentEntryRenderCache {
     pub entry: AgentPanelEntry,
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::markdown::RenderedLink>,
+    pub images: Vec<mbtui::ImagePlacement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DailyVirtualItem {
-    pub id: String,
+    pub date: NaiveDate,
     pub cache: Option<DailyCardRenderCache>,
 }
 
@@ -680,6 +680,7 @@ impl Default for AgentVirtualList {
 
 pub struct App {
     pub storage: Storage,
+    pub(crate) images: crate::media::ImageService,
 
     pub focus: Focus,
     pub center_view: CenterView,
@@ -688,12 +689,12 @@ pub struct App {
     pub document: Option<Document>,
     document_render_lru: DocumentRenderLru,
 
-    pub messages: Vec<Message>,
+    pub daily_notes: Vec<DailyNote>,
     pub(crate) daily_vlist: DailyVirtualList,
     pub selected: usize,
     pub scroll: u16,
     /// Set only when navigation should bring the selected card back on screen.
-    pub reveal_selected_message: bool,
+    pub reveal_selected_daily: bool,
 
     pub input: String,
     /// Insertion point in `input`, as a character index.
@@ -714,8 +715,8 @@ pub struct App {
     pub new_file_input: String,
     pub new_file_cursor: usize,
 
-    /// Message being moved/created/deleted by a contextual interaction.
-    pub pending_id: Option<String>,
+    /// Daily note being moved, filed, or deleted by a contextual interaction.
+    pub pending_daily_date: Option<NaiveDate>,
     /// File awaiting rename or delete confirmation.
     pub pending_file: Option<PathBuf>,
 
@@ -766,7 +767,7 @@ pub struct App {
     agent_conversation: AgentConversation,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
-    ai_source_id: Option<String>,
+    ai_source_date: Option<NaiveDate>,
     pub approval_request: Option<ApprovalRequest>,
     pub approval_scroll: u16,
     pub ask_user_request: Option<AskUserRequest>,
@@ -785,26 +786,28 @@ pub struct App {
 
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
-        let messages = storage.load_messages()?;
-        let selected = messages.len().saturating_sub(1);
+        let daily_notes = storage.load_daily_notes()?;
+        let selected = daily_notes.len().saturating_sub(1);
         let mut note_files = storage.list_note_files()?;
         let first_note = note_files.first().map(|file| file.path.clone());
         note_files.extend(storage.list_archived_note_files()?);
         let file_row = usize::from(first_note.is_some());
         let todo_items = storage.load_todo_tasks();
+        let images = crate::media::ImageService::new(&storage.root);
         Ok(Self {
             storage,
-            focus: Focus::Compose,
-            center_view: CenterView::Chat,
+            images,
+            focus: Focus::Center,
+            center_view: CenterView::Daily,
             files_context: FilesContext::Browse,
             overlay: None,
             document: None,
             document_render_lru: DocumentRenderLru::default(),
-            messages,
+            daily_notes,
             daily_vlist: DailyVirtualList::default(),
             selected,
             scroll: u16::MAX,
-            reveal_selected_message: true,
+            reveal_selected_daily: true,
             input: String::new(),
             input_cursor: 0,
             note_files,
@@ -818,7 +821,7 @@ impl App {
             rename_cursor: 0,
             new_file_input: String::new(),
             new_file_cursor: 0,
-            pending_id: None,
+            pending_daily_date: None,
             pending_file: None,
             todo_items,
             todo_index: 0,
@@ -858,7 +861,7 @@ impl App {
             agent_conversation: AgentConversation::default(),
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,
-            ai_source_id: None,
+            ai_source_date: None,
             approval_request: None,
             approval_scroll: 0,
             ask_user_request: None,
@@ -875,22 +878,22 @@ impl App {
     }
 
     pub fn reload(&mut self) {
-        let selected_id = self.selected_id().map(str::to_owned);
-        match self.storage.load_messages() {
-            Ok(messages) => {
-                self.messages = messages;
-                self.selected = selected_id
-                    .as_deref()
-                    .and_then(|id| self.messages.iter().position(|message| message.id == id))
-                    .unwrap_or_else(|| self.selected.min(self.messages.len().saturating_sub(1)));
+        let selected_date = self.selected_date();
+        match self.storage.load_daily_notes() {
+            Ok(daily_notes) => {
+                self.daily_notes = daily_notes;
+                self.selected = selected_date
+                    .and_then(|date| self.daily_notes.iter().position(|note| note.date == date))
+                    .unwrap_or_else(|| self.selected.min(self.daily_notes.len().saturating_sub(1)));
             }
             Err(error) => self.set_status(format!("Reload error: {error}")),
         }
     }
 
     pub fn advance_animation(&mut self) {
-        if self.center_view == CenterView::Chat
+        if self.center_view == CenterView::Daily
             || self.ai_running
+            || self.focus == Focus::Compose
             || self.permission_mode == PermissionMode::Bypass
         {
             self.animation_tick = self.animation_tick.wrapping_add(1);
@@ -937,15 +940,9 @@ impl App {
         ) {
             self.recompute_search();
         }
-        let document_path = self.document.as_ref().and_then(|document| {
-            if let DocumentKind::File(path) = &document.kind {
-                Some(path.clone())
-            } else {
-                None
-            }
-        });
-        if let Some(path) = document_path {
-            match self.storage.read_document_file(&path) {
+        let document_kind = self.document.as_ref().map(|document| document.kind.clone());
+        match document_kind {
+            Some(DocumentKind::File(path)) => match self.storage.read_document_file(&path) {
                 Ok(updated) => {
                     if let Some(document) = self.document.as_mut() {
                         document.replace_source(updated);
@@ -960,11 +957,28 @@ impl App {
                     self.document_render_lru
                         .remove(&DocumentKind::File(path.clone()));
                     self.document = None;
-                    self.center_view = CenterView::Chat;
+                    self.center_view = CenterView::Daily;
                     self.focus = Focus::Center;
                     self.set_status(format!("Reload error: {error}"));
                 }
+            },
+            Some(DocumentKind::Daily(date)) => {
+                match self.storage.read_daily_by_date(&date.to_string()) {
+                    Ok(updated) => {
+                        if let Some(document) = self.document.as_mut() {
+                            document.replace_source(updated.body);
+                        }
+                    }
+                    Err(error) => {
+                        self.document_render_lru.remove(&DocumentKind::Daily(date));
+                        self.document = None;
+                        self.center_view = CenterView::Daily;
+                        self.focus = Focus::Center;
+                        self.set_status(format!("Reload error: {error}"));
+                    }
+                }
             }
+            None => {}
         }
     }
 
@@ -1077,7 +1091,7 @@ impl App {
                     self.handle_agent_file_moved(&from, &to);
                 }
                 AgentEvent::OpenFile(path) => {
-                    self.open_file_document(&path, DocumentReturn::Chat);
+                    self.open_file_document(&path, DocumentReturn::Daily);
                     if self
                         .document
                         .as_ref()
@@ -1115,11 +1129,14 @@ impl App {
                     match result {
                         Ok(output) => {
                             self.agent_scroll = u16::MAX;
-                            self.set_status(if output.is_empty() {
-                                "Agent paused at the request-round limit"
+                            if output.is_empty() {
+                                self.notifications
+                                    .notify("Agent stopped at the request-round limit");
+                                self.set_status("Agent paused at the request-round limit");
                             } else {
-                                "Agent finished"
-                            });
+                                self.notifications.notify("Agent finished");
+                                self.set_status("Agent finished");
+                            }
                         }
                         Err(error) => {
                             for entry in &mut self.agent_panel {
@@ -1130,6 +1147,7 @@ impl App {
                             self.agent_panel
                                 .push(AgentPanelEntry::Error(format!("Agent failed: {error}")));
                             self.agent_scroll = u16::MAX;
+                            self.notifications.notify(format!("Agent failed: {error}"));
                             self.set_status(format!("AI error: {error}"));
                         }
                     }
@@ -1226,10 +1244,8 @@ impl App {
             .collect()
     }
 
-    pub fn selected_id(&self) -> Option<&str> {
-        self.messages
-            .get(self.selected)
-            .map(|message| message.id.as_str())
+    pub fn selected_date(&self) -> Option<NaiveDate> {
+        self.daily_notes.get(self.selected).map(|note| note.date)
     }
 
     pub fn open_files(&mut self) {
@@ -1372,7 +1388,7 @@ impl App {
             .filter(|_| self.center_view == CenterView::Document)
             .and_then(|document| match &document.kind {
                 DocumentKind::File(path) => Some(path.clone()),
-                DocumentKind::Message(_) => None,
+                DocumentKind::Daily(_) => None,
             })
     }
 
@@ -1425,7 +1441,6 @@ impl App {
     /// Open a caller-defined command dialog. The caller can inspect the
     /// resulting value with [`App::take_dialog_result`] after the dialog
     /// closes.
-    #[allow(dead_code)]
     pub fn open_dialog(&mut self, dialog: DialogState) {
         self.dialog_result = None;
         self.dialog = Some(dialog);
@@ -1437,7 +1452,7 @@ impl App {
         self.dialog_result.take()
     }
 
-    fn set_overlay(&mut self, overlay: Overlay) {
+    pub(crate) fn set_overlay(&mut self, overlay: Overlay) {
         self.overlay = Some(overlay);
         self.dialog = Some(self.dialog_for_overlay(overlay));
     }
@@ -1506,11 +1521,11 @@ impl App {
 
     fn dialog_for_overlay(&self, overlay: Overlay) -> DialogState {
         match overlay {
-            Overlay::ConfirmDeleteMessage => DialogState::new(
-                "Delete message",
-                "Delete this message?",
+            Overlay::ConfirmDeleteDaily => DialogState::new(
+                "Delete daily note",
+                "Delete this daily note?",
                 DialogMode::Confirm,
-                DialogPurpose::DeleteMessage,
+                DialogPurpose::DeleteDaily,
                 Vec::new(),
             ),
             Overlay::ConfirmDeleteFile => {
@@ -1670,76 +1685,6 @@ impl App {
         }
     }
 
-    /// Ensure dialogs opened by older call sites or tests are represented by
-    /// the shared state. Normal application paths call `set_overlay`, while
-    /// this fallback keeps direct overlay assignment deterministic.
-    pub fn ensure_dialog_state(&mut self) {
-        let Some(overlay) = self.overlay else {
-            self.dialog = None;
-            return;
-        };
-        let purpose = match overlay {
-            Overlay::ConfirmDeleteMessage => DialogPurpose::DeleteMessage,
-            Overlay::ConfirmDeleteFile => DialogPurpose::DeleteFile,
-            Overlay::Help => DialogPurpose::Help,
-            Overlay::AiPrompt => DialogPurpose::AgentPrompt,
-            Overlay::Approval => DialogPurpose::AgentApproval,
-            Overlay::AskUser => DialogPurpose::AskUser,
-            Overlay::WikiLinkChoice => DialogPurpose::WikiLinkChoice,
-            Overlay::Dialog => self
-                .dialog
-                .as_ref()
-                .map_or(DialogPurpose::Custom, |dialog| dialog.purpose),
-        };
-        let stale =
-            self.dialog.as_ref().is_none_or(|dialog| {
-                if dialog.purpose != purpose {
-                    return true;
-                }
-                match purpose {
-                    DialogPurpose::AgentPrompt => dialog.input != self.ai_prompt_input,
-                    DialogPurpose::NewFile => dialog.input != self.new_file_input,
-                    DialogPurpose::RenameFile => dialog.input != self.rename_input,
-                    DialogPurpose::AskUser => {
-                        dialog.input != self.ask_user_input
-                            || self.ask_user_request.as_ref().is_some_and(|request| {
-                                dialog.options.len() != request.options.len()
-                                    || dialog
-                                        .options
-                                        .iter()
-                                        .zip(request.options.iter())
-                                        .any(|(option, expected)| option.label != *expected)
-                            })
-                    }
-                    DialogPurpose::AgentApproval => {
-                        self.approval_request.as_ref().is_some_and(|request| {
-                            dialog.message != request.diff || dialog.title != request.title
-                        })
-                    }
-                    DialogPurpose::WikiLinkChoice => {
-                        dialog.options.len() != self.wiki_link_candidates.len()
-                            || self.wiki_link_candidates.iter().enumerate().any(
-                                |(index, candidate)| {
-                                    let expected = candidate
-                                        .path
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_default();
-                                    dialog
-                                        .options
-                                        .get(index)
-                                        .is_none_or(|option| option.label != expected)
-                                },
-                            )
-                    }
-                    _ => false,
-                }
-            });
-        if stale {
-            self.dialog = Some(self.dialog_for_overlay(overlay));
-        }
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self
@@ -1787,7 +1732,7 @@ impl App {
             Focus::Todo => self.handle_todo(key),
             Focus::Agent => self.handle_agent(key),
             Focus::Center => match self.center_view {
-                CenterView::Chat => self.handle_chat(key),
+                CenterView::Daily => self.handle_daily(key),
                 CenterView::Document => self.handle_document(key),
                 CenterView::Search | CenterView::DocumentSearch => self.handle_search(key),
             },
@@ -1797,7 +1742,6 @@ impl App {
     /// Paste into whichever orthogonal state currently owns a text buffer.
     pub fn handle_paste(&mut self, text: &str) {
         if self.overlay.is_some() {
-            self.ensure_dialog_state();
             let purpose = self.dialog.as_ref().map(|dialog| dialog.purpose);
             if matches!(
                 purpose,
@@ -1821,7 +1765,7 @@ impl App {
                     };
                     paste_into(&mut dialog.input, &mut dialog.cursor, &text);
                 }
-                self.sync_legacy_from_dialog();
+                self.sync_dialog_owner_state();
                 if purpose == Some(DialogPurpose::CommandPalette) {
                     self.refresh_command_palette();
                 }
@@ -1830,7 +1774,7 @@ impl App {
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match (self.focus, self.center_view, self.files_context) {
-            (Focus::Compose, CenterView::Chat | CenterView::Document, _) => {
+            (Focus::Compose, CenterView::Daily | CenterView::Document, _) => {
                 paste_into(&mut self.input, &mut self.input_cursor, &text)
             }
             (Focus::Center, CenterView::Search | CenterView::DocumentSearch, _) => {
@@ -1985,7 +1929,7 @@ impl App {
                     match self.storage.create_named_file(&requested) {
                         Ok(path) => {
                             self.reload_files();
-                            self.open_file_document(&path, DocumentReturn::Chat);
+                            self.open_file_document(&path, DocumentReturn::Daily);
                             self.set_status(format!("Created note {}", path.display()));
                         }
                         Err(error) => self.set_status(format!("Wiki note error: {error}")),
@@ -2020,7 +1964,7 @@ impl App {
                     DocumentKind::File(candidate.path.clone()),
                     title,
                     source,
-                    DocumentReturn::Chat,
+                    DocumentReturn::Daily,
                 );
                 self.center_view = CenterView::Document;
                 self.focus = Focus::Center;
@@ -2034,35 +1978,7 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
-    fn handle_wiki_link_choice(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.overlay = None;
-                self.wiki_link_target = None;
-                self.wiki_link_candidates.clear();
-                self.wiki_link_index = 0;
-            }
-            KeyCode::Up => {
-                self.wiki_link_index = self.wiki_link_index.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                self.wiki_link_index = (self.wiki_link_index + 1)
-                    .min(self.wiki_link_candidates.len().saturating_sub(1));
-            }
-            KeyCode::Enter => {
-                if let Some(candidate) =
-                    self.wiki_link_candidates.get(self.wiki_link_index).cloned()
-                {
-                    self.open_wiki_candidate(&candidate);
-                }
-            }
-            _ => {}
-        }
-        None
-    }
-
-    fn handle_chat(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_daily(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(Command::Quit),
             KeyCode::Tab | KeyCode::Char('i') | KeyCode::Enter => {
@@ -2070,11 +1986,11 @@ impl App {
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_message_selection(1);
+                self.move_daily_selection(1);
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.move_message_selection(-1);
+                self.move_daily_selection(-1);
                 None
             }
             KeyCode::Left => {
@@ -2087,21 +2003,21 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.selected = 0;
-                self.reveal_selected_message = true;
+                self.reveal_selected_daily = true;
                 None
             }
             KeyCode::Char('G') => {
-                self.selected = self.messages.len().saturating_sub(1);
-                self.reveal_selected_message = true;
+                self.selected = self.daily_notes.len().saturating_sub(1);
+                self.reveal_selected_daily = true;
                 None
             }
             KeyCode::PageDown => {
-                self.reveal_selected_message = false;
+                self.reveal_selected_daily = false;
                 self.scroll = self.scroll.saturating_add(5);
                 None
             }
             KeyCode::PageUp => {
-                self.reveal_selected_message = false;
+                self.reveal_selected_daily = false;
                 self.scroll = self.scroll.saturating_sub(5);
                 None
             }
@@ -2151,7 +2067,7 @@ impl App {
                 None
             }
             KeyCode::Right => {
-                if self.center_view == CenterView::Chat {
+                if self.center_view == CenterView::Daily {
                     self.focus = Focus::Center;
                 } else if let Some(group) = self.selected_file_group() {
                     let expanded = match group {
@@ -2167,7 +2083,7 @@ impl App {
                         *expanded = true;
                     }
                 } else {
-                    self.open_selected_file(DocumentReturn::Chat);
+                    self.open_selected_file(DocumentReturn::Daily);
                 }
                 None
             }
@@ -2197,7 +2113,7 @@ impl App {
                 if let Some(group) = self.selected_file_group() {
                     self.toggle_file_group(group);
                 } else {
-                    self.open_selected_file(DocumentReturn::Chat);
+                    self.open_selected_file(DocumentReturn::Daily);
                 }
                 None
             }
@@ -2258,7 +2174,7 @@ impl App {
                 None
             }
             KeyCode::Enter => {
-                self.open_selected_file(DocumentReturn::Chat);
+                self.open_selected_file(DocumentReturn::Daily);
                 None
             }
             KeyCode::Backspace => {
@@ -2300,7 +2216,7 @@ impl App {
     }
 
     fn begin_new_note(&mut self) {
-        self.pending_id = None;
+        self.pending_daily_date = None;
         self.new_file_input.clear();
         self.new_file_cursor = 0;
         self.files_context = FilesContext::NewTarget;
@@ -2318,13 +2234,13 @@ impl App {
                 let name = self.new_file_input.clone();
                 match self.storage.create_named_file(&name) {
                     Ok(path) => {
-                        if let Some(id) = self.pending_id.clone() {
-                            self.perform_move_to_id(&path, &id);
+                        if let Some(date) = self.pending_daily_date {
+                            self.perform_move_to_date(&path, date);
                         } else {
                             self.files_context = FilesContext::Browse;
                             self.reload_files();
                             self.selected_file = Some(path.clone());
-                            self.open_file_document(&path, DocumentReturn::Chat);
+                            self.open_file_document(&path, DocumentReturn::Daily);
                             self.set_status(format!("Created note {}", path.display()));
                         }
                     }
@@ -2547,7 +2463,7 @@ impl App {
                 self.center_view = if document_search && self.document.is_some() {
                     CenterView::Document
                 } else {
-                    CenterView::Chat
+                    CenterView::Daily
                 };
                 None
             }
@@ -2613,7 +2529,7 @@ impl App {
             }
             KeyCode::Char('e') => match self.document.as_ref().map(|doc| &doc.kind) {
                 Some(DocumentKind::File(path)) => Some(Command::Edit(path.clone())),
-                Some(DocumentKind::Message(id)) => self.message_edit_command(id),
+                Some(DocumentKind::Daily(date)) => self.daily_edit_command(*date),
                 None => None,
             },
             KeyCode::Char('a')
@@ -2652,7 +2568,6 @@ impl App {
     }
 
     fn handle_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        self.ensure_dialog_state();
         self.handle_dialog_key(key)
     }
 
@@ -2662,12 +2577,12 @@ impl App {
             return None;
         };
         match dialog.purpose {
-            DialogPurpose::DeleteMessage => {
+            DialogPurpose::DeleteDaily => {
                 return match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                        self.handle_delete_message_overlay(key)
+                        self.handle_delete_daily_overlay(key)
                     }
-                    _ => self.handle_delete_message_overlay(key),
+                    _ => self.handle_delete_daily_overlay(key),
                 };
             }
             DialogPurpose::DeleteFile => return self.handle_delete_file_overlay(key),
@@ -3070,7 +2985,7 @@ impl App {
                 self.insert_dialog_char('\n');
             }
             KeyCode::Enter => {
-                self.sync_legacy_from_dialog();
+                self.sync_dialog_owner_state();
                 match self.dialog.as_ref().map(|dialog| dialog.purpose) {
                     Some(DialogPurpose::AgentPrompt) => self.submit_agent_prompt(),
                     Some(DialogPurpose::NewFile) => {
@@ -3098,9 +3013,9 @@ impl App {
             }
             KeyCode::Esc => {
                 match self.dialog.as_ref().map(|dialog| dialog.purpose) {
-                    Some(DialogPurpose::AgentPrompt) => self.ai_source_id = None,
+                    Some(DialogPurpose::AgentPrompt) => self.ai_source_date = None,
                     Some(DialogPurpose::NewFile) => {
-                        self.pending_id = None;
+                        self.pending_daily_date = None;
                         self.files_context = FilesContext::Browse;
                     }
                     Some(DialogPurpose::RenameFile) => {
@@ -3135,7 +3050,7 @@ impl App {
             return;
         };
         insert_char(&mut dialog.input, &mut dialog.cursor, character);
-        self.sync_legacy_from_dialog();
+        self.sync_dialog_owner_state();
     }
 
     fn delete_dialog_backward(&mut self) {
@@ -3143,7 +3058,7 @@ impl App {
             return;
         };
         delete_backward(&mut dialog.input, &mut dialog.cursor);
-        self.sync_legacy_from_dialog();
+        self.sync_dialog_owner_state();
     }
 
     fn delete_dialog_forward(&mut self) {
@@ -3151,7 +3066,7 @@ impl App {
             return;
         };
         delete_forward(&mut dialog.input, &mut dialog.cursor);
-        self.sync_legacy_from_dialog();
+        self.sync_dialog_owner_state();
     }
 
     fn move_dialog_cursor(&mut self, movement: CursorMove) {
@@ -3159,7 +3074,7 @@ impl App {
             return;
         };
         dialog.cursor = move_cursor(&dialog.input, dialog.cursor, movement);
-        self.sync_legacy_from_dialog();
+        self.sync_dialog_owner_state();
     }
 
     fn select_custom_dialog_option(&mut self) {
@@ -3173,7 +3088,7 @@ impl App {
         self.ask_user_option = count;
     }
 
-    fn sync_legacy_from_dialog(&mut self) {
+    fn sync_dialog_owner_state(&mut self) {
         let Some(dialog) = self.dialog.as_ref() else {
             return;
         };
@@ -3207,21 +3122,21 @@ impl App {
         self.dialog = None;
     }
 
-    fn handle_delete_message_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+    fn handle_delete_daily_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(id) = self.pending_id.take() {
-                    let message = self.message_clone(&id);
-                    match self.storage.remove_message_by_id(&id) {
+                if let Some(date) = self.pending_daily_date.take() {
+                    let note = self.daily_note_clone(date);
+                    match self.storage.remove_daily(&date.to_string()) {
                         Ok(true) => {
-                            if let Some(message) = message {
-                                self.record_undo(UndoOp::Delete(message));
+                            if let Some(note) = note {
+                                self.record_undo(UndoOp::Delete(note));
                             }
                             self.set_status("Deleted");
                             self.reload();
                             self.reload_todos();
                         }
-                        Ok(false) => self.set_status("Message not found"),
+                        Ok(false) => self.set_status("Daily note not found"),
                         Err(error) => self.set_status(format!("Error: {error}")),
                     }
                 }
@@ -3230,7 +3145,7 @@ impl App {
                 None
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.pending_id = None;
+                self.pending_daily_date = None;
                 self.overlay = None;
                 self.dialog = None;
                 None
@@ -3267,7 +3182,7 @@ impl App {
                                 .is_some_and(|document| document.kind == DocumentKind::File(path))
                             {
                                 self.document = None;
-                                self.center_view = CenterView::Chat;
+                                self.center_view = CenterView::Daily;
                             }
                             self.reload_files();
                         }
@@ -3286,295 +3201,6 @@ impl App {
             }
             _ => None,
         }
-    }
-
-    #[allow(dead_code)]
-    fn handle_help_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-                self.overlay = None;
-                None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.help_scroll = self.help_scroll.saturating_add(1);
-                None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.help_scroll = self.help_scroll.saturating_sub(1);
-                None
-            }
-            KeyCode::PageDown => {
-                self.help_scroll = self.help_scroll.saturating_add(8);
-                None
-            }
-            KeyCode::PageUp => {
-                self.help_scroll = self.help_scroll.saturating_sub(8);
-                None
-            }
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn handle_ai_prompt_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        let modifiers = key.modifiers;
-        match key.code {
-            KeyCode::Enter
-                if modifiers.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ) =>
-            {
-                insert_char(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor, '\n');
-                None
-            }
-            KeyCode::Enter => {
-                self.submit_agent_prompt();
-                None
-            }
-            KeyCode::Esc => {
-                self.overlay = None;
-                self.ai_source_id = None;
-                None
-            }
-            KeyCode::Backspace => {
-                delete_backward(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor);
-                None
-            }
-            KeyCode::Delete => {
-                delete_forward(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor);
-                None
-            }
-            KeyCode::Left => {
-                self.ai_prompt_cursor = move_cursor(
-                    &self.ai_prompt_input,
-                    self.ai_prompt_cursor,
-                    CursorMove::Left,
-                );
-                None
-            }
-            KeyCode::Right => {
-                self.ai_prompt_cursor = move_cursor(
-                    &self.ai_prompt_input,
-                    self.ai_prompt_cursor,
-                    CursorMove::Right,
-                );
-                None
-            }
-            KeyCode::Up => {
-                self.ai_prompt_cursor =
-                    move_cursor(&self.ai_prompt_input, self.ai_prompt_cursor, CursorMove::Up);
-                None
-            }
-            KeyCode::Down => {
-                self.ai_prompt_cursor = move_cursor(
-                    &self.ai_prompt_input,
-                    self.ai_prompt_cursor,
-                    CursorMove::Down,
-                );
-                None
-            }
-            KeyCode::Home => {
-                self.ai_prompt_cursor = move_cursor(
-                    &self.ai_prompt_input,
-                    self.ai_prompt_cursor,
-                    CursorMove::LineStart,
-                );
-                None
-            }
-            KeyCode::End => {
-                self.ai_prompt_cursor = move_cursor(
-                    &self.ai_prompt_input,
-                    self.ai_prompt_cursor,
-                    CursorMove::LineEnd,
-                );
-                None
-            }
-            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_char(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor, '\n');
-                None
-            }
-            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_char(
-                    &mut self.ai_prompt_input,
-                    &mut self.ai_prompt_cursor,
-                    character,
-                );
-                None
-            }
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn handle_approval_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let _ = self.send_approval(ApprovalDecision::Approve);
-                None
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                let _ = self.send_approval(ApprovalDecision::Deny);
-                None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.approval_scroll = self.approval_scroll.saturating_add(1);
-                None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.approval_scroll = self.approval_scroll.saturating_sub(1);
-                None
-            }
-            KeyCode::PageDown => {
-                self.approval_scroll = self.approval_scroll.saturating_add(8);
-                None
-            }
-            KeyCode::PageUp => {
-                self.approval_scroll = self.approval_scroll.saturating_sub(8);
-                None
-            }
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn handle_ask_user_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        let modifiers = key.modifiers;
-        let round_limit = self
-            .ask_user_request
-            .as_ref()
-            .is_some_and(|request| request.kind == AskUserKind::RoundLimit);
-        let option_count = self
-            .ask_user_request
-            .as_ref()
-            .map_or(0, |request| request.options.len());
-        if round_limit {
-            match key.code {
-                KeyCode::Esc => {
-                    let _ = self.send_user_response(AskUserResponse::Answer("Stop".to_string()));
-                }
-                KeyCode::Up => {
-                    self.ask_user_option = self.ask_user_option.saturating_sub(1);
-                }
-                KeyCode::Down if option_count > 0 => {
-                    self.ask_user_option =
-                        (self.ask_user_option + 1).min(option_count.saturating_sub(1));
-                }
-                KeyCode::Enter => {
-                    if let Some(answer) = self
-                        .ask_user_request
-                        .as_ref()
-                        .and_then(|request| request.options.get(self.ask_user_option))
-                        .cloned()
-                    {
-                        let _ = self.send_user_response(AskUserResponse::Answer(answer));
-                    }
-                }
-                _ => {}
-            }
-            return None;
-        }
-        match key.code {
-            KeyCode::Esc => {
-                let _ = self.send_user_response(AskUserResponse::Cancelled);
-                None
-            }
-            KeyCode::Up if option_count > 0 => {
-                self.ask_user_option = self.ask_user_option.saturating_sub(1);
-                None
-            }
-            KeyCode::Down if option_count > 0 => {
-                self.ask_user_option = (self.ask_user_option + 1).min(option_count);
-                None
-            }
-            KeyCode::Enter
-                if modifiers.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ) && self.ask_user_option == option_count =>
-            {
-                insert_char(&mut self.ask_user_input, &mut self.ask_user_cursor, '\n');
-                None
-            }
-            KeyCode::Enter => {
-                let answer = self
-                    .ask_user_request
-                    .as_ref()
-                    .and_then(|request| request.options.get(self.ask_user_option))
-                    .cloned()
-                    .unwrap_or_else(|| self.ask_user_input.trim().to_string());
-                if answer.is_empty() {
-                    self.set_status("Enter an answer before submitting");
-                } else {
-                    let _ = self.send_user_response(AskUserResponse::Answer(answer));
-                }
-                None
-            }
-            KeyCode::Backspace => {
-                self.select_custom_answer();
-                delete_backward(&mut self.ask_user_input, &mut self.ask_user_cursor);
-                None
-            }
-            KeyCode::Delete => {
-                self.select_custom_answer();
-                delete_forward(&mut self.ask_user_input, &mut self.ask_user_cursor);
-                None
-            }
-            KeyCode::Left => {
-                self.select_custom_answer();
-                self.ask_user_cursor =
-                    move_cursor(&self.ask_user_input, self.ask_user_cursor, CursorMove::Left);
-                None
-            }
-            KeyCode::Right => {
-                self.select_custom_answer();
-                self.ask_user_cursor = move_cursor(
-                    &self.ask_user_input,
-                    self.ask_user_cursor,
-                    CursorMove::Right,
-                );
-                None
-            }
-            KeyCode::Home => {
-                self.select_custom_answer();
-                self.ask_user_cursor = move_cursor(
-                    &self.ask_user_input,
-                    self.ask_user_cursor,
-                    CursorMove::LineStart,
-                );
-                None
-            }
-            KeyCode::End => {
-                self.select_custom_answer();
-                self.ask_user_cursor = move_cursor(
-                    &self.ask_user_input,
-                    self.ask_user_cursor,
-                    CursorMove::LineEnd,
-                );
-                None
-            }
-            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_custom_answer();
-                insert_char(&mut self.ask_user_input, &mut self.ask_user_cursor, '\n');
-                None
-            }
-            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_custom_answer();
-                insert_char(
-                    &mut self.ask_user_input,
-                    &mut self.ask_user_cursor,
-                    character,
-                );
-                None
-            }
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn select_custom_answer(&mut self) {
-        self.ask_user_option = self
-            .ask_user_request
-            .as_ref()
-            .map_or(0, |request| request.options.len());
     }
 
     fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {
@@ -3663,7 +3289,6 @@ impl App {
     fn route_wheel(&mut self, column: u16, row: u16, delta: i32) {
         if self.overlay.is_some() {
             if self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay) {
-                self.ensure_dialog_state();
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.scroll = if delta > 0 {
                         dialog.scroll.saturating_add(delta as u16)
@@ -3699,8 +3324,8 @@ impl App {
             };
         } else if in_area(column, row, self.layout.center) {
             match self.center_view {
-                CenterView::Chat => {
-                    self.reveal_selected_message = false;
+                CenterView::Daily => {
+                    self.reveal_selected_daily = false;
                     self.scroll = if delta > 0 {
                         self.scroll.saturating_add(delta as u16)
                     } else {
@@ -3717,7 +3342,6 @@ impl App {
 
     fn handle_left_click(&mut self, column: u16, row: u16) -> Option<Command> {
         if self.overlay.is_some() {
-            self.ensure_dialog_state();
             if let Some(index) = self
                 .dialog_hitboxes
                 .iter()
@@ -3733,7 +3357,7 @@ impl App {
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.selected = index;
                 }
-                self.sync_legacy_from_dialog();
+                self.sync_dialog_owner_state();
                 if self
                     .dialog
                     .as_ref()
@@ -3827,7 +3451,7 @@ impl App {
                 self.focus = Focus::Files;
                 match self.files_context {
                     FilesContext::Browse | FilesContext::Search => {
-                        self.open_selected_file(DocumentReturn::Chat)
+                        self.open_selected_file(DocumentReturn::Daily)
                     }
                     FilesContext::MoveTarget => self.perform_move_to(&path),
                     FilesContext::NewTarget | FilesContext::Rename => {}
@@ -3836,19 +3460,19 @@ impl App {
             return None;
         }
 
-        if self.center_view == CenterView::Chat {
-            if let Some((id, action)) = self
+        if self.center_view == CenterView::Daily {
+            if let Some((date, action)) = self
                 .hitboxes
                 .iter()
                 .find(|hitbox| point_in_rect(column, row, hitbox.area))
-                .map(|hitbox| (hitbox.message_id.clone(), hitbox.action))
+                .map(|hitbox| (hitbox.date, hitbox.action))
             {
-                return self.dispatch_action(&id, action);
+                return self.dispatch_action(date, action);
             }
         }
 
         if in_area(column, row, self.layout.compose)
-            && matches!(self.center_view, CenterView::Chat | CenterView::Document)
+            && matches!(self.center_view, CenterView::Daily | CenterView::Document)
         {
             self.focus = Focus::Compose;
         } else if in_area(column, row, self.layout.files) {
@@ -3863,14 +3487,14 @@ impl App {
         None
     }
 
-    fn move_message_selection(&mut self, delta: i32) {
-        if !self.messages.is_empty() {
+    fn move_daily_selection(&mut self, delta: i32) {
+        if !self.daily_notes.is_empty() {
             let selected = (self.selected as i32 + delta)
-                .clamp(0, self.messages.len().saturating_sub(1) as i32)
+                .clamp(0, self.daily_notes.len().saturating_sub(1) as i32)
                 as usize;
             if selected != self.selected {
                 self.selected = selected;
-                self.reveal_selected_message = true;
+                self.reveal_selected_daily = true;
             }
         }
     }
@@ -4013,11 +3637,11 @@ impl App {
                 );
             }
         } else if !query.is_empty() {
-            for message in &self.messages {
-                if message.body.to_lowercase().contains(&query) {
-                    results.push(SearchHit::Message {
-                        id: message.id.clone(),
-                        text: best_line(&message.body, &query),
+            for note in &self.daily_notes {
+                if note.body.to_lowercase().contains(&query) {
+                    results.push(SearchHit::Daily {
+                        date: note.date,
+                        text: best_line(&note.body, &query),
                     });
                 }
             }
@@ -4045,9 +3669,7 @@ impl App {
             return;
         }
         match hit {
-            SearchHit::Message { id, .. } => {
-                self.open_message_document(&id, DocumentReturn::Search)
-            }
+            SearchHit::Daily { date, .. } => self.open_daily_document(date, DocumentReturn::Search),
             SearchHit::FileLine { path, line_no, .. } => {
                 self.open_file_document(&path, DocumentReturn::Search);
                 if let Some(document) = self.document.as_mut() {
@@ -4120,14 +3742,16 @@ impl App {
                         .is_some_and(|document| document.kind == DocumentKind::File(path.clone()))
                     {
                         self.document = None;
-                        self.center_view = CenterView::Chat;
+                        self.center_view = CenterView::Daily;
                         self.focus = Focus::Center;
                     }
                     self.reload_workspace();
-                    if let Some(index) = self.messages.iter().position(|message| message.id == date)
+                    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                        .expect("daily archive name was already validated");
+                    if let Some(index) = self.daily_notes.iter().position(|note| note.date == date)
                     {
                         self.selected = index;
-                        self.reveal_selected_message = true;
+                        self.reveal_selected_daily = true;
                     }
                     self.set_status("Daily note restored");
                 }
@@ -4182,14 +3806,14 @@ impl App {
         self.ensure_visible_file_selection();
     }
 
-    fn open_message_document(&mut self, id: &str, return_to: DocumentReturn) {
-        let Some(message) = self.message_clone(id) else {
+    fn open_daily_document(&mut self, date: NaiveDate, return_to: DocumentReturn) {
+        let Some(note) = self.daily_note_clone(date) else {
             return;
         };
         self.show_document(
-            DocumentKind::Message(message.id),
-            format!("Daily {}", message.created_at.format("%Y-%m-%d")),
-            message.body,
+            DocumentKind::Daily(note.date),
+            format!("Daily {}", note.date),
+            note.body,
             return_to,
         );
         self.center_view = CenterView::Document;
@@ -4228,7 +3852,7 @@ impl App {
 
     fn close_document(&mut self) {
         let Some(document) = self.document.as_ref() else {
-            self.center_view = CenterView::Chat;
+            self.center_view = CenterView::Daily;
             return;
         };
         let return_to = document.return_to;
@@ -4239,8 +3863,8 @@ impl App {
                 self.center_view = CenterView::Search;
                 self.focus = Focus::Center;
             }
-            DocumentReturn::Chat => {
-                self.center_view = CenterView::Chat;
+            DocumentReturn::Daily => {
+                self.center_view = CenterView::Daily;
                 self.focus = if matches!(kind, DocumentKind::File(_)) {
                     Focus::Files
                 } else {
@@ -4251,18 +3875,18 @@ impl App {
     }
 
     fn act(&mut self, action: Action) -> Option<Command> {
-        let id = self.selected_id()?.to_string();
-        self.dispatch_action(&id, action)
+        let date = self.selected_date()?;
+        self.dispatch_action(date, action)
     }
 
-    fn dispatch_action(&mut self, id: &str, action: Action) -> Option<Command> {
+    fn dispatch_action(&mut self, date: NaiveDate, action: Action) -> Option<Command> {
         match action {
             Action::Ai => {
-                self.open_agent_prompt(id);
+                self.open_agent_prompt(date);
                 None
             }
             Action::Move => {
-                self.pending_id = Some(id.to_string());
+                self.pending_daily_date = Some(date);
                 self.file_query.clear();
                 self.reload_files();
                 self.files_context = FilesContext::MoveTarget;
@@ -4271,10 +3895,10 @@ impl App {
                 None
             }
             Action::Archive => {
-                if let Some(message) = self.message_clone(id) {
-                    match self.storage.archive_daily(&message.id) {
+                if let Some(note) = self.daily_note_clone(date) {
+                    match self.storage.archive_daily(&note.date.to_string()) {
                         Ok(_) => {
-                            self.record_undo(UndoOp::Archive(message));
+                            self.record_undo(UndoOp::Archive(note));
                             self.set_status("Daily note archived");
                             self.reload_workspace();
                         }
@@ -4284,7 +3908,7 @@ impl App {
                 None
             }
             Action::New => {
-                self.pending_id = Some(id.to_string());
+                self.pending_daily_date = Some(date);
                 self.new_file_input.clear();
                 self.new_file_cursor = 0;
                 self.files_context = FilesContext::NewTarget;
@@ -4293,85 +3917,54 @@ impl App {
                 None
             }
             Action::View => {
-                self.open_message_document(id, DocumentReturn::Chat);
+                self.open_daily_document(date, DocumentReturn::Daily);
                 None
             }
-            Action::Edit => self.message_edit_command(id),
+            Action::Edit => self.daily_edit_command(date),
             Action::Delete => {
-                self.pending_id = Some(id.to_string());
-                self.set_overlay(Overlay::ConfirmDeleteMessage);
+                self.pending_daily_date = Some(date);
+                self.set_overlay(Overlay::ConfirmDeleteDaily);
                 None
             }
         }
     }
 
-    fn open_agent_prompt(&mut self, id: &str) {
-        if self.message_clone(id).is_none() {
-            self.set_status("Message not found");
+    fn open_agent_prompt(&mut self, date: NaiveDate) {
+        if self.daily_note_clone(date).is_none() {
+            self.set_status("Daily note not found");
             return;
         }
-        self.ai_source_id = Some(id.to_string());
+        self.ai_source_date = Some(date);
         self.ai_prompt_input.clear();
         self.ai_prompt_cursor = 0;
         self.set_overlay(Overlay::AiPrompt);
     }
 
-    fn message_edit_command(&self, id: &str) -> Option<Command> {
-        self.message_clone(id).map(|message| Command::EditMessage {
-            id: message.id,
-            body: message.body,
-        })
-    }
-
-    pub fn apply_external_message_edit(&mut self, id: &str, body: String) {
-        let Some(message) = self.message_clone(id) else {
-            self.set_status("Message not found");
-            return;
-        };
-        if message.body == body {
-            self.set_status("Message unchanged");
-            return;
-        }
-        let old = message.clone();
-        let mut updated = message;
-        updated.body = body;
-        match self.storage.replace_message(&updated) {
-            Ok(true) => {
-                self.record_undo(UndoOp::Edit(old));
-                self.reload();
-                self.reload_todos();
-                if let Some(index) = self.messages.iter().position(|message| message.id == id) {
-                    self.selected = index;
-                }
-                if let Some(document) = self.document.as_mut().filter(|document| {
-                    matches!(&document.kind, DocumentKind::Message(message_id) if message_id == id)
-                }) {
-                    document.replace_source(updated.body);
-                }
-                self.set_status("Message updated in editor");
-            }
-            Ok(false) => self.set_status("Message not found"),
-            Err(error) => self.set_status(format!("Error: {error}")),
-        }
+    fn daily_edit_command(&self, date: NaiveDate) -> Option<Command> {
+        self.storage
+            .daily_file_path(&date.to_string())
+            .ok()
+            .filter(|path| path.is_file())
+            .map(Command::Edit)
     }
 
     fn submit_agent_prompt(&mut self) {
-        let Some(id) = self.ai_source_id.take() else {
+        let Some(date) = self.ai_source_date.take() else {
             self.overlay = None;
             return;
         };
-        let Some(message) = self.message_clone(&id) else {
+        let Some(note) = self.daily_note_clone(date) else {
             self.overlay = None;
-            self.set_status("Message not found");
+            self.set_status("Daily note not found");
             return;
         };
         let requested = self.ai_prompt_input.trim();
         let content = if requested.is_empty() {
-            message.body
+            note.body
         } else {
             requested.to_string()
         };
-        let prompt = format!("Source Nole daily date: {id}\n\n{content}");
+        let prompt = format!("Source Nole daily date: {date}\n\n{content}");
         self.overlay = None;
         self.dialog = None;
         if self.ai_running {
@@ -4432,7 +4025,7 @@ impl App {
             .filter(|_| self.center_view == CenterView::Document)
             .and_then(|document| match &document.kind {
                 DocumentKind::File(path) => Some(path),
-                DocumentKind::Message(_) => None,
+                DocumentKind::Daily(_) => None,
             });
         Some(if let Some(path) = note {
             let display = path
@@ -4555,6 +4148,7 @@ impl App {
         self.agent_panel
             .push(AgentPanelEntry::Error("Cancelled".to_string()));
         self.agent_scroll = u16::MAX;
+        self.notifications.notify("Agent task cancelled");
         self.set_status("Agent task cancelled");
     }
 
@@ -4583,29 +4177,29 @@ impl App {
     }
 
     fn cancel_file_context(&mut self) {
-        self.pending_id = None;
+        self.pending_daily_date = None;
         self.pending_file = None;
         self.files_context = FilesContext::Browse;
         self.focus = Focus::Center;
     }
 
     fn perform_move_to(&mut self, path: &Path) {
-        let Some(id) = self.pending_id.clone() else {
+        let Some(date) = self.pending_daily_date else {
             self.cancel_file_context();
             return;
         };
-        self.perform_move_to_id(path, &id);
+        self.perform_move_to_date(path, date);
     }
 
-    fn perform_move_to_id(&mut self, path: &Path, id: &str) {
-        let Some(message) = self.message_clone(id) else {
-            self.set_status("Message not found");
+    fn perform_move_to_date(&mut self, path: &Path, date: NaiveDate) {
+        let Some(note) = self.daily_note_clone(date) else {
+            self.set_status("Daily note not found");
             return;
         };
-        match self.storage.move_to_markdown(path, &message) {
+        match self.storage.move_to_markdown(path, &note) {
             Ok(appended) => {
                 self.record_undo(UndoOp::Move {
-                    message,
+                    daily_note: note,
                     target: path.to_path_buf(),
                     appended,
                 });
@@ -4613,10 +4207,10 @@ impl App {
                     "Moved to {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ));
-                self.pending_id = None;
+                self.pending_daily_date = None;
                 self.files_context = FilesContext::Browse;
                 self.focus = Focus::Center;
-                self.center_view = CenterView::Chat;
+                self.center_view = CenterView::Daily;
                 self.reload_workspace();
             }
             Err(error) => self.set_status(format!("Error: {error}")),
@@ -4635,7 +4229,7 @@ impl App {
             .map(|document| document.kind.clone());
         let result = match document_kind {
             Some(DocumentKind::File(path)) => self.append_to_open_note(&path, &body),
-            Some(DocumentKind::Message(date)) => self.append_to_open_daily(&date, &body),
+            Some(DocumentKind::Daily(date)) => self.append_to_open_daily(&date.to_string(), &body),
             None => self.append_to_today(&body),
         };
         if let Err(error) = result {
@@ -4663,9 +4257,9 @@ impl App {
     }
 
     fn append_to_open_daily(&mut self, date: &str, body: &str) -> anyhow::Result<()> {
-        let message = self.storage.append_daily(date, body)?;
+        let note = self.storage.append_daily(date, body)?;
         if let Some(document) = self.document.as_mut() {
-            document.replace_source(message.body);
+            document.replace_source(note.body);
         }
         self.input.clear();
         self.input_cursor = 0;
@@ -4678,22 +4272,22 @@ impl App {
     }
 
     fn append_to_today(&mut self, body: &str) -> anyhow::Result<()> {
-        self.storage.append_chat_message(body)?;
+        self.storage.append_to_today(body)?;
         self.input.clear();
         self.input_cursor = 0;
         self.reload();
         self.reload_todos();
-        self.selected = self.messages.len().saturating_sub(1);
+        self.selected = self.daily_notes.len().saturating_sub(1);
         self.scroll = u16::MAX;
-        self.reveal_selected_message = true;
+        self.reveal_selected_daily = true;
         self.set_status("Saved");
         Ok(())
     }
 
-    fn message_clone(&self, id: &str) -> Option<Message> {
-        self.messages
+    fn daily_note_clone(&self, date: NaiveDate) -> Option<DailyNote> {
+        self.daily_notes
             .iter()
-            .find(|message| message.id == id)
+            .find(|note| note.date == date)
             .cloned()
     }
 
@@ -4715,15 +4309,15 @@ impl App {
             return;
         };
         let status = match operation {
-            UndoOp::Delete(message) => match self.storage.restore_message_to_chat(&message) {
+            UndoOp::Delete(note) => match self.storage.restore_daily(&note) {
                 Ok(()) => "Undid delete".to_string(),
                 Err(error) => format!("Undo error: {error}"),
             },
             UndoOp::Move {
-                message,
+                daily_note,
                 target,
                 appended,
-            } => match self.storage.restore_message_to_chat(&message) {
+            } => match self.storage.restore_daily(&daily_note) {
                 Ok(()) => {
                     let name = target
                         .file_name()
@@ -4741,19 +4335,16 @@ impl App {
                 }
                 Err(error) => format!("Undo error: {error}"),
             },
-            UndoOp::Archive(message) => match self.storage.restore_archived_daily(&message.id) {
-                Ok(()) => "Undid archive".to_string(),
-                Err(error) => format!("Undo error: {error}"),
-            },
-            UndoOp::Edit(message) => match self.storage.replace_message(&message) {
-                Ok(true) => "Undid edit".to_string(),
-                Ok(false) => "Undid edit (message gone)".to_string(),
-                Err(error) => format!("Undo error: {error}"),
-            },
+            UndoOp::Archive(note) => {
+                match self.storage.restore_archived_daily(&note.date.to_string()) {
+                    Ok(()) => "Undid archive".to_string(),
+                    Err(error) => format!("Undo error: {error}"),
+                }
+            }
         };
         self.set_status(status);
         self.reload_workspace();
-        self.selected = self.messages.len().saturating_sub(1);
+        self.selected = self.daily_notes.len().saturating_sub(1);
         self.scroll = u16::MAX;
     }
 }
@@ -4774,18 +4365,18 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn add_message(app: &mut App, body: &str) {
-        app.storage.append_chat_message(body).unwrap();
+    fn add_daily_note(app: &mut App, body: &str) {
+        app.storage.append_to_today(body).unwrap();
         app.reload();
-        app.selected = app.messages.len() - 1;
+        app.selected = app.daily_notes.len() - 1;
         app.focus = Focus::Center;
     }
 
     #[test]
-    fn starts_with_compose_focused_and_chat_in_center() {
+    fn starts_with_daily_center_focused() {
         let (app, _directory) = make_app();
-        assert_eq!(app.focus, Focus::Compose);
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.focus, Focus::Center);
+        assert_eq!(app.center_view, CenterView::Daily);
         assert_eq!(app.files_context, FilesContext::Browse);
         assert_eq!(app.overlay, None);
         assert_eq!(app.permission_mode, PermissionMode::Approve);
@@ -4850,16 +4441,20 @@ mod tests {
         app.center_view = CenterView::Document;
         app.advance_animation();
         assert_eq!(app.animation_tick, 1);
+        app.focus = Focus::Compose;
+        app.advance_animation();
+        assert_eq!(app.animation_tick, 2);
+        app.focus = Focus::Center;
         app.ai_running = true;
         app.advance_animation();
         app.advance_animation();
-        assert_eq!(app.animation_tick, 3);
+        assert_eq!(app.animation_tick, 4);
         app.ai_running = false;
         app.advance_animation();
-        assert_eq!(app.animation_tick, 3);
+        assert_eq!(app.animation_tick, 4);
         app.permission_mode = PermissionMode::Bypass;
         app.advance_animation();
-        assert_eq!(app.animation_tick, 4);
+        assert_eq!(app.animation_tick, 5);
     }
 
     #[test]
@@ -4956,7 +4551,7 @@ mod tests {
         fs::write(&current, "# Current\n").unwrap();
         fs::write(&other, "# Other\n").unwrap();
         app.reload_files();
-        app.open_file_document(&current, DocumentReturn::Chat);
+        app.open_file_document(&current, DocumentReturn::Daily);
         app.selected_file = Some(other);
         app.agent_panel.push(AgentPanelEntry::Assistant {
             text: "Final response".to_string(),
@@ -4994,7 +4589,7 @@ mod tests {
         fs::write(&note, "archive me\n").unwrap();
         let archived = app.storage.archive_note(&note).unwrap();
         app.reload_files();
-        app.open_file_document(&archived, DocumentReturn::Chat);
+        app.open_file_document(&archived, DocumentReturn::Daily);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
 
@@ -5035,7 +4630,7 @@ mod tests {
         fs::write(&first, "first\n").unwrap();
         fs::write(&second, "second\n").unwrap();
         app.reload_files();
-        app.open_file_document(&first, DocumentReturn::Chat);
+        app.open_file_document(&first, DocumentReturn::Daily);
         app.open_files();
         let second_row = app
             .visible_file_rows()
@@ -5067,7 +4662,7 @@ mod tests {
         let note = app.storage.data_dir.join("Selected.md");
         fs::write(&note, "selected note\n").unwrap();
         app.reload_files();
-        app.center_view = CenterView::Chat;
+        app.center_view = CenterView::Daily;
         app.document = None;
         app.open_files();
         let note_row = app
@@ -5082,7 +4677,7 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
 
         assert_eq!(app.focus, Focus::Center);
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.center_view, CenterView::Daily);
         assert!(app.document.is_none());
         assert_eq!(app.selected_file.as_ref(), Some(&note));
     }
@@ -5122,10 +4717,10 @@ mod tests {
     #[test]
     fn tab_switches_permission_mode_without_changing_focus() {
         let (mut app, _directory) = make_app();
-        assert_eq!(app.focus, Focus::Compose);
+        assert_eq!(app.focus, Focus::Center);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.permission_mode, PermissionMode::Bypass);
-        assert_eq!(app.focus, Focus::Compose);
+        assert_eq!(app.focus, Focus::Center);
         assert!(app.permission_bypass.load(Ordering::Relaxed));
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.permission_mode, PermissionMode::Approve);
@@ -5135,11 +4730,11 @@ mod tests {
     #[test]
     fn ai_action_opens_an_optional_prompt_overlay() {
         let (mut app, _directory) = make_app();
-        add_message(&mut app, "card body");
-        let id = app.selected_id().unwrap().to_string();
-        app.dispatch_action(&id, Action::Ai);
+        add_daily_note(&mut app, "card body");
+        let date = app.selected_date().unwrap();
+        app.dispatch_action(date, Action::Ai);
         assert_eq!(app.overlay, Some(Overlay::AiPrompt));
-        assert_eq!(app.ai_source_id.as_deref(), Some(id.as_str()));
+        assert_eq!(app.ai_source_date, Some(date));
         app.handle_paste("custom prompt");
         assert_eq!(app.ai_prompt_input, "custom prompt");
         app.handle_key(key(KeyCode::Esc));
@@ -5155,7 +4750,7 @@ mod tests {
             title: "Update note".to_string(),
             diff: "--- old\n+++ new\n-old\n+new\n".to_string(),
         });
-        app.overlay = Some(Overlay::Approval);
+        app.set_overlay(Overlay::Approval);
         app.handle_key(key(KeyCode::Char('y')));
         assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Approve);
         assert_eq!(app.overlay, None);
@@ -5340,6 +4935,46 @@ mod tests {
                 if text == "final reply"
         ));
         assert_eq!(app.status, "Agent finished");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Agent finished")
+        );
+        assert_eq!(app.notifications.take_bells(), 1);
+    }
+
+    #[test]
+    fn agent_terminal_outcomes_send_distinct_notifications() {
+        let (mut app, _directory) = make_app();
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+        app.ai_running = true;
+
+        sender
+            .send(AgentEvent::Finished(Ok(String::new())))
+            .unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.status, "Agent paused at the request-round limit");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Agent stopped at the request-round limit")
+        );
+        assert_eq!(app.notifications.take_bells(), 1);
+
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+        app.ai_running = true;
+        sender
+            .send(AgentEvent::Finished(Err("network unavailable".to_string())))
+            .unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.status, "AI error: network unavailable");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Agent failed: network unavailable")
+        );
+        assert_eq!(app.notifications.take_bells(), 1);
     }
 
     #[test]
@@ -5394,6 +5029,11 @@ mod tests {
         assert!(app.ai_approval_sender.is_none());
         assert!(app.ai_user_sender.is_none());
         assert_eq!(app.status, "Agent task cancelled");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Agent task cancelled")
+        );
+        assert_eq!(app.notifications.take_bells(), 1);
     }
 
     #[test]
@@ -5434,7 +5074,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         let path = app.storage.data_dir.join("Article.md");
         fs::write(&path, "# Article\n\nInspiration\n").unwrap();
-        app.open_file_document(&path, DocumentReturn::Chat);
+        app.open_file_document(&path, DocumentReturn::Daily);
         app.document.as_mut().unwrap().scroll = 1;
         app.handle_key(key(KeyCode::Char('i')));
         assert_eq!(app.focus, Focus::Compose);
@@ -5447,7 +5087,7 @@ mod tests {
             Some(&DocumentKind::File(path.clone()))
         );
         assert_eq!(app.document.as_ref().unwrap().scroll, 1);
-        assert!(app.messages.is_empty());
+        assert!(app.daily_notes.is_empty());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# Article\n\nInspiration\n\nnew idea\n"
@@ -5467,7 +5107,10 @@ mod tests {
         let (mut app, _directory) = make_app();
         app.storage.append_daily("2026-07-26", "first").unwrap();
         app.reload();
-        app.open_message_document("2026-07-26", DocumentReturn::Chat);
+        app.open_daily_document(
+            NaiveDate::from_ymd_opt(2026, 7, 26).unwrap(),
+            DocumentReturn::Daily,
+        );
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_paste("second");
         app.handle_key(key(KeyCode::Enter));
@@ -5485,26 +5128,27 @@ mod tests {
     }
 
     #[test]
-    fn reload_keeps_the_selected_message_by_id() {
+    fn reload_keeps_the_selected_daily_note_by_date() {
         let (mut app, _directory) = make_app();
         let first = app.storage.append_daily("2026-07-26", "first").unwrap();
         let second = app.storage.append_daily("2026-07-27", "second").unwrap();
         app.reload();
         app.selected = app
-            .messages
+            .daily_notes
             .iter()
-            .position(|message| message.id == second.id)
+            .position(|note| note.date == second.date)
             .unwrap();
 
-        app.storage.remove_message_by_id(&first.id).unwrap();
+        app.storage.remove_daily(&first.date.to_string()).unwrap();
         app.reload();
 
-        assert_eq!(app.selected_id(), Some(second.id.as_str()));
+        assert_eq!(app.selected_date(), Some(second.date));
     }
 
     #[test]
     fn compose_paste_normalizes_newlines_at_character_cursor() {
         let (mut app, _directory) = make_app();
+        app.focus = Focus::Compose;
         app.input = "ab".to_string();
         app.input_cursor = 1;
         app.handle_paste("X\r\nY\rZ");
@@ -5517,7 +5161,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         let path = app.storage.data_dir.join("Reference.md");
         fs::write(&path, "# Reference\n").unwrap();
-        app.open_file_document(&path, DocumentReturn::Chat);
+        app.open_file_document(&path, DocumentReturn::Daily);
         app.input = "Summarize the key point".to_string();
 
         let prompt = app.compose_agent_prompt().unwrap();
@@ -5525,12 +5169,12 @@ mod tests {
         assert!(prompt.ends_with("Summarize the key point"));
 
         app.document = Some(Document {
-            kind: DocumentKind::Message("msg-1".to_string()),
-            title: "Message".to_string(),
+            kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),
+            title: "Daily".to_string(),
             source: String::new(),
             scroll: 0,
             target_line: None,
-            return_to: DocumentReturn::Chat,
+            return_to: DocumentReturn::Daily,
             render_cache: None,
         });
         assert_eq!(
@@ -5542,7 +5186,8 @@ mod tests {
     #[test]
     fn ctrl_enter_sends_compose_to_agent_without_creating_a_chat_card() {
         let (mut app, _directory) = make_app();
-        let message_count = app.messages.len();
+        app.focus = Focus::Compose;
+        let daily_count = app.daily_notes.len();
         app.agent_usage.input_tokens = 1_234;
         app.agent_timed_output_tokens = 400;
         app.agent_response_duration = Duration::from_secs(2);
@@ -5558,7 +5203,7 @@ mod tests {
         ));
         assert!(app.input.is_empty());
         assert_eq!(app.input_cursor, 0);
-        assert_eq!(app.messages.len(), message_count);
+        assert_eq!(app.daily_notes.len(), daily_count);
         assert_eq!(app.agent_usage.input_tokens, 1_234);
         assert_eq!(app.agent_timed_output_tokens, 400);
         assert_eq!(app.agent_response_duration, Duration::from_secs(2));
@@ -5567,6 +5212,7 @@ mod tests {
     #[test]
     fn ctrl_enter_buffers_and_clears_compose_while_agent_is_busy() {
         let (mut app, _directory) = make_app();
+        app.focus = Focus::Compose;
         app.ai_running = true;
         app.agent_panel.push(AgentPanelEntry::Prompt {
             text: "Initial prompt".to_string(),
@@ -5613,23 +5259,23 @@ mod tests {
         app.focus = Focus::Center;
         app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(app.focus, Focus::Files);
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.center_view, CenterView::Daily);
         app.handle_key(key(KeyCode::Char('T')));
         assert_eq!(app.focus, Focus::Todo);
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.center_view, CenterView::Daily);
     }
 
     #[test]
     fn arrows_move_focus_across_the_workspace() {
         let (mut app, _directory) = make_app();
-        add_message(&mut app, "selected card");
+        add_daily_note(&mut app, "selected card");
         app.focus = Focus::Center;
 
         app.handle_key(key(KeyCode::Left));
         assert_eq!(app.focus, Focus::Files);
         app.handle_key(key(KeyCode::Right));
         assert_eq!(app.focus, Focus::Center);
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.center_view, CenterView::Daily);
 
         app.handle_key(key(KeyCode::Right));
         assert_eq!(app.focus, Focus::Todo);
@@ -5722,7 +5368,7 @@ mod tests {
     #[test]
     fn enter_on_agent_panel_does_not_move_output_to_daily() {
         let (mut app, _directory) = make_app();
-        let original_count = app.messages.len();
+        let original_count = app.daily_notes.len();
         app.agent_panel = vec![
             AgentPanelEntry::Prompt {
                 text: "User prompt".to_string(),
@@ -5738,7 +5384,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(app.messages.len(), original_count);
+        assert_eq!(app.daily_notes.len(), original_count);
         assert_eq!(app.agent_panel.len(), 2);
         assert_eq!(app.focus, Focus::Agent);
     }
@@ -5791,7 +5437,7 @@ mod tests {
             Some(&DocumentKind::File(path))
         );
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.center_view, CenterView::Daily);
         assert_eq!(app.focus, Focus::Files);
     }
 
@@ -5818,7 +5464,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n").unwrap();
-        app.open_file_document(&path, DocumentReturn::Chat);
+        app.open_file_document(&path, DocumentReturn::Daily);
 
         assert_eq!(
             app.handle_key(key(KeyCode::Char('e'))),
@@ -5835,7 +5481,7 @@ mod tests {
             source: "```rust\nfn main() {}\n```".repeat(100),
             scroll: 0,
             target_line: None,
-            return_to: DocumentReturn::Chat,
+            return_to: DocumentReturn::Daily,
             render_cache: None,
         };
 
@@ -5859,12 +5505,12 @@ mod tests {
         fs::write(&first, "```rust\nfn main() {}\n```".repeat(100)).unwrap();
         fs::write(&second, "# Second").unwrap();
 
-        app.open_file_document(&first, DocumentReturn::Chat);
+        app.open_file_document(&first, DocumentReturn::Daily);
         assert!(app.document.as_mut().unwrap().ensure_rendered(80));
-        app.open_file_document(&second, DocumentReturn::Chat);
+        app.open_file_document(&second, DocumentReturn::Daily);
         assert_eq!(app.document_render_lru.entries.len(), 1);
 
-        app.open_file_document(&first, DocumentReturn::Chat);
+        app.open_file_document(&first, DocumentReturn::Daily);
         let document = app.document.as_mut().unwrap();
         assert!(document.render_cache.is_some());
         assert!(!document.ensure_rendered(80));
@@ -5878,12 +5524,12 @@ mod tests {
         fs::write(&first, "old source").unwrap();
         fs::write(&second, "second source").unwrap();
 
-        app.open_file_document(&first, DocumentReturn::Chat);
+        app.open_file_document(&first, DocumentReturn::Daily);
         app.document.as_mut().unwrap().ensure_rendered(80);
-        app.open_file_document(&second, DocumentReturn::Chat);
+        app.open_file_document(&second, DocumentReturn::Daily);
         fs::write(&first, "new source").unwrap();
 
-        app.open_file_document(&first, DocumentReturn::Chat);
+        app.open_file_document(&first, DocumentReturn::Daily);
         assert!(app.document.as_ref().unwrap().render_cache.is_none());
         assert_eq!(app.document.as_ref().unwrap().source, "new source");
     }
@@ -5897,13 +5543,13 @@ mod tests {
         fs::write(&from, "cached source").unwrap();
         fs::write(&other, "other source").unwrap();
 
-        app.open_file_document(&from, DocumentReturn::Chat);
+        app.open_file_document(&from, DocumentReturn::Daily);
         app.document.as_mut().unwrap().ensure_rendered(80);
-        app.open_file_document(&other, DocumentReturn::Chat);
+        app.open_file_document(&other, DocumentReturn::Daily);
         fs::rename(&from, &to).unwrap();
         assert!(!app.retarget_open_document(&from, &to));
 
-        app.open_file_document(&to, DocumentReturn::Chat);
+        app.open_file_document(&to, DocumentReturn::Daily);
         assert!(!app.document.as_mut().unwrap().ensure_rendered(80));
     }
 
@@ -5919,7 +5565,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for path in &paths {
-            app.open_file_document(path, DocumentReturn::Chat);
+            app.open_file_document(path, DocumentReturn::Daily);
             app.document.as_mut().unwrap().ensure_rendered(80);
         }
 
@@ -5939,7 +5585,7 @@ mod tests {
         let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n").unwrap();
         app.reload_files();
-        app.open_file_document(&path, DocumentReturn::Chat);
+        app.open_file_document(&path, DocumentReturn::Daily);
 
         app.handle_key(key(KeyCode::Char('r')));
         assert_eq!(app.overlay, Some(Overlay::Dialog));
@@ -5977,7 +5623,7 @@ mod tests {
             "needle outside document\n",
         )
         .unwrap();
-        app.open_file_document(&path, DocumentReturn::Chat);
+        app.open_file_document(&path, DocumentReturn::Daily);
 
         app.handle_key(key(KeyCode::Char('/')));
         assert_eq!(app.center_view, CenterView::DocumentSearch);
@@ -5999,7 +5645,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n").unwrap();
-        app.open_file_document(&path, DocumentReturn::Chat);
+        app.open_file_document(&path, DocumentReturn::Daily);
         app.handle_key(key(KeyCode::Char('/')));
 
         app.handle_key(key(KeyCode::Esc));
@@ -6014,7 +5660,7 @@ mod tests {
     #[test]
     fn move_and_new_are_file_contexts() {
         let (mut app, _directory) = make_app();
-        add_message(&mut app, "file this");
+        add_daily_note(&mut app, "file this");
         app.handle_key(key(KeyCode::Char('m')));
         assert_eq!(app.focus, Focus::Files);
         assert_eq!(app.files_context, FilesContext::MoveTarget);
@@ -6083,12 +5729,14 @@ mod tests {
             .position(|file| file.path == from)
             .unwrap();
         app.sync_selected_file();
-        app.open_file_document(&from, DocumentReturn::Chat);
+        app.open_file_document(&from, DocumentReturn::Daily);
         app.focus = Focus::Files;
 
         app.handle_key(key(KeyCode::Char('r')));
-        app.rename_input = "Renamed".to_string();
-        app.rename_cursor = app.rename_input.chars().count();
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.input = "Renamed".to_string();
+            dialog.cursor = dialog.input.chars().count();
+        }
         app.handle_key(key(KeyCode::Enter));
 
         let to = app.storage.data_dir.join("Renamed.md");
@@ -6121,7 +5769,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         let from = app.storage.data_dir.join("Old.md");
         fs::write(&from, "# Old\n\nBody\n").unwrap();
-        app.open_file_document(&from, DocumentReturn::Chat);
+        app.open_file_document(&from, DocumentReturn::Daily);
         let destination_dir = app.storage.data_dir.join("moved");
         fs::create_dir(&destination_dir).unwrap();
         let to = destination_dir.join("Renamed.md");
@@ -6171,9 +5819,9 @@ mod tests {
     }
 
     #[test]
-    fn search_result_message_edit_returns_external_editor_command() {
+    fn search_result_daily_edit_returns_physical_file_command() {
         let (mut app, _directory) = make_app();
-        add_message(&mut app, "needle");
+        add_daily_note(&mut app, "needle");
         app.handle_key(key(KeyCode::Char('/')));
         assert_eq!(app.center_view, CenterView::Search);
         app.handle_paste("needle");
@@ -6184,13 +5832,13 @@ mod tests {
             app.document.as_ref().map(|document| document.return_to),
             Some(DocumentReturn::Search)
         );
-        let id = app.messages[0].id.clone();
+        let expected = app
+            .storage
+            .daily_file_path(&app.daily_notes[0].date.to_string())
+            .unwrap();
         assert_eq!(
             app.handle_key(key(KeyCode::Char('e'))),
-            Some(Command::EditMessage {
-                id,
-                body: "needle".to_string(),
-            })
+            Some(Command::Edit(expected))
         );
         assert_eq!(app.center_view, CenterView::Document);
     }
@@ -6212,21 +5860,56 @@ mod tests {
     }
 
     #[test]
-    fn external_message_edit_writes_by_id_and_remains_undoable() {
+    fn full_text_search_orders_daily_active_and_archived_results() {
         let (mut app, _directory) = make_app();
-        add_message(&mut app, "before");
-        let id = app.messages[0].id.clone();
+        add_daily_note(&mut app, "shared needle in Daily");
+        let active = app.storage.data_dir.join("Active.md");
+        let archived = app.storage.archives_dir.join("Archived.md");
+        fs::write(&active, "shared needle in active note\n").unwrap();
+        fs::write(&archived, "shared needle in archived note\n").unwrap();
+
+        app.open_search();
+        app.handle_paste("shared needle");
+
+        assert_eq!(app.search_results.len(), 3);
+        assert!(matches!(app.search_results[0], SearchHit::Daily { .. }));
+        assert!(matches!(
+            &app.search_results[1],
+            SearchHit::FileLine { path, .. } if path == &active
+        ));
+        assert!(matches!(
+            &app.search_results[2],
+            SearchHit::FileLine { path, .. } if path == &archived
+        ));
+    }
+
+    #[test]
+    fn daily_edit_returns_its_physical_file() {
+        let (mut app, _directory) = make_app();
+        add_daily_note(&mut app, "before");
+        let expected = app
+            .storage
+            .daily_file_path(&app.daily_notes[0].date.to_string())
+            .unwrap();
         assert_eq!(
             app.handle_key(key(KeyCode::Char('e'))),
-            Some(Command::EditMessage {
-                id: id.clone(),
-                body: "before".to_string(),
-            })
+            Some(Command::Edit(expected))
         );
-        app.apply_external_message_edit(&id, "after".to_string());
-        assert_eq!(app.messages[0].body, "after");
-        app.handle_key(key(KeyCode::Char('u')));
-        assert_eq!(app.messages[0].body, "before");
+    }
+
+    #[test]
+    fn workspace_reload_refreshes_an_open_daily_note_from_disk() {
+        let (mut app, _directory) = make_app();
+        let note = app.storage.append_daily("2026-07-26", "before").unwrap();
+        app.reload();
+        app.open_daily_document(note.date, DocumentReturn::Daily);
+        let path = app.storage.daily_file_path(&note.date.to_string()).unwrap();
+        fs::write(path, "after\n").unwrap();
+
+        app.reload_workspace();
+
+        assert_eq!(app.document.as_ref().unwrap().source, "after");
+        assert_eq!(app.daily_notes[0].body, "after");
     }
 
     #[test]
@@ -6239,7 +5922,7 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.overlay, None);
         assert_eq!(app.focus, Focus::Todo);
-        assert_eq!(app.center_view, CenterView::Chat);
+        assert_eq!(app.center_view, CenterView::Daily);
     }
 
     #[test]
@@ -6383,7 +6066,7 @@ mod tests {
         assert_eq!(app.document.as_ref().unwrap().source, "archived version");
 
         app.document = None;
-        app.center_view = CenterView::Chat;
+        app.center_view = CenterView::Daily;
         app.link_hitboxes.clear();
         app.link_hitboxes.push(LinkHitbox {
             target: LinkTarget::WikiLink("New Note".to_string()),
@@ -6439,7 +6122,7 @@ mod tests {
     fn move_targets_list_managed_data_notes() {
         let (mut app, _directory) = make_app();
         fs::write(app.storage.data_dir.join("Work.md"), "# Work\n").unwrap();
-        add_message(&mut app, "file this");
+        add_daily_note(&mut app, "file this");
         app.handle_key(key(KeyCode::Char('m')));
         let names: Vec<String> = app
             .visible_file_rows()
@@ -6469,7 +6152,10 @@ mod tests {
             .unwrap();
         app.sync_selected_file();
         app.handle_key(key(KeyCode::Char('r')));
-        app.rename_input = "Taken".to_string();
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.input = "Taken".to_string();
+            dialog.cursor = dialog.input.chars().count();
+        }
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.files_context, FilesContext::Rename);
         assert!(app.pending_file.is_some());
@@ -6506,13 +6192,13 @@ mod tests {
     #[test]
     fn delete_overlay_and_undo_keep_business_behavior() {
         let (mut app, _directory) = make_app();
-        add_message(&mut app, "remove me");
+        add_daily_note(&mut app, "remove me");
         app.handle_key(key(KeyCode::Char('d')));
-        assert_eq!(app.overlay, Some(Overlay::ConfirmDeleteMessage));
+        assert_eq!(app.overlay, Some(Overlay::ConfirmDeleteDaily));
         app.handle_key(key(KeyCode::Char('y')));
-        assert!(app.messages.is_empty());
+        assert!(app.daily_notes.is_empty());
         app.handle_key(key(KeyCode::Char('u')));
-        assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.messages[0].body, "remove me");
+        assert_eq!(app.daily_notes.len(), 1);
+        assert_eq!(app.daily_notes[0].body, "remove me");
     }
 }

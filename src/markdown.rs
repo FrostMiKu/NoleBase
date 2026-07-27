@@ -21,6 +21,7 @@ const LINK_UNDERLINE_COLOR: Color = ctp::BLUE;
 pub struct RenderedMarkup {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<RenderedLink>,
+    pub images: Vec<mbtui::ImagePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,16 +40,22 @@ pub fn to_lines_at_width(source: &str, width: usize) -> Vec<Line<'static>> {
 pub fn render_at_width(source: &str, width: usize) -> RenderedMarkup {
     match mbdown::parse(source) {
         Ok(document) => {
-            let lines = Renderer::with_theme(width.max(1), note_theme().clone())
-                .render(&document)
-                .lines;
+            let rendered = Renderer::with_theme(width.max(1), note_theme().clone())
+                .with_image_height(12)
+                .render(&document);
+            let lines = rendered.text.lines;
             let specs = link_specs(document.nodes());
             let links = locate_links(&lines, &specs);
-            RenderedMarkup { lines, links }
+            RenderedMarkup {
+                lines,
+                links,
+                images: rendered.images,
+            }
         }
         Err(error) => RenderedMarkup {
             lines: Text::raw(format!("MBDown parse error: {error}")).lines,
             links: Vec::new(),
+            images: Vec::new(),
         },
     }
 }
@@ -402,6 +409,23 @@ mod tests {
         let wikilink = span_with(&lines, "[[项目计划]]");
         assert_eq!(wikilink.style.fg, Some(ctp::SKY));
         assert!(wikilink.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn reports_markdown_image_rows_without_embedding_terminal_escapes() {
+        let rendered = render_at_width(
+            "Before\n\n![Diagram](assets/diagram.png \"Overview\")\n\nAfter",
+            30,
+        );
+        assert_eq!(rendered.images.len(), 1);
+        let image = &rendered.images[0];
+        assert_eq!(image.source, "assets/diagram.png");
+        assert_eq!(image.title, "Overview");
+        assert_eq!(image.alt, "Diagram");
+        assert_eq!((image.column, image.width, image.height), (0, 30, 12));
+        assert!(rendered.lines[image.row..image.row + image.height]
+            .iter()
+            .all(|line| line.spans.is_empty()));
     }
 
     #[test]

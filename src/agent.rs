@@ -218,7 +218,7 @@ struct ApprovalGate {
 #[derive(Default)]
 struct ReadTracker {
     files: Mutex<HashMap<PathBuf, FileReadState>>,
-    messages: Mutex<HashMap<String, String>>,
+    daily_notes: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -285,28 +285,28 @@ impl ReadTracker {
         Ok(())
     }
 
-    fn mark_message(&self, id: String, body: String) -> Result<()> {
-        self.messages
+    fn mark_daily(&self, date: String, body: String) -> Result<()> {
+        self.daily_notes
             .lock()
-            .map_err(|_| anyhow::anyhow!("message read tracker lock poisoned"))?
-            .insert(id, body);
+            .map_err(|_| anyhow::anyhow!("daily read tracker lock poisoned"))?
+            .insert(date, body);
         Ok(())
     }
 
-    fn message_snapshot(&self, id: &str) -> Result<Option<String>> {
+    fn daily_snapshot(&self, date: &str) -> Result<Option<String>> {
         Ok(self
-            .messages
+            .daily_notes
             .lock()
-            .map_err(|_| anyhow::anyhow!("message read tracker lock poisoned"))?
-            .get(id)
+            .map_err(|_| anyhow::anyhow!("daily read tracker lock poisoned"))?
+            .get(date)
             .cloned())
     }
 
-    fn consume_message(&self, id: &str) -> Result<()> {
-        self.messages
+    fn consume_daily(&self, date: &str) -> Result<()> {
+        self.daily_notes
             .lock()
-            .map_err(|_| anyhow::anyhow!("message read tracker lock poisoned"))?
-            .remove(id);
+            .map_err(|_| anyhow::anyhow!("daily read tracker lock poisoned"))?
+            .remove(date);
         Ok(())
     }
 }
@@ -1030,7 +1030,19 @@ impl Agent {
                 );
                 break;
             }
-            results.push(self.execute_tool_call(call));
+            let _ = self
+                .events
+                .send(AgentEvent::ToolStarted(tool_start_activity(call)));
+            let result = self.execute_tool_call(call);
+            let error = if result.get("is_error").and_then(Value::as_bool) == Some(true) {
+                result.get("content").and_then(Value::as_str)
+            } else {
+                None
+            };
+            let _ = self
+                .events
+                .send(AgentEvent::ToolFinished(tool_finish_activity(call, error)));
+            results.push(result);
         }
         buffered.extend(self.take_buffered_prompts()?);
         if !buffered.is_empty() {
@@ -1055,34 +1067,19 @@ impl Agent {
                 "content": error.to_string(), "is_error": true
             });
         }
-        let _ = self
-            .events
-            .send(AgentEvent::ToolStarted(tool_start_activity(name)));
         let result = self
             .tools
             .get(name)
             .context("unknown tool")
             .and_then(|tool| tool.execute(input));
         match result {
-            Ok(content) => {
-                let _ = self.events.send(AgentEvent::ToolFinished(format!(
-                    "Completed {}.",
-                    tool_display_name(name)
-                )));
-                json!({
+            Ok(content) => json!({
                 "type": "tool_result", "tool_use_id": id, "content": content
-                })
-            }
-            Err(error) => {
-                let _ = self.events.send(AgentEvent::ToolFinished(format!(
-                    "Failed {}: {error}",
-                    tool_display_name(name)
-                )));
-                json!({
+            }),
+            Err(error) => json!({
                 "type": "tool_result", "tool_use_id": id,
                 "content": error.to_string(), "is_error": true
-                })
-            }
+            }),
         }
     }
 }
@@ -1241,12 +1238,80 @@ fn empty_response_diagnostic(stop_reason: &str, content: &[Value]) -> String {
     )
 }
 
-fn tool_start_activity(name: &str) -> String {
+fn tool_start_activity(call: &Value) -> String {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+    let target = tool_activity_target(call)
+        .map(|target| format!("\n{target}"))
+        .unwrap_or_default();
     match name {
-        "web_fetch" => "Fetching Web...".to_string(),
-        "web_search" => "Searching Web...".to_string(),
-        _ => format!("Calling {}...", tool_display_name(name)),
+        "web_fetch" => format!("Fetching Web...{target}"),
+        "web_search" => format!("Searching Web...{target}"),
+        _ => format!("Calling {}...{target}", tool_display_name(name)),
     }
+}
+
+fn tool_finish_activity(call: &Value, error: Option<&str>) -> String {
+    let name = tool_display_name(call.get("name").and_then(Value::as_str).unwrap_or(""));
+    let target = tool_activity_target(call)
+        .map(|target| format!("\n{target}"))
+        .unwrap_or_default();
+    if let Some(error) = error {
+        format!("Failed {name}: {error}{target}")
+    } else {
+        format!("Completed {name}.{target}")
+    }
+}
+
+fn tool_activity_target(call: &Value) -> Option<String> {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+    let input = call.get("input")?;
+    let text = |field: &str| {
+        input
+            .get(field)
+            .and_then(Value::as_str)
+            .map(compact_activity_value)
+            .filter(|value| !value.is_empty())
+    };
+    match name {
+        "web_fetch" => text("url").map(|url| web_base_url(&url)),
+        "web_search" | "search_content" | "search_files" => text("query"),
+        "read_daily" => {
+            let start = text("start_date")?;
+            let end = text("end_date")?;
+            Some(if start == end {
+                start
+            } else {
+                format!("{start}..{end}")
+            })
+        }
+        "update_daily" | "append_daily" => text("date"),
+        "copy_file" | "move_file" => {
+            Some(format!("{} -> {}", text("source")?, text("destination")?))
+        }
+        "move_files" => {
+            let count = input.get("sources").and_then(Value::as_array)?.len();
+            Some(format!(
+                "{count} files -> {}",
+                text("destination_directory")?
+            ))
+        }
+        "rename_file" => Some(format!("{} -> {}", text("path")?, text("new_name")?)),
+        "notify" => text("message"),
+        "ask_user" => text("question"),
+        _ => text("path"),
+    }
+}
+
+fn compact_activity_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn web_base_url(value: &str) -> String {
+    reqwest::Url::parse(value)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        .filter(|origin| origin != "null")
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn tool_display_name(name: &str) -> String {
@@ -1288,8 +1353,8 @@ Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never em
 ## Workspace
 Root: {root}
 - data/: ordinary .md/.mb articles and notes; create them here by default.
-- daily/: YYYY-MM-DD.md chat cards. Use only daily tools.
-- archives/: archived daily cards and articles.
+- daily/: YYYY-MM-DD.md DailyNotes. Use only DailyNote tools.
+- archives/: archived DailyNotes and regular notes.
 - config/: user-owned configuration. Never modify, move, copy, rename, or delete anything here. Never read config/ai.toml.
 - config/AGENTS.md: user instructions injected below.
 - MEMORY.md: persistent Agent memory injected below; you may update it.
@@ -1401,7 +1466,7 @@ impl Tool for ReadFile {
         let path =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
         if path == self.private_config || path.starts_with(&self.daily_dir) {
-            bail!("use daily tools for daily cards; AI configuration is private");
+            bail!("use DailyNote tools for daily notes; AI configuration is private");
         }
         let metadata =
             fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -1809,11 +1874,11 @@ impl Tool for SearchContent {
     }
 
     fn description(&self) -> &'static str {
-        "Case-insensitive full-text search across daily Chat cards and managed note files. Returns daily dates or note paths with matching snippets and supports result pagination."
+        "Case-insensitive full-text search across DailyNotes and managed note files. Returns daily dates or note paths with matching snippets and supports result pagination."
     }
 
     fn input_schema(&self) -> Value {
-        search_schema("Text to find in Chat cards and note contents")
+        search_schema("Text to find in DailyNotes and regular note contents")
     }
 
     fn execute(&self, input: &Value) -> Result<String> {
@@ -1825,12 +1890,12 @@ impl Tool for SearchContent {
         let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
         let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
-        for message in self.storage.load_messages()? {
-            if message.body.to_lowercase().contains(&query_lower) {
+        for note in self.storage.load_daily_notes()? {
+            if note.body.to_lowercase().contains(&query_lower) {
                 matches.push(json!({
                     "type": "daily",
-                    "date": message.id,
-                    "snippet": matching_line(&message.body, &query_lower),
+                    "date": note.date.to_string(),
+                    "snippet": matching_line(&note.body, &query_lower),
                 }));
             }
         }
@@ -2119,7 +2184,7 @@ impl Tool for ReadDaily {
     }
 
     fn description(&self) -> &'static str {
-        "Read all existing daily cards in an inclusive YYYY-MM-DD date range. Use the same start_date and end_date for one day. Every returned card is eligible for update_daily in this Agent run."
+        "Read existing DailyNotes in an inclusive YYYY-MM-DD date range. Use the same start_date and end_date for one day. Every returned DailyNote is eligible for update_daily in this Agent run."
     }
 
     fn input_schema(&self) -> Value {
@@ -2147,31 +2212,28 @@ impl Tool for ReadDaily {
         if start > end {
             bail!("start_date must not be after end_date");
         }
-        let messages = self
+        let notes = self
             .storage
-            .load_messages()?
+            .load_daily_notes()?
             .into_iter()
-            .filter(|message| {
-                let date = message.created_at.date_naive();
-                date >= start && date <= end
-            })
+            .filter(|note| note.date >= start && note.date <= end)
             .collect::<Vec<_>>();
-        let cards = messages
+        let daily_notes = notes
             .iter()
-            .map(|message| json!({ "date": message.id, "body": message.body }))
+            .map(|note| json!({ "date": note.date.to_string(), "body": note.body }))
             .collect::<Vec<_>>();
         let encoded = serde_json::to_string_pretty(&json!({
             "start_date": start_text,
             "end_date": end_text,
-            "count": cards.len(),
-            "cards": cards,
+            "count": daily_notes.len(),
+            "daily_notes": daily_notes,
         }))
         .context("encoding daily range")?;
         if encoded.len() as u64 > MAX_FETCH_BYTES {
             bail!("daily range response exceeds 1 MB; request a narrower date range");
         }
-        for message in messages {
-            self.reads.mark_message(message.id, message.body)?;
+        for note in notes {
+            self.reads.mark_daily(note.date.to_string(), note.body)?;
         }
         Ok(encoded)
     }
@@ -2199,7 +2261,7 @@ impl Tool for UpdateDaily {
     }
 
     fn description(&self) -> &'static str {
-        "Replace an existing daily card body by YYYY-MM-DD date after read_daily and, unless bypassed, user diff approval."
+        "Replace an existing DailyNote body by YYYY-MM-DD date after read_daily and, unless bypassed, user diff approval."
     }
 
     fn input_schema(&self) -> Value {
@@ -2217,17 +2279,17 @@ impl Tool for UpdateDaily {
         let date = required_string(input, "date")?;
         let body = required_string(input, "body")?;
         if body.len() as u64 > MAX_FILE_BYTES {
-            bail!("message body exceeds 1 MB");
+            bail!("DailyNote body exceeds 1 MB");
         }
-        let mut message = self.storage.read_daily_by_date(date)?;
-        let old = message.body.clone();
+        let mut note = self.storage.read_daily_by_date(date)?;
+        let old = note.body.clone();
         let snapshot = self
             .reads
-            .message_snapshot(date)?
+            .daily_snapshot(date)?
             .context("update_daily requires read_daily for the same date first")?;
         if snapshot != old {
-            self.reads.consume_message(date)?;
-            bail!("daily card changed since read_daily; read it again before updating");
+            self.reads.consume_daily(date)?;
+            bail!("DailyNote changed since read_daily; read it again before updating");
         }
         if old == body {
             return Ok(format!("no changes needed for daily {date}"));
@@ -2240,16 +2302,16 @@ impl Tool for UpdateDaily {
         let current = self
             .storage
             .read_daily_by_date(date)
-            .with_context(|| format!("daily card disappeared while awaiting approval: {date}"))?;
+            .with_context(|| format!("DailyNote disappeared while awaiting approval: {date}"))?;
         if current.body != old {
-            self.reads.consume_message(date)?;
-            bail!("daily card changed while awaiting approval; read it again before updating");
+            self.reads.consume_daily(date)?;
+            bail!("DailyNote changed while awaiting approval; read it again before updating");
         }
-        message.body = body.to_string();
-        if !self.storage.replace_message(&message)? {
-            bail!("daily card not found: {date}");
+        note.body = body.to_string();
+        if !self.storage.replace_daily(&note)? {
+            bail!("DailyNote not found: {date}");
         }
-        self.reads.consume_message(date)?;
+        self.reads.consume_daily(date)?;
         Ok(format!("updated daily {date}"))
     }
 }
@@ -2272,7 +2334,7 @@ impl Tool for AppendDaily {
     }
 
     fn description(&self) -> &'static str {
-        "Append content to a YYYY-MM-DD daily card, creating it if absent. This operation does not require approval."
+        "Append content to a YYYY-MM-DD DailyNote, creating it if absent. This operation does not require approval."
     }
 
     fn input_schema(&self) -> Value {
@@ -2288,10 +2350,11 @@ impl Tool for AppendDaily {
         let date = required_string(input, "date")?;
         let body = required_string(input, "body")?;
         if body.len() as u64 > MAX_FILE_BYTES {
-            bail!("message body exceeds 1 MB");
+            bail!("DailyNote body exceeds 1 MB");
         }
-        let message = self.storage.append_daily(date, body)?;
-        serde_json::to_string(&json!({ "date": message.id })).context("encoding daily result")
+        let note = self.storage.append_daily(date, body)?;
+        serde_json::to_string(&json!({ "date": note.date.to_string() }))
+            .context("encoding daily result")
     }
 }
 
@@ -3488,13 +3551,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        storage.append_chat_message("Rust in Chat").unwrap();
+        storage.append_to_today("Rust in Daily").unwrap();
         fs::write(
             directory.path().join("data/RustProject.md"),
             "# Project\nRust in a note\n",
         )
         .unwrap();
         fs::write(directory.path().join("data/Research.md"), "unrelated\n").unwrap();
+        fs::write(
+            directory.path().join("archives/RustHistory.md"),
+            "Rust in an archived note\n",
+        )
+        .unwrap();
 
         let content = SearchContent::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(
@@ -3504,10 +3572,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["returned"], 1);
-        assert_eq!(result["total_matches"], 2);
+        assert_eq!(result["total_matches"], 3);
         assert_eq!(result["has_more"], true);
         assert_eq!(result["matches"][0]["type"], "daily");
         assert!(result["matches"][0]["date"].is_string());
+
+        let remaining: Value = serde_json::from_str(
+            &content
+                .execute(&json!({"query": "rust", "offset": 1, "limit": 10}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remaining["matches"][0]["path"], "data/RustProject.md");
+        assert_eq!(remaining["matches"][1]["path"], "archives/RustHistory.md");
 
         let files = SearchFiles::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(
@@ -3836,11 +3913,106 @@ mod tests {
     }
 
     #[test]
-    fn tool_activity_uses_readable_names_and_web_fetch_wording() {
-        assert_eq!(tool_start_activity("web_fetch"), "Fetching Web...");
-        assert_eq!(tool_start_activity("web_search"), "Searching Web...");
-        assert_eq!(tool_start_activity("read_file"), "Calling Read File...");
+    fn tool_activity_uses_readable_names_and_identifying_arguments() {
+        let fetch = json!({
+            "name": "web_fetch",
+            "input": {"url": "https://docs.example.com:8443/guide/page?q=private"}
+        });
+        assert_eq!(
+            tool_start_activity(&fetch),
+            "Fetching Web...\nhttps://docs.example.com:8443"
+        );
+        assert_eq!(
+            tool_finish_activity(&fetch, None),
+            "Completed Web Fetch.\nhttps://docs.example.com:8443"
+        );
+
+        let search = json!({
+            "name": "web_search",
+            "input": {"query": "Rust terminal user interface"}
+        });
+        assert_eq!(
+            tool_start_activity(&search),
+            "Searching Web...\nRust terminal user interface"
+        );
+
+        let read = json!({
+            "name": "read_file",
+            "input": {"path": "data/project notes.md", "offset": 100}
+        });
+        assert_eq!(
+            tool_start_activity(&read),
+            "Calling Read File...\ndata/project notes.md"
+        );
+        assert_eq!(
+            tool_finish_activity(&read, None),
+            "Completed Read File.\ndata/project notes.md"
+        );
         assert_eq!(tool_display_name("update_daily"), "Update Daily");
+
+        assert_eq!(
+            tool_finish_activity(&read, Some("file not found")),
+            "Failed Read File: file not found\ndata/project notes.md"
+        );
+    }
+
+    #[test]
+    fn tool_batch_emits_one_timeline_activity_per_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            "api_key = 'test'\nmodel = 'test-model'\n",
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = std::sync::mpsc::channel();
+        let (_user_sender, user_receiver) = std::sync::mpsc::channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let calls = [
+            json!({
+                "type": "tool_use", "id": "notify-1", "name": "notify",
+                "input": {"message": "First"}
+            }),
+            json!({
+                "type": "tool_use", "id": "notify-2", "name": "notify",
+                "input": {"message": "Second"}
+            }),
+        ];
+        let calls = calls.iter().collect::<Vec<_>>();
+
+        let results = agent.execute_tool_batch(&calls).unwrap();
+        assert_eq!(results.len(), 2);
+        let activities = event_receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolStarted(text) => Some((true, text)),
+                AgentEvent::ToolFinished(text) => Some((false, text)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            activities,
+            [
+                (true, "Calling Notify...\nFirst".to_string()),
+                (false, "Completed Notify.\nFirst".to_string()),
+                (true, "Calling Notify...\nSecond".to_string()),
+                (false, "Completed Notify.\nSecond".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -4215,9 +4387,9 @@ mod tests {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("#tag"));
         assert!(prompt.contains("[[wikilink]]"));
-        assert!(prompt.contains("archived daily cards and articles"));
+        assert!(prompt.contains("archived DailyNotes and regular notes"));
         assert!(prompt.contains("create them here by default"));
-        assert!(prompt.contains("Use only daily tools"));
+        assert!(prompt.contains("Use only DailyNote tools"));
         assert!(prompt.contains("Use list_directory for filesystem structure"));
         assert!(prompt.contains("Generic file tools cannot operate in daily/ or config/"));
         assert!(prompt.contains("Use open_file"));
@@ -4396,29 +4568,30 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let message = storage.append_daily("2026-07-27", "old").unwrap();
+        let note = storage.append_daily("2026-07-27", "old").unwrap();
+        let date = note.date.to_string();
         let reads = Arc::new(ReadTracker::default());
         let update = UpdateDaily::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
-        let input = json!({"date": message.id.clone(), "body": "new"});
+        let input = json!({"date": date, "body": "new"});
         assert!(update.execute(&input).is_err());
 
         let read = ReadDaily::new(directory.path(), reads).unwrap();
         read.execute(&json!({
-            "start_date": message.id,
-            "end_date": message.id
+            "start_date": date,
+            "end_date": date
         }))
         .unwrap();
         update.execute(&input).unwrap();
-        assert_eq!(storage.load_messages().unwrap()[0].body, "new");
+        assert_eq!(storage.load_daily_notes().unwrap()[0].body, "new");
         assert!(update
-            .execute(&json!({"date": message.id, "body": "again"}))
+            .execute(&json!({"date": date, "body": "again"}))
             .is_err());
 
         let append = AppendDaily::new(directory.path()).unwrap();
         append
             .execute(&json!({"date": "2026-07-27", "body": "added"}))
             .unwrap();
-        assert_eq!(storage.load_messages().unwrap()[0].body, "new\n\nadded");
+        assert_eq!(storage.load_daily_notes().unwrap()[0].body, "new\n\nadded");
     }
 
     #[test]
@@ -4441,17 +4614,17 @@ mod tests {
             .unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["count"], 2);
-        assert_eq!(result["cards"][0]["date"], "2026-07-26");
-        assert_eq!(result["cards"][1]["date"], "2026-07-28");
+        assert_eq!(result["daily_notes"][0]["date"], "2026-07-26");
+        assert_eq!(result["daily_notes"][1]["date"], "2026-07-28");
         assert_eq!(
-            reads.message_snapshot("2026-07-26").unwrap().as_deref(),
+            reads.daily_snapshot("2026-07-26").unwrap().as_deref(),
             Some("first")
         );
         assert_eq!(
-            reads.message_snapshot("2026-07-28").unwrap().as_deref(),
+            reads.daily_snapshot("2026-07-28").unwrap().as_deref(),
             Some("last")
         );
-        assert!(reads.message_snapshot("2026-07-25").unwrap().is_none());
+        assert!(reads.daily_snapshot("2026-07-25").unwrap().is_none());
         assert!(read
             .execute(&json!({
                 "start_date": "2026-07-29",

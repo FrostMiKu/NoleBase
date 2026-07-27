@@ -19,6 +19,7 @@ pub mod catppuccin {
     pub const OVERLAY_0: Color = Color::Rgb(108, 112, 134);
     pub const SURFACE_1: Color = Color::Rgb(69, 71, 90);
     pub const SURFACE_0: Color = Color::Rgb(49, 50, 68);
+    pub const BASE: Color = Color::Rgb(30, 30, 46);
     pub const MANTLE: Color = Color::Rgb(24, 24, 37);
     pub const CRUST: Color = Color::Rgb(17, 17, 27);
 }

@@ -3,6 +3,7 @@
 mod agent;
 mod app;
 mod markdown;
+mod media;
 mod model;
 mod notification;
 mod storage;
@@ -10,7 +11,6 @@ mod theme;
 mod ui;
 mod vlist;
 
-use std::fs;
 use std::io::{self, Stdout, Write};
 use std::process::Command as ProcCommand;
 use std::sync::mpsc::{self, Receiver};
@@ -99,29 +99,6 @@ fn run_editor(path: &std::path::Path, terminal: &mut Tui) -> Result<()> {
     }
 }
 
-fn run_message_editor(body: &str, terminal: &mut Tui) -> Result<String> {
-    let mut file = tempfile::Builder::new()
-        .prefix("nole-message-")
-        .suffix(".md")
-        .tempfile()
-        .context("creating temporary message file")?;
-    file.write_all(body.as_bytes())?;
-    file.flush()?;
-    run_editor(file.path(), terminal)?;
-    let edited = fs::read_to_string(file.path())
-        .with_context(|| format!("reading edited message {}", file.path().display()))?;
-    Ok(normalize_editor_body(edited))
-}
-
-fn normalize_editor_body(mut body: String) -> String {
-    if body.ends_with("\r\n") {
-        body.truncate(body.len() - 2);
-    } else if body.ends_with('\n') {
-        body.pop();
-    }
-    body
-}
-
 fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Result<bool> {
     match cmd {
         Some(Command::Quit) => Ok(true),
@@ -132,13 +109,6 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
                 app.status = format!("Editor error: {e}");
             }
             app.reload_workspace();
-            Ok(false)
-        }
-        Some(Command::EditMessage { id, body }) => {
-            match run_message_editor(&body, terminal) {
-                Ok(edited) => app.apply_external_message_edit(&id, edited),
-                Err(error) => app.status = format!("Editor error: {error}"),
-            }
             Ok(false)
         }
         Some(Command::OpenLink(target)) => {
@@ -294,6 +264,10 @@ fn main() -> Result<()> {
 
     enter_tui()?;
     let _guard = TerminalGuard;
+    app.images.set_picker(
+        ratatui_image::picker::Picker::from_query_stdio()
+            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
+    );
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -313,14 +287,6 @@ mod tests {
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
 
     #[test]
-    fn editor_body_drops_one_conventional_final_newline() {
-        assert_eq!(normalize_editor_body("body\n".to_string()), "body");
-        assert_eq!(normalize_editor_body("body\r\n".to_string()), "body");
-        assert_eq!(normalize_editor_body("body\n\n".to_string()), "body\n");
-        assert_eq!(normalize_editor_body("body".to_string()), "body");
-    }
-
-    #[test]
     fn markdown_change_events_reload_the_visible_workspace() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
@@ -336,14 +302,12 @@ mod tests {
             source: "before".into(),
             scroll: 3,
             target_line: None,
-            return_to: DocumentReturn::Chat,
+            return_to: DocumentReturn::Daily,
             render_cache: None,
         });
 
-        app.storage.append_chat_message("external message").unwrap();
-        app.storage
-            .append_chat_message("- [ ] external task")
-            .unwrap();
+        app.storage.append_to_today("external message").unwrap();
+        app.storage.append_to_today("- [ ] external task").unwrap();
         fs::write(&document_path, "after").unwrap();
 
         let (sender, receiver) = mpsc::channel();
@@ -354,7 +318,7 @@ mod tests {
             .unwrap();
         process_workspace_events(&receiver, &mut app);
 
-        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.daily_notes.len(), 1);
         assert_eq!(app.todo_items.len(), 1);
         assert_eq!(app.document.as_ref().unwrap().source, "after");
         assert_eq!(app.document.as_ref().unwrap().scroll, 3);
@@ -366,7 +330,7 @@ mod tests {
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         let mut app = App::new(storage).unwrap();
-        app.storage.append_chat_message("not loaded yet").unwrap();
+        app.storage.append_to_today("not loaded yet").unwrap();
 
         let (sender, receiver) = mpsc::channel();
         sender
@@ -375,7 +339,7 @@ mod tests {
             .unwrap();
         process_workspace_events(&receiver, &mut app);
 
-        assert!(app.messages.is_empty());
+        assert!(app.daily_notes.is_empty());
     }
 
     #[test]
@@ -393,7 +357,7 @@ mod tests {
             source: "line\n".repeat(100),
             scroll: 10,
             target_line: None,
-            return_to: DocumentReturn::Chat,
+            return_to: DocumentReturn::Daily,
             render_cache: None,
         });
 

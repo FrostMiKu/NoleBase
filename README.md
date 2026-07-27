@@ -64,6 +64,19 @@ Columns stack when the center pane is too narrow. Widths are Unicode terminal
 columns, and background colors fill the complete Box or column rectangle. The
 full syntax rules live in the sibling MBDown workspace.
 
+CommonMark images (`![alt](source)`) render in Daily cards, document views, and
+Agent messages. Nole detects Kitty, Sixel, and iTerm2 graphics after entering
+the alternate screen and otherwise falls back to true-color Unicode half
+blocks. Relative local sources resolve from the containing note (or `daily/`
+for Daily cards) and must remain inside the Nole root; HTTP(S) sources are
+loaded through at most five validated redirects. PNG, JPEG, GIF first frames,
+and WebP are supported.
+Downloads are limited to 8 MB and decoded images to 4096x4096 with a 64 MB
+allocation budget. Localhost, private-network, and link-local remote targets are
+rejected. Images reserve twelve terminal rows, scale proportionally,
+and are sliced to the visible virtual-scroll window. While loading, or after a
+failure, the alt text remains visible.
+
 Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
 with the system default application. Clicking `[[wikilink]]` searches both
 `data/` and `archives/` by filename or filename stem. Multiple MD/MB matches
@@ -276,11 +289,11 @@ modification timestamps, and byte size. Results can be sorted ascending or
 descending by name or any of those metadata fields and paginated with
 `offset`/`limit`.
 
-`search_content` performs case-insensitive full-text search across daily cards
-and managed note contents, returning daily dates or file paths and line
-numbers. `search_files` uses the same case-insensitive fuzzy filename matching
-as the Files sidebar. Both search tools support result `offset`/`limit`
-pagination.
+`search_content` performs case-insensitive full-text search across daily cards,
+active notes, and archived notes, in that order, returning daily dates or file
+paths and line numbers. `search_files` uses the same case-insensitive fuzzy
+filename matching as the Files sidebar. Both search tools support result
+`offset`/`limit` pagination.
 
 `write_file` creates new files and refuses existing paths. `update_file` changes
 existing files, while `read_daily`, `update_daily`, and `append_daily` provide

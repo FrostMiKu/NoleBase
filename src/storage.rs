@@ -1,7 +1,7 @@
 //! Markdown persistence for Nole.
 //!
-//! Chat is persisted as one Markdown file per day under `daily/`. Sending the
-//! first message of a day creates `YYYY-MM-DD.md`; later messages append to it.
+//! Daily entries are persisted as one Markdown file per day under `daily/`.
+//! The first entry of a day creates `YYYY-MM-DD.md`; later entries append to it.
 //! `archives/` is a flat archive containing both whole daily files and articles
 //! moved from `data/`; archived daily files retain their `YYYY-MM-DD.md` names.
 
@@ -10,9 +10,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate};
 
-use crate::model::{Message, NoteFile, SearchHit, TodoItem};
+use crate::model::{DailyNote, NoteFile, SearchHit, TodoItem};
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
@@ -104,21 +104,21 @@ impl Storage {
     }
 
     /// Load one card per daily file, oldest first.
-    pub fn load_messages(&self) -> Result<Vec<Message>> {
+    pub fn load_daily_notes(&self) -> Result<Vec<DailyNote>> {
         self.daily_dates()?
             .into_iter()
             .map(|date| self.read_daily(date))
             .collect()
     }
 
-    /// Append a message to today's daily card, creating it on first send.
-    pub fn append_chat_message(&self, body: &str) -> Result<Message> {
+    /// Append content to today's daily note, creating it on first send.
+    pub fn append_to_today(&self, body: &str) -> Result<DailyNote> {
         let date = Local::now().date_naive();
         self.append_daily_for_date(date, body)?;
         self.read_daily(date)
     }
 
-    pub fn append_daily(&self, date: &str, body: &str) -> Result<Message> {
+    pub fn append_daily(&self, date: &str, body: &str) -> Result<DailyNote> {
         let date = parse_daily_date(date)?;
         self.append_daily_for_date(date, body)?;
         self.read_daily(date)
@@ -138,26 +138,22 @@ impl Storage {
         append_text(&path, &content)
     }
 
-    pub fn read_daily_by_date(&self, date: &str) -> Result<Message> {
+    pub fn read_daily_by_date(&self, date: &str) -> Result<DailyNote> {
         self.read_daily(parse_daily_date(date)?)
     }
 
-    fn read_daily(&self, date: NaiveDate) -> Result<Message> {
+    fn read_daily(&self, date: NaiveDate) -> Result<DailyNote> {
         let path = self.daily_path(date);
         let mut body = fs::read_to_string(&path)
             .with_context(|| format!("reading daily note {}", path.display()))?;
         if body.ends_with('\n') {
             body.pop();
         }
-        Ok(Message {
-            id: date.format("%Y-%m-%d").to_string(),
-            created_at: date_at_local_midnight(date)?,
-            body,
-        })
+        Ok(DailyNote { date, body })
     }
 
-    pub fn remove_message_by_id(&self, date: &str) -> Result<bool> {
-        let path = self.daily_path(parse_daily_date(date)?);
+    pub fn remove_daily(&self, date: &str) -> Result<bool> {
+        let path = self.daily_file_path(date)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -230,9 +226,9 @@ impl Storage {
         Ok(false)
     }
 
-    /// Case-insensitive substring search across every managed `.md`/`.mb` file
-    /// in `data/`. One hit per matching non-blank line. Capped to keep the
-    /// result list bounded.
+    /// Case-insensitive substring search across every managed `.md`/`.mb` file.
+    /// Active `data/` hits precede `archives/` hits. One result is returned per
+    /// matching non-blank line, with a shared cap to keep the list bounded.
     pub fn search_file_lines(&self, query: &str) -> Vec<SearchHit> {
         let q = query.to_lowercase();
         if q.is_empty() {
@@ -240,8 +236,16 @@ impl Storage {
         }
         const CAP: usize = 200;
         let mut out: Vec<SearchHit> = Vec::new();
-        for path in self.list_markdown_files().unwrap_or_default() {
-            let Ok(text) = self.read_note_file(&path) else {
+        let active = self.list_note_files().unwrap_or_default();
+        let archived = self.list_archived_note_files().unwrap_or_default();
+        for file in active.into_iter().chain(archived) {
+            let path = file.path;
+            let text = if file.archived {
+                self.read_archived_note_file(&path)
+            } else {
+                self.read_note_file(&path)
+            };
+            let Ok(text) = text else {
                 continue;
             };
             for (i, line) in text.lines().enumerate() {
@@ -264,12 +268,12 @@ impl Storage {
         out
     }
 
-    /// Append a daily card to a managed data note, then remove its daily file.
-    pub fn move_to_markdown(&self, target: &Path, msg: &Message) -> Result<String> {
+    /// Append a DailyNote to a managed note, then remove its daily file.
+    pub fn move_to_markdown(&self, target: &Path, note: &DailyNote) -> Result<String> {
         let safe = self.validate_target(target)?;
-        let content = append_markdown_section(&safe, msg)?;
-        let removed = self.remove_message_by_id(&msg.id)?;
-        debug_assert!(removed, "moved daily card not found after append");
+        let content = append_markdown_section(&safe, note)?;
+        let removed = self.remove_daily(&note.date.to_string())?;
+        debug_assert!(removed, "moved DailyNote not found after append");
         Ok(content)
     }
 
@@ -302,15 +306,15 @@ impl Storage {
         Ok(())
     }
 
-    /// Restore a deleted or filed daily card.
-    pub fn restore_message_to_chat(&self, msg: &Message) -> Result<()> {
-        let path = self.daily_path(parse_daily_date(&msg.id)?);
+    /// Restore a deleted or filed DailyNote.
+    pub fn restore_daily(&self, note: &DailyNote) -> Result<()> {
+        let path = self.daily_path(note.date);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)?;
-        file.write_all(msg.body.as_bytes())?;
-        if !msg.body.ends_with('\n') {
+        file.write_all(note.body.as_bytes())?;
+        if !note.body.ends_with('\n') {
             file.write_all(b"\n")?;
         }
         Ok(())
@@ -332,12 +336,12 @@ impl Storage {
     }
 
     /// Replace a daily file's complete card body.
-    pub fn replace_message(&self, msg: &Message) -> Result<bool> {
-        let path = self.daily_path(parse_daily_date(&msg.id)?);
+    pub fn replace_daily(&self, note: &DailyNote) -> Result<bool> {
+        let path = self.daily_path(note.date);
         if !path.is_file() {
             return Ok(false);
         }
-        let mut body = msg.body.clone();
+        let mut body = note.body.clone();
         if !body.ends_with('\n') {
             body.push('\n');
         }
@@ -347,6 +351,11 @@ impl Storage {
 
     fn daily_path(&self, date: NaiveDate) -> PathBuf {
         self.daily_dir.join(date_file_name(date))
+    }
+
+    /// Return the physical path for a validated `YYYY-MM-DD` daily date.
+    pub fn daily_file_path(&self, date: &str) -> Result<PathBuf> {
+        Ok(self.daily_path(parse_daily_date(date)?))
     }
 
     fn daily_dates(&self) -> Result<Vec<NaiveDate>> {
@@ -523,7 +532,7 @@ impl Storage {
     }
 
     /// Read an open article after it has been moved anywhere within the Nole
-    /// workspace. Daily cards and configuration remain owned by their
+    /// workspace. DailyNotes and configuration remain owned by their
     /// dedicated APIs.
     pub fn read_document_file(&self, path: &Path) -> Result<String> {
         let metadata = fs::symlink_metadata(path)
@@ -548,15 +557,6 @@ impl Storage {
             );
         }
         fs::read_to_string(canonical).context("reading document")
-    }
-
-    /// List only the paths, preserving the sidebar's recent-first order.
-    pub fn list_markdown_files(&self) -> Result<Vec<PathBuf>> {
-        Ok(self
-            .list_note_files()?
-            .into_iter()
-            .map(|file| file.path)
-            .collect())
     }
 
     /// Ensure a target is a flat data note.
@@ -639,16 +639,6 @@ fn date_from_path(path: &Path) -> Option<NaiveDate> {
         return None;
     }
     NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()
-}
-
-fn date_at_local_midnight(date: NaiveDate) -> Result<DateTime<Local>> {
-    let naive = date
-        .and_hms_opt(0, 0, 0)
-        .context("daily date is outside the supported time range")?;
-    Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .context("daily date has no corresponding local time")
 }
 
 fn is_note_path(path: &Path) -> bool {
@@ -764,12 +754,12 @@ fn flip_task_line(line: &str) -> Option<String> {
     Some(s)
 }
 
-fn append_markdown_section(path: &Path, msg: &Message) -> Result<String> {
-    let date = msg.created_at.format("%Y-%m-%d");
+fn append_markdown_section(path: &Path, note: &DailyNote) -> Result<String> {
+    let date = note.date.format("%Y-%m-%d");
     let mut content = String::new();
     content.push_str(&format!("\n## {date}\n\n"));
-    content.push_str(&msg.body);
-    if !msg.body.ends_with('\n') {
+    content.push_str(&note.body);
+    if !note.body.ends_with('\n') {
         content.push('\n');
     }
     append_text(path, &content)?;
@@ -814,32 +804,32 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_single_message() {
+    fn round_trip_single_daily_note() {
         let (_dir, st) = fresh();
-        st.append_chat_message("hello world").unwrap();
-        let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].body, "hello world");
+        st.append_to_today("hello world").unwrap();
+        let notes = st.load_daily_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "hello world");
     }
 
     #[test]
     fn preserves_multiline_body() {
         let (_dir, st) = fresh();
         let body = "line one\n\nline three\n- [ ] a checkbox";
-        st.append_chat_message(body).unwrap();
-        let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs[0].body, body);
+        st.append_to_today(body).unwrap();
+        let notes = st.load_daily_notes().unwrap();
+        assert_eq!(notes[0].body, body);
     }
 
     #[test]
     fn multiple_sends_append_to_one_daily_card() {
         let (_dir, st) = fresh();
-        st.append_chat_message("first").unwrap();
-        st.append_chat_message("second").unwrap();
-        st.append_chat_message("third").unwrap();
-        let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].body, "first\n\nsecond\n\nthird");
+        st.append_to_today("first").unwrap();
+        st.append_to_today("second").unwrap();
+        st.append_to_today("third").unwrap();
+        let notes = st.load_daily_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "first\n\nsecond\n\nthird");
     }
 
     #[test]
@@ -847,10 +837,10 @@ mod tests {
         let (_dir, st) = fresh();
         st.append_daily("2026-07-26", "keep").unwrap();
         st.append_daily("2026-07-27", "drop").unwrap();
-        assert!(st.remove_message_by_id("2026-07-27").unwrap());
-        let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].id, "2026-07-26");
+        assert!(st.remove_daily("2026-07-27").unwrap());
+        let notes = st.load_daily_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].date.to_string(), "2026-07-26");
     }
 
     #[test]
@@ -905,13 +895,24 @@ mod tests {
         st.create_named_file("Project").unwrap();
         let p = st.data_dir.join("Project.md");
         fs::write(&p, "# Project\n\nA note about Rust speed\n\nunrelated\n").unwrap();
+        let archived = st.archives_dir.join("Legacy.md");
+        fs::write(&archived, "Archived Rust notes\n").unwrap();
 
         let hits = st.search_file_lines("rust");
         assert!(hits.iter().any(|h| matches!(h,
             SearchHit::FileLine { text, .. } if text.to_lowercase().contains("rust"))));
-        // Case-insensitive.
+        let active_index = hits
+            .iter()
+            .position(|hit| matches!(hit, SearchHit::FileLine { path, .. } if path == &p))
+            .unwrap();
+        let archived_index = hits
+            .iter()
+            .position(|hit| matches!(hit, SearchHit::FileLine { path, .. } if path == &archived))
+            .unwrap();
+        assert!(active_index < archived_index);
+        // Case-insensitive across both storage groups.
         let hi = st.search_file_lines("RUST");
-        assert!(!hi.is_empty());
+        assert_eq!(hi.len(), 2);
         // Empty query returns nothing.
         assert!(st.search_file_lines("").is_empty());
     }
@@ -925,7 +926,7 @@ mod tests {
         let body = fs::read_to_string(&target).unwrap();
         assert!(body.contains("## 2026-06-18"));
         assert!(body.contains("idea!"));
-        assert!(st.load_messages().unwrap().is_empty());
+        assert!(st.load_daily_notes().unwrap().is_empty());
     }
 
     #[test]
@@ -945,10 +946,15 @@ mod tests {
         assert!(!from.exists());
         assert!(to.exists());
         let names: Vec<String> = st
-            .list_markdown_files()
+            .list_note_files()
             .unwrap()
             .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .filter_map(|file| {
+                file.path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(String::from)
+            })
             .collect();
         assert!(names.contains(&"new name.md".to_string()));
         assert!(!names.contains(&"old.md".to_string()));
@@ -979,18 +985,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_message_and_remove_first_occurrence() {
+    fn restore_daily_and_remove_first_occurrence() {
         let (_dir, st) = fresh();
-        let m = st.append_chat_message("hello").unwrap();
-        assert!(st.remove_message_by_id(&m.id).unwrap());
-        assert!(st.load_messages().unwrap().is_empty());
+        let note = st.append_to_today("hello").unwrap();
+        assert!(st.remove_daily(&note.date.to_string()).unwrap());
+        assert!(st.load_daily_notes().unwrap().is_empty());
 
-        // Restore re-inserts the block with the original id.
-        st.restore_message_to_chat(&m).unwrap();
-        let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].id, m.id);
-        assert_eq!(msgs[0].body, "hello");
+        st.restore_daily(&note).unwrap();
+        let notes = st.load_daily_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].date, note.date);
+        assert_eq!(notes[0].body, "hello");
 
         // remove_first_occurrence on a file.
         let p = st.create_named_file("X").unwrap();
@@ -1001,29 +1006,32 @@ mod tests {
     }
 
     #[test]
-    fn replace_message_updates_body_preserving_id() {
+    fn replace_daily_updates_only_the_target_date() {
         let (_dir, st) = fresh();
-        let m = st.append_chat_message("original").unwrap();
+        let note = st.append_to_today("original").unwrap();
         st.append_daily("2026-06-17", "keep me").unwrap();
 
-        let mut updated = m.clone();
+        let mut updated = note.clone();
         updated.body = "edited body".to_string();
-        assert!(st.replace_message(&updated).unwrap());
+        assert!(st.replace_daily(&updated).unwrap());
 
-        let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs.len(), 2);
-        let got = msgs.iter().find(|x| x.id == m.id).unwrap();
+        let notes = st.load_daily_notes().unwrap();
+        assert_eq!(notes.len(), 2);
+        let got = notes
+            .iter()
+            .find(|candidate| candidate.date == note.date)
+            .unwrap();
         assert_eq!(got.body, "edited body");
-        assert_eq!(got.created_at, m.created_at, "timestamp preserved");
-        assert!(msgs.iter().any(|x| x.body == "keep me"), "others untouched");
+        assert!(
+            notes.iter().any(|x| x.body == "keep me"),
+            "others untouched"
+        );
 
-        // Unknown id is a no-op.
-        let unknown = Message {
-            id: "2026-01-01".to_string(),
-            created_at: m.created_at,
+        let unknown = DailyNote {
+            date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             body: "x".to_string(),
         };
-        assert!(!st.replace_message(&unknown).unwrap());
+        assert!(!st.replace_daily(&unknown).unwrap());
     }
 
     #[test]
@@ -1130,10 +1138,15 @@ mod tests {
         fs::create_dir(st.data_dir.join("directory.md")).unwrap();
 
         let names: Vec<_> = st
-            .list_markdown_files()
+            .list_note_files()
             .unwrap()
             .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .filter_map(|file| {
+                file.path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(String::from)
+            })
             .collect();
         assert!(names.contains(&"alpha.MD".to_string()));
         assert!(names.contains(&"beta.mB".to_string()));
@@ -1150,9 +1163,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let newer = st.create_named_file("newer").unwrap();
 
-        let files = st.list_markdown_files().unwrap();
-        let older_index = files.iter().position(|path| path == &older).unwrap();
-        let newer_index = files.iter().position(|path| path == &newer).unwrap();
+        let files = st.list_note_files().unwrap();
+        let older_index = files.iter().position(|file| file.path == older).unwrap();
+        let newer_index = files.iter().position(|file| file.path == newer).unwrap();
         assert!(newer_index < older_index);
     }
 
@@ -1221,7 +1234,11 @@ mod tests {
         assert!(st.rename_file(&link, "renamed.md").is_err());
         assert!(st.delete_file(&link).is_err());
         assert!(link.exists());
-        assert!(!st.list_markdown_files().unwrap().contains(&link));
+        assert!(!st
+            .list_note_files()
+            .unwrap()
+            .iter()
+            .any(|file| file.path == link));
     }
 
     #[test]

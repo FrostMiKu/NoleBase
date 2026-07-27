@@ -1,20 +1,19 @@
-//! Core data model: messages, actions, and button hitboxes.
+//! Core data model for daily notes, regular notes, actions, and hitboxes.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
+use chrono::NaiveDate;
 use ratatui::layout::Rect;
 
-/// One daily chat card. `id` is its `YYYY-MM-DD` date.
+/// One daily note backed by `daily/YYYY-MM-DD.md`.
 #[derive(Debug, Clone)]
-pub struct Message {
-    pub id: String,
-    pub created_at: DateTime<Local>,
+pub struct DailyNote {
+    pub date: NaiveDate,
     pub body: String,
 }
 
-/// The per-message actions exposed in the UI.
+/// The actions exposed on each daily note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Ai,
@@ -40,7 +39,7 @@ impl Action {
         }
     }
 
-    /// Ordered list of actions rendered left to right on each message card.
+    /// Ordered list of actions rendered left to right on each daily note.
     pub fn all() -> &'static [Action] {
         &[
             Action::Move,
@@ -56,7 +55,7 @@ impl Action {
 /// A recorded screen rectangle for a clickable button, rebuilt each frame.
 #[derive(Debug, Clone)]
 pub struct ButtonHitbox {
-    pub message_id: String,
+    pub date: NaiveDate,
     pub action: Action,
     pub area: Rect,
 }
@@ -146,8 +145,8 @@ pub struct TodoHitbox {
 /// One content-search match.
 #[derive(Debug, Clone)]
 pub enum SearchHit {
-    /// A chat message whose body matched.
-    Message { id: String, text: String },
+    /// A daily note whose body matched.
+    Daily { date: NaiveDate, text: String },
     /// A matching line in a `.md` file.
     FileLine {
         path: std::path::PathBuf,
