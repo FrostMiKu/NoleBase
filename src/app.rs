@@ -316,6 +316,7 @@ pub struct App {
     permission_bypass: Arc<AtomicBool>,
     pub agent_prompt: String,
     pub agent_output: Vec<String>,
+    pub agent_output_final: bool,
     pub agent_scroll: u16,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
@@ -327,6 +328,8 @@ pub struct App {
     pub ask_user_cursor: usize,
     pub ask_user_option: usize,
     pub notifications: NotificationService,
+
+    ai_cancel: Option<Arc<AtomicBool>>,
 
     undo_stack: Vec<UndoOp>,
 }
@@ -382,6 +385,7 @@ impl App {
             permission_bypass: Arc::new(AtomicBool::new(false)),
             agent_prompt: String::new(),
             agent_output: Vec::new(),
+            agent_output_final: false,
             agent_scroll: 0,
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,
@@ -393,6 +397,7 @@ impl App {
             ask_user_cursor: 0,
             ask_user_option: 0,
             notifications: NotificationService::default(),
+            ai_cancel: None,
             undo_stack: Vec::new(),
         })
     }
@@ -493,7 +498,12 @@ impl App {
         }
         for event in events {
             match event {
-                AgentEvent::Progress(message) => self.set_status(message),
+                AgentEvent::Progress(message) => {
+                    self.agent_output.push(message.clone());
+                    self.agent_output_final = false;
+                    self.agent_scroll = u16::MAX;
+                    self.set_status(message);
+                }
                 AgentEvent::Notification(message) => {
                     self.notifications.notify(message);
                     self.set_status("Agent sent a notification");
@@ -518,9 +528,11 @@ impl App {
                 }
                 AgentEvent::Finished(result) => {
                     self.ai_running = false;
+                    self.ai_cancel = None;
                     match result {
                         Ok(output) => {
                             self.agent_output.clear();
+                            self.agent_output_final = true;
                             self.agent_scroll = 0;
                             if !output.trim().is_empty() {
                                 self.agent_output.push(output);
@@ -529,6 +541,7 @@ impl App {
                         }
                         Err(error) => {
                             self.agent_output.clear();
+                            self.agent_output_final = false;
                             self.agent_scroll = 0;
                             self.set_status(format!("AI error: {error}"));
                         }
@@ -540,7 +553,9 @@ impl App {
         }
         if disconnected && self.ai_running {
             self.ai_running = false;
+            self.ai_cancel = None;
             self.agent_output.clear();
+            self.agent_output_final = false;
             self.agent_scroll = 0;
             self.clear_ask_user();
             self.set_status("AI error: worker stopped unexpectedly");
@@ -1168,11 +1183,19 @@ impl App {
                 self.add_agent_output_to_chat();
                 None
             }
+            KeyCode::Char('c') if self.ai_running => {
+                self.cancel_agent();
+                None
+            }
             _ => None,
         }
     }
 
     fn add_agent_output_to_chat(&mut self) {
+        if self.ai_running || !self.agent_output_final {
+            self.set_status("Agent has no final response to add");
+            return;
+        }
         let body = self.agent_output.join("\n\n");
         if body.trim().is_empty() {
             self.set_status("Agent has no output to add");
@@ -1182,6 +1205,7 @@ impl App {
             Ok(message) => {
                 self.agent_prompt.clear();
                 self.agent_output.clear();
+                self.agent_output_final = false;
                 self.agent_scroll = 0;
                 self.reload();
                 self.reload_todos();
@@ -2213,9 +2237,12 @@ impl App {
         self.ai_running = true;
         self.agent_prompt = display_prompt;
         self.agent_output.clear();
+        self.agent_output_final = false;
         self.agent_scroll = 0;
         self.set_status("AI is working...");
         let bypass = self.permission_bypass.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.ai_cancel = Some(cancelled.clone());
         thread::spawn(move || {
             let result = Agent::from_config(
                 &config_path,
@@ -2224,12 +2251,36 @@ impl App {
                 approval_receiver,
                 user_receiver,
                 bypass,
+                cancelled,
             )
             .and_then(|agent| agent.run(&prompt))
             .map_err(|error| error.to_string());
             let _ = event_sender.send(AgentEvent::Finished(result));
         });
         true
+    }
+
+    fn cancel_agent(&mut self) {
+        if !self.ai_running {
+            self.set_status("Agent is not running");
+            return;
+        }
+        if let Some(cancelled) = self.ai_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.ai_running = false;
+        self.ai_events = None;
+        self.ai_approval_sender = None;
+        self.ai_user_sender = None;
+        self.approval_request = None;
+        self.clear_ask_user();
+        if self.overlay == Some(Overlay::Approval) {
+            self.overlay = None;
+        }
+        self.agent_output.push("Cancelled".to_string());
+        self.agent_output_final = false;
+        self.agent_scroll = u16::MAX;
+        self.set_status("Agent task cancelled");
     }
 
     fn cancel_file_context(&mut self) {
@@ -2549,14 +2600,44 @@ mod tests {
             .unwrap();
         app.poll_agent();
         assert_eq!(app.status, "Using read_file");
-        assert!(app.agent_output.is_empty());
+        assert_eq!(app.agent_output, ["Using read_file"]);
+        assert!(!app.agent_output_final);
 
         sender
             .send(AgentEvent::Finished(Ok("final reply".to_string())))
             .unwrap();
         app.poll_agent();
         assert_eq!(app.agent_output, ["final reply"]);
+        assert!(app.agent_output_final);
         assert_eq!(app.status, "Agent finished");
+    }
+
+    #[test]
+    fn c_cancels_a_running_agent_only_from_the_agent_panel() {
+        let (mut app, _directory) = make_app();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.ai_cancel = Some(cancelled.clone());
+        app.ai_running = true;
+        app.agent_output = vec!["Using web_fetch".to_string()];
+        app.focus = Focus::Center;
+
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.ai_running);
+        assert!(!cancelled.load(Ordering::Relaxed));
+
+        app.focus = Focus::Agent;
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(!app.ai_running);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(
+            app.agent_output.last().map(String::as_str),
+            Some("Cancelled")
+        );
+        assert!(!app.agent_output_final);
+        assert!(app.ai_events.is_none());
+        assert!(app.ai_approval_sender.is_none());
+        assert!(app.ai_user_sender.is_none());
+        assert_eq!(app.status, "Agent task cancelled");
     }
 
     #[test]
@@ -2760,6 +2841,7 @@ mod tests {
         let original_count = app.messages.len();
         app.agent_prompt = "User prompt".to_string();
         app.agent_output = vec!["Agent final reply".to_string()];
+        app.agent_output_final = true;
         app.focus = Focus::Agent;
 
         app.handle_key(key(KeyCode::Enter));
@@ -2772,7 +2854,7 @@ mod tests {
 
         app.add_agent_output_to_chat();
         assert_eq!(app.messages.len(), original_count + 1);
-        assert_eq!(app.status, "Agent has no output to add");
+        assert_eq!(app.status, "Agent has no final response to add");
     }
 
     #[test]

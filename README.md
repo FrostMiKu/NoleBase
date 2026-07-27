@@ -46,7 +46,8 @@ view is useful for scrolling through a long message.
 Daily cards and document views parse the shared MBDown language with `mbdown`,
 then render its AST directly to Ratatui with `mbtui`. There is no ANSI
 round-trip. In addition to CommonMark, notes may use restricted BBCode for
-terminal colors, backgrounds, boxes, and responsive columns:
+terminal colors, backgrounds, boxes, and responsive columns. MBDown also
+recognizes `#tag` and `[[wikilink]]` references in ordinary text:
 
 ```text
 [box title="Status" width=full border=single bg=17]
@@ -153,7 +154,6 @@ under `~/.nole`:
 ```text
 config/        # reserved for configuration
   ai.toml       # Anthropic Messages API configuration
-  legacy/       # backups from the old root-file layout
 daily/         # chat cards; absent dates have no file
   YYYY-MM-DD.md
 archives/      # archived daily cards
@@ -168,13 +168,6 @@ direct, regular files in `data/`; symlinks, nested paths, and paths outside that
 directory are rejected. Startup creates `daily/` and `archives/`, but a daily
 file is created only when content is first sent for that date. Later sends
 append with a blank line separator.
-
-On first startup after upgrading, old `CHAT.md` blocks are grouped into daily
-files by their original timestamps, old Todo tasks are appended to the latest
-daily file when one exists, and old Archive content is retained under
-`archives/`. The original root files move to `config/legacy/` as backups, so a
-Todo-only workspace does not manufacture a daily card. Ordinary legacy root
-notes still move into `data/` without overwriting conflicts.
 
 ### AI agent
 
@@ -198,9 +191,12 @@ and you press Enter. The latter appends to the current Daily card, clears the
 Agent panel, and returns focus to the center view.
 
 While the Agent is running, its panel border carries a moving color gradient
-and a color highlight advances character by character across the stationary
-bottom status text. Both return to the normal static theme as soon as the Agent
-stops.
+and the panel lists tool activity. A color highlight advances character by
+character across the current activity item; the bottom status text stays
+static. When the Agent finishes, its final response replaces the activity log.
+Focus the Agent panel and press `c` to cancel the current task. Cancellation is
+cooperative: no later tools will start, although an in-flight HTTP request or
+tool call may need to return before its worker thread exits.
 
 All scrollable TUI surfaces use virtual row windows. Daily cards, note previews,
 Agent output, approval diffs, help, searches, file/Todo lists, and multiline
@@ -228,15 +224,22 @@ pagination.
 `write_file` creates new files and refuses existing paths. `update_file` changes
 existing files, while `read_daily`, `update_daily`, and `append_daily` provide
 date-based access to daily cards without exposing `daily/` to generic file
-tools. A file update is rejected until every line of that exact file has been
-covered by one or more `read_file` calls in the same Agent run. Daily updates
-still require `read_daily` for the exact date.
+tools. `read_daily` accepts an inclusive `start_date`/`end_date` range and
+returns every existing card in it; use equal bounds for one day. `update_file`
+accepts one or more zero-based `[start_line, end_line)` replacements and
+preserves the rest of the file internally, so large files do not need to be
+read or submitted in full. Changed/deleted ranges must have been covered by
+`read_file` in the same Agent run; insertions require adjacent anchor lines.
+Daily updates require a prior range read containing the exact date.
 
 `copy_file` and `move_file` accept a regular source file anywhere on the
 filesystem, but the destination must be a new path inside the Nole directory;
-neither operation requires approval. `delete_file` only accepts regular files
-inside Nole and uses the common approval dialog. Generic file tools cannot
-operate directly inside `daily/` or on `config/ai.toml`.
+neither operation requires approval. `move_files` moves up to 200 sources into
+one existing Nole directory, preserves basenames, preflights all collisions,
+and attempts rollback if a later move fails. `rename_file` gives same-directory
+renames an explicit non-overwriting operation. `delete_file` only accepts
+regular files inside Nole and uses the common approval dialog. Generic file
+tools cannot operate directly inside `daily/` or on `config/ai.toml`.
 
 The `notify` tool lets the Agent display a short notification card in the TUI's
 top-right corner. Notifications are non-blocking and expire automatically.
@@ -245,6 +248,10 @@ The Agent may provide up to ten choices; use Up/Down and Enter to select one,
 or type a different free-text response. Esc cancels the question. Questions
 are interactive requests rather than permission checks, so APPROVE/BYPASS does
 not skip them.
+
+Each Agent launch is a single-turn task; later prompts do not inherit its
+conversation history. The system prompt requires the Agent to use `ask_user`
+for any clarification needed before its final response.
 
 In `APPROVE` mode, updates and deletes pause and show an MBTUI-rendered diff or
 deletion preview. Use Enter/Y to approve or N/Esc to deny. In `BYPASS` mode

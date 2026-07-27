@@ -30,6 +30,12 @@ fn note_theme() -> &'static Theme {
             .add_modifier(Modifier::BOLD);
         theme.rule = Style::default().fg(Color::DarkGray);
         theme.code = Style::default().fg(Color::Cyan);
+        theme.hashtag = Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD);
+        theme.wikilink = Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::UNDERLINED);
         theme.insert("markdown-box", Style::default().fg(Color::DarkGray));
         theme
     })
@@ -168,6 +174,18 @@ mod tests {
             span_with(&lines, "background").style.bg,
             Some(Color::Indexed(196))
         );
+    }
+
+    #[test]
+    fn renders_mbdown_hashtags_and_wikilinks() {
+        let lines = to_lines_at_width("See #开发/日志 and [[项目计划]]", WIDTH);
+        assert_eq!(
+            span_with(&lines, "#开发/日志").style.fg,
+            Some(Color::LightMagenta)
+        );
+        let wikilink = span_with(&lines, "[[项目计划]]");
+        assert_eq!(wikilink.style.fg, Some(Color::LightCyan));
+        assert!(wikilink.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

@@ -152,15 +152,43 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::default());
         }
         lines.push(Line::from(Span::styled(
-            "Response",
+            if app.agent_output_final {
+                "Response"
+            } else {
+                "Activity"
+            },
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.extend(crate::markdown::to_lines_at_width(
-            &app.agent_output.join("\n\n"),
-            inner.width as usize,
-        ));
+        if app.agent_output_final {
+            lines.extend(crate::markdown::to_lines_at_width(
+                &app.agent_output.join("\n\n"),
+                inner.width as usize,
+            ));
+        } else {
+            for (index, entry) in app.agent_output.iter().enumerate() {
+                if app.ai_running && index + 1 == app.agent_output.len() {
+                    lines.extend(animated_activity_lines(
+                        entry,
+                        inner.width as usize,
+                        app.animation_tick,
+                    ));
+                } else {
+                    lines.extend(
+                        wrap_spans_to_width(
+                            &[Span::styled(
+                                entry.replace(['\n', '\r'], " "),
+                                Style::default().fg(Color::DarkGray),
+                            )],
+                            inner.width as usize,
+                        )
+                        .into_iter()
+                        .map(Line::from),
+                    );
+                }
+            }
+        }
     }
     let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
     app.agent_scroll = app.agent_scroll.min(max_scroll);
@@ -484,6 +512,42 @@ fn animated_color(position: usize, tick: u64) -> Color {
         blend(from.1, to.1),
         blend(from.2, to.2),
     )
+}
+
+fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
+    let characters = text
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .filter(|character| UnicodeWidthChar::width(*character).unwrap_or(0) > 0)
+        .collect::<Vec<_>>();
+    if characters.is_empty() {
+        return vec![Line::default()];
+    }
+    let active = tick as usize % characters.len();
+    let spans = characters
+        .into_iter()
+        .enumerate()
+        .map(|(index, character)| {
+            let style = if index == active {
+                Style::default()
+                    .fg(animated_color(index * 8, tick))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Span::styled(character.to_string(), style)
+        })
+        .collect::<Vec<_>>();
+    wrap_spans_to_width(&spans, width)
+        .into_iter()
+        .map(Line::from)
+        .collect()
 }
 
 fn draw_animated_border(frame: &mut Frame, area: Rect, tick: u64) {
@@ -1238,14 +1302,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(hint.width() as u16)
         .saturating_sub(u16::from(!hint.is_empty()));
     if !app.status.is_empty() && available_status > 2 {
-        let status = if app.ai_running {
-            animated_status_line(&app.status, available_status as usize, app.animation_tick)
-        } else {
-            Line::from(Span::styled(
-                format!(" {}", app.status),
-                Style::default().fg(Color::Yellow),
-            ))
-        };
+        let status = Line::from(Span::styled(
+            format!(" {}", app.status),
+            Style::default().fg(Color::Yellow),
+        ));
         frame.render_widget(
             Paragraph::new(status),
             Rect::new(area.x + mode_width, area.y, available_status, area.height),
@@ -1261,46 +1321,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn animated_status_line(status: &str, width: usize, tick: u64) -> Line<'static> {
-    if width == 0 || status.is_empty() {
-        return Line::default();
-    }
-    let mut visible = Vec::new();
-    let mut used = 1usize.min(width);
-    for character in status.chars() {
-        let character = if character == '\n' || character == '\r' {
-            ' '
-        } else {
-            character
-        };
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if character_width == 0 {
-            continue;
-        }
-        if used + character_width > width {
-            break;
-        }
-        visible.push((character, character_width));
-        used += character_width;
-    }
-    if visible.is_empty() {
-        return Line::from(" ".repeat(width.min(1)));
-    }
-    let active = tick as usize % visible.len();
-    let mut spans = vec![Span::raw(" ")];
-    for (index, (character, _)) in visible.into_iter().enumerate() {
-        let style = if index == active {
-            Style::default()
-                .fg(animated_color(index * 8, tick))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(character.to_string(), style));
-    }
-    Line::from(spans)
-}
-
 fn footer_hint(app: &App, width: u16) -> &'static str {
     if width < 28 {
         return "";
@@ -1311,6 +1331,7 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
             (Focus::Compose, _) => "Esc daily",
             (Focus::Files, _) => "Esc back · Enter open",
             (Focus::Todo, _) => "Esc back · Enter toggle",
+            (Focus::Agent, _) if app.ai_running => "c cancel · Esc back",
             (Focus::Agent, _) => "Enter add · Esc back",
             (Focus::Center, _) => "? help",
         };
@@ -1322,6 +1343,7 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
         }
         (Focus::Files, _) => "↑↓ select · Enter open · e edit · / filter · Esc back",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
+        (Focus::Agent, _) if app.ai_running => "c cancel · ↑↓ scroll · ← center",
         (Focus::Agent, _) => "Enter add to Daily · ↑↓ scroll · ← center",
         (_, CenterView::Chat) if width >= 95 => "i compose · f files · T todo · / search · ? help",
         (_, CenterView::Document)
@@ -1737,6 +1759,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("type / Esc", "custom answer / cancel question"),
         Line::default(),
         heading("Agent output"),
+        key("c", "cancel running Agent while panel is focused"),
         key("Enter", "add final output to Daily"),
     ]
 }
@@ -1929,10 +1952,14 @@ mod tests {
     }
 
     #[test]
-    fn running_agent_animates_its_border_and_footer_status() {
+    fn running_agent_animates_its_border_and_current_activity_only() {
         let (mut app, _directory) = make_app();
         app.ai_running = true;
         app.agent_prompt = "Analyze this".to_string();
+        app.agent_output = vec![
+            "Completed read_file".to_string(),
+            "Using web_fetch".to_string(),
+        ];
         app.status = "AI is working".to_string();
         app.animation_tick = 0;
         let first = render(&mut app, 170, 24);
@@ -1946,37 +1973,43 @@ mod tests {
             .all(|color| matches!(color, Color::Rgb(..))));
         assert!(top_colors.windows(2).any(|colors| colors[0] != colors[1]));
         let first_footer = buffer_string(&first).lines().last().unwrap().to_string();
-        let first_highlights = (0..170)
+        let first_footer_highlights = (0..170)
             .filter(|x| matches!(first.backend().buffer()[(*x, 23)].fg, Color::Rgb(..)))
             .collect::<Vec<_>>();
-        assert_eq!(first_highlights.len(), 1);
+        assert!(first_footer_highlights.is_empty());
+        let first_activity_highlights = (agent.y + 1..agent.y + agent.height - 1)
+            .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
+            .filter(|(x, y)| matches!(first.backend().buffer()[(*x, *y)].fg, Color::Rgb(..)))
+            .count();
+        assert_eq!(first_activity_highlights, 1);
 
         app.animation_tick = 1;
         let second = render(&mut app, 170, 24);
         let second_corner = second.backend().buffer()[(agent.x, agent.y)].fg;
         let second_footer = buffer_string(&second).lines().last().unwrap().to_string();
-        let second_highlights = (0..170)
+        let second_footer_highlights = (0..170)
             .filter(|x| matches!(second.backend().buffer()[(*x, 23)].fg, Color::Rgb(..)))
             .collect::<Vec<_>>();
         assert_ne!(first_corner, second_corner);
         assert_eq!(first_footer, second_footer);
-        assert_eq!(second_highlights.len(), 1);
-        assert_ne!(first_highlights, second_highlights);
+        assert!(second_footer_highlights.is_empty());
     }
 
     #[test]
-    fn animated_status_line_respects_terminal_cell_width() {
-        let line = animated_status_line("正在调用工具", 19, 4);
-        assert_eq!(line.to_string(), " 正在调用工具");
-        assert_eq!(line.width(), 13);
+    fn animated_activity_respects_terminal_cell_width() {
+        let lines = animated_activity_lines("正在调用工具", 19, 4);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "正在调用工具");
+        assert_eq!(lines[0].width(), 12);
         assert_eq!(
-            line.spans
+            lines[0]
+                .spans
                 .iter()
                 .filter(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
                 .count(),
             1
         );
-        assert!(line
+        assert!(lines[0]
             .spans
             .iter()
             .filter(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
@@ -2231,6 +2264,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         app.agent_prompt = "Explain the selected note".to_string();
         app.agent_output = vec!["Here is the explanation".to_string()];
+        app.agent_output_final = true;
         app.focus = Focus::Agent;
 
         let terminal = render(&mut app, 170, 24);

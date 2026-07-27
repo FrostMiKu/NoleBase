@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -99,6 +99,7 @@ struct ReadTracker {
     messages: Mutex<HashMap<String, String>>,
 }
 
+#[derive(Clone)]
 struct FileReadState {
     snapshot: String,
     ranges: Vec<(usize, usize)>,
@@ -146,19 +147,12 @@ impl ReadTracker {
         Ok(())
     }
 
-    fn file_snapshot(&self, path: &Path) -> Result<Option<String>> {
+    fn file_state(&self, path: &Path) -> Result<Option<FileReadState>> {
         let files = self
             .files
             .lock()
             .map_err(|_| anyhow::anyhow!("file read tracker lock poisoned"))?;
-        Ok(files.get(path).and_then(|state| {
-            let complete = state.total_lines == 0
-                || state
-                    .ranges
-                    .first()
-                    .is_some_and(|range| range.0 == 0 && range.1 >= state.total_lines);
-            complete.then(|| state.snapshot.clone())
-        }))
+        Ok(files.get(path).cloned())
     }
 
     fn consume_file(&self, path: &Path) -> Result<()> {
@@ -191,6 +185,35 @@ impl ReadTracker {
             .lock()
             .map_err(|_| anyhow::anyhow!("message read tracker lock poisoned"))?
             .remove(id);
+        Ok(())
+    }
+}
+
+impl FileReadState {
+    fn covers(&self, start: usize, end: usize) -> bool {
+        start == end
+            || self
+                .ranges
+                .iter()
+                .any(|range| range.0 <= start && range.1 >= end)
+    }
+
+    fn ensure_edit_read(&self, start_line: usize, end_line: usize) -> Result<()> {
+        if start_line < end_line {
+            if !self.covers(start_line, end_line) {
+                bail!(
+                    "update_file must read changed zero-based lines {start_line}..{end_line} first"
+                );
+            }
+        } else if self.total_lines > 0 {
+            let anchor_start = start_line.saturating_sub(1);
+            let anchor_end = (start_line + 1).min(self.total_lines);
+            if !self.covers(anchor_start, anchor_end) {
+                bail!(
+                    "update_file must read insertion anchor lines {anchor_start}..{anchor_end} first"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -275,6 +298,7 @@ pub struct Agent {
     tools: HashMap<String, Box<dyn Tool>>,
     system: String,
     events: Sender<AgentEvent>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -285,6 +309,7 @@ impl Agent {
         decisions: Receiver<ApprovalDecision>,
         user_responses: Receiver<AskUserResponse>,
         bypass: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
         let config = AgentConfig::load(config_path)?;
         let client = Client::builder()
@@ -298,6 +323,7 @@ impl Agent {
             tools: HashMap::new(),
             system: system_prompt(nole_root),
             events: events.clone(),
+            cancelled,
         };
         let gate = ApprovalGate {
             bypass,
@@ -312,6 +338,8 @@ impl Agent {
         agent.register(WriteFile::new(nole_root)?);
         agent.register(CopyFile::new(nole_root)?);
         agent.register(MoveFile::new(nole_root)?);
+        agent.register(MoveFiles::new(nole_root)?);
+        agent.register(RenameFile::new(nole_root)?);
         agent.register(DeleteFile::new(nole_root, gate.clone())?);
         agent.register(UpdateFile::new(nole_root, gate.clone(), reads.clone())?);
         agent.register(ReadDaily::new(nole_root, reads.clone())?);
@@ -338,6 +366,7 @@ impl Agent {
         let definitions: Vec<Value> = self.tools.values().map(|tool| tool.definition()).collect();
 
         for _ in 0..MAX_AGENT_ROUNDS {
+            self.ensure_active()?;
             let url = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
             let response = self
                 .client
@@ -353,8 +382,10 @@ impl Agent {
                 }))
                 .send()
                 .context("calling Anthropic Messages API")?;
+            self.ensure_active()?;
             let status = response.status();
             let body = response.text().context("reading Anthropic response")?;
+            self.ensure_active()?;
             if !status.is_success() {
                 let message = serde_json::from_str::<Value>(&body)
                     .ok()
@@ -386,6 +417,7 @@ impl Agent {
             }
 
             messages.push(json!({ "role": "assistant", "content": content }));
+            self.ensure_active()?;
             let results: Vec<Value> = tool_uses
                 .into_iter()
                 .map(|call| self.execute_tool_call(call))
@@ -395,10 +427,23 @@ impl Agent {
         bail!("agent exceeded {MAX_AGENT_ROUNDS} tool-call rounds")
     }
 
+    fn ensure_active(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            bail!("agent task cancelled");
+        }
+        Ok(())
+    }
+
     fn execute_tool_call(&self, call: &Value) -> Value {
         let id = call.get("id").and_then(Value::as_str).unwrap_or("");
         let name = call.get("name").and_then(Value::as_str).unwrap_or("");
         let input = call.get("input").unwrap_or(&Value::Null);
+        if let Err(error) = self.ensure_active() {
+            return json!({
+                "type": "tool_result", "tool_use_id": id,
+                "content": error.to_string(), "is_error": true
+            });
+        }
         let _ = self
             .events
             .send(AgentEvent::Progress(format!("Using {name}")));
@@ -432,9 +477,10 @@ impl Agent {
 fn system_prompt(root: &Path) -> String {
     format!(
         r#"You are the AI assistant inside Nole, a chat-style terminal note app.
-Answer the user's card directly. Your final response becomes a new Chat card, so return only useful content, without discussing tool mechanics.
+This is a single-turn task. After your final response, the user cannot reply in the same conversation and you will not see a follow-up. If you need clarification, confirmation, a choice, or any other user input to complete the task, you MUST call ask_user before returning your final response. Never put a question that requires an answer in the final response.
+Answer the user's request directly. Your final response is shown in the Agent panel, so return only useful content, without discussing tool mechanics.
 
-Nole renders MBDown. MBDown supports CommonMark headings, emphasis, strong text, strikethrough, links, lists, task lists, fenced code, block quotes, and tables. It also supports restricted BBCode:
+Nole renders MBDown. MBDown supports CommonMark headings, emphasis, strong text, strikethrough, links, lists, task lists, fenced code, block quotes, and tables. It also supports #tag at word boundaries and [[wikilink]] for references between notes. Tag names may use Unicode letters and numbers plus _, -, and /. Keep both forms literal inside code. MBDown also supports restricted BBCode:
 - inline: [b], [i], [u], [s], [dim], named colors such as [red], [color=196], [color=#12abef], [bg=blue], and [link=https://example.com]label[/link]
 - layout: [center]...[/center], [right]...[/right], [indent first=4]...[/indent]
 - boxes: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0]...[/box]
@@ -446,7 +492,7 @@ The Nole root is {root}. Special paths are:
 - archives/: archived daily files, retaining the same YYYY-MM-DD.md name
 - config/ai.toml: Anthropic API configuration; never read or expose secrets from it
 - data/: flat user note storage; notes use .md or .mb
-Relative file paths use this root. read_file accepts absolute paths, but write_file, update_file, and all destinations are restricted to this root. read_file is line-paginated; use offset and limit to inspect only relevant portions. Generic file tools must never operate inside daily/ or on config/ai.toml. Use list_notes to inspect managed notes and sort them by name, line count, creation time, modification time, or file size. Use search_content for full-text search across daily cards and notes, and search_files for fuzzy note-name search. copy_file and move_file accept a source anywhere on the filesystem, but only create a non-existing destination under the Nole root and do not require approval. delete_file only deletes a regular file under the Nole root and requires approval unless permission checks are bypassed. Use read_daily and update_daily for an existing daily card by YYYY-MM-DD date; use append_daily to append content for a date. append_daily is not approval-gated, while updates may pause for user approval. write_file only creates new files and update_file only changes existing files. Before update_file you MUST successfully read every line of the exact file in this agent run, possibly across multiple read_file calls; before update_daily you MUST successfully read_daily the exact date. Updates are automatically rejected without that read, even in bypass mode. Todo items are Markdown task-list items scanned from all files in daily/. Use ask_user when a missing decision or ambiguity materially affects the result; include concise options when useful, while allowing free-text answers. Use notify to surface a short, time-sensitive message in the user's TUI. Do not assume your final response is added to daily: call append_daily when content belongs there. Your final text is shown in the Agent output panel. Use tools only when the request requires local context or changes."#,
+Relative file paths use this root. read_file accepts absolute paths, but write_file, update_file, and all destinations are restricted to this root. read_file is line-paginated; use offset and limit to inspect only relevant portions. Generic file tools must never operate inside daily/ or on config/ai.toml. Use list_notes to inspect managed notes and sort them by name, line count, creation time, modification time, or file size. Use search_content for full-text search across daily cards and notes, and search_files for fuzzy note-name search. copy_file and move_file accept a source anywhere on the filesystem, but only create a non-existing destination under the Nole root and do not require approval. Use move_files to move up to 200 files into one existing Nole directory while preserving basenames. Use rename_file for a same-directory rename under Nole instead of expressing renames as moves. delete_file only deletes a regular file under the Nole root and requires approval unless permission checks are bypassed. read_daily requires an inclusive start_date and end_date and returns all existing cards in that range; use the same date for both bounds to read one card. Use update_daily to replace an existing daily card and append_daily to append content for a date. append_daily is not approval-gated, while updates may pause for user approval. write_file only creates new files. update_file applies zero-based line edits and preserves all content outside each [start_line, end_line) range; replacement content is exact, so include required newlines. Before update_file you MUST read each changed or deleted range of the exact file in this agent run; insertions require the adjacent anchor lines. You do not need to read or submit unrelated portions of a large file. Before update_daily you MUST read a range containing the exact date. Updates are automatically rejected without the required read, even in bypass mode. Todo items are Markdown task-list items scanned from all files in daily/. Use ask_user when a missing decision or ambiguity materially affects the result; include concise options when useful, while allowing free-text answers. Use notify to surface a short, time-sensitive message in the user's TUI. Do not assume your final response is added to daily: call append_daily when content belongs there. Your final text is shown in the Agent output panel. Use tools only when the request requires local context or changes."#,
         root = root.display()
     )
 }
@@ -855,7 +901,7 @@ impl Tool for UpdateFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replace an existing UTF-8 file under the Nole root after every line has been covered by read_file in this run and, unless bypassed, user diff approval."
+        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root while preserving all other content. Each edit replaces [start_line, end_line) with exact content. Changed/deleted lines, or adjacent anchors for insertions, must have been read in this run. Requires user diff approval unless bypassed."
     }
 
     fn input_schema(&self) -> Value {
@@ -863,18 +909,36 @@ impl Tool for UpdateFile {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "content": { "type": "string" }
+                "edits": {
+                    "type": "array", "minItems": 1, "maxItems": 100,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start_line": {
+                                "type": "integer", "minimum": 0,
+                                "description": "Zero-based inclusive source line"
+                            },
+                            "end_line": {
+                                "type": "integer", "minimum": 0,
+                                "description": "Zero-based exclusive source line"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Exact replacement text; include newlines where required"
+                            }
+                        },
+                        "required": ["start_line", "end_line", "content"],
+                        "additionalProperties": false
+                    }
+                }
             },
-            "required": ["path", "content"], "additionalProperties": false
+            "required": ["path", "edits"], "additionalProperties": false
         })
     }
 
     fn execute(&self, input: &Value) -> Result<String> {
         let relative = required_string(input, "path")?;
-        let content = required_string(input, "content")?;
-        if content.len() as u64 > MAX_FILE_BYTES {
-            bail!("content exceeds 1 MB");
-        }
+        let edits = parse_line_edits(input)?;
         let unresolved = safe_relative(&self.root, relative)?;
         if fs::symlink_metadata(&unresolved)?.file_type().is_symlink() {
             bail!("refusing to update through a symlink");
@@ -890,20 +954,36 @@ impl Tool for UpdateFile {
         }
         let old = fs::read_to_string(&path)
             .with_context(|| format!("reading current file {}", path.display()))?;
-        let snapshot = self
+        let state = self
             .reads
-            .file_snapshot(&path)?
+            .file_state(&path)?
             .context("update_file requires read_file on the same path first")?;
-        if snapshot != old {
+        if state.snapshot != old {
             self.reads.consume_file(&path)?;
             bail!("file changed since read_file; read it again before updating");
+        }
+        let offsets = line_byte_offsets(&old);
+        let total_lines = offsets.len().saturating_sub(1);
+        for edit in &edits {
+            if edit.start_line > edit.end_line || edit.end_line > total_lines {
+                bail!(
+                    "invalid edit range {}..{} for file with {total_lines} lines",
+                    edit.start_line,
+                    edit.end_line
+                );
+            }
+            state.ensure_edit_read(edit.start_line, edit.end_line)?;
+        }
+        let content = apply_line_edits(&old, &offsets, &edits);
+        if content.len() as u64 > MAX_FILE_BYTES {
+            bail!("updated content exceeds 1 MB");
         }
         if old == content {
             return Ok(format!("no changes needed for {relative}"));
         }
         self.gate.request(ApprovalRequest {
             title: format!("Update {relative}"),
-            diff: limited_diff(&old, content, relative, relative),
+            diff: limited_diff(&old, &content, relative, relative),
         })?;
         let current =
             fs::read_to_string(&path).with_context(|| format!("rechecking {}", path.display()))?;
@@ -911,10 +991,78 @@ impl Tool for UpdateFile {
             self.reads.consume_file(&path)?;
             bail!("file changed while awaiting approval; read it again before updating");
         }
-        fs::write(&path, content).with_context(|| format!("updating {}", path.display()))?;
+        fs::write(&path, &content).with_context(|| format!("updating {}", path.display()))?;
         self.reads.consume_file(&path)?;
         Ok(format!("updated {relative}"))
     }
+}
+
+#[derive(Debug)]
+struct LineEdit {
+    start_line: usize,
+    end_line: usize,
+    content: String,
+}
+
+fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
+    let values = input
+        .get("edits")
+        .and_then(Value::as_array)
+        .context("field edits must be an array")?;
+    if values.is_empty() || values.len() > 100 {
+        bail!("edits must contain between 1 and 100 entries");
+    }
+    let mut edits = values
+        .iter()
+        .map(|value| {
+            let start_line = value
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .context("edit start_line must be a non-negative integer")?;
+            let end_line = value
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .context("edit end_line must be a non-negative integer")?;
+            Ok(LineEdit {
+                start_line: usize::try_from(start_line).context("start_line is too large")?,
+                end_line: usize::try_from(end_line).context("end_line is too large")?,
+                content: required_string(value, "content")?.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    edits.sort_by_key(|edit| (edit.start_line, edit.end_line));
+    for pair in edits.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if current.start_line < previous.end_line || current.start_line == previous.start_line {
+            bail!("edits must not overlap or share a start_line");
+        }
+    }
+    Ok(edits)
+}
+
+fn line_byte_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(index + 1);
+        }
+    }
+    if offsets.last().copied() != Some(content.len()) {
+        offsets.push(content.len());
+    }
+    offsets
+}
+
+fn apply_line_edits(old: &str, offsets: &[usize], edits: &[LineEdit]) -> String {
+    let mut content = old.to_string();
+    for edit in edits.iter().rev() {
+        content.replace_range(
+            offsets[edit.start_line]..offsets[edit.end_line],
+            &edit.content,
+        );
+    }
+    content
 }
 
 struct ReadDaily {
@@ -937,26 +1085,61 @@ impl Tool for ReadDaily {
     }
 
     fn description(&self) -> &'static str {
-        "Read one daily Chat card by YYYY-MM-DD date. Required before update_daily for that date."
+        "Read all existing daily cards in an inclusive YYYY-MM-DD date range. Use the same start_date and end_date for one day. Every returned card is eligible for update_daily in this Agent run."
     }
 
     fn input_schema(&self) -> Value {
         json!({
-            "type": "object", "properties": { "date": { "type": "string" } },
-            "required": ["date"], "additionalProperties": false
+            "type": "object",
+            "properties": {
+                "start_date": {
+                    "type": "string", "description": "Inclusive YYYY-MM-DD start date"
+                },
+                "end_date": {
+                    "type": "string", "description": "Inclusive YYYY-MM-DD end date"
+                }
+            },
+            "required": ["start_date", "end_date"], "additionalProperties": false
         })
     }
 
     fn execute(&self, input: &Value) -> Result<String> {
-        let date = required_string(input, "date")?;
-        let message = self.storage.read_daily_by_date(date)?;
-        self.reads
-            .mark_message(date.to_string(), message.body.clone())?;
-        serde_json::to_string_pretty(&json!({
-            "date": message.id,
-            "body": message.body,
+        let start_text = required_string(input, "start_date")?;
+        let end_text = required_string(input, "end_date")?;
+        let start = NaiveDate::parse_from_str(start_text, "%Y-%m-%d")
+            .with_context(|| format!("invalid start_date: {start_text}"))?;
+        let end = NaiveDate::parse_from_str(end_text, "%Y-%m-%d")
+            .with_context(|| format!("invalid end_date: {end_text}"))?;
+        if start > end {
+            bail!("start_date must not be after end_date");
+        }
+        let messages = self
+            .storage
+            .load_messages()?
+            .into_iter()
+            .filter(|message| {
+                let date = message.created_at.date_naive();
+                date >= start && date <= end
+            })
+            .collect::<Vec<_>>();
+        let cards = messages
+            .iter()
+            .map(|message| json!({ "date": message.id, "body": message.body }))
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_string_pretty(&json!({
+            "start_date": start_text,
+            "end_date": end_text,
+            "count": cards.len(),
+            "cards": cards,
         }))
-        .context("encoding message")
+        .context("encoding daily range")?;
+        if encoded.len() as u64 > MAX_FETCH_BYTES {
+            bail!("daily range response exceeds 1 MB; request a narrower date range");
+        }
+        for message in messages {
+            self.reads.mark_message(message.id, message.body)?;
+        }
+        Ok(encoded)
     }
 }
 
@@ -1266,6 +1449,23 @@ fn copy_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
     }
 }
 
+fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
+    let bytes = copy_to_new_file(source, destination)?;
+    if let Err(error) = fs::remove_file(source) {
+        let rollback = fs::remove_file(destination);
+        bail!(
+            "could not remove move source {}: {error}; destination rollback {}",
+            source.display(),
+            if rollback.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            }
+        );
+    }
+    Ok(bytes)
+}
+
 struct CopyFile {
     root: PathBuf,
 }
@@ -1329,20 +1529,222 @@ impl Tool for MoveFile {
         let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
-        let bytes = copy_to_new_file(&source, &destination)?;
-        if let Err(error) = fs::remove_file(&source) {
-            let rollback = fs::remove_file(&destination);
-            bail!(
-                "could not remove move source {}: {error}; destination rollback {}",
-                source.display(),
-                if rollback.is_ok() {
-                    "succeeded"
-                } else {
-                    "failed"
-                }
-            );
-        }
+        let bytes = move_to_new_file(&source, &destination)?;
         Ok(format!("moved {bytes} bytes to {destination_text}"))
+    }
+}
+
+struct MoveFiles {
+    root: PathBuf,
+}
+
+impl MoveFiles {
+    fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: canonical_root(root)?,
+        })
+    }
+}
+
+impl Tool for MoveFiles {
+    fn name(&self) -> &'static str {
+        "move_files"
+    }
+
+    fn description(&self) -> &'static str {
+        "Move multiple regular files into one existing directory under the Nole root, preserving each basename. Sources may be absolute or Nole-relative. Preflights duplicate names and destination conflicts, never overwrites, and does not require approval."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "sources": {
+                    "type": "array", "minItems": 1, "maxItems": 200,
+                    "items": { "type": "string" }
+                },
+                "destination_directory": {
+                    "type": "string",
+                    "description": "Existing directory relative to the Nole root"
+                }
+            },
+            "required": ["sources", "destination_directory"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(&self, input: &Value) -> Result<String> {
+        let source_values = input
+            .get("sources")
+            .and_then(Value::as_array)
+            .context("field sources must be an array")?;
+        if source_values.is_empty() || source_values.len() > 200 {
+            bail!("sources must contain between 1 and 200 paths");
+        }
+        let directory_text = required_string(input, "destination_directory")?;
+        let destination_directory = resolve_destination_directory(&self.root, directory_text)?;
+        let mut transfers = Vec::with_capacity(source_values.len());
+        let mut sources = std::collections::HashSet::new();
+        let mut destinations = std::collections::HashSet::new();
+        for value in source_values {
+            let source_text = value.as_str().context("each source must be a string")?;
+            let source = resolve_transfer_source(&self.root, source_text)?;
+            if !sources.insert(source.clone()) {
+                bail!("duplicate source: {source_text}");
+            }
+            let name = source.file_name().context("source must have a file name")?;
+            let destination = destination_directory.join(name);
+            ensure_not_special(&self.root, &destination)?;
+            if !destinations.insert(destination.clone()) {
+                bail!(
+                    "multiple sources have the same basename: {}",
+                    name.to_string_lossy()
+                );
+            }
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => bail!("destination already exists: {}", destination.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("checking batch destination"),
+            }
+            transfers.push((source, destination));
+        }
+
+        let mut completed = Vec::with_capacity(transfers.len());
+        for (source, destination) in &transfers {
+            match move_to_new_file(source, destination) {
+                Ok(bytes) => completed.push((source.clone(), destination.clone(), bytes)),
+                Err(error) => {
+                    let rollback_errors = rollback_moves(&completed);
+                    if rollback_errors.is_empty() {
+                        bail!("batch move failed and was rolled back: {error}");
+                    }
+                    bail!(
+                        "batch move failed: {error}; rollback failures: {}",
+                        rollback_errors.join("; ")
+                    );
+                }
+            }
+        }
+        let moved = completed
+            .iter()
+            .map(|(source, destination, bytes)| {
+                json!({
+                    "source": source.to_string_lossy(),
+                    "destination": display_path(&self.root, destination),
+                    "bytes": bytes,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&json!({
+            "destination_directory": directory_text,
+            "count": moved.len(),
+            "moved": moved,
+        }))
+        .context("encoding batch move result")
+    }
+}
+
+fn resolve_destination_directory(root: &Path, input: &str) -> Result<PathBuf> {
+    let relative = Path::new(input);
+    if relative.is_absolute() {
+        bail!("destination_directory must be relative to the Nole root");
+    }
+    let unresolved = root.join(relative);
+    if fs::symlink_metadata(&unresolved)?.file_type().is_symlink() {
+        bail!("destination_directory cannot be a symlink");
+    }
+    let directory = fs::canonicalize(&unresolved)
+        .with_context(|| format!("resolving destination directory {input}"))?;
+    if !directory.starts_with(root) {
+        bail!("destination_directory escapes the Nole root");
+    }
+    ensure_not_special(root, &directory)?;
+    if !fs::metadata(&directory)?.is_dir() {
+        bail!("destination_directory must be an existing directory");
+    }
+    Ok(directory)
+}
+
+fn rollback_moves(completed: &[(PathBuf, PathBuf, u64)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (source, destination, _) in completed.iter().rev() {
+        match move_to_new_file(destination, source) {
+            Ok(_) => {}
+            Err(error) => errors.push(format!(
+                "{} -> {}: {error}",
+                destination.display(),
+                source.display()
+            )),
+        }
+    }
+    errors
+}
+
+struct RenameFile {
+    root: PathBuf,
+}
+
+impl RenameFile {
+    fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: canonical_root(root)?,
+        })
+    }
+}
+
+impl Tool for RenameFile {
+    fn name(&self) -> &'static str {
+        "rename_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Rename one regular file under the Nole root without changing its directory. The new name must be a basename, never overwrites, and does not require approval."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path relative to the Nole root" },
+                "new_name": { "type": "string", "description": "New basename only" }
+            },
+            "required": ["path", "new_name"], "additionalProperties": false
+        })
+    }
+
+    fn execute(&self, input: &Value) -> Result<String> {
+        let path_text = required_string(input, "path")?;
+        if Path::new(path_text).is_absolute() {
+            bail!("rename_file path must be relative to the Nole root");
+        }
+        let source = resolve_transfer_source(&self.root, path_text)?;
+        if !source.starts_with(&self.root) {
+            bail!("rename_file source must be under the Nole root");
+        }
+        let new_name = required_string(input, "new_name")?;
+        let candidate = Path::new(new_name);
+        if candidate.file_name().is_none()
+            || candidate.components().count() != 1
+            || candidate == Path::new(".")
+            || candidate == Path::new("..")
+        {
+            bail!("new_name must be a file basename without directory components");
+        }
+        let destination = source
+            .parent()
+            .context("source must have a parent directory")?
+            .join(candidate);
+        ensure_not_special(&self.root, &destination)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => bail!("destination already exists: {}", destination.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking rename destination"),
+        }
+        let bytes = move_to_new_file(&source, &destination)?;
+        Ok(format!(
+            "renamed {path_text} to {} ({bytes} bytes)",
+            display_path(&self.root, &destination)
+        ))
     }
 }
 
@@ -1673,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn paginated_file_reads_require_complete_coverage_before_update() {
+    fn paginated_file_reads_require_only_the_ranges_touched_by_update() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
@@ -1696,15 +2098,19 @@ mod tests {
         assert_eq!(first["total_lines"], 450);
         assert_eq!(first["has_more"], true);
         assert!(update
-            .execute(&json!({"path": "data/large.md", "content": content}))
+            .execute(&json!({
+                "path": "data/large.md",
+                "edits": [{"start_line": 450, "end_line": 450, "content": "done\n"}]
+            }))
             .is_err());
 
-        read.execute(&json!({"path": "data/large.md", "offset": 200, "limit": 200}))
-            .unwrap();
-        read.execute(&json!({"path": "data/large.md", "offset": 400, "limit": 100}))
+        read.execute(&json!({"path": "data/large.md", "offset": 400, "limit": 50}))
             .unwrap();
         update
-            .execute(&json!({"path": "data/large.md", "content": format!("{content}done\n")}))
+            .execute(&json!({
+                "path": "data/large.md",
+                "edits": [{"start_line": 450, "end_line": 450, "content": "done\n"}]
+            }))
             .unwrap();
     }
 
@@ -1850,6 +2256,59 @@ mod tests {
     }
 
     #[test]
+    fn batch_move_and_rename_are_explicit_non_overwriting_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let destination = directory.path().join("data/collected");
+        fs::create_dir(&destination).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alpha = outside.path().join("alpha.md");
+        let beta = outside.path().join("beta.md");
+        fs::write(&alpha, "alpha").unwrap();
+        fs::write(&beta, "beta").unwrap();
+
+        let mover = MoveFiles::new(directory.path()).unwrap();
+        let result = mover
+            .execute(&json!({
+                "sources": [alpha, beta],
+                "destination_directory": "data/collected"
+            }))
+            .unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["count"], 2);
+        assert!(!alpha.exists());
+        assert!(!beta.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("alpha.md")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("beta.md")).unwrap(),
+            "beta"
+        );
+
+        let rename = RenameFile::new(directory.path()).unwrap();
+        rename
+            .execute(&json!({
+                "path": "data/collected/alpha.md",
+                "new_name": "renamed.md"
+            }))
+            .unwrap();
+        assert!(!destination.join("alpha.md").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("renamed.md")).unwrap(),
+            "alpha"
+        );
+        assert!(rename
+            .execute(&json!({
+                "path": "data/collected/renamed.md",
+                "new_name": "beta.md"
+            }))
+            .is_err());
+    }
+
+    #[test]
     fn delete_file_is_internal_and_waits_for_approval() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
@@ -1888,6 +2347,23 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_requires_ask_user_for_single_turn_clarification() {
+        let prompt = system_prompt(Path::new("/tmp/nole"));
+        assert!(prompt.contains("This is a single-turn task"));
+        assert!(prompt.contains("MUST call ask_user"));
+        assert!(
+            prompt.contains("Never put a question that requires an answer in the final response")
+        );
+    }
+
+    #[test]
+    fn system_prompt_describes_mbdown_tags_and_wikilinks() {
+        let prompt = system_prompt(Path::new("/tmp/nole"));
+        assert!(prompt.contains("#tag at word boundaries"));
+        assert!(prompt.contains("[[wikilink]]"));
+    }
+
+    #[test]
     fn file_update_requires_read_and_write_file_never_overwrites() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
@@ -1896,7 +2372,10 @@ mod tests {
         fs::write(directory.path().join("data/note.md"), "old\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
         let update = UpdateFile::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
-        let input = json!({"path": "data/note.md", "content": "new\n"});
+        let input = json!({
+            "path": "data/note.md",
+            "edits": [{"start_line": 0, "end_line": 1, "content": "new\n"}]
+        });
         assert!(update.execute(&input).is_err());
 
         let read = ReadFile::new(directory.path(), reads).unwrap();
@@ -1907,13 +2386,71 @@ mod tests {
             "new\n"
         );
         assert!(update
-            .execute(&json!({"path": "data/note.md", "content": "again\n"}))
+            .execute(&json!({
+                "path": "data/note.md",
+                "edits": [{"start_line": 0, "end_line": 1, "content": "again\n"}]
+            }))
             .is_err());
 
         let write = WriteFile::new(directory.path()).unwrap();
         assert!(write
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
             .is_err());
+    }
+
+    #[test]
+    fn file_update_requires_only_changed_lines_and_insertion_anchors() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("data")).unwrap();
+        fs::create_dir(directory.path().join("config")).unwrap();
+        fs::create_dir(directory.path().join("daily")).unwrap();
+        let path = directory.path().join("data/large.md");
+        let original = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(&path, &original).unwrap();
+
+        let reads = Arc::new(ReadTracker::default());
+        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
+            .unwrap();
+        update
+            .execute(&json!({
+                "path": "data/large.md",
+                "edits": [{"start_line": 10, "end_line": 11, "content": "changed 10\n"}]
+            }))
+            .unwrap();
+
+        fs::write(&path, &original).unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
+            .unwrap();
+        let error = update
+            .execute(&json!({
+                "path": "data/large.md",
+                "edits": [{"start_line": 2, "end_line": 3, "content": "changed 2\n"}]
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed zero-based lines 2..3"));
+
+        fs::write(&path, "first\nsecond\nthird\n").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        read.execute(&json!({"path": "data/large.md", "offset": 1, "limit": 1}))
+            .unwrap();
+        let error = update
+            .execute(&json!({
+                "path": "data/large.md",
+                "edits": [{"start_line": 1, "end_line": 1, "content": "inserted\n"}]
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("insertion anchor lines 0..2"));
     }
 
     #[test]
@@ -1928,7 +2465,11 @@ mod tests {
         assert!(update.execute(&input).is_err());
 
         let read = ReadDaily::new(directory.path(), reads).unwrap();
-        read.execute(&json!({"date": message.id})).unwrap();
+        read.execute(&json!({
+            "start_date": message.id,
+            "end_date": message.id
+        }))
+        .unwrap();
         update.execute(&input).unwrap();
         assert_eq!(storage.load_messages().unwrap()[0].body, "new");
         assert!(update
@@ -1940,6 +2481,45 @@ mod tests {
             .execute(&json!({"date": "2026-07-27", "body": "added"}))
             .unwrap();
         assert_eq!(storage.load_messages().unwrap()[0].body, "new\n\nadded");
+    }
+
+    #[test]
+    fn read_daily_returns_an_inclusive_range_and_marks_each_card_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        storage.append_daily("2026-07-25", "before").unwrap();
+        storage.append_daily("2026-07-26", "first").unwrap();
+        storage.append_daily("2026-07-28", "last").unwrap();
+        storage.append_daily("2026-07-29", "after").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        let read = ReadDaily::new(directory.path(), reads.clone()).unwrap();
+
+        let result = read
+            .execute(&json!({
+                "start_date": "2026-07-26",
+                "end_date": "2026-07-28"
+            }))
+            .unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["cards"][0]["date"], "2026-07-26");
+        assert_eq!(result["cards"][1]["date"], "2026-07-28");
+        assert_eq!(
+            reads.message_snapshot("2026-07-26").unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            reads.message_snapshot("2026-07-28").unwrap().as_deref(),
+            Some("last")
+        );
+        assert!(reads.message_snapshot("2026-07-25").unwrap().is_none());
+        assert!(read
+            .execute(&json!({
+                "start_date": "2026-07-29",
+                "end_date": "2026-07-28"
+            }))
+            .is_err());
     }
 
     #[test]
@@ -1963,7 +2543,10 @@ mod tests {
         };
         let update = UpdateFile::new(directory.path(), gate, reads).unwrap();
         let worker = std::thread::spawn(move || {
-            update.execute(&json!({"path": "data/note.md", "content": "new\n"}))
+            update.execute(&json!({
+                "path": "data/note.md",
+                "edits": [{"start_line": 0, "end_line": 1, "content": "new\n"}]
+            }))
         });
 
         let AgentEvent::Approval(request) = event_receiver.recv().unwrap() else {

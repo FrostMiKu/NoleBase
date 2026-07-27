@@ -13,13 +13,6 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone};
 
 use crate::model::{Message, NoteFile, SearchHit, TodoItem};
 
-const OPEN_PREFIX: &str = "<!-- nole-msg";
-const OPEN_SUFFIX: &str = "-->";
-const CLOSE_MARKER: &str = "<!-- /nole-msg -->";
-
-const LEGACY_CHAT_FILE: &str = "CHAT.md";
-const LEGACY_TODO_FILE: &str = "TODO.md";
-const LEGACY_ARCHIVE_FILE: &str = "ARCHIVE.md";
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
 const DATA_DIR: &str = "data";
@@ -58,7 +51,7 @@ impl Storage {
         })
     }
 
-    /// Create the storage layout and default files, migrating legacy root notes.
+    /// Create the storage layout and default configuration.
     pub fn ensure_files(&self) -> Result<()> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("creating {}", self.root.display()))?;
@@ -72,66 +65,6 @@ impl Storage {
             .with_context(|| format!("creating {}", self.archives_dir.display()))?;
         if !self.ai_config_path.exists() {
             self.write_default_ai_config()?;
-        }
-        self.migrate_legacy_root_notes()?;
-        self.migrate_legacy_chat_files()?;
-        Ok(())
-    }
-
-    fn migrate_legacy_chat_files(&self) -> Result<()> {
-        let chat = self.root.join(LEGACY_CHAT_FILE);
-        if chat.is_file() {
-            let text = fs::read_to_string(&chat)?;
-            for message in parse_messages(&text) {
-                self.append_daily_for_date(message.created_at.date_naive(), &message.body)?;
-            }
-            self.back_up_legacy_file(&chat)?;
-        }
-
-        let todo = self.root.join(LEGACY_TODO_FILE);
-        if todo.is_file() {
-            let text = fs::read_to_string(&todo)?;
-            let tasks = text
-                .lines()
-                .filter(|line| parse_task_line(line).is_some() || line.starts_with("    "))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !tasks.trim().is_empty() {
-                if let Some(date) = self.daily_dates()?.last().copied() {
-                    self.append_daily_for_date(date, &tasks)?;
-                }
-            }
-            self.back_up_legacy_file(&todo)?;
-        }
-
-        let archive = self.root.join(LEGACY_ARCHIVE_FILE);
-        if archive.is_file() {
-            let text = fs::read_to_string(&archive)?;
-            if !text.trim().is_empty() {
-                let modified = fs::metadata(&archive)
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .map(DateTime::<Local>::from)
-                    .unwrap_or_else(Local::now)
-                    .date_naive();
-                let destination = self.archives_dir.join(date_file_name(modified));
-                if !destination.exists() {
-                    fs::write(&destination, text)?;
-                }
-            }
-            self.back_up_legacy_file(&archive)?;
-        }
-        Ok(())
-    }
-
-    fn back_up_legacy_file(&self, path: &Path) -> Result<()> {
-        let backup_dir = self.config_dir.join("legacy");
-        fs::create_dir_all(&backup_dir)?;
-        let destination = backup_dir.join(path.file_name().unwrap_or_default());
-        if destination.exists() {
-            fs::remove_file(path)?;
-        } else {
-            fs::rename(path, destination)?;
         }
         Ok(())
     }
@@ -155,32 +88,6 @@ impl Storage {
             .open(&self.ai_config_path)
             .with_context(|| format!("creating {}", self.ai_config_path.display()))?;
         file.write_all(DEFAULT.as_bytes())?;
-        Ok(())
-    }
-
-    fn migrate_legacy_root_notes(&self) -> Result<()> {
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() || file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if !is_note_path(&path) || is_legacy_root_file(&path) {
-                continue;
-            }
-            let destination = self.data_dir.join(entry.file_name());
-            if destination.exists() {
-                continue;
-            }
-            fs::rename(&path, &destination).with_context(|| {
-                format!(
-                    "migrating legacy note {} to {}",
-                    path.display(),
-                    destination.display()
-                )
-            })?;
-        }
         Ok(())
     }
 
@@ -646,16 +553,6 @@ fn is_note_path(path: &Path) -> bool {
         })
 }
 
-fn is_legacy_root_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            [LEGACY_CHAT_FILE, LEGACY_TODO_FILE, LEGACY_ARCHIVE_FILE]
-                .iter()
-                .any(|legacy| name.eq_ignore_ascii_case(legacy))
-        })
-}
-
 /// Normalize a user-entered file name: trim, default to `.md`, reject traversal.
 pub fn normalize_new_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
@@ -681,61 +578,6 @@ fn stem(file_name: &str) -> &str {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(file_name)
-}
-
-/// Parse all message blocks out of raw `CHAT.md` text.
-pub fn parse_messages(text: &str) -> Vec<Message> {
-    let mut messages = Vec::new();
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-        if trimmed.starts_with(OPEN_PREFIX) && trimmed.ends_with(OPEN_SUFFIX) {
-            if let Some((id, created_at)) = parse_open_marker(trimmed) {
-                let mut body = String::new();
-                i += 1;
-                while i < lines.len() {
-                    if lines[i].trim() == CLOSE_MARKER {
-                        break;
-                    }
-                    body.push_str(lines[i]);
-                    i += 1;
-                }
-                // Drop a single trailing newline so display matches input.
-                if body.ends_with('\n') {
-                    body.pop();
-                }
-                if let Ok(created_at) = DateTime::parse_from_rfc3339(&created_at) {
-                    messages.push(Message {
-                        id,
-                        created_at: created_at.with_timezone(&Local),
-                        body,
-                    });
-                }
-            }
-        }
-        i += 1;
-    }
-    messages
-}
-
-fn parse_open_marker(line: &str) -> Option<(String, String)> {
-    let id = extract_attr(line, "id=")?;
-    let created_at = extract_attr(line, "created_at=")?;
-    Some((id, created_at))
-}
-
-fn extract_attr(line: &str, key: &str) -> Option<String> {
-    let idx = line.find(key)?;
-    let after = &line[idx + key.len()..];
-    let after = after.trim_start();
-    let quote = after.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let rest = &after[quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    Some(rest[..end].to_string())
 }
 
 /// If `line` is a `- [ ]` / `- [x]` task, return `(checked, body_text)`.
@@ -1059,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn data_notes_no_longer_reserve_legacy_file_names() {
+    fn data_notes_allow_chat_todo_and_archive_names() {
         let (_dir, st) = fresh();
         for name in ["chat", "todo.Md", "Archive.MD"] {
             assert!(st.create_named_file(name).unwrap().is_file());
@@ -1196,61 +1038,35 @@ mod tests {
     }
 
     #[test]
-    fn ensure_files_migrates_legacy_root_notes_without_overwriting() {
+    fn ensure_files_never_moves_existing_root_files() {
         let root_dir = tempdir().unwrap();
         let st = Storage::new(root_dir.path()).unwrap();
-        fs::create_dir_all(&st.data_dir).unwrap();
+        fs::create_dir_all(&st.root).unwrap();
         fs::write(st.root.join("Legacy.md"), "legacy").unwrap();
-        fs::write(st.root.join("Game.MB"), "game").unwrap();
-        fs::write(st.root.join("Conflict.md"), "root copy").unwrap();
-        fs::write(st.data_dir.join("Conflict.md"), "data copy").unwrap();
+        fs::write(st.root.join("CHAT.md"), "old chat").unwrap();
+        fs::write(st.root.join("TODO.md"), "old todo").unwrap();
+        fs::write(st.root.join("ARCHIVE.md"), "old archive").unwrap();
 
         st.ensure_files().unwrap();
 
         assert_eq!(
-            fs::read_to_string(st.data_dir.join("Legacy.md")).unwrap(),
+            fs::read_to_string(st.root.join("Legacy.md")).unwrap(),
             "legacy"
         );
         assert_eq!(
-            fs::read_to_string(st.data_dir.join("Game.MB")).unwrap(),
-            "game"
-        );
-        assert!(!st.root.join("Legacy.md").exists());
-        assert!(!st.root.join("Game.MB").exists());
-        assert_eq!(
-            fs::read_to_string(st.root.join("Conflict.md")).unwrap(),
-            "root copy"
+            fs::read_to_string(st.root.join("CHAT.md")).unwrap(),
+            "old chat"
         );
         assert_eq!(
-            fs::read_to_string(st.data_dir.join("Conflict.md")).unwrap(),
-            "data copy"
+            fs::read_to_string(st.root.join("TODO.md")).unwrap(),
+            "old todo"
         );
-    }
-
-    #[test]
-    fn ensure_files_migrates_legacy_chat_and_keeps_a_backup() {
-        let root = tempdir().unwrap();
-        let st = Storage::new(root.path()).unwrap();
-        fs::create_dir_all(&st.root).unwrap();
-        let text = "<!-- nole-msg id=\"abc\" created_at=\"2026-06-18T17:20:00+08:00\" -->\nbody\n<!-- /nole-msg -->\n";
-        fs::write(st.root.join("CHAT.md"), text).unwrap();
-        st.ensure_files().unwrap();
-
-        let daily = st.read_daily_by_date("2026-06-18").unwrap();
-        assert_eq!(daily.body, "body");
-        assert!(!st.root.join("CHAT.md").exists());
-        assert!(st.config_dir.join("legacy/CHAT.md").is_file());
-    }
-
-    #[test]
-    fn todo_only_legacy_workspace_does_not_create_a_daily_file() {
-        let root = tempdir().unwrap();
-        let st = Storage::new(root.path()).unwrap();
-        fs::create_dir_all(&st.root).unwrap();
-        fs::write(st.root.join("TODO.md"), "# TODO\n\n- [ ] old task\n").unwrap();
-        st.ensure_files().unwrap();
-
+        assert_eq!(
+            fs::read_to_string(st.root.join("ARCHIVE.md")).unwrap(),
+            "old archive"
+        );
+        assert!(!st.data_dir.join("Legacy.md").exists());
         assert!(fs::read_dir(&st.daily_dir).unwrap().next().is_none());
-        assert!(st.config_dir.join("legacy/TODO.md").is_file());
+        assert!(!st.config_dir.join("legacy").exists());
     }
 }
