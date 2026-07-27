@@ -61,6 +61,40 @@ pub struct ButtonHitbox {
     pub area: Rect,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    External(String),
+    WikiLink(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiLinkCandidate {
+    pub path: PathBuf,
+    pub archived: bool,
+}
+
+/// A recorded screen rectangle for a wikilink candidate in its chooser.
+#[derive(Debug, Clone)]
+pub struct WikiLinkHitbox {
+    pub index: usize,
+    pub area: Rect,
+}
+
+/// A selectable row inside the command dialog. The renderer rebuilds these
+/// rectangles every frame so mouse and keyboard selection share one model.
+#[derive(Debug, Clone)]
+pub struct DialogOptionHitbox {
+    pub index: usize,
+    pub area: Rect,
+}
+
+/// One visible, clickable segment of a rendered Markdown link.
+#[derive(Debug, Clone)]
+pub struct LinkHitbox {
+    pub target: LinkTarget,
+    pub area: Rect,
+}
+
 /// A managed markdown file shown in the persistent file list.
 #[derive(Debug, Clone)]
 pub struct NoteFile {

@@ -139,6 +139,13 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
             }
             Ok(false)
         }
+        Some(Command::OpenLink(target)) => {
+            match open::that_detached(&target) {
+                Ok(()) => app.status = format!("Opened {target}"),
+                Err(error) => app.status = format!("Link error: {error}"),
+            }
+            Ok(false)
+        }
         None => Ok(false),
     }
 }

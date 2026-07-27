@@ -64,6 +64,12 @@ Columns stack when the center pane is too narrow. Widths are Unicode terminal
 columns, and background colors fill the complete Box or column rectangle. The
 full syntax rules live in the sibling MBDown workspace.
 
+Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
+with the system default application. Clicking `[[wikilink]]` searches both
+`data/` and `archives/` by filename or filename stem. Multiple MD/MB matches
+open a chooser showing archive and format metadata; a missing note is created
+as a new `.md` file under `data/`.
+
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
 opens that file in `$EDITOR` (then `$VISUAL`, then `vi`). Search and message
 editing also use Center instead of covering the workspace with a popup. External
@@ -268,7 +274,7 @@ sibling directories:
 
 ```text
 Codes/
-  mbterm/
+  mbdown/
   nole/
 ```
 

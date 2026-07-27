@@ -15,8 +15,8 @@ use crate::agent::{
     PermissionMode,
 };
 use crate::model::{
-    Action, ButtonHitbox, FileHitbox, Message, NoteFile, SearchHit, SearchHitbox, TodoHitbox,
-    TodoItem,
+    Action, ButtonHitbox, DialogOptionHitbox, FileHitbox, LinkHitbox, LinkTarget, Message,
+    NoteFile, SearchHit, SearchHitbox, TodoHitbox, TodoItem, WikiLinkCandidate, WikiLinkHitbox,
 };
 use crate::notification::NotificationService;
 use crate::storage::Storage;
@@ -30,6 +30,14 @@ fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
 
 fn in_area(col: u16, row: u16, area: Option<Rect>) -> bool {
     area.is_some_and(|area| point_in_rect(col, row, area))
+}
+
+fn wiki_name_matches(path: &Path, requested: &str) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(requested))
+        || path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
 }
 
 /// Case-insensitive subsequence matching. An empty query matches every file.
@@ -152,6 +160,7 @@ pub enum Command {
     Quit,
     Edit(PathBuf),
     EditMessage { id: String, body: String },
+    OpenLink(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +223,130 @@ pub enum Overlay {
     AiPrompt,
     Approval,
     AskUser,
+    WikiLinkChoice,
+    /// A caller-provided command dialog. Its mode and purpose live in
+    /// [`DialogState`], allowing new command-style interactions without
+    /// adding another overlay variant.
+    #[allow(dead_code)]
+    Dialog,
+}
+
+/// The interaction model used by every modal dialog in the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogMode {
+    Confirm,
+    SingleSelect,
+    MultiSelect,
+    SelectOrInput,
+    FreeText,
+    Approval,
+    Informational,
+}
+
+/// Business purpose of a dialog. The mode controls interaction while the
+/// purpose controls the result that is sent to the owning subsystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogPurpose {
+    DeleteMessage,
+    DeleteFile,
+    AgentPrompt,
+    AgentApproval,
+    AskUser,
+    WikiLinkChoice,
+    Help,
+    NewFile,
+    RenameFile,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogOption {
+    pub label: String,
+    pub hint: Option<String>,
+}
+
+impl DialogOption {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            hint: None,
+        }
+    }
+
+    pub fn with_hint(label: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            hint: Some(hint.into()),
+        }
+    }
+}
+
+/// State shared by confirmations, selectors, text prompts, approvals and
+/// Agent questions. `options` can be used by both single- and multi-select
+/// dialogs; `checked` stores the multi-select state by option index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogState {
+    pub title: String,
+    pub message: String,
+    pub mode: DialogMode,
+    pub purpose: DialogPurpose,
+    pub options: Vec<DialogOption>,
+    pub selected: usize,
+    pub checked: Vec<bool>,
+    pub input: String,
+    pub cursor: usize,
+    pub scroll: u16,
+}
+
+impl DialogState {
+    pub fn new(
+        title: impl Into<String>,
+        message: impl Into<String>,
+        mode: DialogMode,
+        purpose: DialogPurpose,
+        options: Vec<DialogOption>,
+    ) -> Self {
+        let checked = vec![false; options.len()];
+        Self {
+            title: title.into(),
+            message: message.into(),
+            mode,
+            purpose,
+            options,
+            selected: 0,
+            checked,
+            input: String::new(),
+            cursor: 0,
+            scroll: 0,
+        }
+    }
+
+    pub fn selected_option(&self) -> Option<&DialogOption> {
+        self.options.get(self.selected)
+    }
+
+    pub fn selected_options(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .enumerate()
+            .filter_map(|(index, option)| {
+                self.checked
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(option.label.clone())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogResult {
+    Confirm(bool),
+    Selected(String),
+    SelectedMany(Vec<String>),
+    Text(String),
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,9 +437,18 @@ pub struct App {
 
     /// Rebuilt every frame by the renderer.
     pub hitboxes: Vec<ButtonHitbox>,
+    pub link_hitboxes: Vec<LinkHitbox>,
     pub file_hitboxes: Vec<FileHitbox>,
     pub todo_hitboxes: Vec<TodoHitbox>,
     pub search_hitboxes: Vec<SearchHitbox>,
+    pub wiki_link_hitboxes: Vec<WikiLinkHitbox>,
+    pub dialog_hitboxes: Vec<DialogOptionHitbox>,
+
+    /// The one modal state shared by all command-style dialogs.
+    pub dialog: Option<DialogState>,
+    /// Result of a caller-provided [`Overlay::Dialog`]. Business dialogs
+    /// deliver their result directly to their existing subsystem channels.
+    pub dialog_result: Option<DialogResult>,
 
     ai_events: Option<Receiver<AgentEvent>>,
     ai_approval_sender: Option<mpsc::Sender<ApprovalDecision>>,
@@ -328,6 +470,9 @@ pub struct App {
     pub ask_user_cursor: usize,
     pub ask_user_option: usize,
     pub notifications: NotificationService,
+    pub wiki_link_target: Option<String>,
+    pub wiki_link_candidates: Vec<WikiLinkCandidate>,
+    pub wiki_link_index: usize,
 
     ai_cancel: Option<Arc<AtomicBool>>,
 
@@ -374,9 +519,14 @@ impl App {
             animation_tick: 0,
             layout: LayoutSnapshot::default(),
             hitboxes: Vec::new(),
+            link_hitboxes: Vec::new(),
             file_hitboxes: Vec::new(),
             todo_hitboxes: Vec::new(),
             search_hitboxes: Vec::new(),
+            wiki_link_hitboxes: Vec::new(),
+            dialog_hitboxes: Vec::new(),
+            dialog: None,
+            dialog_result: None,
             ai_events: None,
             ai_approval_sender: None,
             ai_user_sender: None,
@@ -397,6 +547,9 @@ impl App {
             ask_user_cursor: 0,
             ask_user_option: 0,
             notifications: NotificationService::default(),
+            wiki_link_target: None,
+            wiki_link_candidates: Vec::new(),
+            wiki_link_index: 0,
             ai_cancel: None,
             undo_stack: Vec::new(),
         })
@@ -464,11 +617,16 @@ impl App {
             }
         });
         if let Some(path) = document_path {
-            match self.storage.read_note_file(&path) {
+            match self.storage.read_document_file(&path) {
                 Ok(updated) => {
                     if let Some(document) = self.document.as_mut() {
                         document.source = updated;
                     }
+                }
+                Err(_) if self.ai_running && !path.exists() => {
+                    // The watcher can observe a move before the Agent event
+                    // channel reports its destination. Keep the page open
+                    // until that mapping arrives or the task finishes.
                 }
                 Err(error) => {
                     self.document = None;
@@ -508,6 +666,9 @@ impl App {
                     self.notifications.notify(message);
                     self.set_status("Agent sent a notification");
                 }
+                AgentEvent::FileMoved { from, to } => {
+                    self.handle_agent_file_moved(&from, &to);
+                }
                 AgentEvent::Approval(request) => {
                     if self.permission_mode == PermissionMode::Bypass {
                         let _ = self.send_approval(ApprovalDecision::Approve);
@@ -515,7 +676,7 @@ impl App {
                         self.set_status(format!("Approval required: {}", request.title));
                         self.approval_request = Some(request);
                         self.approval_scroll = 0;
-                        self.overlay = Some(Overlay::Approval);
+                        self.set_overlay(Overlay::Approval);
                     }
                 }
                 AgentEvent::AskUser(request) => {
@@ -524,7 +685,7 @@ impl App {
                     self.ask_user_input.clear();
                     self.ask_user_cursor = 0;
                     self.ask_user_request = Some(request);
-                    self.overlay = Some(Overlay::AskUser);
+                    self.set_overlay(Overlay::AskUser);
                 }
                 AgentEvent::Finished(result) => {
                     self.ai_running = false;
@@ -640,7 +801,315 @@ impl App {
 
     pub fn open_help(&mut self) {
         self.help_scroll = 0;
-        self.overlay = Some(Overlay::Help);
+        self.set_overlay(Overlay::Help);
+    }
+
+    /// Open a caller-defined command dialog. The caller can inspect the
+    /// resulting value with [`App::take_dialog_result`] after the dialog
+    /// closes.
+    #[allow(dead_code)]
+    pub fn open_dialog(&mut self, dialog: DialogState) {
+        self.dialog_result = None;
+        self.dialog = Some(dialog);
+        self.overlay = Some(Overlay::Dialog);
+    }
+
+    #[allow(dead_code)]
+    pub fn take_dialog_result(&mut self) -> Option<DialogResult> {
+        self.dialog_result.take()
+    }
+
+    fn set_overlay(&mut self, overlay: Overlay) {
+        self.overlay = Some(overlay);
+        self.dialog = Some(self.dialog_for_overlay(overlay));
+    }
+
+    fn open_file_name_dialog(&mut self, purpose: DialogPurpose) {
+        let (title, input, cursor) = match purpose {
+            DialogPurpose::NewFile => (
+                "New file · Enter create",
+                self.new_file_input.clone(),
+                self.new_file_cursor,
+            ),
+            DialogPurpose::RenameFile => (
+                "Rename file · Enter save",
+                self.rename_input.clone(),
+                self.rename_cursor,
+            ),
+            _ => return,
+        };
+        let mut dialog =
+            DialogState::new(title, "Name  ", DialogMode::FreeText, purpose, Vec::new());
+        dialog.input = input;
+        dialog.cursor = cursor;
+        self.open_dialog(dialog);
+    }
+
+    pub(crate) fn ensure_file_input_dialog(&mut self) {
+        let purpose = match self.files_context {
+            FilesContext::NewTarget => Some(DialogPurpose::NewFile),
+            FilesContext::Rename => Some(DialogPurpose::RenameFile),
+            _ => None,
+        };
+        match purpose {
+            Some(purpose) => {
+                let needs_open = self.overlay != Some(Overlay::Dialog)
+                    || self
+                        .dialog
+                        .as_ref()
+                        .is_none_or(|dialog| dialog.purpose != purpose);
+                if needs_open {
+                    self.open_file_name_dialog(purpose);
+                } else {
+                    let current = self.dialog.as_ref().map(|dialog| dialog.input.as_str());
+                    let expected = match purpose {
+                        DialogPurpose::NewFile => self.new_file_input.as_str(),
+                        DialogPurpose::RenameFile => self.rename_input.as_str(),
+                        _ => "",
+                    };
+                    if current != Some(expected) {
+                        self.open_file_name_dialog(purpose);
+                    }
+                }
+            }
+            None => {
+                if self.dialog.as_ref().is_some_and(|dialog| {
+                    matches!(
+                        dialog.purpose,
+                        DialogPurpose::NewFile | DialogPurpose::RenameFile
+                    )
+                }) {
+                    self.overlay = None;
+                    self.dialog = None;
+                }
+            }
+        }
+    }
+
+    fn dialog_for_overlay(&self, overlay: Overlay) -> DialogState {
+        match overlay {
+            Overlay::ConfirmDeleteMessage => DialogState::new(
+                "Delete message",
+                "Delete this message?",
+                DialogMode::Confirm,
+                DialogPurpose::DeleteMessage,
+                Vec::new(),
+            ),
+            Overlay::ConfirmDeleteFile => {
+                let name = self
+                    .pending_file
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "this file".to_string());
+                DialogState::new(
+                    "Delete file",
+                    format!("Delete {name}?"),
+                    DialogMode::Confirm,
+                    DialogPurpose::DeleteFile,
+                    Vec::new(),
+                )
+            }
+            Overlay::Help => DialogState::new(
+                "Help",
+                String::new(),
+                DialogMode::Informational,
+                DialogPurpose::Help,
+                Vec::new(),
+            ),
+            Overlay::AiPrompt => {
+                let mut dialog = DialogState::new(
+                    "Agent prompt",
+                    "",
+                    DialogMode::FreeText,
+                    DialogPurpose::AgentPrompt,
+                    Vec::new(),
+                );
+                dialog.input = self.ai_prompt_input.clone();
+                dialog.cursor = self.ai_prompt_cursor;
+                dialog
+            }
+            Overlay::Approval => {
+                let request = self.approval_request.as_ref();
+                let mut dialog = DialogState::new(
+                    request
+                        .map(|request| request.title.clone())
+                        .unwrap_or_else(|| "Approve change".to_string()),
+                    request
+                        .map(|request| request.diff.clone())
+                        .unwrap_or_default(),
+                    DialogMode::Approval,
+                    DialogPurpose::AgentApproval,
+                    Vec::new(),
+                );
+                dialog.scroll = self.approval_scroll;
+                dialog
+            }
+            Overlay::AskUser => {
+                let request = self.ask_user_request.as_ref();
+                let mut dialog = DialogState::new(
+                    "Agent question",
+                    request
+                        .map(|request| request.question.clone())
+                        .unwrap_or_default(),
+                    DialogMode::SelectOrInput,
+                    DialogPurpose::AskUser,
+                    request
+                        .map(|request| {
+                            request
+                                .options
+                                .iter()
+                                .cloned()
+                                .map(DialogOption::new)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+                dialog.selected = self.ask_user_option;
+                dialog.input = self.ask_user_input.clone();
+                dialog.cursor = self.ask_user_cursor;
+                dialog
+            }
+            Overlay::WikiLinkChoice => {
+                let target = self.wiki_link_target.as_deref().unwrap_or("wikilink");
+                let options = self
+                    .wiki_link_candidates
+                    .iter()
+                    .map(|candidate| {
+                        let filename = candidate
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "(unnamed)".to_string());
+                        let extension = candidate
+                            .path
+                            .extension()
+                            .map(|extension| extension.to_string_lossy().to_ascii_uppercase())
+                            .unwrap_or_else(|| "?".to_string());
+                        let hint = if candidate.archived {
+                            format!("Archived · {extension}")
+                        } else {
+                            extension
+                        };
+                        DialogOption::with_hint(filename, hint)
+                    })
+                    .collect();
+                let mut dialog = DialogState::new(
+                    format!("Choose wikilink · [[{target}]]"),
+                    String::new(),
+                    DialogMode::SingleSelect,
+                    DialogPurpose::WikiLinkChoice,
+                    options,
+                );
+                dialog.selected = self.wiki_link_index;
+                dialog
+            }
+            Overlay::Dialog => match self.dialog.as_ref().map(|dialog| dialog.purpose) {
+                Some(DialogPurpose::NewFile) => {
+                    let mut dialog = DialogState::new(
+                        "New file · Enter create",
+                        "Name  ",
+                        DialogMode::FreeText,
+                        DialogPurpose::NewFile,
+                        Vec::new(),
+                    );
+                    dialog.input = self.new_file_input.clone();
+                    dialog.cursor = self.new_file_cursor;
+                    dialog
+                }
+                Some(DialogPurpose::RenameFile) => {
+                    let mut dialog = DialogState::new(
+                        "Rename file · Enter save",
+                        "Name  ",
+                        DialogMode::FreeText,
+                        DialogPurpose::RenameFile,
+                        Vec::new(),
+                    );
+                    dialog.input = self.rename_input.clone();
+                    dialog.cursor = self.rename_cursor;
+                    dialog
+                }
+                _ => self.dialog.clone().unwrap_or_else(|| {
+                    DialogState::new(
+                        "Dialog",
+                        String::new(),
+                        DialogMode::Informational,
+                        DialogPurpose::Custom,
+                        Vec::new(),
+                    )
+                }),
+            },
+        }
+    }
+
+    /// Ensure dialogs opened by older call sites or tests are represented by
+    /// the shared state. Normal application paths call `set_overlay`, while
+    /// this fallback keeps direct overlay assignment deterministic.
+    pub fn ensure_dialog_state(&mut self) {
+        let Some(overlay) = self.overlay else {
+            self.dialog = None;
+            return;
+        };
+        let purpose = match overlay {
+            Overlay::ConfirmDeleteMessage => DialogPurpose::DeleteMessage,
+            Overlay::ConfirmDeleteFile => DialogPurpose::DeleteFile,
+            Overlay::Help => DialogPurpose::Help,
+            Overlay::AiPrompt => DialogPurpose::AgentPrompt,
+            Overlay::Approval => DialogPurpose::AgentApproval,
+            Overlay::AskUser => DialogPurpose::AskUser,
+            Overlay::WikiLinkChoice => DialogPurpose::WikiLinkChoice,
+            Overlay::Dialog => self
+                .dialog
+                .as_ref()
+                .map_or(DialogPurpose::Custom, |dialog| dialog.purpose),
+        };
+        let stale =
+            self.dialog.as_ref().is_none_or(|dialog| {
+                if dialog.purpose != purpose {
+                    return true;
+                }
+                match purpose {
+                    DialogPurpose::AgentPrompt => dialog.input != self.ai_prompt_input,
+                    DialogPurpose::NewFile => dialog.input != self.new_file_input,
+                    DialogPurpose::RenameFile => dialog.input != self.rename_input,
+                    DialogPurpose::AskUser => {
+                        dialog.input != self.ask_user_input
+                            || self.ask_user_request.as_ref().is_some_and(|request| {
+                                dialog.options.len() != request.options.len()
+                                    || dialog
+                                        .options
+                                        .iter()
+                                        .zip(request.options.iter())
+                                        .any(|(option, expected)| option.label != *expected)
+                            })
+                    }
+                    DialogPurpose::AgentApproval => {
+                        self.approval_request.as_ref().is_some_and(|request| {
+                            dialog.message != request.diff || dialog.title != request.title
+                        })
+                    }
+                    DialogPurpose::WikiLinkChoice => {
+                        dialog.options.len() != self.wiki_link_candidates.len()
+                            || self.wiki_link_candidates.iter().enumerate().any(
+                                |(index, candidate)| {
+                                    let expected = candidate
+                                        .path
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    dialog
+                                        .options
+                                        .get(index)
+                                        .is_none_or(|option| option.label != expected)
+                                },
+                            )
+                    }
+                    _ => false,
+                }
+            });
+        if stale {
+            self.dialog = Some(self.dialog_for_overlay(overlay));
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
@@ -686,18 +1155,27 @@ impl App {
 
     /// Paste into whichever orthogonal state currently owns a text buffer.
     pub fn handle_paste(&mut self, text: &str) {
-        if self.overlay == Some(Overlay::AiPrompt) {
-            let text = text.replace("\r\n", "\n").replace('\r', "\n");
-            paste_into(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor, &text);
-            return;
-        }
-        if self.overlay == Some(Overlay::AskUser) {
-            let text = text.replace("\r\n", "\n").replace('\r', "\n");
-            self.select_custom_answer();
-            paste_into(&mut self.ask_user_input, &mut self.ask_user_cursor, &text);
-            return;
-        }
         if self.overlay.is_some() {
+            self.ensure_dialog_state();
+            let purpose = self.dialog.as_ref().map(|dialog| dialog.purpose);
+            if matches!(
+                purpose,
+                Some(
+                    DialogPurpose::AgentPrompt
+                        | DialogPurpose::AskUser
+                        | DialogPurpose::NewFile
+                        | DialogPurpose::RenameFile
+                )
+            ) {
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if matches!(purpose, Some(DialogPurpose::AskUser)) {
+                    self.select_custom_dialog_option();
+                }
+                if let Some(dialog) = self.dialog.as_mut() {
+                    paste_into(&mut dialog.input, &mut dialog.cursor, &text);
+                }
+                self.sync_legacy_from_dialog();
+            }
             return;
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -826,6 +1304,116 @@ impl App {
         None
     }
 
+    fn activate_link(&mut self, target: LinkTarget) -> Option<Command> {
+        match target {
+            LinkTarget::External(target) => Some(Command::OpenLink(target)),
+            LinkTarget::WikiLink(target) => {
+                let requested = target.trim().to_string();
+                let mut candidates = self
+                    .storage
+                    .list_note_files()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|note| wiki_name_matches(&note.path, &requested))
+                    .map(|note| WikiLinkCandidate {
+                        path: note.path,
+                        archived: false,
+                    })
+                    .collect::<Vec<_>>();
+                candidates.extend(
+                    self.storage
+                        .list_archived_note_files()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|note| wiki_name_matches(&note.path, &requested))
+                        .map(|note| WikiLinkCandidate {
+                            path: note.path,
+                            archived: true,
+                        }),
+                );
+                if candidates.is_empty() {
+                    match self.storage.create_named_file(&requested) {
+                        Ok(path) => {
+                            self.reload_files();
+                            self.open_file_document(&path, DocumentReturn::Chat);
+                            self.set_status(format!("Created note {}", path.display()));
+                        }
+                        Err(error) => self.set_status(format!("Wiki note error: {error}")),
+                    }
+                } else if candidates.len() == 1 {
+                    self.open_wiki_candidate(&candidates[0]);
+                } else {
+                    self.wiki_link_target = Some(requested);
+                    self.wiki_link_candidates = candidates;
+                    self.wiki_link_index = 0;
+                    self.set_overlay(Overlay::WikiLinkChoice);
+                }
+                None
+            }
+        }
+    }
+
+    fn open_wiki_candidate(&mut self, candidate: &WikiLinkCandidate) {
+        let source = if candidate.archived {
+            self.storage.read_archived_note_file(&candidate.path)
+        } else {
+            self.storage.read_note_file(&candidate.path)
+        };
+        match source {
+            Ok(source) => {
+                let title = candidate
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Document".to_string());
+                self.document = Some(Document {
+                    kind: DocumentKind::File(candidate.path.clone()),
+                    title,
+                    source,
+                    scroll: 0,
+                    target_line: None,
+                    return_to: DocumentReturn::Chat,
+                });
+                self.center_view = CenterView::Document;
+                self.focus = Focus::Center;
+                self.overlay = None;
+                self.dialog = None;
+                self.wiki_link_target = None;
+                self.wiki_link_candidates.clear();
+                self.wiki_link_index = 0;
+            }
+            Err(error) => self.set_status(format!("Wiki note error: {error}")),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn handle_wiki_link_choice(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = None;
+                self.wiki_link_target = None;
+                self.wiki_link_candidates.clear();
+                self.wiki_link_index = 0;
+            }
+            KeyCode::Up => {
+                self.wiki_link_index = self.wiki_link_index.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.wiki_link_index = (self.wiki_link_index + 1)
+                    .min(self.wiki_link_candidates.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                if let Some(candidate) =
+                    self.wiki_link_candidates.get(self.wiki_link_index).cloned()
+                {
+                    self.open_wiki_candidate(&candidate);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     fn handle_chat(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(Command::Quit),
@@ -936,13 +1524,14 @@ impl App {
                     self.rename_cursor = self.rename_input.chars().count();
                     self.pending_file = Some(path);
                     self.files_context = FilesContext::Rename;
+                    self.open_file_name_dialog(DialogPurpose::RenameFile);
                 }
                 None
             }
             KeyCode::Char('d') => {
                 if let Some(path) = self.selected_file.clone() {
                     self.pending_file = Some(path);
-                    self.overlay = Some(Overlay::ConfirmDeleteFile);
+                    self.set_overlay(Overlay::ConfirmDeleteFile);
                 }
                 None
             }
@@ -1075,6 +1664,7 @@ impl App {
                     match self.storage.rename_file(&from, &self.rename_input) {
                         Ok(to) => {
                             self.pending_file = None;
+                            self.retarget_open_document(&from, &to);
                             self.selected_file = Some(to);
                             self.set_status("Renamed");
                             self.reload_files();
@@ -1115,6 +1705,41 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn retarget_open_document(&mut self, from: &Path, to: &Path) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            return false;
+        };
+        if !matches!(&document.kind, DocumentKind::File(path) if path == from) {
+            return false;
+        }
+        document.kind = DocumentKind::File(to.to_path_buf());
+        document.title = to
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Document".to_string());
+        true
+    }
+
+    fn handle_agent_file_moved(&mut self, from: &Path, to: &Path) {
+        let from = self.resolve_agent_event_path(from);
+        let to = self.resolve_agent_event_path(to);
+        let document_retargeted = self.retarget_open_document(&from, &to);
+        if document_retargeted || self.selected_file.as_deref() == Some(from.as_path()) {
+            self.selected_file = Some(to.clone());
+        }
+        if self.pending_file.as_deref() == Some(from.as_path()) {
+            self.pending_file = Some(to);
+        }
+    }
+
+    fn resolve_agent_event_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.storage.root.join(path)
         }
     }
 
@@ -1311,15 +1936,502 @@ impl App {
     }
 
     fn handle_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        match self.overlay {
-            Some(Overlay::ConfirmDeleteMessage) => self.handle_delete_message_overlay(key),
-            Some(Overlay::ConfirmDeleteFile) => self.handle_delete_file_overlay(key),
-            Some(Overlay::Help) => self.handle_help_overlay(key),
-            Some(Overlay::AiPrompt) => self.handle_ai_prompt_overlay(key),
-            Some(Overlay::Approval) => self.handle_approval_overlay(key),
-            Some(Overlay::AskUser) => self.handle_ask_user_overlay(key),
-            None => None,
+        self.ensure_dialog_state();
+        self.handle_dialog_key(key)
+    }
+
+    fn handle_dialog_key(&mut self, key: KeyEvent) -> Option<Command> {
+        let Some(dialog) = self.dialog.clone() else {
+            self.overlay = None;
+            return None;
+        };
+        match dialog.purpose {
+            DialogPurpose::DeleteMessage => {
+                return match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        self.handle_delete_message_overlay(key)
+                    }
+                    _ => self.handle_delete_message_overlay(key),
+                };
+            }
+            DialogPurpose::DeleteFile => return self.handle_delete_file_overlay(key),
+            DialogPurpose::Help => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                        self.overlay = None;
+                        self.dialog = None;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.adjust_dialog_scroll(1),
+                    KeyCode::Up | KeyCode::Char('k') => self.adjust_dialog_scroll(-1),
+                    KeyCode::PageDown => self.adjust_dialog_scroll(8),
+                    KeyCode::PageUp => self.adjust_dialog_scroll(-8),
+                    _ => {}
+                }
+                return None;
+            }
+            DialogPurpose::AgentApproval => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        let _ = self.send_approval(ApprovalDecision::Approve);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        let _ = self.send_approval(ApprovalDecision::Deny);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => self.adjust_dialog_scroll(1),
+                    KeyCode::Up | KeyCode::Char('k') => self.adjust_dialog_scroll(-1),
+                    KeyCode::PageDown => self.adjust_dialog_scroll(8),
+                    KeyCode::PageUp => self.adjust_dialog_scroll(-8),
+                    _ => {}
+                }
+                return None;
+            }
+            DialogPurpose::WikiLinkChoice => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.overlay = None;
+                        self.dialog = None;
+                        self.wiki_link_target = None;
+                        self.wiki_link_candidates.clear();
+                        self.wiki_link_index = 0;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
+                    KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
+                    KeyCode::Enter => {
+                        if let Some(candidate) = self
+                            .wiki_link_candidates
+                            .get(self.dialog_selected())
+                            .cloned()
+                        {
+                            self.open_wiki_candidate(&candidate);
+                        }
+                    }
+                    _ => {}
+                }
+                return None;
+            }
+            DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
+            DialogPurpose::AgentPrompt | DialogPurpose::NewFile | DialogPurpose::RenameFile => {
+                return self.handle_text_dialog(key)
+            }
+            DialogPurpose::Custom => {}
         }
+
+        match dialog.mode {
+            DialogMode::Confirm => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.dialog_result = Some(DialogResult::Confirm(true));
+                    self.close_dialog();
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.dialog_result = Some(DialogResult::Confirm(false));
+                    self.close_dialog();
+                }
+                _ => {}
+            },
+            DialogMode::SingleSelect => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
+                KeyCode::Enter => {
+                    if let Some(option) =
+                        self.dialog.as_ref().and_then(DialogState::selected_option)
+                    {
+                        self.dialog_result = Some(DialogResult::Selected(option.label.clone()));
+                    }
+                    self.close_dialog();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.dialog_result = Some(DialogResult::Cancelled);
+                    self.close_dialog();
+                }
+                _ => {}
+            },
+            DialogMode::MultiSelect => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
+                KeyCode::Char(' ') => self.toggle_dialog_option(),
+                KeyCode::Enter => {
+                    let selected = self
+                        .dialog
+                        .as_ref()
+                        .map(DialogState::selected_options)
+                        .unwrap_or_default();
+                    self.dialog_result = Some(DialogResult::SelectedMany(selected));
+                    self.close_dialog();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.dialog_result = Some(DialogResult::Cancelled);
+                    self.close_dialog();
+                }
+                _ => {}
+            },
+            DialogMode::SelectOrInput => return self.handle_custom_select_or_input(key),
+            DialogMode::FreeText => return self.handle_text_dialog(key),
+            DialogMode::Approval | DialogMode::Informational => {}
+        }
+        None
+    }
+
+    fn handle_custom_select_or_input(&mut self, key: KeyEvent) -> Option<Command> {
+        let option_count = self
+            .dialog
+            .as_ref()
+            .map_or(0, |dialog| dialog.options.len());
+        let custom_selected = self.dialog_selected() >= option_count;
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Esc => {
+                self.dialog_result = Some(DialogResult::Cancelled);
+                self.close_dialog();
+            }
+            KeyCode::Up if option_count > 0 => self.move_dialog_selection(-1),
+            KeyCode::Down if option_count > 0 => {
+                let next = (self.dialog_selected() + 1).min(option_count);
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.selected = next;
+                }
+            }
+            KeyCode::Enter
+                if custom_selected
+                    && modifiers.intersects(
+                        KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    ) =>
+            {
+                self.insert_dialog_char('\n');
+            }
+            KeyCode::Enter => {
+                let result = if custom_selected {
+                    DialogResult::Text(
+                        self.dialog
+                            .as_ref()
+                            .map(|dialog| dialog.input.trim().to_string())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    DialogResult::Selected(
+                        self.dialog
+                            .as_ref()
+                            .and_then(DialogState::selected_option)
+                            .map(|option| option.label.clone())
+                            .unwrap_or_default(),
+                    )
+                };
+                self.dialog_result = Some(result);
+                self.close_dialog();
+            }
+            KeyCode::Backspace => {
+                self.select_custom_dialog_option();
+                self.delete_dialog_backward();
+            }
+            KeyCode::Delete => {
+                self.select_custom_dialog_option();
+                self.delete_dialog_forward();
+            }
+            KeyCode::Left => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::Left);
+            }
+            KeyCode::Right => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::Right);
+            }
+            KeyCode::Home => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::LineStart);
+            }
+            KeyCode::End => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::LineEnd);
+            }
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_custom_dialog_option();
+                self.insert_dialog_char('\n');
+            }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_custom_dialog_option();
+                self.insert_dialog_char(character);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn dialog_selected(&self) -> usize {
+        self.dialog.as_ref().map_or(0, |dialog| dialog.selected)
+    }
+
+    fn move_dialog_selection(&mut self, delta: i32) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        let max = dialog.options.len().saturating_sub(1);
+        dialog.selected = if delta < 0 {
+            dialog
+                .selected
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            dialog.selected.saturating_add(delta as usize).min(max)
+        };
+        if dialog.purpose == DialogPurpose::AskUser {
+            self.ask_user_option = dialog.selected;
+        } else if dialog.purpose == DialogPurpose::WikiLinkChoice {
+            self.wiki_link_index = dialog.selected;
+        }
+    }
+
+    fn toggle_dialog_option(&mut self) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        if let Some(checked) = dialog.checked.get_mut(dialog.selected) {
+            *checked = !*checked;
+        }
+    }
+
+    fn adjust_dialog_scroll(&mut self, delta: i32) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        dialog.scroll = if delta < 0 {
+            dialog.scroll.saturating_sub(delta.unsigned_abs() as u16)
+        } else {
+            dialog.scroll.saturating_add(delta as u16)
+        };
+        match dialog.purpose {
+            DialogPurpose::Help => self.help_scroll = dialog.scroll,
+            DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
+            _ => {}
+        }
+    }
+
+    fn handle_select_or_input_dialog(&mut self, key: KeyEvent) -> Option<Command> {
+        let option_count = self
+            .dialog
+            .as_ref()
+            .map_or(0, |dialog| dialog.options.len());
+        let custom_selected = self.dialog_selected() >= option_count;
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Esc => {
+                let _ = self.send_user_response(AskUserResponse::Cancelled);
+            }
+            KeyCode::Up if option_count > 0 => self.move_dialog_selection(-1),
+            KeyCode::Down if option_count > 0 => {
+                let next = (self.dialog_selected() + 1).min(option_count);
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.selected = next;
+                }
+                self.ask_user_option = next;
+            }
+            KeyCode::Enter
+                if custom_selected
+                    && modifiers.intersects(
+                        KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    ) =>
+            {
+                self.insert_dialog_char('\n');
+            }
+            KeyCode::Enter => {
+                let answer = if custom_selected {
+                    self.dialog
+                        .as_ref()
+                        .map(|dialog| dialog.input.trim().to_string())
+                        .unwrap_or_default()
+                } else {
+                    self.dialog
+                        .as_ref()
+                        .and_then(DialogState::selected_option)
+                        .map(|option| option.label.clone())
+                        .unwrap_or_default()
+                };
+                if answer.is_empty() {
+                    self.set_status("Enter an answer before submitting");
+                } else {
+                    let _ = self.send_user_response(AskUserResponse::Answer(answer));
+                }
+            }
+            KeyCode::Backspace => {
+                self.select_custom_dialog_option();
+                self.delete_dialog_backward();
+            }
+            KeyCode::Delete => {
+                self.select_custom_dialog_option();
+                self.delete_dialog_forward();
+            }
+            KeyCode::Left => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::Left);
+            }
+            KeyCode::Right => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::Right);
+            }
+            KeyCode::Home => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::LineStart);
+            }
+            KeyCode::End => {
+                self.select_custom_dialog_option();
+                self.move_dialog_cursor(CursorMove::LineEnd);
+            }
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_custom_dialog_option();
+                self.insert_dialog_char('\n');
+            }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_custom_dialog_option();
+                self.insert_dialog_char(character);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_text_dialog(&mut self, key: KeyEvent) -> Option<Command> {
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Enter
+                if modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ) =>
+            {
+                self.insert_dialog_char('\n');
+            }
+            KeyCode::Enter => {
+                self.sync_legacy_from_dialog();
+                match self.dialog.as_ref().map(|dialog| dialog.purpose) {
+                    Some(DialogPurpose::AgentPrompt) => self.submit_agent_prompt(),
+                    Some(DialogPurpose::NewFile) => {
+                        self.handle_new_target(key);
+                        if self.files_context != FilesContext::NewTarget {
+                            self.close_dialog();
+                        }
+                    }
+                    Some(DialogPurpose::RenameFile) => {
+                        self.handle_rename(key);
+                        if self.files_context != FilesContext::Rename {
+                            self.close_dialog();
+                        }
+                    }
+                    _ => {
+                        let text = self
+                            .dialog
+                            .as_ref()
+                            .map(|dialog| dialog.input.clone())
+                            .unwrap_or_default();
+                        self.dialog_result = Some(DialogResult::Text(text));
+                        self.close_dialog();
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                match self.dialog.as_ref().map(|dialog| dialog.purpose) {
+                    Some(DialogPurpose::AgentPrompt) => self.ai_source_id = None,
+                    Some(DialogPurpose::NewFile) => {
+                        self.pending_id = None;
+                        self.files_context = FilesContext::Browse;
+                    }
+                    Some(DialogPurpose::RenameFile) => {
+                        self.pending_file = None;
+                        self.files_context = FilesContext::Browse;
+                    }
+                    _ => self.dialog_result = Some(DialogResult::Cancelled),
+                }
+                self.close_dialog();
+            }
+            KeyCode::Backspace => self.delete_dialog_backward(),
+            KeyCode::Delete => self.delete_dialog_forward(),
+            KeyCode::Left => self.move_dialog_cursor(CursorMove::Left),
+            KeyCode::Right => self.move_dialog_cursor(CursorMove::Right),
+            KeyCode::Up => self.move_dialog_cursor(CursorMove::Up),
+            KeyCode::Down => self.move_dialog_cursor(CursorMove::Down),
+            KeyCode::Home => self.move_dialog_cursor(CursorMove::LineStart),
+            KeyCode::End => self.move_dialog_cursor(CursorMove::LineEnd),
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_dialog_char('\n')
+            }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_dialog_char(character)
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn insert_dialog_char(&mut self, character: char) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        insert_char(&mut dialog.input, &mut dialog.cursor, character);
+        self.sync_legacy_from_dialog();
+    }
+
+    fn delete_dialog_backward(&mut self) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        delete_backward(&mut dialog.input, &mut dialog.cursor);
+        self.sync_legacy_from_dialog();
+    }
+
+    fn delete_dialog_forward(&mut self) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        delete_forward(&mut dialog.input, &mut dialog.cursor);
+        self.sync_legacy_from_dialog();
+    }
+
+    fn move_dialog_cursor(&mut self, movement: CursorMove) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        dialog.cursor = move_cursor(&dialog.input, dialog.cursor, movement);
+        self.sync_legacy_from_dialog();
+    }
+
+    fn select_custom_dialog_option(&mut self) {
+        let count = self
+            .dialog
+            .as_ref()
+            .map_or(0, |dialog| dialog.options.len());
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.selected = count;
+        }
+        self.ask_user_option = count;
+    }
+
+    fn sync_legacy_from_dialog(&mut self) {
+        let Some(dialog) = self.dialog.as_ref() else {
+            return;
+        };
+        match dialog.purpose {
+            DialogPurpose::AgentPrompt => {
+                self.ai_prompt_input = dialog.input.clone();
+                self.ai_prompt_cursor = dialog.cursor;
+            }
+            DialogPurpose::AskUser => {
+                self.ask_user_input = dialog.input.clone();
+                self.ask_user_cursor = dialog.cursor;
+                self.ask_user_option = dialog.selected;
+            }
+            DialogPurpose::NewFile => {
+                self.new_file_input = dialog.input.clone();
+                self.new_file_cursor = dialog.cursor;
+            }
+            DialogPurpose::RenameFile => {
+                self.rename_input = dialog.input.clone();
+                self.rename_cursor = dialog.cursor;
+            }
+            DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
+            DialogPurpose::Help => self.help_scroll = dialog.scroll,
+            DialogPurpose::WikiLinkChoice => self.wiki_link_index = dialog.selected,
+            _ => {}
+        }
+    }
+
+    fn close_dialog(&mut self) {
+        self.overlay = None;
+        self.dialog = None;
     }
 
     fn handle_delete_message_overlay(&mut self, key: KeyEvent) -> Option<Command> {
@@ -1341,11 +2453,13 @@ impl App {
                     }
                 }
                 self.overlay = None;
+                self.dialog = None;
                 None
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.pending_id = None;
                 self.overlay = None;
+                self.dialog = None;
                 None
             }
             _ => None,
@@ -1376,17 +2490,20 @@ impl App {
                     }
                 }
                 self.overlay = None;
+                self.dialog = None;
                 None
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.pending_file = None;
                 self.overlay = None;
+                self.dialog = None;
                 None
             }
             _ => None,
         }
     }
 
+    #[allow(dead_code)]
     fn handle_help_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -1413,6 +2530,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_ai_prompt_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         let modifiers = key.modifiers;
         match key.code {
@@ -1502,6 +2620,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_approval_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -1532,6 +2651,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_ask_user_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         let modifiers = key.modifiers;
         let option_count = self
@@ -1634,6 +2754,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn select_custom_answer(&mut self) {
         self.ask_user_option = self
             .ask_user_request
@@ -1665,6 +2786,13 @@ impl App {
         if self.overlay == Some(Overlay::AskUser) {
             self.overlay = None;
         }
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.purpose == DialogPurpose::AskUser)
+        {
+            self.dialog = None;
+        }
     }
 
     fn send_approval(&mut self, decision: ApprovalDecision) -> anyhow::Result<()> {
@@ -1683,6 +2811,13 @@ impl App {
         if self.overlay == Some(Overlay::Approval) {
             self.overlay = None;
         }
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.purpose == DialogPurpose::AgentApproval)
+        {
+            self.dialog = None;
+        }
         Ok(())
     }
 
@@ -1700,20 +2835,21 @@ impl App {
     }
 
     fn route_wheel(&mut self, column: u16, row: u16, delta: i32) {
-        if let Some(overlay) = self.overlay {
-            if matches!(overlay, Overlay::Help | Overlay::Approval)
-                && (self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay))
-            {
-                let scroll = if overlay == Overlay::Help {
-                    &mut self.help_scroll
-                } else {
-                    &mut self.approval_scroll
-                };
-                *scroll = if delta > 0 {
-                    scroll.saturating_add(delta as u16)
-                } else {
-                    scroll.saturating_sub(delta.unsigned_abs() as u16)
-                };
+        if self.overlay.is_some() {
+            if self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay) {
+                self.ensure_dialog_state();
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.scroll = if delta > 0 {
+                        dialog.scroll.saturating_add(delta as u16)
+                    } else {
+                        dialog.scroll.saturating_sub(delta.unsigned_abs() as u16)
+                    };
+                    match dialog.purpose {
+                        DialogPurpose::Help => self.help_scroll = dialog.scroll,
+                        DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
+                        _ => {}
+                    }
+                }
             }
             return;
         }
@@ -1754,13 +2890,50 @@ impl App {
     }
 
     fn handle_left_click(&mut self, column: u16, row: u16) -> Option<Command> {
-        if self.overlay.is_some()
-            || matches!(
-                self.files_context,
-                FilesContext::NewTarget | FilesContext::Rename
-            )
-        {
+        if self.overlay.is_some() {
+            self.ensure_dialog_state();
+            if let Some(index) = self
+                .dialog_hitboxes
+                .iter()
+                .find(|hitbox| point_in_rect(column, row, hitbox.area))
+                .map(|hitbox| hitbox.index)
+                .or_else(|| {
+                    self.wiki_link_hitboxes
+                        .iter()
+                        .find(|hitbox| point_in_rect(column, row, hitbox.area))
+                        .map(|hitbox| hitbox.index)
+                })
+            {
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.selected = index;
+                }
+                self.sync_legacy_from_dialog();
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.purpose == DialogPurpose::WikiLinkChoice)
+                {
+                    if let Some(candidate) = self.wiki_link_candidates.get(index).cloned() {
+                        self.open_wiki_candidate(&candidate);
+                    }
+                }
+            }
             return None;
+        }
+        if matches!(
+            self.files_context,
+            FilesContext::NewTarget | FilesContext::Rename
+        ) {
+            return None;
+        }
+
+        if let Some(target) = self
+            .link_hitboxes
+            .iter()
+            .find(|hitbox| point_in_rect(column, row, hitbox.area))
+            .map(|hitbox| hitbox.target.clone())
+        {
+            return self.activate_link(target);
         }
 
         if matches!(
@@ -2095,6 +3268,7 @@ impl App {
                 self.new_file_cursor = 0;
                 self.files_context = FilesContext::NewTarget;
                 self.focus = Focus::Files;
+                self.open_file_name_dialog(DialogPurpose::NewFile);
                 None
             }
             Action::View => {
@@ -2104,7 +3278,7 @@ impl App {
             Action::Edit => self.message_edit_command(id),
             Action::Delete => {
                 self.pending_id = Some(id.to_string());
-                self.overlay = Some(Overlay::ConfirmDeleteMessage);
+                self.set_overlay(Overlay::ConfirmDeleteMessage);
                 None
             }
         }
@@ -2122,7 +3296,7 @@ impl App {
         self.ai_source_id = Some(id.to_string());
         self.ai_prompt_input.clear();
         self.ai_prompt_cursor = 0;
-        self.overlay = Some(Overlay::AiPrompt);
+        self.set_overlay(Overlay::AiPrompt);
     }
 
     fn message_edit_command(&self, id: &str) -> Option<Command> {
@@ -2182,6 +3356,7 @@ impl App {
         };
         let prompt = format!("Source Nole daily date: {id}\n\n{content}");
         self.overlay = None;
+        self.dialog = None;
         self.start_agent(prompt, content);
     }
 
@@ -2490,6 +3665,57 @@ mod tests {
         assert_eq!(app.files_context, FilesContext::Browse);
         assert_eq!(app.overlay, None);
         assert_eq!(app.permission_mode, PermissionMode::Approve);
+    }
+
+    #[test]
+    fn command_dialog_supports_single_multi_and_free_text_modes() {
+        let (mut app, _directory) = make_app();
+        app.open_dialog(DialogState::new(
+            "Format",
+            "Choose a format",
+            DialogMode::SingleSelect,
+            DialogPurpose::Custom,
+            vec![DialogOption::new("Markdown"), DialogOption::new("MBDown")],
+        ));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_dialog_result(),
+            Some(DialogResult::Selected("MBDown".to_string()))
+        );
+
+        app.open_dialog(DialogState::new(
+            "Targets",
+            "Select targets",
+            DialogMode::MultiSelect,
+            DialogPurpose::Custom,
+            vec![DialogOption::new("daily"), DialogOption::new("archives")],
+        ));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_dialog_result(),
+            Some(DialogResult::SelectedMany(vec![
+                "daily".to_string(),
+                "archives".to_string()
+            ]))
+        );
+
+        app.open_dialog(DialogState::new(
+            "Name",
+            "Choose or type a name",
+            DialogMode::SelectOrInput,
+            DialogPurpose::Custom,
+            vec![DialogOption::new("Existing")],
+        ));
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_dialog_result(),
+            Some(DialogResult::Text("n".to_string()))
+        );
     }
 
     #[test]
@@ -3017,6 +4243,105 @@ mod tests {
     }
 
     #[test]
+    fn renaming_the_open_document_retargets_it_before_workspace_reload() {
+        let (mut app, _directory) = make_app();
+        let from = app.storage.data_dir.join("Old.md");
+        fs::write(&from, "# Old\n\nBody\n").unwrap();
+        app.reload_files();
+        app.file_index = app
+            .note_files
+            .iter()
+            .position(|file| file.path == from)
+            .unwrap();
+        app.sync_selected_file();
+        app.open_file_document(&from, DocumentReturn::Chat);
+        app.focus = Focus::Files;
+
+        app.handle_key(key(KeyCode::Char('r')));
+        app.rename_input = "Renamed".to_string();
+        app.rename_cursor = app.rename_input.chars().count();
+        app.handle_key(key(KeyCode::Enter));
+
+        let to = app.storage.data_dir.join("Renamed.md");
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(app.selected_file.as_ref(), Some(&to));
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(to.clone()))
+        );
+        assert_eq!(
+            app.document
+                .as_ref()
+                .map(|document| document.title.as_str()),
+            Some("Renamed.md")
+        );
+
+        app.reload_workspace();
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document
+                .as_ref()
+                .map(|document| document.source.as_str()),
+            Some("# Old\n\nBody\n")
+        );
+        assert!(!app.status.starts_with("Reload error:"));
+    }
+
+    #[test]
+    fn agent_move_event_keeps_the_open_document_across_watcher_reload() {
+        let (mut app, _directory) = make_app();
+        let from = app.storage.data_dir.join("Old.md");
+        fs::write(&from, "# Old\n\nBody\n").unwrap();
+        app.open_file_document(&from, DocumentReturn::Chat);
+        let destination_dir = app.storage.data_dir.join("moved");
+        fs::create_dir(&destination_dir).unwrap();
+        let to = destination_dir.join("Renamed.md");
+        fs::rename(&from, &to).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+        app.ai_running = true;
+
+        // The filesystem watcher can run before the Agent event is polled.
+        app.reload_workspace();
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(from))
+        );
+
+        sender
+            .send(AgentEvent::FileMoved {
+                from: PathBuf::from("data/Old.md"),
+                to: PathBuf::from("data/moved/Renamed.md"),
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::Finished(Ok("Moved the file".to_string())))
+            .unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(to.clone()))
+        );
+        assert_eq!(
+            app.document
+                .as_ref()
+                .map(|document| document.source.as_str()),
+            Some("# Old\n\nBody\n")
+        );
+        assert_eq!(
+            app.document
+                .as_ref()
+                .map(|document| document.title.as_str()),
+            Some("Renamed.md")
+        );
+        assert!(!app.status.starts_with("Reload error:"));
+    }
+
+    #[test]
     fn search_result_message_edit_returns_external_editor_command() {
         let (mut app, _directory) = make_app();
         add_message(&mut app, "needle");
@@ -3159,6 +4484,94 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.focus, Focus::Center);
+    }
+
+    #[test]
+    fn link_clicks_open_external_targets_or_internal_wiki_notes() {
+        let (mut app, _directory) = make_app();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::External("https://example.test".to_string()),
+            area: Rect::new(4, 3, 7, 1),
+        });
+        let command = app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            command,
+            Some(Command::OpenLink("https://example.test".to_string()))
+        );
+
+        let path = app.storage.data_dir.join("Project.md");
+        fs::write(&path, "linked note").unwrap();
+        app.reload_files();
+        app.link_hitboxes.clear();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::WikiLink("Project".to_string()),
+            area: Rect::new(4, 3, 7, 1),
+        });
+        assert!(app
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_none());
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(path))
+        );
+    }
+
+    #[test]
+    fn wikilink_chooses_between_data_and_archived_matches_and_creates_missing_notes() {
+        let (mut app, _directory) = make_app();
+        let data = app.storage.data_dir.join("Project.md");
+        let archived = app.storage.archives_dir.join("Project.md");
+        fs::write(&data, "data version").unwrap();
+        fs::write(&archived, "archived version").unwrap();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::WikiLink("Project".to_string()),
+            area: Rect::new(1, 1, 8, 1),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.overlay, Some(Overlay::WikiLinkChoice));
+        assert_eq!(app.wiki_link_candidates.len(), 2);
+        assert!(!app.wiki_link_candidates[0].archived);
+        assert!(app.wiki_link_candidates[1].archived);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.document.as_ref().unwrap().source, "archived version");
+
+        app.document = None;
+        app.center_view = CenterView::Chat;
+        app.link_hitboxes.clear();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::WikiLink("New Note".to_string()),
+            area: Rect::new(1, 1, 8, 1),
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        let created = app.storage.data_dir.join("New Note.md");
+        assert!(created.is_file());
+        assert_eq!(
+            app.document.as_ref().unwrap().kind,
+            DocumentKind::File(created)
+        );
     }
 
     #[test]

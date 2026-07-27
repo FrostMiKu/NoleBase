@@ -8,18 +8,26 @@ use ratatui::widgets::{block::Padding, Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, CenterView, FilesContext, Focus, LayoutSnapshot, Overlay};
-use crate::model::{Action, ButtonHitbox, FileHitbox, SearchHit, SearchHitbox, TodoHitbox};
+use crate::app::{
+    App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus, LayoutSnapshot,
+    Overlay,
+};
+use crate::model::{
+    Action, ButtonHitbox, FileHitbox, LinkHitbox, SearchHit, SearchHitbox, TodoHitbox,
+    WikiLinkHitbox,
+};
 
 const DATE_FMT: &str = "%Y-%m-%d";
 const WIDE_BREAKPOINT: u16 = 170;
-const FILES_WIDTH: u16 = 30;
-const TODO_WIDTH: u16 = 36;
+const FILES_WIDTH: u16 = 33;
+const RIGHT_SIDEBAR_WIDTH: u16 = 48;
 const CENTER_MAX_WIDTH: u16 = 120;
 const PANEL_PADDING: u16 = 1;
 const MESSAGE_PADDING_X: usize = 1;
 const PAGE_PADDING_X: usize = MESSAGE_PADDING_X + 12;
+#[allow(dead_code)]
 const ASK_USER_WIDTH: u16 = 80;
+#[allow(dead_code)]
 const ASK_USER_MAX_HEIGHT: u16 = 32;
 
 /// Render one frame and rebuild all geometry consumed by mouse handling.
@@ -29,6 +37,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let root = frame.area();
     let (body, footer) = body_and_footer(root);
+    app.ensure_file_input_dialog();
     let file_input_modal = matches!(
         app.files_context,
         FilesContext::NewTarget | FilesContext::Rename
@@ -51,15 +60,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         clear_hitboxes(app);
         let area = draw_overlay(frame, app, root, overlay);
         app.layout.overlay = non_empty(area);
-    } else if file_input_modal {
-        clear_hitboxes(app);
-        let area = draw_file_input_modal(frame, app, root);
-        app.layout.overlay = non_empty(area);
     }
 }
 
 fn clear_hitboxes(app: &mut App) {
     app.hitboxes.clear();
+    app.link_hitboxes.clear();
+    app.wiki_link_hitboxes.clear();
+    app.dialog_hitboxes.clear();
     app.file_hitboxes.clear();
     app.todo_hitboxes.clear();
     app.search_hitboxes.clear();
@@ -77,7 +85,7 @@ fn body_and_footer(area: Rect) -> (Rect, Rect) {
 
 fn draw_wide_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
     let files = Rect::new(body.x, body.y, FILES_WIDTH.min(body.width), body.height);
-    let todo_width = TODO_WIDTH.min(body.width.saturating_sub(files.width));
+    let todo_width = RIGHT_SIDEBAR_WIDTH.min(body.width.saturating_sub(files.width));
     let todo = Rect::new(
         body.x + body.width.saturating_sub(todo_width),
         body.y,
@@ -135,6 +143,7 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let mut lines = Vec::new();
+    let mut rendered_links = Vec::new();
     if !app.agent_prompt.is_empty() {
         lines.push(Line::from(Span::styled(
             "Prompt",
@@ -142,10 +151,13 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.extend(crate::markdown::to_lines_at_width(
-            &app.agent_prompt,
-            inner.width as usize,
-        ));
+        let row = lines.len();
+        let rendered = crate::markdown::render_at_width(&app.agent_prompt, inner.width as usize);
+        rendered_links.extend(rendered.links.into_iter().map(|mut link| {
+            link.row += row;
+            link
+        }));
+        lines.extend(rendered.lines);
     }
     if !app.agent_output.is_empty() {
         if !lines.is_empty() {
@@ -162,10 +174,16 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )));
         if app.agent_output_final {
-            lines.extend(crate::markdown::to_lines_at_width(
+            let row = lines.len();
+            let rendered = crate::markdown::render_at_width(
                 &app.agent_output.join("\n\n"),
                 inner.width as usize,
-            ));
+            );
+            rendered_links.extend(rendered.links.into_iter().map(|mut link| {
+                link.row += row;
+                link
+            }));
+            lines.extend(rendered.lines);
         } else {
             for (index, entry) in app.agent_output.iter().enumerate() {
                 if app.ai_running && index + 1 == app.agent_output.len() {
@@ -175,17 +193,7 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
                         app.animation_tick,
                     ));
                 } else {
-                    lines.extend(
-                        wrap_spans_to_width(
-                            &[Span::styled(
-                                entry.replace(['\n', '\r'], " "),
-                                Style::default().fg(Color::DarkGray),
-                            )],
-                            inner.width as usize,
-                        )
-                        .into_iter()
-                        .map(Line::from),
-                    );
+                    lines.extend(activity_lines(entry, inner.width as usize));
                 }
             }
         }
@@ -194,6 +202,12 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     app.agent_scroll = app.agent_scroll.min(max_scroll);
     let visible = visible_line_window(&lines, app.agent_scroll as usize, inner.height as usize);
     frame.render_widget(Paragraph::new(visible), inner);
+    register_link_hitboxes(
+        &mut app.link_hitboxes,
+        &rendered_links,
+        inner,
+        app.agent_scroll as usize,
+    );
 }
 
 fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
@@ -530,24 +544,50 @@ fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'sta
         return vec![Line::default()];
     }
     let active = tick as usize % characters.len();
-    let spans = characters
-        .into_iter()
-        .enumerate()
-        .map(|(index, character)| {
-            let style = if index == active {
-                Style::default()
-                    .fg(animated_color(index * 8, tick))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            Span::styled(character.to_string(), style)
-        })
-        .collect::<Vec<_>>();
+    let mut spans = vec![activity_marker()];
+    spans.extend(
+        characters
+            .into_iter()
+            .enumerate()
+            .map(|(index, character)| {
+                let style = if index == active {
+                    Style::default()
+                        .fg(animated_color(index * 8, tick))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Span::styled(character.to_string(), style)
+            })
+            .collect::<Vec<_>>(),
+    );
     wrap_spans_to_width(&spans, width)
         .into_iter()
         .map(Line::from)
         .collect()
+}
+
+fn activity_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let spans = [
+        activity_marker(),
+        Span::styled(
+            text.replace(['\n', '\r'], " "),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    wrap_spans_to_width(&spans, width)
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+fn activity_marker() -> Span<'static> {
+    Span::styled(
+        " • ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn draw_animated_border(frame: &mut Frame, area: Rect, tick: u64) {
@@ -665,6 +705,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     let mut card_first = Vec::with_capacity(app.messages.len());
     let mut button_lines = Vec::with_capacity(app.messages.len());
     let mut button_starts = Vec::with_capacity(app.messages.len());
+    let mut rendered_links = Vec::new();
 
     for (index, message) in app.messages.iter().enumerate() {
         card_first.push(lines.len());
@@ -694,9 +735,15 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             card_style,
         ));
         lines.push(line_with_background(Vec::new(), width, card_style));
-        let markdown_lines = crate::markdown::to_lines_at_width(&message.body, body_width);
+        let markdown = crate::markdown::render_at_width(&message.body, body_width);
+        let body_line_start = lines.len();
+        rendered_links.extend(markdown.links.into_iter().map(|mut link| {
+            link.row += body_line_start;
+            link.column += body_start;
+            link
+        }));
         let mut body_rows = Vec::new();
-        for markdown_line in markdown_lines {
+        for markdown_line in markdown.lines {
             body_rows.extend(wrap_spans_to_width(&markdown_line.spans, body_width));
         }
         for body in &body_rows {
@@ -737,6 +784,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     app.scroll = scroll as u16;
 
     if interactive {
+        register_link_hitboxes(&mut app.link_hitboxes, &rendered_links, area, scroll);
         for (index, message) in app.messages.iter().enumerate() {
             let Some(button_line) = button_lines.get(index).copied() else {
                 continue;
@@ -790,6 +838,36 @@ fn action_buttons_width() -> usize {
         .map(|action| action.label().width() + 2)
         .sum::<usize>()
         + Action::all().len().saturating_sub(1)
+}
+
+fn register_link_hitboxes(
+    hitboxes: &mut Vec<LinkHitbox>,
+    links: &[crate::markdown::RenderedLink],
+    viewport: Rect,
+    scroll: usize,
+) {
+    let bottom = scroll.saturating_add(viewport.height as usize);
+    for link in links
+        .iter()
+        .filter(|link| link.row >= scroll && link.row < bottom)
+    {
+        let column = link.column.min(viewport.width as usize);
+        let width = link
+            .width
+            .min((viewport.width as usize).saturating_sub(column));
+        if width == 0 {
+            continue;
+        }
+        hitboxes.push(LinkHitbox {
+            target: link.target.clone(),
+            area: Rect::new(
+                viewport.x.saturating_add(column as u16),
+                viewport.y.saturating_add((link.row - scroll) as u16),
+                width as u16,
+                1,
+            ),
+        });
+    }
 }
 
 fn render_button_line(selected: bool) -> Line<'static> {
@@ -954,7 +1032,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             .height
             .saturating_sub(vertical_padding.saturating_mul(2)),
     );
-    {
+    let (rendered_links, document_scroll) = {
         let document = app.document.as_mut().expect("document checked above");
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -968,8 +1046,10 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             ])),
             header,
         );
-        let lines =
-            crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
+        let rendered =
+            crate::markdown::render_at_width(&document.source, document_area.width as usize);
+        let rendered_links = rendered.links;
+        let lines = rendered.lines;
         if let Some(target_line) = document.target_line.take() {
             document.scroll = crate::markdown::rendered_row_for_source_line(
                 &document.source,
@@ -980,12 +1060,22 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         }
         let max_scroll = lines.len().saturating_sub(document_area.height as usize);
         document.scroll = (document.scroll as usize).min(max_scroll) as u16;
+        let document_scroll = document.scroll as usize;
         let visible = visible_line_window(
             &lines,
             document.scroll as usize,
             document_area.height as usize,
         );
         frame.render_widget(Paragraph::new(visible).style(page_style), document_area);
+        (rendered_links, document_scroll)
+    };
+    if interactive {
+        register_link_hitboxes(
+            &mut app.link_hitboxes,
+            &rendered_links,
+            document_area,
+            document_scroll,
+        );
     }
     if compose.width > 0 && compose.height > 0 {
         frame.render_widget(Clear, compose);
@@ -1378,6 +1468,7 @@ fn draw_left_right_line(frame: &mut Frame, area: Rect, left: &str, right: &str, 
     }
 }
 
+#[allow(dead_code)]
 fn draw_file_input_modal(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     let area = centered_rect(root, 56.min(root.width), 5.min(root.height));
     if area.width == 0 || area.height == 0 {
@@ -1414,34 +1505,368 @@ fn draw_file_input_modal(frame: &mut Frame, app: &App, root: Rect) -> Rect {
 }
 
 fn draw_overlay(frame: &mut Frame, app: &mut App, root: Rect, overlay: Overlay) -> Rect {
-    match overlay {
-        Overlay::Help => draw_help(frame, app, root),
-        Overlay::AiPrompt => draw_ai_prompt(frame, app, root),
-        Overlay::Approval => draw_approval(frame, app, root),
-        Overlay::AskUser => draw_ask_user(frame, app, root),
-        Overlay::ConfirmDeleteMessage => draw_confirmation(
-            frame,
-            root,
-            " Delete message ",
-            "Delete this message? [y/N]",
-        ),
-        Overlay::ConfirmDeleteFile => {
-            let name = app
-                .pending_file
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "this file".to_string());
-            draw_confirmation(
-                frame,
-                root,
-                " Delete file ",
-                &format!("Delete {name}? [y/N]"),
-            )
-        }
-    }
+    let _ = overlay;
+    app.ensure_dialog_state();
+    draw_dialog(frame, app, root)
 }
 
+/// Render every modal interaction through one fixed-width, bounded-height
+/// command surface. The body changes by mode, but title, scrolling, option
+/// selection, input and footer geometry remain identical.
+fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
+    let Some(dialog) = app.dialog.clone() else {
+        return Rect::new(root.x, root.y, 0, 0);
+    };
+    let width = match dialog.mode {
+        DialogMode::Approval => 110,
+        DialogMode::Informational => 92,
+        _ => 80,
+    }
+    .min(root.width.saturating_sub(4).max(root.width.min(1)));
+    let text_width = width.saturating_sub(4).max(1) as usize;
+    let message_rows = if dialog.purpose == DialogPurpose::Help {
+        help_lines().len() as u16
+    } else {
+        wrap_spans_to_width(&[Span::raw(dialog.message.clone())], text_width)
+            .len()
+            .max(1) as u16
+    };
+    let option_count = dialog.options.len() as u16;
+    let desired_height = match dialog.mode {
+        DialogMode::Confirm => 5,
+        DialogMode::FreeText
+            if matches!(
+                dialog.purpose,
+                DialogPurpose::NewFile | DialogPurpose::RenameFile
+            ) =>
+        {
+            5
+        }
+        DialogMode::FreeText => 11,
+        DialogMode::SelectOrInput => message_rows
+            .min(8)
+            .saturating_add(option_count.saturating_add(1))
+            .saturating_add(4)
+            .saturating_add(1)
+            .saturating_add(2),
+        DialogMode::SingleSelect | DialogMode::MultiSelect => message_rows
+            .min(8)
+            .saturating_add(option_count)
+            .saturating_add(1)
+            .saturating_add(2),
+        DialogMode::Approval => root.height.saturating_sub(4).min(36),
+        DialogMode::Informational => root.height.saturating_sub(2).min(30),
+    };
+    let height = desired_height
+        .max(3)
+        .min(root.height.saturating_sub(2).max(root.height.min(1)));
+    let area = centered_rect(root, width, height);
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(Clear, area);
+    let border = match dialog.mode {
+        DialogMode::Approval => Color::LightYellow,
+        DialogMode::FreeText => Color::LightMagenta,
+        DialogMode::SelectOrInput | DialogMode::SingleSelect | DialogMode::MultiSelect => {
+            Color::LightCyan
+        }
+        _ => Color::Gray,
+    };
+    let modal_background = if matches!(
+        dialog.purpose,
+        DialogPurpose::NewFile | DialogPurpose::RenameFile
+    ) {
+        Color::Indexed(235)
+    } else {
+        Color::Indexed(234)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .title(format!(" {} ", dialog.title))
+        .style(Style::default().bg(modal_background))
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return area;
+    }
+
+    app.dialog_hitboxes.clear();
+    match dialog.mode {
+        DialogMode::Confirm => {
+            let body = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(1),
+            );
+            frame.render_widget(
+                Paragraph::new(dialog.message.clone())
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false }),
+                body,
+            );
+            draw_dialog_footer(frame, inner, "Enter/Y confirm · N/Esc cancel");
+        }
+        DialogMode::FreeText => {
+            let (input, footer) = split_last_row(inner);
+            if matches!(
+                dialog.purpose,
+                DialogPurpose::NewFile | DialogPurpose::RenameFile
+            ) {
+                let single = Rect::new(input.x, input.y, input.width, 1);
+                draw_single_line_input(
+                    frame,
+                    single,
+                    &dialog.message,
+                    &dialog.input,
+                    dialog.cursor,
+                    true,
+                );
+                draw_dialog_footer(frame, footer, "Enter save · Esc cancel");
+            } else {
+                draw_multiline_input(
+                    frame,
+                    input,
+                    &dialog.input,
+                    dialog.cursor,
+                    "Optional prompt; empty uses the card content",
+                    true,
+                );
+                draw_dialog_footer(
+                    frame,
+                    footer,
+                    "Enter submit · Shift/Ctrl/Alt+Enter newline · Esc cancel",
+                );
+            }
+        }
+        DialogMode::Approval => {
+            let (content, footer) = split_last_row(inner);
+            let lines = crate::markdown::to_lines_at_width(
+                &format!("```diff\n{}\n```", dialog.message),
+                content.width as usize,
+            );
+            let maximum = lines.len().saturating_sub(content.height as usize);
+            let scroll = dialog.scroll.min(maximum as u16);
+            if let Some(state) = app.dialog.as_mut() {
+                state.scroll = scroll;
+            }
+            app.approval_scroll = scroll;
+            frame.render_widget(
+                Paragraph::new(visible_line_window(
+                    &lines,
+                    scroll as usize,
+                    content.height as usize,
+                )),
+                content,
+            );
+            draw_dialog_footer(
+                frame,
+                footer,
+                "Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab bypass",
+            );
+        }
+        DialogMode::Informational => {
+            let lines = help_lines();
+            let maximum = lines.len().saturating_sub(inner.height as usize);
+            let scroll = dialog.scroll.min(maximum as u16);
+            if let Some(state) = app.dialog.as_mut() {
+                state.scroll = scroll;
+            }
+            app.help_scroll = scroll;
+            frame.render_widget(
+                Paragraph::new(visible_line_window(
+                    &lines,
+                    scroll as usize,
+                    inner.height as usize,
+                )),
+                inner,
+            );
+        }
+        DialogMode::SingleSelect | DialogMode::MultiSelect | DialogMode::SelectOrInput => {
+            draw_select_dialog(frame, app, &dialog, inner);
+        }
+    }
+    area
+}
+
+fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let footer = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
+    );
+}
+
+fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, inner: Rect) {
+    if inner.height == 0 {
+        return;
+    }
+    let has_input = dialog.mode == DialogMode::SelectOrInput;
+    let footer_height = 1;
+    let input_height = if has_input {
+        4.min(inner.height.saturating_sub(footer_height))
+    } else {
+        0
+    };
+    let message_height = if dialog.message.is_empty() {
+        0
+    } else {
+        wrap_spans_to_width(&[Span::raw(dialog.message.clone())], inner.width as usize)
+            .len()
+            .min(8) as u16
+    };
+    let available = inner
+        .height
+        .saturating_sub(footer_height)
+        .saturating_sub(input_height);
+    let option_extra = u16::from(has_input);
+    let option_capacity = available.saturating_sub(message_height) as usize;
+    let option_height = dialog
+        .options
+        .len()
+        .saturating_add(option_extra as usize)
+        .min(option_capacity) as u16;
+    let message = Rect::new(inner.x, inner.y, inner.width, message_height);
+    let options = Rect::new(
+        inner.x,
+        message.y + message.height,
+        inner.width,
+        option_height,
+    );
+    let input = Rect::new(
+        inner.x,
+        options.y + options.height,
+        inner.width,
+        input_height,
+    );
+    let footer = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(footer_height),
+        inner.width,
+        footer_height,
+    );
+    if message.height > 0 {
+        frame.render_widget(
+            Paragraph::new(dialog.message.clone())
+                .wrap(Wrap { trim: false })
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            message,
+        );
+    }
+    let total_rows = dialog.options.len() + usize::from(has_input);
+    let visible_rows = options.height as usize;
+    let list_start = dialog
+        .selected
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(total_rows.saturating_sub(visible_rows));
+    for (index, option) in dialog
+        .options
+        .iter()
+        .enumerate()
+        .skip(list_start)
+        .take(options.height as usize)
+    {
+        let row = index - list_start;
+        let selected = dialog.selected == index;
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let marker = if dialog.mode == DialogMode::MultiSelect {
+            if dialog.checked.get(index).copied().unwrap_or(false) {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+        } else if selected {
+            ">"
+        } else {
+            " "
+        };
+        let mut spans = vec![Span::styled(format!("{marker} {}", option.label), style)];
+        if let Some(hint) = &option.hint {
+            spans.push(Span::styled(
+                format!("  {hint}"),
+                if selected {
+                    style.add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ));
+        }
+        let row_area = Rect::new(options.x, options.y + row as u16, options.width, 1);
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+        app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
+            index,
+            area: row_area,
+        });
+        if dialog.purpose == DialogPurpose::WikiLinkChoice {
+            app.wiki_link_hitboxes.push(crate::model::WikiLinkHitbox {
+                index,
+                area: row_area,
+            });
+        }
+    }
+    if has_input && input.height > 0 {
+        let custom_selected = dialog.selected >= dialog.options.len();
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Your answer ")
+            .border_style(focus_border(custom_selected));
+        let input_inner = input_block.inner(input);
+        frame.render_widget(input_block, input);
+        draw_multiline_input(
+            frame,
+            input_inner,
+            &dialog.input,
+            dialog.cursor,
+            "Type a different response",
+            custom_selected,
+        );
+        let other_index = dialog.options.len();
+        if other_index >= list_start && other_index < list_start + visible_rows {
+            let row = other_index - list_start;
+            let row_area = Rect::new(options.x, options.y + row as u16, options.width, 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "> Other answer",
+                    if custom_selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                ))),
+                row_area,
+            );
+            app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
+                index: other_index,
+                area: row_area,
+            });
+        }
+    }
+    let footer_text = match dialog.mode {
+        DialogMode::MultiSelect => "↑↓ move · Space toggle · Enter submit · Esc cancel",
+        DialogMode::SelectOrInput => "↑↓ choose · Enter submit · type custom · Esc cancel",
+        _ => "↑↓ choose · Enter open · Esc cancel",
+    };
+    draw_dialog_footer(frame, footer, footer_text);
+}
+
+#[allow(dead_code)]
 fn draw_ai_prompt(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     let area = centered_rect(root, root.width.min(80), root.height.min(11));
     if area.width == 0 || area.height == 0 {
@@ -1467,6 +1892,7 @@ fn draw_ai_prompt(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     area
 }
 
+#[allow(dead_code)]
 fn draw_approval(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     let area = centered_rect(
         root,
@@ -1526,6 +1952,7 @@ fn draw_approval(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     area
 }
 
+#[allow(dead_code)]
 fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     let width = ASK_USER_WIDTH.min(root.width.saturating_sub(4));
     let text_width = width.saturating_sub(4).max(1) as usize;
@@ -1654,6 +2081,102 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     area
 }
 
+#[allow(dead_code)]
+fn draw_wiki_link_choice(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
+    let width = root.width.saturating_sub(4).min(88);
+    let height = (app.wiki_link_candidates.len() as u16)
+        .saturating_add(5)
+        .min(root.height.saturating_sub(2));
+    let area = centered_rect(root, width, height);
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(Clear, area);
+    let target = app.wiki_link_target.as_deref().unwrap_or("wikilink");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .title(format!(" Choose wikilink · [[{target}]] "))
+        .style(Style::default().bg(Color::Indexed(234)))
+        .border_style(Style::default().fg(Color::LightCyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return area;
+    }
+    let list_height = inner.height.saturating_sub(1) as usize;
+    let list_start = app
+        .wiki_link_index
+        .saturating_sub(list_height.saturating_sub(1));
+    app.wiki_link_hitboxes.clear();
+    for (index, candidate) in app
+        .wiki_link_candidates
+        .iter()
+        .enumerate()
+        .skip(list_start)
+        .take(list_height)
+    {
+        let selected = index == app.wiki_link_index;
+        let row_area = Rect::new(
+            inner.x,
+            inner.y + (index - list_start) as u16,
+            inner.width,
+            1,
+        );
+        let row_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let filename = candidate
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "(unnamed)".to_string());
+        let extension = candidate
+            .path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_uppercase())
+            .unwrap_or_else(|| "?".to_string());
+        let mut spans = vec![Span::styled(
+            format!("{}{} ", if selected { "> " } else { "  " }, filename),
+            row_style,
+        )];
+        let metadata = if candidate.archived {
+            format!("Archived · {extension}")
+        } else {
+            extension.to_string()
+        };
+        spans.push(Span::styled(
+            metadata,
+            if selected {
+                row_style.add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+        app.wiki_link_hitboxes.push(WikiLinkHitbox {
+            index,
+            area: row_area,
+        });
+    }
+    let footer = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new("↑↓ choose · Enter open · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
+    );
+    area
+}
+
+#[allow(dead_code)]
 fn draw_confirmation(frame: &mut Frame, root: Rect, title: &str, message: &str) -> Rect {
     let area = centered_rect(root, 56.min(root.width), 3.min(root.height));
     if area.width > 0 && area.height > 0 {
@@ -1673,6 +2196,7 @@ fn draw_confirmation(frame: &mut Frame, root: Rect, title: &str, message: &str) 
     area
 }
 
+#[allow(dead_code)]
 fn draw_help(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     let width = root.width.saturating_sub(2).min(92).max(root.width.min(1));
     let height = root
@@ -1849,7 +2373,7 @@ mod tests {
     use super::*;
     use crate::agent::ApprovalRequest;
     use crate::app::{Document, DocumentKind, DocumentReturn};
-    use crate::model::TodoItem;
+    use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate};
     use crate::storage::Storage;
 
     fn make_app() -> (App, tempfile::TempDir) {
@@ -1918,13 +2442,13 @@ mod tests {
             let center = app.layout.center.unwrap();
             let todo = app.layout.todo.unwrap();
             let agent = app.layout.agent.unwrap();
-            assert_eq!(files, Rect::new(0, 0, 30, 23), "width {width}");
-            assert_eq!(todo.width, 36, "width {width}");
+            assert_eq!(files, Rect::new(0, 0, FILES_WIDTH, 23), "width {width}");
+            assert_eq!(todo.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
             assert_eq!(todo.x + todo.width, width, "width {width}");
             assert_eq!(todo.height, 23u16.div_ceil(3), "width {width}");
             assert_eq!(agent.y, todo.y + todo.height, "width {width}");
             assert_eq!(agent.height, 23 - todo.height, "width {width}");
-            let region_width = width - FILES_WIDTH - TODO_WIDTH;
+            let region_width = width - FILES_WIDTH - RIGHT_SIDEBAR_WIDTH;
             assert_eq!(center, Rect::new(FILES_WIDTH, 0, region_width, 23));
             let content = center_content_axis(center);
             assert_eq!(content.width, region_width.min(CENTER_MAX_WIDTH));
@@ -1982,6 +2506,8 @@ mod tests {
             .filter(|(x, y)| matches!(first.backend().buffer()[(*x, *y)].fg, Color::Rgb(..)))
             .count();
         assert_eq!(first_activity_highlights, 1);
+        assert!(buffer_string(&first).contains("• Completed read_file"));
+        assert!(buffer_string(&first).contains("• Using web_fetch"));
 
         app.animation_tick = 1;
         let second = render(&mut app, 170, 24);
@@ -1999,8 +2525,8 @@ mod tests {
     fn animated_activity_respects_terminal_cell_width() {
         let lines = animated_activity_lines("正在调用工具", 19, 4);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), "正在调用工具");
-        assert_eq!(lines[0].width(), 12);
+        assert_eq!(lines[0].to_string(), " • 正在调用工具");
+        assert_eq!(lines[0].width(), 15);
         assert_eq!(
             lines[0]
                 .spans
@@ -2207,9 +2733,70 @@ mod tests {
         render(&mut app, 220, 24);
         assert!(app.layout.overlay.is_some());
         assert!(app.hitboxes.is_empty());
+        assert!(app.link_hitboxes.is_empty());
         assert!(app.file_hitboxes.is_empty());
         assert!(app.todo_hitboxes.is_empty());
         assert!(app.search_hitboxes.is_empty());
+    }
+
+    #[test]
+    fn links_are_clickable_in_daily_documents_and_agent_output() {
+        let (mut app, _directory) = make_app();
+        app.storage
+            .append_chat_message("Open [site](https://example.test)")
+            .unwrap();
+        app.reload();
+        render(&mut app, 170, 24);
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target == LinkTarget::External("https://example.test".to_string())
+        }));
+
+        app.document = Some(Document {
+            kind: DocumentKind::Message("2026-07-27".to_string()),
+            title: "Preview".to_string(),
+            source: "See [[Project]]".to_string(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+        });
+        app.center_view = CenterView::Document;
+        render(&mut app, 170, 24);
+        assert!(app
+            .link_hitboxes
+            .iter()
+            .any(|hitbox| { hitbox.target == LinkTarget::WikiLink("Project".to_string()) }));
+
+        app.agent_prompt.clear();
+        app.agent_output = vec!["[result](https://agent.example)".to_string()];
+        app.agent_output_final = true;
+        render(&mut app, 170, 24);
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target == LinkTarget::External("https://agent.example".to_string())
+        }));
+    }
+
+    #[test]
+    fn wikilink_choice_marks_archive_and_file_format_as_muted_metadata() {
+        let (mut app, directory) = make_app();
+        app.overlay = Some(Overlay::WikiLinkChoice);
+        app.wiki_link_target = Some("Project".to_string());
+        app.wiki_link_candidates = vec![
+            WikiLinkCandidate {
+                path: directory.path().join("data/Project.md"),
+                archived: false,
+            },
+            WikiLinkCandidate {
+                path: directory.path().join("archives/Project.mb"),
+                archived: true,
+            },
+        ];
+        let terminal = render(&mut app, 100, 18);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Project.md"));
+        assert!(screen.contains("MD"));
+        assert!(screen.contains("Archived"));
+        assert!(screen.contains("MB"));
+        assert_eq!(app.wiki_link_hitboxes.len(), 2);
     }
 
     #[test]

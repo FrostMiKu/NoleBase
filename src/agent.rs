@@ -69,6 +69,7 @@ pub enum ApprovalDecision {
 pub enum AgentEvent {
     Progress(String),
     Notification(String),
+    FileMoved { from: PathBuf, to: PathBuf },
     Approval(ApprovalRequest),
     AskUser(AskUserRequest),
     Finished(Result<String, String>),
@@ -337,9 +338,10 @@ impl Agent {
         agent.register(SearchFiles::new(nole_root)?);
         agent.register(WriteFile::new(nole_root)?);
         agent.register(CopyFile::new(nole_root)?);
-        agent.register(MoveFile::new(nole_root)?);
-        agent.register(MoveFiles::new(nole_root)?);
-        agent.register(RenameFile::new(nole_root)?);
+        let file_events = agent.events.clone();
+        agent.register(MoveFile::new(nole_root, file_events.clone())?);
+        agent.register(MoveFiles::new(nole_root, file_events.clone())?);
+        agent.register(RenameFile::new(nole_root, file_events)?);
         agent.register(DeleteFile::new(nole_root, gate.clone())?);
         agent.register(UpdateFile::new(nole_root, gate.clone(), reads.clone())?);
         agent.register(ReadDaily::new(nole_root, reads.clone())?);
@@ -446,7 +448,7 @@ impl Agent {
         }
         let _ = self
             .events
-            .send(AgentEvent::Progress(format!("Using {name}")));
+            .send(AgentEvent::Progress(tool_start_activity(name)));
         let result = self
             .tools
             .get(name)
@@ -454,17 +456,19 @@ impl Agent {
             .and_then(|tool| tool.execute(input));
         match result {
             Ok(content) => {
-                let _ = self
-                    .events
-                    .send(AgentEvent::Progress(format!("Completed {name}")));
+                let _ = self.events.send(AgentEvent::Progress(format!(
+                    "Completed {}.",
+                    tool_display_name(name)
+                )));
                 json!({
                 "type": "tool_result", "tool_use_id": id, "content": content
                 })
             }
             Err(error) => {
-                let _ = self
-                    .events
-                    .send(AgentEvent::Progress(format!("Failed {name}: {error}")));
+                let _ = self.events.send(AgentEvent::Progress(format!(
+                    "Failed {}: {error}",
+                    tool_display_name(name)
+                )));
                 json!({
                 "type": "tool_result", "tool_use_id": id,
                 "content": error.to_string(), "is_error": true
@@ -474,13 +478,34 @@ impl Agent {
     }
 }
 
+fn tool_start_activity(name: &str) -> String {
+    if name == "web_fetch" {
+        "Fetching Web...".to_string()
+    } else {
+        format!("Calling {}...", tool_display_name(name))
+    }
+}
+
+fn tool_display_name(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(characters).collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn system_prompt(root: &Path) -> String {
     format!(
         r#"You are the AI assistant inside Nole, a chat-style terminal note app.
 This is a single-turn task. After your final response, the user cannot reply in the same conversation and you will not see a follow-up. If you need clarification, confirmation, a choice, or any other user input to complete the task, you MUST call ask_user before returning your final response. Never put a question that requires an answer in the final response.
 Answer the user's request directly. Your final response is shown in the Agent panel, so return only useful content, without discussing tool mechanics.
 
-Nole renders MBDown. MBDown supports CommonMark headings, emphasis, strong text, strikethrough, links, lists, task lists, fenced code, block quotes, and tables. It also supports #tag at word boundaries and [[wikilink]] for references between notes. Tag names may use Unicode letters and numbers plus _, -, and /. Keep both forms literal inside code. MBDown also supports restricted BBCode:
+Nole renders MBDown. MBDown supports CommonMark headings, emphasis, strong text, strikethrough, links, lists, task lists, fenced code, block quotes, and tables. It also supports #tag at word boundaries and [[wikilink]] for references between notes. Tag names may use Unicode letters and numbers plus _, -, and /. Keep both forms literal inside code. Clicking a wikilink searches data/ and archives/; if multiple MD/MB files match, the user chooses in a popup, and if none match Nole creates a new data note. MBDown also supports restricted BBCode:
 - inline: [b], [i], [u], [s], [dim], named colors such as [red], [color=196], [color=#12abef], [bg=blue], and [link=https://example.com]label[/link]
 - layout: [center]...[/center], [right]...[/right], [indent first=4]...[/indent]
 - boxes: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0]...[/box]
@@ -1502,12 +1527,14 @@ impl Tool for CopyFile {
 
 struct MoveFile {
     root: PathBuf,
+    events: Sender<AgentEvent>,
 }
 
 impl MoveFile {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(root: &Path, events: Sender<AgentEvent>) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            events,
         })
     }
 }
@@ -1530,18 +1557,21 @@ impl Tool for MoveFile {
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
         let bytes = move_to_new_file(&source, &destination)?;
+        send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!("moved {bytes} bytes to {destination_text}"))
     }
 }
 
 struct MoveFiles {
     root: PathBuf,
+    events: Sender<AgentEvent>,
 }
 
 impl MoveFiles {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(root: &Path, events: Sender<AgentEvent>) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            events,
         })
     }
 }
@@ -1635,6 +1665,9 @@ impl Tool for MoveFiles {
                 })
             })
             .collect::<Vec<_>>();
+        for (source, destination, _) in &completed {
+            send_file_moved(&self.events, &self.root, source, destination);
+        }
         serde_json::to_string_pretty(&json!({
             "destination_directory": directory_text,
             "count": moved.len(),
@@ -1682,12 +1715,14 @@ fn rollback_moves(completed: &[(PathBuf, PathBuf, u64)]) -> Vec<String> {
 
 struct RenameFile {
     root: PathBuf,
+    events: Sender<AgentEvent>,
 }
 
 impl RenameFile {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(root: &Path, events: Sender<AgentEvent>) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            events,
         })
     }
 }
@@ -1741,11 +1776,24 @@ impl Tool for RenameFile {
             Err(error) => return Err(error).context("checking rename destination"),
         }
         let bytes = move_to_new_file(&source, &destination)?;
+        send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!(
             "renamed {path_text} to {} ({bytes} bytes)",
             display_path(&self.root, &destination)
         ))
     }
+}
+
+fn send_file_moved(events: &Sender<AgentEvent>, root: &Path, from: &Path, to: &Path) {
+    let display = |path: &Path| {
+        path.strip_prefix(root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let _ = events.send(AgentEvent::FileMoved {
+        from: display(from),
+        to: display(to),
+    });
 }
 
 fn transfer_schema() -> Value {
@@ -2216,6 +2264,7 @@ mod tests {
         let move_source = outside.path().join("move.txt");
         fs::write(&copy_source, "copy me").unwrap();
         fs::write(&move_source, "move me").unwrap();
+        let canonical_move_source = fs::canonicalize(&move_source).unwrap();
 
         let copy = CopyFile::new(directory.path()).unwrap();
         copy.execute(&json!({
@@ -2241,7 +2290,8 @@ mod tests {
             }))
             .is_err());
 
-        let move_file = MoveFile::new(directory.path()).unwrap();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let move_file = MoveFile::new(directory.path(), event_sender).unwrap();
         move_file
             .execute(&json!({
                 "source": move_source,
@@ -2253,6 +2303,11 @@ mod tests {
             fs::read_to_string(directory.path().join("data/moved.md")).unwrap(),
             "move me"
         );
+        let AgentEvent::FileMoved { from, to } = event_receiver.recv().unwrap() else {
+            panic!("expected file-moved event");
+        };
+        assert_eq!(from, canonical_move_source);
+        assert_eq!(to, PathBuf::from("data/moved.md"));
     }
 
     #[test]
@@ -2268,7 +2323,8 @@ mod tests {
         fs::write(&alpha, "alpha").unwrap();
         fs::write(&beta, "beta").unwrap();
 
-        let mover = MoveFiles::new(directory.path()).unwrap();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let mover = MoveFiles::new(directory.path(), event_sender.clone()).unwrap();
         let result = mover
             .execute(&json!({
                 "sources": [alpha, beta],
@@ -2287,8 +2343,15 @@ mod tests {
             fs::read_to_string(destination.join("beta.md")).unwrap(),
             "beta"
         );
+        let moved_events = [
+            event_receiver.recv().unwrap(),
+            event_receiver.recv().unwrap(),
+        ];
+        assert!(moved_events
+            .iter()
+            .all(|event| matches!(event, AgentEvent::FileMoved { .. })));
 
-        let rename = RenameFile::new(directory.path()).unwrap();
+        let rename = RenameFile::new(directory.path(), event_sender).unwrap();
         rename
             .execute(&json!({
                 "path": "data/collected/alpha.md",
@@ -2300,6 +2363,11 @@ mod tests {
             fs::read_to_string(destination.join("renamed.md")).unwrap(),
             "alpha"
         );
+        let AgentEvent::FileMoved { from, to } = event_receiver.recv().unwrap() else {
+            panic!("expected file-moved event");
+        };
+        assert_eq!(from, PathBuf::from("data/collected/alpha.md"));
+        assert_eq!(to, PathBuf::from("data/collected/renamed.md"));
         assert!(rename
             .execute(&json!({
                 "path": "data/collected/renamed.md",
@@ -2344,6 +2412,13 @@ mod tests {
         assert!(prompt.starts_with("Current local date and time: "));
         assert!(prompt.contains(&now.to_rfc3339()));
         assert!(prompt.ends_with("\n\nSummarize this"));
+    }
+
+    #[test]
+    fn tool_activity_uses_readable_names_and_web_fetch_wording() {
+        assert_eq!(tool_start_activity("web_fetch"), "Fetching Web...");
+        assert_eq!(tool_start_activity("read_file"), "Calling Read File...");
+        assert_eq!(tool_display_name("update_daily"), "Update Daily");
     }
 
     #[test]

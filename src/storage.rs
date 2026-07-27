@@ -423,10 +423,19 @@ impl Storage {
 
     /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
     pub fn list_note_files(&self) -> Result<Vec<NoteFile>> {
+        self.list_note_files_in(&self.data_dir)
+    }
+
+    /// List flat `.md` and `.mb` files under `archives/`, most recently modified first.
+    pub fn list_archived_note_files(&self) -> Result<Vec<NoteFile>> {
+        self.list_note_files_in(&self.archives_dir)
+    }
+
+    fn list_note_files_in(&self, directory: &Path) -> Result<Vec<NoteFile>> {
         let mut files = Vec::new();
-        fs::create_dir_all(&self.data_dir)
-            .with_context(|| format!("creating {}", self.data_dir.display()))?;
-        for entry in fs::read_dir(&self.data_dir)? {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+        for entry in fs::read_dir(directory)? {
             let Ok(entry) = entry else { continue };
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -450,6 +459,56 @@ impl Storage {
                 .then_with(|| a.path.file_name().cmp(&b.path.file_name()))
         });
         Ok(files)
+    }
+
+    /// Read a regular note from `archives/` after rejecting symlinks and paths
+    /// outside that directory.
+    pub fn read_archived_note_file(&self, path: &Path) -> Result<String> {
+        let canonical_archives = fs::canonicalize(&self.archives_dir).with_context(|| {
+            format!(
+                "resolving archive directory {}",
+                self.archives_dir.display()
+            )
+        })?;
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("checking archived note {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("archived note must be a regular file: {}", path.display());
+        }
+        let canonical = fs::canonicalize(path)
+            .with_context(|| format!("resolving archived note {}", path.display()))?;
+        if canonical.parent() != Some(canonical_archives.as_path()) || !is_note_path(&canonical) {
+            bail!("archived note must be a direct .md or .mb file in archives");
+        }
+        fs::read_to_string(canonical).context("reading archived note")
+    }
+
+    /// Read an open article after it has been moved anywhere within the Nole
+    /// workspace. Daily cards and configuration remain owned by their
+    /// dedicated APIs.
+    pub fn read_document_file(&self, path: &Path) -> Result<String> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("checking document {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("document must be a regular file: {}", path.display());
+        }
+        let canonical_root = fs::canonicalize(&self.root)
+            .with_context(|| format!("resolving Nole root {}", self.root.display()))?;
+        let canonical = fs::canonicalize(path)
+            .with_context(|| format!("resolving document {}", path.display()))?;
+        let config = fs::canonicalize(&self.config_dir).unwrap_or_else(|_| self.config_dir.clone());
+        let daily = fs::canonicalize(&self.daily_dir).unwrap_or_else(|_| self.daily_dir.clone());
+        if !canonical.starts_with(&canonical_root)
+            || canonical.starts_with(config)
+            || canonical.starts_with(daily)
+            || !is_note_path(&canonical)
+        {
+            bail!(
+                "document must be a managed .md or .mb file: {}",
+                path.display()
+            );
+        }
+        fs::read_to_string(canonical).context("reading document")
     }
 
     /// List only the paths, preserving the sidebar's recent-first order.
@@ -998,6 +1057,23 @@ mod tests {
         let older_index = files.iter().position(|path| path == &older).unwrap();
         let newer_index = files.iter().position(|path| path == &newer).unwrap();
         assert!(newer_index < older_index);
+    }
+
+    #[test]
+    fn archived_notes_are_listed_and_read_separately_from_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let archived = storage.archives_dir.join("Project.MB");
+        fs::write(&archived, "archived").unwrap();
+        let files = storage.list_archived_note_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, archived);
+        assert_eq!(
+            storage.read_archived_note_file(&archived).unwrap(),
+            "archived"
+        );
+        assert!(storage.read_note_file(&archived).is_err());
     }
 
     #[cfg(unix)]
