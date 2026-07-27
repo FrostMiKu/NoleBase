@@ -159,21 +159,27 @@ under `~/.nole`:
 
 ```text
 config/        # reserved for configuration
-  ai.toml       # Anthropic Messages API configuration
+  ai.toml       # Anthropic and optional Tavily configuration
+  AGENTS.md      # user-authored Agent instructions
+MEMORY.md       # Agent-maintained persistent memory
 daily/         # chat cards; absent dates have no file
   YYYY-MM-DD.md
-archives/      # archived daily cards
+archives/      # flat storage for archived daily cards and articles
   YYYY-MM-DD.md
+  <name>.md
+  <name>.mb
 data/          # flat note storage
   <name>.md
   <name>.mb
 ```
 
-`.md` and `.mb` extensions are recognized case-insensitively. Files manages only
-direct, regular files in `data/`; symlinks, nested paths, and paths outside that
-directory are rejected. Startup creates `daily/` and `archives/`, but a daily
-file is created only when content is first sent for that date. Later sends
-append with a blank line separator.
+`.md` and `.mb` extensions are recognized case-insensitively. NoleBase shows
+direct, regular files from both `data/` and `archives/` as separate Notes and
+Archives groups; symlinks and nested paths are rejected. Startup creates
+`daily/` and `archives/`, but a daily file is created only when content is first
+sent for that date. Later sends append with a blank line separator. Archiving an
+article moves it from `data/` to `archives/`; restoring it moves it back without
+overwriting an existing file.
 
 ### AI agent
 
@@ -181,9 +187,11 @@ On first start Nole creates `config/ai.toml` with private file permissions:
 
 ```toml
 api_key = ""
+tavily_api_key = ""
 model = "claude-sonnet-4-5"
 base_url = "https://api.anthropic.com"
 max_tokens = 4096
+max_rounds = 25
 ```
 
 Set the Anthropic API key directly in `api_key`. The card's `AI` button runs the
@@ -191,16 +199,28 @@ Anthropic Messages API in the background. It first opens a prompt dialog; an
 empty prompt sends the source card content. Tool calls and Agent state appear in
 the bottom status bar. The lower two-thirds of the right sidebar shows the
 user's prompt followed by the Agent's final reply; Todo uses the upper third.
+`max_rounds` limits Messages API request rounds for each submitted prompt, not
+the lifetime of the in-memory conversation; one response may call several tools.
 Agent output enters the current daily card only when
 the Agent explicitly calls `append_daily`, or when the Agent panel is focused
 and you press Enter. The latter appends to the current Daily card, clears the
 Agent panel, and returns focus to the center view.
 
+Set `tavily_api_key` to enable the Agent's Tavily `web_search` tool. When the
+key is empty or absent, Nole omits the tool and its instructions entirely, so
+the Agent does not know that web search is available.
+
 While the Agent is running, its panel border carries a moving color gradient
 and the panel lists tool activity. A color highlight advances character by
 character across the current activity item; the bottom status text stays
-static. When the Agent finishes, its final response replaces the activity log.
-Focus the Agent panel and press `c` to cancel the current task. Cancellation is
+static. The panel title shows request rounds against the configured limit plus
+input/output token counts, for example `↻3/25 · ↑12.4k ↓842`. Multiple tool
+calls returned in one model response still count as one round. When the Agent
+finishes, its final response replaces the activity log.
+Agent conversations persist across completed prompts. Continue in the compose
+box with `Ctrl+Enter`; the Agent receives the completed conversation history.
+Focus the Agent panel and press `c` to cancel the current task, or `C` to clear
+the conversation and start a new session. Cancellation is
 cooperative: no later tools will start, although an in-flight HTTP request or
 tool call may need to return before its worker thread exits.
 
@@ -210,7 +230,9 @@ inputs submit only their currently visible rows to Ratatui; off-screen rows are
 retained as scroll state rather than rendered.
 
 The Agent can read arbitrary text files with zero-based `offset`/`limit` line
-pagination, write only inside the Nole directory, and fetch HTTP(S) text.
+pagination, write only inside the Nole directory, and fetch HTTP(S) text. When
+configured, `web_search` queries Tavily with optional topic, depth, time range,
+answer, and result-count controls, then returns compact ranked results.
 Every user prompt sent to the Agent includes the current local date and time.
 `read_file` defaults to 200 lines and accepts at most 2,000 lines per call. Its
 structured response includes the total line count and whether more content
@@ -255,9 +277,15 @@ or type a different free-text response. Esc cancels the question. Questions
 are interactive requests rather than permission checks, so APPROVE/BYPASS does
 not skip them.
 
-Each Agent launch is a single-turn task; later prompts do not inherit its
-conversation history. The system prompt requires the Agent to use `ask_user`
-for any clarification needed before its final response.
+The system prompt requires the Agent to use `ask_user` when it needs an answer
+before it can complete the current task. Later `Ctrl+Enter` prompts remain part
+of the same in-memory conversation until `C` is pressed or Nole exits.
+
+Nole also creates empty `config/AGENTS.md` and `MEMORY.md` files. Their complete
+contents are appended to the system prompt in that order for every Agent task.
+`config/AGENTS.md` is user-owned: Agent file tools cannot mutate anything in
+`config/`. The Agent may read and update root-level `MEMORY.md` through the
+normal read-before-update and approval flow.
 
 In `APPROVE` mode, updates and deletes pause and show an MBTUI-rendered diff or
 deletion preview. Use Enter/Y to approve or N/Esc to deny. In `BYPASS` mode

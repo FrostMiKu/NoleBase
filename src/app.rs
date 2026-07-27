@@ -11,8 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::agent::{
-    Agent, AgentEvent, ApprovalDecision, ApprovalRequest, AskUserRequest, AskUserResponse,
-    PermissionMode,
+    Agent, AgentConversation, AgentEvent, ApprovalDecision, ApprovalRequest, AskUserRequest,
+    AskUserResponse, PermissionMode, TokenUsage,
 };
 use crate::model::{
     Action, ButtonHitbox, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow,
@@ -465,6 +465,10 @@ pub struct App {
     pub agent_output: Vec<String>,
     pub agent_output_final: bool,
     pub agent_scroll: u16,
+    pub agent_usage: TokenUsage,
+    pub agent_round: u32,
+    pub agent_round_limit: u32,
+    agent_conversation: AgentConversation,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
     ai_source_id: Option<String>,
@@ -548,6 +552,10 @@ impl App {
             agent_output: Vec::new(),
             agent_output_final: false,
             agent_scroll: 0,
+            agent_usage: TokenUsage::default(),
+            agent_round: 0,
+            agent_round_limit: 0,
+            agent_conversation: AgentConversation::default(),
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,
             ai_source_id: None,
@@ -678,6 +686,14 @@ impl App {
                     self.agent_output_final = false;
                     self.agent_scroll = u16::MAX;
                     self.set_status(message);
+                }
+                AgentEvent::Usage(usage) => self.agent_usage.add(usage),
+                AgentEvent::Round { current, limit } => {
+                    self.agent_round = current;
+                    self.agent_round_limit = limit;
+                }
+                AgentEvent::ConversationUpdated(conversation) => {
+                    self.agent_conversation = conversation;
                 }
                 AgentEvent::Notification(message) => {
                     self.notifications.notify(message);
@@ -1881,6 +1897,10 @@ impl App {
 
     fn handle_agent(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
+            KeyCode::Char('C') => {
+                self.clear_agent_session();
+                None
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                 self.focus = Focus::Center;
                 None
@@ -2537,7 +2557,7 @@ impl App {
 
     fn handle_delete_message_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(id) = self.pending_id.take() {
                     let message = self.message_clone(&id);
                     match self.storage.remove_message_by_id(&id) {
@@ -2569,7 +2589,7 @@ impl App {
 
     fn handle_delete_file_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(path) = self.pending_file.take() {
                     let archived = self
                         .note_files
@@ -3667,8 +3687,12 @@ impl App {
         self.agent_output.clear();
         self.agent_output_final = false;
         self.agent_scroll = 0;
+        self.agent_usage = TokenUsage::default();
+        self.agent_round = 0;
+        self.agent_round_limit = 0;
         self.set_status("AI is working...");
         let bypass = self.permission_bypass.clone();
+        let mut conversation = self.agent_conversation.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.ai_cancel = Some(cancelled.clone());
         thread::spawn(move || {
@@ -3681,8 +3705,11 @@ impl App {
                 bypass,
                 cancelled,
             )
-            .and_then(|agent| agent.run(&prompt))
+            .and_then(|agent| agent.run(&prompt, &mut conversation))
             .map_err(|error| error.to_string());
+            if result.is_ok() {
+                let _ = event_sender.send(AgentEvent::ConversationUpdated(conversation));
+            }
             let _ = event_sender.send(AgentEvent::Finished(result));
         });
         true
@@ -3709,6 +3736,27 @@ impl App {
         self.agent_output_final = false;
         self.agent_scroll = u16::MAX;
         self.set_status("Agent task cancelled");
+    }
+
+    fn clear_agent_session(&mut self) {
+        let was_running = self.ai_running;
+        if was_running {
+            self.cancel_agent();
+        }
+        let had_history = self.agent_conversation.clear();
+        let had_panel_content = !self.agent_prompt.is_empty() || !self.agent_output.is_empty();
+        self.agent_prompt.clear();
+        self.agent_output.clear();
+        self.agent_output_final = false;
+        self.agent_scroll = 0;
+        self.agent_usage = TokenUsage::default();
+        self.agent_round = 0;
+        self.agent_round_limit = 0;
+        if was_running || had_history || had_panel_content {
+            self.set_status("Agent session cleared");
+        } else {
+            self.set_status("Agent session is already empty");
+        }
     }
 
     fn cancel_file_context(&mut self) {
@@ -4077,9 +4125,17 @@ mod tests {
         sender
             .send(AgentEvent::Progress("Using read_file".to_string()))
             .unwrap();
+        sender
+            .send(AgentEvent::Round {
+                current: 2,
+                limit: 25,
+            })
+            .unwrap();
         app.poll_agent();
         assert_eq!(app.status, "Using read_file");
         assert_eq!(app.agent_output, ["Using read_file"]);
+        assert_eq!(app.agent_round, 2);
+        assert_eq!(app.agent_round_limit, 25);
         assert!(!app.agent_output_final);
 
         sender
@@ -4117,6 +4173,27 @@ mod tests {
         assert!(app.ai_approval_sender.is_none());
         assert!(app.ai_user_sender.is_none());
         assert_eq!(app.status, "Agent task cancelled");
+    }
+
+    #[test]
+    fn uppercase_c_cancels_work_and_clears_the_in_memory_agent_session() {
+        let (mut app, _directory) = make_app();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.ai_cancel = Some(cancelled.clone());
+        app.ai_running = true;
+        app.agent_prompt = "Current prompt".to_string();
+        app.agent_output = vec!["Searching Web...".to_string()];
+        app.agent_conversation = AgentConversation::seeded_for_test();
+        app.focus = Focus::Agent;
+
+        app.handle_key(key(KeyCode::Char('C')));
+
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!app.ai_running);
+        assert!(!app.agent_conversation.clear());
+        assert!(app.agent_prompt.is_empty());
+        assert!(app.agent_output.is_empty());
+        assert_eq!(app.status, "Agent session cleared");
     }
 
     #[test]
@@ -4547,6 +4624,28 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.overlay, None);
         assert_eq!(app.focus, Focus::Files);
+    }
+
+    #[test]
+    fn enter_confirms_file_deletion_dialog() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("DeleteMe.md");
+        fs::write(&path, "delete me").unwrap();
+        app.open_files();
+        app.file_index = app
+            .note_files
+            .iter()
+            .position(|file| file.path == path)
+            .unwrap();
+        app.sync_selected_file();
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.overlay, Some(Overlay::ConfirmDeleteFile));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(!path.exists());
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.status, "Deleted DeleteMe.md");
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! Chat is persisted as one Markdown file per day under `daily/`. Sending the
 //! first message of a day creates `YYYY-MM-DD.md`; later messages append to it.
-//! Archived cards are whole daily files moved into `archives/`.
+//! `archives/` is a flat archive containing both whole daily files and articles
+//! moved from `data/`; archived daily files retain their `YYYY-MM-DD.md` names.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -15,6 +16,8 @@ use crate::model::{Message, NoteFile, SearchHit, TodoItem};
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
+const AGENTS_FILE: &str = "AGENTS.md";
+const MEMORY_FILE: &str = "MEMORY.md";
 const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
 const ARCHIVES_DIR: &str = "archives";
@@ -28,6 +31,8 @@ pub struct Storage {
     pub daily_dir: PathBuf,
     pub archives_dir: PathBuf,
     pub ai_config_path: PathBuf,
+    pub agents_path: PathBuf,
+    pub memory_path: PathBuf,
 }
 
 impl Storage {
@@ -47,6 +52,8 @@ impl Storage {
             daily_dir: root.join(DAILY_DIR),
             archives_dir: root.join(ARCHIVES_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
+            agents_path: root.join(CONFIG_DIR).join(AGENTS_FILE),
+            memory_path: root.join(MEMORY_FILE),
             root,
         })
     }
@@ -66,16 +73,20 @@ impl Storage {
         if !self.ai_config_path.exists() {
             self.write_default_ai_config()?;
         }
+        create_empty_file(&self.agents_path)?;
+        create_empty_file(&self.memory_path)?;
         Ok(())
     }
 
     fn write_default_ai_config(&self) -> Result<()> {
         const DEFAULT: &str = concat!(
-            "# Anthropic Messages API configuration. Keep this file private.\n",
+            "# AI service credentials. Keep this file private.\n",
             "api_key = \"\"\n",
+            "tavily_api_key = \"\"\n",
             "model = \"claude-sonnet-4-5\"\n",
             "base_url = \"https://api.anthropic.com\"\n",
             "max_tokens = 4096\n",
+            "max_rounds = 25\n",
         );
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -601,6 +612,14 @@ impl Storage {
                 Err(error).with_context(|| format!("checking note target {}", target.display()))
             }
         }
+    }
+}
+
+fn create_empty_file(path: &Path) -> Result<()> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("creating {}", path.display())),
     }
 }
 
@@ -1215,10 +1234,33 @@ mod tests {
         assert!(st.append_daily("2026-07-27", "   ").is_err());
         assert!(!st.daily_dir.join("2026-07-27.md").exists());
         assert!(st.ai_config_path.exists());
+        assert!(st.agents_path.exists());
+        assert!(st.memory_path.exists());
+        assert_eq!(fs::read_to_string(&st.agents_path).unwrap(), "");
+        assert_eq!(fs::read_to_string(&st.memory_path).unwrap(), "");
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
-        assert!(fs::read_to_string(&st.ai_config_path)
-            .unwrap()
-            .contains("api_key = \"\""));
+        let config = fs::read_to_string(&st.ai_config_path).unwrap();
+        assert!(config.contains("api_key = \"\""));
+        assert!(config.contains("tavily_api_key = \"\""));
+        assert!(config.contains("max_rounds = 25"));
+    }
+
+    #[test]
+    fn ensure_files_preserves_agent_instructions_and_memory() {
+        let (_directory, storage) = fresh();
+        fs::write(&storage.agents_path, "user instruction\n").unwrap();
+        fs::write(&storage.memory_path, "remember this\n").unwrap();
+
+        storage.ensure_files().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&storage.agents_path).unwrap(),
+            "user instruction\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&storage.memory_path).unwrap(),
+            "remember this\n"
+        );
     }
 
     #[test]

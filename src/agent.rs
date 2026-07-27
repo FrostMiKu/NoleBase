@@ -19,9 +19,11 @@ use similar::TextDiff;
 use crate::storage::Storage;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const MAX_AGENT_ROUNDS: usize = 12;
+const DEFAULT_MAX_ROUNDS: u32 = 25;
 const MAX_FILE_BYTES: u64 = 1_000_000;
 const MAX_FETCH_BYTES: u64 = 1_000_000;
+const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
+const MAX_WEB_SEARCH_RESULTS: usize = 10;
 const MAX_NOTE_RESULTS: usize = 2_000;
 const MAX_DIFF_BYTES: usize = 200_000;
 const DEFAULT_READ_LINES: usize = 200;
@@ -68,11 +70,67 @@ pub enum ApprovalDecision {
 #[derive(Debug)]
 pub enum AgentEvent {
     Progress(String),
+    Usage(TokenUsage),
+    Round { current: u32, limit: u32 },
+    ConversationUpdated(AgentConversation),
     Notification(String),
     FileMoved { from: PathBuf, to: PathBuf },
     Approval(ApprovalRequest),
     AskUser(AskUserRequest),
     Finished(Result<String, String>),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentConversation {
+    messages: Vec<Value>,
+}
+
+impl AgentConversation {
+    pub fn clear(&mut self) -> bool {
+        let had_history = !self.messages.is_empty();
+        self.messages.clear();
+        had_history
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seeded_for_test() -> Self {
+        Self {
+            messages: vec![json!({ "role": "user", "content": "previous prompt" })],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total_input(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
+    pub fn add(&mut self, usage: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.total_input() == 0 && self.output_tokens == 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,11 +301,15 @@ impl ApprovalGate {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AgentConfig {
     pub api_key: String,
+    #[serde(default)]
+    pub tavily_api_key: String,
     pub model: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: u32,
 }
 
 fn default_base_url() -> String {
@@ -256,6 +318,10 @@ fn default_base_url() -> String {
 
 const fn default_max_tokens() -> u32 {
     4096
+}
+
+const fn default_max_rounds() -> u32 {
+    DEFAULT_MAX_ROUNDS
 }
 
 impl AgentConfig {
@@ -272,6 +338,9 @@ impl AgentConfig {
         }
         if config.max_tokens == 0 {
             bail!("max_tokens must be greater than zero");
+        }
+        if config.max_rounds == 0 {
+            bail!("max_rounds must be greater than zero");
         }
         Ok(config)
     }
@@ -313,6 +382,12 @@ impl Agent {
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
         let config = AgentConfig::load(config_path)?;
+        let tavily_api_key = config.tavily_api_key.trim().to_string();
+        let has_web_search = !tavily_api_key.is_empty();
+        let agents_instructions = fs::read_to_string(nole_root.join("config/AGENTS.md"))
+            .context("reading config/AGENTS.md")?;
+        let memory =
+            fs::read_to_string(nole_root.join("MEMORY.md")).context("reading MEMORY.md")?;
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
             .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
@@ -322,7 +397,7 @@ impl Agent {
             config,
             client: client.clone(),
             tools: HashMap::new(),
-            system: system_prompt(nole_root),
+            system: system_prompt(nole_root, has_web_search, &agents_instructions, &memory),
             events: events.clone(),
             cancelled,
         };
@@ -354,6 +429,12 @@ impl Agent {
             events: agent.events.clone(),
             responses: Arc::new(Mutex::new(user_responses)),
         });
+        if has_web_search {
+            agent.register(WebSearch {
+                client: client.clone(),
+                api_key: tavily_api_key,
+            });
+        }
         agent.register(WebFetch { client });
         Ok(agent)
     }
@@ -362,13 +443,19 @@ impl Agent {
         self.tools.insert(tool.name().to_string(), Box::new(tool));
     }
 
-    pub fn run(&self, prompt: &str) -> Result<String> {
+    pub fn run(&self, prompt: &str, conversation: &mut AgentConversation) -> Result<String> {
         let prompt = prompt_with_datetime(prompt, Local::now());
-        let mut messages = vec![json!({ "role": "user", "content": prompt })];
+        conversation
+            .messages
+            .push(json!({ "role": "user", "content": prompt }));
         let definitions: Vec<Value> = self.tools.values().map(|tool| tool.definition()).collect();
 
-        for _ in 0..MAX_AGENT_ROUNDS {
+        for round in 1..=self.config.max_rounds {
             self.ensure_active()?;
+            let _ = self.events.send(AgentEvent::Round {
+                current: round,
+                limit: self.config.max_rounds,
+            });
             let url = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
             let response = self
                 .client
@@ -379,7 +466,7 @@ impl Agent {
                     "model": self.config.model,
                     "max_tokens": self.config.max_tokens,
                     "system": self.system,
-                    "messages": messages,
+                    "messages": conversation.messages,
                     "tools": definitions,
                 }))
                 .send()
@@ -397,6 +484,14 @@ impl Agent {
             }
             let value: Value =
                 serde_json::from_str(&body).context("decoding Anthropic response")?;
+            let usage: TokenUsage = serde_json::from_value(
+                value
+                    .get("usage")
+                    .cloned()
+                    .context("Anthropic response has no usage object")?,
+            )
+            .context("decoding Anthropic token usage")?;
+            let _ = self.events.send(AgentEvent::Usage(usage));
             let content = value
                 .get("content")
                 .and_then(Value::as_array)
@@ -415,18 +510,25 @@ impl Agent {
                 if output.trim().is_empty() {
                     bail!("Anthropic returned no text");
                 }
+                conversation
+                    .messages
+                    .push(json!({ "role": "assistant", "content": content }));
                 return Ok(output);
             }
 
-            messages.push(json!({ "role": "assistant", "content": content }));
+            conversation
+                .messages
+                .push(json!({ "role": "assistant", "content": content }));
             self.ensure_active()?;
             let results: Vec<Value> = tool_uses
                 .into_iter()
                 .map(|call| self.execute_tool_call(call))
                 .collect();
-            messages.push(json!({ "role": "user", "content": results }));
+            conversation
+                .messages
+                .push(json!({ "role": "user", "content": results }));
         }
-        bail!("agent exceeded {MAX_AGENT_ROUNDS} tool-call rounds")
+        bail!("agent exceeded {} request rounds", self.config.max_rounds)
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -479,10 +581,10 @@ impl Agent {
 }
 
 fn tool_start_activity(name: &str) -> String {
-    if name == "web_fetch" {
-        "Fetching Web...".to_string()
-    } else {
-        format!("Calling {}...", tool_display_name(name))
+    match name {
+        "web_fetch" => "Fetching Web...".to_string(),
+        "web_search" => "Searching Web...".to_string(),
+        _ => format!("Calling {}...", tool_display_name(name)),
     }
 }
 
@@ -499,26 +601,55 @@ fn tool_display_name(name: &str) -> String {
         .join(" ")
 }
 
-fn system_prompt(root: &Path) -> String {
+fn system_prompt(
+    root: &Path,
+    has_web_search: bool,
+    agents_instructions: &str,
+    memory: &str,
+) -> String {
+    let web_search_guidance = if has_web_search {
+        "- Use web_search for current information; use web_fetch when you already have a URL.\n"
+    } else {
+        ""
+    };
     format!(
-        r#"You are the AI assistant inside Nole, a chat-style terminal note app.
-This is a single-turn task. After your final response, the user cannot reply in the same conversation and you will not see a follow-up. If you need clarification, confirmation, a choice, or any other user input to complete the task, you MUST call ask_user before returning your final response. Never put a question that requires an answer in the final response.
-Answer the user's request directly. Your final response is shown in the Agent panel, so return only useful content, without discussing tool mechanics.
+        r#"You are the AI assistant in Nole, a terminal note app.
+The conversation is multi-turn and completed history is retained in memory. Use ask_user when input is required before finishing the current task. Return only the useful final answer; it appears in the Agent panel.
 
-Nole renders MBDown. MBDown supports CommonMark headings, emphasis, strong text, strikethrough, links, lists, task lists, fenced code, block quotes, and tables. It also supports #tag at word boundaries and [[wikilink]] for references between notes. Tag names may use Unicode letters and numbers plus _, -, and /. Keep both forms literal inside code. Clicking a wikilink searches data/ and archives/; if multiple MD/MB files match, the user chooses in a popup, and if none match Nole creates a new data note. MBDown also supports restricted BBCode:
-- inline: [b], [i], [u], [s], [dim], named colors such as [red], [color=196], [color=#12abef], [bg=blue], and [link=https://example.com]label[/link]
-- layout: [center]...[/center], [right]...[/right], [indent first=4]...[/indent]
-- boxes: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0]...[/box]
-- responsive columns: [columns gap=2][column width=1fr]...[/column][column width=2fr]...[/column][/columns]
-Use ordinary Markdown unless richer MBDown layout materially improves the answer. Close every BBCode tag and never emit raw terminal escape sequences.
+## MBDown
+Nole renders CommonMark plus #tag and [[wikilink]]. Tags allow Unicode letters/numbers and _, -, /. Wikilinks resolve .md/.mb notes in data/ and archives/. Restricted BBCode is also available:
+- inline: [b], [i], [u], [s], [dim], [red], [color=#12abef], [bg=blue], [link=https://example.com]label[/link]
+- layout: [center], [right], [indent first=4]
+- containers: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0], [columns gap=2], [column width=1fr]
+Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never emit terminal escape sequences.
 
-The Nole root is {root}. Special paths are:
-- daily/: chat cards stored as YYYY-MM-DD.md, one card per day
-- archives/: archived daily files, retaining the same YYYY-MM-DD.md name
-- config/ai.toml: Anthropic API configuration; never read or expose secrets from it
-- data/: flat user note storage; notes use .md or .mb
-Relative file paths use this root. read_file accepts absolute paths, but write_file, update_file, and all destinations are restricted to this root. read_file is line-paginated; use offset and limit to inspect only relevant portions. Generic file tools must never operate inside daily/ or on config/ai.toml. Use list_notes to inspect managed notes and sort them by name, line count, creation time, modification time, or file size. Use search_content for full-text search across daily cards and notes, and search_files for fuzzy note-name search. copy_file and move_file accept a source anywhere on the filesystem, but only create a non-existing destination under the Nole root and do not require approval. Use move_files to move up to 200 files into one existing Nole directory while preserving basenames. Use rename_file for a same-directory rename under Nole instead of expressing renames as moves. delete_file only deletes a regular file under the Nole root and requires approval unless permission checks are bypassed. read_daily requires an inclusive start_date and end_date and returns all existing cards in that range; use the same date for both bounds to read one card. Use update_daily to replace an existing daily card and append_daily to append content for a date. append_daily is not approval-gated, while updates may pause for user approval. write_file only creates new files. update_file applies zero-based line edits and preserves all content outside each [start_line, end_line) range; replacement content is exact, so include required newlines. Before update_file you MUST read each changed or deleted range of the exact file in this agent run; insertions require the adjacent anchor lines. You do not need to read or submit unrelated portions of a large file. Before update_daily you MUST read a range containing the exact date. Updates are automatically rejected without the required read, even in bypass mode. Todo items are Markdown task-list items scanned from all files in daily/. Use ask_user when a missing decision or ambiguity materially affects the result; include concise options when useful, while allowing free-text answers. Use notify to surface a short, time-sensitive message in the user's TUI. Do not assume your final response is added to daily: call append_daily when content belongs there. Your final text is shown in the Agent output panel. Use tools only when the request requires local context or changes."#,
-        root = root.display()
+## Workspace
+Root: {root}
+- data/: ordinary .md/.mb articles and notes; create them here by default.
+- daily/: YYYY-MM-DD.md chat cards. Use only daily tools.
+- archives/: archived daily cards and articles.
+- config/: user-owned configuration. Never modify, move, copy, rename, or delete anything here. Never read config/ai.toml.
+- config/AGENTS.md: user instructions injected below.
+- MEMORY.md: persistent Agent memory injected below; you may update it.
+
+## Tool rules
+- Paths are root-relative unless documented otherwise. File destinations must stay under the root.
+- read_file is paginated; read only needed lines. Use list_notes, search_content, and search_files to discover notes.
+- write_file creates only new files. update_file uses exact zero-based line ranges. Every changed/deleted range must first be read in this run; insertions require adjacent lines. Unrelated lines need not be read.
+- Generic file tools cannot operate in daily/ or config/. Use read_daily before update_daily. append_daily creates/appends without approval; updates require approval unless bypassed.
+- Copy/move sources may be outside Nole; destinations must be new paths under Nole. Use move_files for batches and rename_file for renames. Deletes require approval unless bypassed.
+{web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
+- Final text is not saved automatically; call append_daily when it belongs in Daily.
+
+## Project instructions (config/AGENTS.md)
+{agents_instructions}
+
+## Agent memory (MEMORY.md)
+{memory}"#,
+        root = root.display(),
+        web_search_guidance = web_search_guidance,
+        agents_instructions = agents_instructions,
+        memory = memory,
     )
 }
 
@@ -901,7 +1032,7 @@ impl Tool for SearchFiles {
 
 struct UpdateFile {
     root: PathBuf,
-    private_config: PathBuf,
+    config_dir: PathBuf,
     daily_dir: PathBuf,
     gate: ApprovalGate,
     reads: Arc<ReadTracker>,
@@ -911,7 +1042,7 @@ impl UpdateFile {
     fn new(root: &Path, gate: ApprovalGate, reads: Arc<ReadTracker>) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
-            private_config: root.join("config/ai.toml"),
+            config_dir: root.join("config"),
             daily_dir: root.join("daily"),
             root,
             gate,
@@ -926,7 +1057,7 @@ impl Tool for UpdateFile {
     }
 
     fn description(&self) -> &'static str {
-        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root while preserving all other content. Each edit replaces [start_line, end_line) with exact content. Changed/deleted lines, or adjacent anchors for insertions, must have been read in this run. Requires user diff approval unless bypassed."
+        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root, outside config/ and daily/, while preserving all other content. Each edit replaces [start_line, end_line) with exact content. Changed/deleted lines, or adjacent anchors for insertions, must have been read in this run. Requires user diff approval unless bypassed."
     }
 
     fn input_schema(&self) -> Value {
@@ -970,7 +1101,7 @@ impl Tool for UpdateFile {
         }
         let path = fs::canonicalize(&unresolved)
             .with_context(|| format!("resolving existing file {}", unresolved.display()))?;
-        if path == self.private_config || path.starts_with(&self.daily_dir) {
+        if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
             bail!("generic file tools cannot operate on this special file");
         }
         let metadata = fs::metadata(&path)?;
@@ -1450,7 +1581,7 @@ fn resolve_new_destination(root: &Path, input: &str) -> Result<PathBuf> {
 }
 
 fn ensure_not_special(root: &Path, path: &Path) -> Result<()> {
-    if path == root.join("config/ai.toml") || path.starts_with(root.join("daily")) {
+    if path.starts_with(root.join("config")) || path.starts_with(root.join("daily")) {
         bail!("generic file tools cannot operate on this special file");
     }
     Ok(())
@@ -1509,7 +1640,7 @@ impl Tool for CopyFile {
     }
 
     fn description(&self) -> &'static str {
-        "Copy a regular file from any absolute path (or a Nole-relative source) to a new path under the Nole root. Never overwrites and does not require approval."
+        "Copy a regular file from any absolute path (or a Nole-relative source) to a new path under the Nole root, outside config/ and daily/. Never overwrites and does not require approval."
     }
 
     fn input_schema(&self) -> Value {
@@ -1545,7 +1676,7 @@ impl Tool for MoveFile {
     }
 
     fn description(&self) -> &'static str {
-        "Move a regular file from any absolute path (or a Nole-relative source) to a new path under the Nole root. Never overwrites and does not require approval."
+        "Move a regular file from any absolute path (or a Nole-relative source) to a new path under the Nole root, outside config/ and daily/. Never overwrites and does not require approval."
     }
 
     fn input_schema(&self) -> Value {
@@ -1582,7 +1713,7 @@ impl Tool for MoveFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Move multiple regular files into one existing directory under the Nole root, preserving each basename. Sources may be absolute or Nole-relative. Preflights duplicate names and destination conflicts, never overwrites, and does not require approval."
+        "Move multiple regular files into one existing directory under the Nole root, outside config/ and daily/, preserving each basename. Sources may be absolute or Nole-relative. Preflights duplicate names and destination conflicts, never overwrites, and does not require approval."
     }
 
     fn input_schema(&self) -> Value {
@@ -1733,7 +1864,7 @@ impl Tool for RenameFile {
     }
 
     fn description(&self) -> &'static str {
-        "Rename one regular file under the Nole root without changing its directory. The new name must be a basename, never overwrites, and does not require approval."
+        "Rename one regular file under the Nole root outside config/ and daily/ without changing its directory. The new name must be a basename, never overwrites, and does not require approval."
     }
 
     fn input_schema(&self) -> Value {
@@ -1827,7 +1958,7 @@ impl Tool for DeleteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Delete a regular file under the Nole root after user approval, unless permission checks are bypassed. Special files are forbidden."
+        "Delete a regular file under the Nole root after user approval, unless permission checks are bypassed. Files in config/ and daily/ are forbidden."
     }
 
     fn input_schema(&self) -> Value {
@@ -1880,7 +2011,7 @@ impl Tool for DeleteFile {
 
 struct WriteFile {
     root: PathBuf,
-    private_config: PathBuf,
+    config_dir: PathBuf,
     daily_dir: PathBuf,
 }
 
@@ -1888,7 +2019,7 @@ impl WriteFile {
     fn new(root: &Path) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
-            private_config: root.join("config/ai.toml"),
+            config_dir: root.join("config"),
             daily_dir: root.join("daily"),
             root,
         })
@@ -1900,7 +2031,7 @@ impl Tool for WriteFile {
         "write_file"
     }
     fn description(&self) -> &'static str {
-        "Create a new UTF-8 text file under the Nole root. Fails if the path already exists."
+        "Create a new UTF-8 text file under the Nole root, outside config/ and daily/. Fails if the path already exists."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1919,7 +2050,7 @@ impl Tool for WriteFile {
             bail!("content exceeds 1 MB");
         }
         let path = safe_relative(&self.root, relative)?;
-        if path == self.private_config || path.starts_with(&self.daily_dir) {
+        if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
             bail!("generic file tools cannot operate on this special file");
         }
         let mut file = OpenOptions::new()
@@ -1930,6 +2061,166 @@ impl Tool for WriteFile {
         file.write_all(content.as_bytes())?;
         Ok(format!("wrote {} bytes to {relative}", content.len()))
     }
+}
+
+struct WebSearch {
+    client: Client,
+    api_key: String,
+}
+
+impl Tool for WebSearch {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search the web with Tavily for current information. Returns a compact JSON object containing an optional answer and ranked results with titles, URLs, snippets, scores, and publication dates when available."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "topic": {
+                    "type": "string", "enum": ["general", "news", "finance"],
+                    "default": "general"
+                },
+                "search_depth": {
+                    "type": "string", "enum": ["basic", "advanced"],
+                    "default": "basic"
+                },
+                "max_results": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": MAX_WEB_SEARCH_RESULTS, "default": 5
+                },
+                "time_range": {
+                    "type": "string", "enum": ["day", "week", "month", "year"]
+                },
+                "include_answer": { "type": "boolean", "default": false }
+            },
+            "required": ["query"], "additionalProperties": false
+        })
+    }
+
+    fn execute(&self, input: &Value) -> Result<String> {
+        let query = required_string(input, "query")?.trim();
+        if query.is_empty() {
+            bail!("search query must not be empty");
+        }
+        if query.chars().count() > 1_000 {
+            bail!("search query exceeds 1000 characters");
+        }
+        let topic = optional_choice(input, "topic", "general", &["general", "news", "finance"])?;
+        let search_depth = optional_choice(input, "search_depth", "basic", &["basic", "advanced"])?;
+        let max_results = optional_usize(input, "max_results", 5, MAX_WEB_SEARCH_RESULTS)?;
+        let include_answer = input
+            .get("include_answer")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .context("field include_answer must be a boolean")
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let time_range = input
+            .get("time_range")
+            .map(|_| optional_choice(input, "time_range", "", &["day", "week", "month", "year"]))
+            .transpose()?;
+
+        let mut request = json!({
+            "api_key": self.api_key,
+            "query": query,
+            "topic": topic,
+            "search_depth": search_depth,
+            "max_results": max_results,
+            "include_answer": include_answer,
+            "include_raw_content": false,
+            "include_images": false
+        });
+        if let Some(time_range) = time_range {
+            request["time_range"] = Value::String(time_range.to_string());
+        }
+        let response = self
+            .client
+            .post(TAVILY_SEARCH_URL)
+            .json(&request)
+            .send()
+            .context("calling Tavily Search API")?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_FETCH_BYTES)
+        {
+            bail!("Tavily response exceeds 1 MB");
+        }
+        let mut bytes = Vec::new();
+        response.take(MAX_FETCH_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FETCH_BYTES {
+            bail!("Tavily response exceeds 1 MB");
+        }
+        let body = String::from_utf8(bytes).context("Tavily response is not UTF-8")?;
+        if !status.is_success() {
+            let message = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("error").and_then(Value::as_str))
+                        .map(str::to_owned)
+                })
+                .unwrap_or(body);
+            bail!("Tavily API returned {status}: {message}");
+        }
+        let response: Value =
+            serde_json::from_str(&body).context("decoding Tavily search response")?;
+        compact_tavily_response(query, &response)
+    }
+}
+
+fn compact_tavily_response(query: &str, response: &Value) -> Result<String> {
+    let results = response
+        .get("results")
+        .and_then(Value::as_array)
+        .context("Tavily response has no results array")?
+        .iter()
+        .map(|result| {
+            let mut compact = serde_json::Map::new();
+            for field in ["title", "url", "content", "score", "published_date"] {
+                if let Some(value) = result.get(field).filter(|value| !value.is_null()) {
+                    compact.insert(field.to_string(), value.clone());
+                }
+            }
+            Value::Object(compact)
+        })
+        .collect::<Vec<_>>();
+    let mut compact = json!({ "query": query, "results": results });
+    if let Some(answer) = response.get("answer").and_then(Value::as_str) {
+        compact["answer"] = Value::String(answer.to_string());
+    }
+    serde_json::to_string(&compact).context("encoding Tavily search results")
+}
+
+fn optional_choice<'a>(
+    input: &'a Value,
+    field: &str,
+    default: &'a str,
+    choices: &[&str],
+) -> Result<&'a str> {
+    let value = input
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("field {field} must be a string"))
+        })
+        .transpose()?
+        .unwrap_or(default);
+    if !choices.contains(&value) {
+        bail!("field {field} must be one of {}", choices.join(", "));
+    }
+    Ok(value)
 }
 
 struct WebFetch {
@@ -2090,6 +2381,67 @@ fn required_string<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_config_defaults_to_twenty_five_rounds_and_validates_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ai.toml");
+        fs::write(&path, "api_key = 'test'\nmodel = 'test-model'\n").unwrap();
+        assert_eq!(AgentConfig::load(&path).unwrap().max_rounds, 25);
+
+        fs::write(
+            &path,
+            "api_key = 'test'\nmodel = 'test-model'\nmax_rounds = 40\n",
+        )
+        .unwrap();
+        assert_eq!(AgentConfig::load(&path).unwrap().max_rounds, 40);
+
+        fs::write(
+            &path,
+            "api_key = 'test'\nmodel = 'test-model'\nmax_rounds = 0\n",
+        )
+        .unwrap();
+        assert!(AgentConfig::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("max_rounds must be greater than zero"));
+    }
+
+    #[test]
+    fn agent_conversation_is_memory_only_and_clearable() {
+        let mut conversation = AgentConversation::default();
+        conversation
+            .messages
+            .push(json!({ "role": "user", "content": "first turn" }));
+        conversation
+            .messages
+            .push(json!({ "role": "assistant", "content": [{ "type": "text", "text": "reply" }] }));
+        assert!(!conversation.messages.is_empty());
+
+        assert!(conversation.clear());
+        assert!(conversation.messages.is_empty());
+        assert!(!conversation.clear());
+    }
+
+    #[test]
+    fn token_usage_accumulates_cached_and_uncached_input() {
+        let mut total = TokenUsage {
+            input_tokens: 400,
+            output_tokens: 80,
+            cache_creation_input_tokens: 1_000,
+            cache_read_input_tokens: 2_000,
+        };
+        total.add(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 500,
+        });
+
+        assert_eq!(total.total_input(), 4_000);
+        assert_eq!(total.output_tokens, 100);
+        assert!(!total.is_empty());
+    }
+
     fn bypass_gate() -> ApprovalGate {
         let (event_sender, _event_receiver) = std::sync::mpsc::channel();
         let (_decision_sender, decision_receiver) = std::sync::mpsc::channel();
@@ -2215,6 +2567,47 @@ mod tests {
         assert!(read
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .is_err());
+    }
+
+    #[test]
+    fn config_is_read_only_to_agent_tools_while_memory_is_updatable() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("config")).unwrap();
+        fs::create_dir(directory.path().join("daily")).unwrap();
+        fs::write(directory.path().join("config/AGENTS.md"), "user rules\n").unwrap();
+        fs::write(directory.path().join("MEMORY.md"), "old memory\n").unwrap();
+
+        let reads = Arc::new(ReadTracker::default());
+        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let write = WriteFile::new(directory.path()).unwrap();
+
+        read.execute(&json!({"path": "config/AGENTS.md"})).unwrap();
+        assert!(update
+            .execute(&json!({
+                "path": "config/AGENTS.md",
+                "edits": [{"start_line": 0, "end_line": 1, "content": "changed\n"}]
+            }))
+            .is_err());
+        assert!(write
+            .execute(&json!({"path": "config/new.md", "content": "forbidden"}))
+            .is_err());
+        assert!(
+            ensure_not_special(directory.path(), &directory.path().join("config/AGENTS.md"))
+                .is_err()
+        );
+
+        read.execute(&json!({"path": "MEMORY.md"})).unwrap();
+        update
+            .execute(&json!({
+                "path": "MEMORY.md",
+                "edits": [{"start_line": 0, "end_line": 1, "content": "new memory\n"}]
+            }))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("MEMORY.md")).unwrap(),
+            "new memory\n"
+        );
     }
 
     #[test]
@@ -2417,25 +2810,103 @@ mod tests {
     #[test]
     fn tool_activity_uses_readable_names_and_web_fetch_wording() {
         assert_eq!(tool_start_activity("web_fetch"), "Fetching Web...");
+        assert_eq!(tool_start_activity("web_search"), "Searching Web...");
         assert_eq!(tool_start_activity("read_file"), "Calling Read File...");
         assert_eq!(tool_display_name("update_daily"), "Update Daily");
     }
 
     #[test]
-    fn system_prompt_requires_ask_user_for_single_turn_clarification() {
-        let prompt = system_prompt(Path::new("/tmp/nole"));
-        assert!(prompt.contains("This is a single-turn task"));
-        assert!(prompt.contains("MUST call ask_user"));
-        assert!(
-            prompt.contains("Never put a question that requires an answer in the final response")
-        );
+    fn system_prompt_describes_multi_turn_conversation_and_ask_user() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
+        assert!(prompt.contains("conversation is multi-turn"));
+        assert!(prompt.contains("history is retained in memory"));
+        assert!(prompt.contains("Use ask_user"));
     }
 
     #[test]
     fn system_prompt_describes_mbdown_tags_and_wikilinks() {
-        let prompt = system_prompt(Path::new("/tmp/nole"));
-        assert!(prompt.contains("#tag at word boundaries"));
+        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
+        assert!(prompt.contains("#tag"));
         assert!(prompt.contains("[[wikilink]]"));
+        assert!(prompt.contains("archived daily cards and articles"));
+        assert!(prompt.contains("create them here by default"));
+        assert!(prompt.contains("Use only daily tools"));
+        assert!(prompt.contains("Generic file tools cannot operate in daily/ or config/"));
+    }
+
+    #[test]
+    fn system_prompt_appends_project_instructions_then_memory() {
+        let prompt = system_prompt(
+            Path::new("/tmp/nole"),
+            false,
+            "PROJECT INSTRUCTION\nsecond line",
+            "MEMORY CONTENT\nlast line",
+        );
+        let project = prompt.find("PROJECT INSTRUCTION").unwrap();
+        let memory = prompt.find("MEMORY CONTENT").unwrap();
+        assert!(project < memory);
+        assert!(prompt.ends_with("MEMORY CONTENT\nlast line"));
+    }
+
+    #[test]
+    fn tavily_tool_and_prompt_guidance_are_registered_only_with_a_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+
+        let make_agent = |tavily_api_key: &str| {
+            fs::write(
+                &storage.ai_config_path,
+                format!(
+                    "api_key = \"anthropic-test\"\ntavily_api_key = \"{tavily_api_key}\"\nmodel = \"test-model\"\n"
+                ),
+            )
+            .unwrap();
+            let (_approval_sender, approval_receiver) = std::sync::mpsc::channel();
+            let (_user_sender, user_receiver) = std::sync::mpsc::channel();
+            let (event_sender, _event_receiver) = std::sync::mpsc::channel();
+            Agent::from_config(
+                &storage.ai_config_path,
+                &storage.root,
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+        };
+
+        let without_key = make_agent("");
+        assert!(!without_key.tools.contains_key("web_search"));
+        assert!(!without_key.system.contains("web_search"));
+
+        let with_key = make_agent("tvly-test");
+        assert!(with_key.tools.contains_key("web_search"));
+        assert!(with_key.system.contains("web_search"));
+    }
+
+    #[test]
+    fn tavily_response_is_reduced_to_agent_relevant_fields() {
+        let response = json!({
+            "answer": "A concise answer",
+            "request_id": "private-noise",
+            "results": [{
+                "title": "Result",
+                "url": "https://example.test",
+                "content": "Useful snippet",
+                "score": 0.9,
+                "published_date": "2026-07-27",
+                "raw_content": "large omitted content"
+            }]
+        });
+        let compact: Value =
+            serde_json::from_str(&compact_tavily_response("query", &response).unwrap()).unwrap();
+        assert_eq!(compact["query"], "query");
+        assert_eq!(compact["answer"], "A concise answer");
+        assert_eq!(compact["results"][0]["title"], "Result");
+        assert!(compact.get("request_id").is_none());
+        assert!(compact["results"][0].get("raw_content").is_none());
     }
 
     #[test]

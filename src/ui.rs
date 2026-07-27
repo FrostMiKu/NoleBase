@@ -128,10 +128,21 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let title = if app.agent_round_limit == 0 && app.agent_usage.is_empty() {
+        " Agent ".to_string()
+    } else {
+        format!(
+            " Agent · ↻{}/{} · ↑{} ↓{} ",
+            app.agent_round,
+            app.agent_round_limit,
+            human_token_count(app.agent_usage.total_input()),
+            human_token_count(app.agent_usage.output_tokens)
+        )
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
-        .title(" Agent ")
+        .title(title)
         .style(Style::default().bg(ctp::MANTLE))
         .border_style(focus_border(app.focus == Focus::Agent));
     let inner = block.inner(area);
@@ -209,6 +220,18 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         inner,
         app.agent_scroll as usize,
     );
+}
+
+fn human_token_count(tokens: u64) -> String {
+    let (value, suffix) = if tokens >= 1_000_000 {
+        (tokens as f64 / 1_000_000.0, "m")
+    } else if tokens >= 1_000 {
+        (tokens as f64 / 1_000.0, "k")
+    } else {
+        return tokens.to_string();
+    };
+    let formatted = format!("{value:.1}");
+    format!("{}{suffix}", formatted.trim_end_matches(".0"))
 }
 
 fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
@@ -1504,8 +1527,8 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
             (Focus::Compose, _) => "Esc daily",
             (Focus::Files, _) => "Esc back · Enter open",
             (Focus::Todo, _) => "Esc back · Enter toggle",
-            (Focus::Agent, _) if app.ai_running => "c cancel · Esc back",
-            (Focus::Agent, _) => "Enter add · Esc back",
+            (Focus::Agent, _) if app.ai_running => "c cancel · C clear · Esc back",
+            (Focus::Agent, _) => "Enter add · C clear · Esc back",
             (Focus::Center, _) => "? help",
         };
     }
@@ -1516,8 +1539,8 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
         }
         (Focus::Files, _) => "↑↓ select · Enter open · a/u archive/restore · e edit · / filter",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
-        (Focus::Agent, _) if app.ai_running => "c cancel · ↑↓ scroll · ← center",
-        (Focus::Agent, _) => "Enter add to Daily · ↑↓ scroll · ← center",
+        (Focus::Agent, _) if app.ai_running => "c cancel · C clear session · ↑↓ scroll · ← center",
+        (Focus::Agent, _) => "Enter add to Daily · C clear session · ↑↓ scroll · ← center",
         (_, CenterView::Chat) if width >= 95 => "i compose · f files · T todo · / search · ? help",
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {
@@ -2363,6 +2386,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::default(),
         heading("Agent output"),
         key("c", "cancel running Agent while panel is focused"),
+        key("C", "clear Agent conversation and start a new session"),
         key("Enter", "add final output to Daily"),
     ]
 }
@@ -2480,6 +2504,26 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    #[test]
+    fn agent_title_shows_request_rounds_and_compact_directional_token_usage() {
+        assert_eq!(human_token_count(999), "999");
+        assert_eq!(human_token_count(1_000), "1k");
+        assert_eq!(human_token_count(12_400), "12.4k");
+        assert_eq!(human_token_count(1_250_000), "1.2m");
+
+        let (mut app, _directory) = make_app();
+        app.agent_round = 3;
+        app.agent_round_limit = 25;
+        app.agent_usage = crate::agent::TokenUsage {
+            input_tokens: 500,
+            output_tokens: 1_234,
+            cache_creation_input_tokens: 1_000,
+            cache_read_input_tokens: 2_000,
+        };
+        let terminal = render(&mut app, 170, 24);
+        assert!(buffer_string(&terminal).contains("Agent · ↻3/25 · ↑3.5k ↓1.2k"));
     }
 
     fn contains(outer: Rect, inner: Rect) -> bool {
