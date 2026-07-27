@@ -31,6 +31,7 @@ const CHAT_FILE: &str = "CHAT.md";
 const TODO_FILE: &str = "TODO.md";
 const ARCHIVE_FILE: &str = "ARCHIVE.md";
 const CONFIG_DIR: &str = "config";
+const AI_CONFIG_FILE: &str = "ai.toml";
 const DATA_DIR: &str = "data";
 
 /// Filesystem locations backing the notes.
@@ -42,6 +43,7 @@ pub struct Storage {
     pub chat_path: PathBuf,
     pub todo_path: PathBuf,
     pub archive_path: PathBuf,
+    pub ai_config_path: PathBuf,
 }
 
 impl Storage {
@@ -61,6 +63,7 @@ impl Storage {
             chat_path: root.join(CHAT_FILE),
             todo_path: root.join(TODO_FILE),
             archive_path: root.join(ARCHIVE_FILE),
+            ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
             root,
         })
     }
@@ -82,7 +85,32 @@ impl Storage {
         if !self.archive_path.exists() {
             fs::write(&self.archive_path, "# Archive\n\n")?;
         }
+        if !self.ai_config_path.exists() {
+            self.write_default_ai_config()?;
+        }
         self.migrate_legacy_root_notes()?;
+        Ok(())
+    }
+
+    fn write_default_ai_config(&self) -> Result<()> {
+        const DEFAULT: &str = concat!(
+            "# Anthropic Messages API configuration. Keep this file private.\n",
+            "api_key = \"\"\n",
+            "model = \"claude-sonnet-4-5\"\n",
+            "base_url = \"https://api.anthropic.com\"\n",
+            "max_tokens = 4096\n",
+        );
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&self.ai_config_path)
+            .with_context(|| format!("creating {}", self.ai_config_path.display()))?;
+        file.write_all(DEFAULT.as_bytes())?;
         Ok(())
     }
 
@@ -1104,6 +1132,11 @@ mod tests {
         assert!(st.archive_path.exists());
         assert_eq!(st.archive_path.parent(), Some(st.root.as_path()));
         assert_eq!(st.archive_path.file_name().unwrap(), "ARCHIVE.md");
+        assert!(st.ai_config_path.exists());
+        assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
+        assert!(fs::read_to_string(&st.ai_config_path)
+            .unwrap()
+            .contains("api_key = \"\""));
     }
 
     #[test]

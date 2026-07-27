@@ -17,6 +17,7 @@ pub struct Message {
 /// The per-message actions exposed in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    Ai,
     Todo,
     Move,
     Archive,
@@ -30,6 +31,7 @@ impl Action {
     /// The short label rendered on the button.
     pub fn label(self) -> &'static str {
         match self {
+            Action::Ai => "AI",
             Action::Todo => "todo",
             Action::Move => "move",
             Action::Archive => "archive",
@@ -49,6 +51,7 @@ impl Action {
             Action::New,
             Action::Edit,
             Action::Delete,
+            Action::Ai,
         ]
     }
 }

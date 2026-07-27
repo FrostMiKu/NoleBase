@@ -1,12 +1,15 @@
 //! Entry point: terminal lifecycle, event loop, and `$EDITOR` integration.
 
+mod agent;
 mod app;
 mod markdown;
 mod model;
+mod notification;
 mod storage;
 mod ui;
 
-use std::io::{self, Stdout};
+use std::fs;
+use std::io::{self, Stdout, Write};
 use std::process::Command as ProcCommand;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -94,6 +97,29 @@ fn run_editor(path: &std::path::Path, terminal: &mut Tui) -> Result<()> {
     }
 }
 
+fn run_message_editor(body: &str, terminal: &mut Tui) -> Result<String> {
+    let mut file = tempfile::Builder::new()
+        .prefix("nole-message-")
+        .suffix(".md")
+        .tempfile()
+        .context("creating temporary message file")?;
+    file.write_all(body.as_bytes())?;
+    file.flush()?;
+    run_editor(file.path(), terminal)?;
+    let edited = fs::read_to_string(file.path())
+        .with_context(|| format!("reading edited message {}", file.path().display()))?;
+    Ok(normalize_editor_body(edited))
+}
+
+fn normalize_editor_body(mut body: String) -> String {
+    if body.ends_with("\r\n") {
+        body.truncate(body.len() - 2);
+    } else if body.ends_with('\n') {
+        body.pop();
+    }
+    body
+}
+
 fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Result<bool> {
     match cmd {
         Some(Command::Quit) => Ok(true),
@@ -104,6 +130,13 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
                 app.status = format!("Editor error: {e}");
             }
             app.reload_workspace();
+            Ok(false)
+        }
+        Some(Command::EditMessage { id, body }) => {
+            match run_message_editor(&body, terminal) {
+                Ok(edited) => app.apply_external_message_edit(&id, edited),
+                Err(error) => app.status = format!("Editor error: {error}"),
+            }
             Ok(false)
         }
         None => Ok(false),
@@ -157,6 +190,8 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
 fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Result<()> {
     loop {
         process_workspace_events(workspace_events, app);
+        app.poll_agent();
+        app.advance_animation();
         terminal.draw(|f| ui::draw(f, app))?;
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
@@ -259,6 +294,14 @@ mod tests {
 
     use super::*;
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
+
+    #[test]
+    fn editor_body_drops_one_conventional_final_newline() {
+        assert_eq!(normalize_editor_body("body\n".to_string()), "body");
+        assert_eq!(normalize_editor_body("body\r\n".to_string()), "body");
+        assert_eq!(normalize_editor_body("body\n\n".to_string()), "body\n");
+        assert_eq!(normalize_editor_body("body".to_string()), "body");
+    }
 
     #[test]
     fn markdown_change_events_reload_the_visible_workspace() {

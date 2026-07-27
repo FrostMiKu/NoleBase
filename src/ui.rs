@@ -19,6 +19,9 @@ const TODO_WIDTH: u16 = 36;
 const CENTER_MAX_WIDTH: u16 = 120;
 const PANEL_PADDING: u16 = 1;
 const MESSAGE_PADDING_X: usize = 1;
+const MESSAGE_BUTTON_RIGHT_MARGIN: usize = 1;
+const ASK_USER_WIDTH: u16 = 80;
+const ASK_USER_MAX_HEIGHT: u16 = 32;
 
 /// Render one frame and rebuild all geometry consumed by mouse handling.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -39,6 +42,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_narrow_workspace(frame, app, body, interactive);
     }
     draw_footer(frame, app, footer);
+    if let Some(message) = app.notifications.visible() {
+        draw_notification(frame, root, &message);
+    }
 
     if let Some(overlay) = app.overlay {
         // Background widgets may still be visible, but an overlay owns all input.
@@ -89,11 +95,78 @@ fn draw_wide_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive
     );
     app.layout.files = non_empty(files);
     app.layout.center = non_empty(center_region);
-    app.layout.todo = non_empty(todo);
-
     draw_files(frame, app, files, interactive);
     draw_center(frame, app, center_region, interactive);
+    draw_right_sidebar(frame, app, todo, interactive);
+}
+
+fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    let todo_height = area.height.div_ceil(3);
+    let todo = Rect::new(area.x, area.y, area.width, todo_height);
+    let agent = Rect::new(
+        area.x,
+        area.y.saturating_add(todo_height),
+        area.width,
+        area.height.saturating_sub(todo_height),
+    );
+    app.layout.todo = non_empty(todo);
+    app.layout.agent = non_empty(agent);
     draw_todo(frame, app, todo, interactive);
+    draw_agent_output(frame, app, agent);
+}
+
+fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(" Agent ")
+        .border_style(focus_border(app.focus == Focus::Agent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.ai_running {
+        draw_animated_border(frame, area, app.animation_tick);
+    }
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.agent_prompt.is_empty() && app.agent_output.is_empty() {
+        return;
+    }
+    let mut lines = Vec::new();
+    if !app.agent_prompt.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Prompt",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(crate::markdown::to_lines_at_width(
+            &app.agent_prompt,
+            inner.width as usize,
+        ));
+    }
+    if !app.agent_output.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(
+            "Response",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(crate::markdown::to_lines_at_width(
+            &app.agent_output.join("\n\n"),
+            inner.width as usize,
+        ));
+    }
+    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+    app.agent_scroll = app.agent_scroll.min(max_scroll);
+    let visible = visible_line_window(&lines, app.agent_scroll as usize, inner.height as usize);
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
 fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
@@ -103,6 +176,9 @@ fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interacti
     } else if app.focus == Focus::Todo {
         app.layout.todo = non_empty(body);
         draw_todo(frame, app, body, interactive);
+    } else if app.focus == Focus::Agent {
+        app.layout.agent = non_empty(body);
+        draw_agent_output(frame, app, body);
     } else {
         app.layout.center = non_empty(body);
         draw_center(frame, app, body, interactive);
@@ -384,13 +460,70 @@ fn focus_border(focused: bool) -> Style {
     })
 }
 
+fn animated_color(position: usize, tick: u64) -> Color {
+    const STOPS: [(u8, u8, u8); 6] = [
+        (50, 220, 255),
+        (70, 120, 255),
+        (210, 80, 255),
+        (255, 80, 150),
+        (255, 210, 70),
+        (80, 240, 160),
+    ];
+    const STEPS: usize = 24;
+    let phase = (position + tick as usize * 3) % (STOPS.len() * STEPS);
+    let stop = phase / STEPS;
+    let amount = phase % STEPS;
+    let from = STOPS[stop];
+    let to = STOPS[(stop + 1) % STOPS.len()];
+    let blend = |a: u8, b: u8| {
+        let a = usize::from(a);
+        let b = usize::from(b);
+        ((a * (STEPS - amount) + b * amount) / STEPS) as u8
+    };
+    Color::Rgb(
+        blend(from.0, to.0),
+        blend(from.1, to.1),
+        blend(from.2, to.2),
+    )
+}
+
+fn draw_animated_border(frame: &mut Frame, area: Rect, tick: u64) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut position = 0usize;
+    for x in area.x..area.x.saturating_add(area.width) {
+        frame.buffer_mut()[(x, area.y)].set_fg(animated_color(position, tick));
+        position += 1;
+    }
+    for y in area.y.saturating_add(1)..area.y.saturating_add(area.height) {
+        let x = area.x.saturating_add(area.width.saturating_sub(1));
+        frame.buffer_mut()[(x, y)].set_fg(animated_color(position, tick));
+        position += 1;
+    }
+    if area.height > 1 {
+        let y = area.y.saturating_add(area.height - 1);
+        for x in (area.x..area.x.saturating_add(area.width.saturating_sub(1))).rev() {
+            frame.buffer_mut()[(x, y)].set_fg(animated_color(position, tick));
+            position += 1;
+        }
+    }
+    if area.width > 1 {
+        for y in
+            (area.y.saturating_add(1)..area.y.saturating_add(area.height.saturating_sub(1))).rev()
+        {
+            frame.buffer_mut()[(area.x, y)].set_fg(animated_color(position, tick));
+            position += 1;
+        }
+    }
+}
+
 fn draw_center(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
     let content = center_content_axis(area);
     match app.center_view {
         CenterView::Chat => draw_chat(frame, app, area, content, interactive),
-        CenterView::Document => draw_document(frame, app, content),
+        CenterView::Document => draw_document(frame, app, content, interactive),
         CenterView::Search => draw_search(frame, app, content, interactive),
-        CenterView::MessageEdit => draw_message_edit(frame, app, content, interactive),
     }
 }
 
@@ -477,15 +610,13 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             Color::Indexed(235)
         });
         let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
-        let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
         lines.push(line_with_background(Vec::new(), width, card_style));
         let date = message.created_at.format(DATE_FMT).to_string();
         let time = message.created_at.format(TIME_FMT).to_string();
         let metadata_width = UnicodeWidthStr::width(date.as_str());
         let column_gap = 2;
-        let body_width = content_width
-            .saturating_sub(metadata_width + column_gap)
-            .max(1);
+        let body_start = horizontal_padding + metadata_width + column_gap;
+        let (body_start, body_width) = centered_message_body_axis(width, body_start);
         let markdown_lines = crate::markdown::to_lines_at_width(&message.body, body_width);
         let mut body_rows = Vec::new();
         for markdown_line in markdown_lines {
@@ -500,7 +631,9 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             let mut spans = Vec::with_capacity(body_rows.get(row).map_or(3, |body| body.len() + 3));
             spans.push(Span::raw(" ".repeat(horizontal_padding)));
             spans.push(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
-            spans.push(Span::raw(" ".repeat(column_gap)));
+            spans.push(Span::raw(" ".repeat(
+                body_start.saturating_sub(horizontal_padding + metadata_width),
+            )));
             if let Some(body) = body_rows.get(row) {
                 spans.extend(body.iter().cloned());
             }
@@ -510,7 +643,9 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             lines.push(line_with_background(Vec::new(), width, card_style));
         }
         let button_width = action_buttons_width();
-        let button_start = horizontal_padding + content_width.saturating_sub(button_width);
+        let button_start = width
+            .saturating_sub(MESSAGE_BUTTON_RIGHT_MARGIN)
+            .saturating_sub(button_width);
         button_lines.push(lines.len());
         button_starts.push(button_start);
         let mut button_spans = vec![Span::raw(" ".repeat(button_start))];
@@ -528,11 +663,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         card_first.get(app.selected).copied(),
         button_lines.get(app.selected).copied(),
     ) {
-        if first < scroll {
-            scroll = first;
-        } else if button >= scroll.saturating_add(view_height) {
-            scroll = button.saturating_sub(view_height.saturating_sub(1));
-        }
+        scroll = stable_card_scroll(scroll, first, button, view_height);
     }
     scroll = scroll.min(max_scroll).min(u16::MAX as usize);
     app.scroll = scroll as u16;
@@ -559,7 +690,30 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         }
     }
 
-    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
+    let visible = visible_line_window(&lines, scroll, view_height);
+    frame.render_widget(Paragraph::new(visible), area);
+}
+
+fn stable_card_scroll(scroll: usize, first: usize, button: usize, view_height: usize) -> usize {
+    let card_height = button.saturating_sub(first).saturating_add(1);
+    if card_height <= view_height {
+        if first < scroll {
+            first
+        } else if button >= scroll.saturating_add(view_height) {
+            button.saturating_sub(view_height.saturating_sub(1))
+        } else {
+            scroll
+        }
+    } else {
+        let last_start = button.saturating_sub(view_height.saturating_sub(1));
+        scroll.clamp(first, last_start)
+    }
+}
+
+fn centered_message_body_axis(width: usize, desired_start: usize) -> (usize, usize) {
+    let start = desired_start.min(width.saturating_sub(1));
+    let trailing = start.min(width.saturating_sub(start).saturating_sub(1));
+    (start, width.saturating_sub(start + trailing).max(1))
 }
 
 fn action_buttons_width() -> usize {
@@ -576,7 +730,12 @@ fn render_button_line(selected: bool) -> Line<'static> {
         if index > 0 {
             spans.push(Span::raw(" "));
         }
-        let style = if selected {
+        let style = if *action == Action::Ai {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -674,10 +833,13 @@ fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
             app.input.lines().count().max(1)
         };
         let count = format!("{lines}l · {}c", app.input.chars().count());
-        let hint = if focused && toolbar.width >= 47 {
-            "Enter send · Ctrl+J newline"
+        let hint = if focused && toolbar.width >= 62 {
+            match app.center_view {
+                CenterView::Document => "Enter record · Ctrl+Enter Agent · Ctrl+J newline",
+                _ => "Enter send · Ctrl+Enter Agent · Ctrl+J newline",
+            }
         } else if focused && toolbar.width >= 25 {
-            "Enter send"
+            "Ctrl+Enter Agent"
         } else {
             ""
         };
@@ -685,54 +847,99 @@ fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
     }
 }
 
-fn draw_document(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Some(document) = app.document.as_mut() else {
+    if app.document.is_none() {
         frame.render_widget(
             Paragraph::new("No document").alignment(Alignment::Center),
             area,
         );
         return;
-    };
+    }
     let content = inset_horizontal(area, 2);
     if content.width == 0 || content.height == 0 {
         return;
     }
+    let compose = compose_rect(content);
+    app.layout.compose = non_empty(compose);
+    let document_bottom = compose.y.saturating_sub(1);
     let header = Rect::new(content.x, content.y, content.width, 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                document.title.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  Esc back", Style::default().fg(Color::DarkGray)),
-        ])),
-        header,
-    );
     let document_area = Rect::new(
         content.x,
         content.y.saturating_add(2),
         content.width,
-        content.height.saturating_sub(2),
+        document_bottom.saturating_sub(content.y.saturating_add(2)),
     );
-    let lines = crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
-    if let Some(target_line) = document.target_line.take() {
-        document.scroll = crate::markdown::rendered_row_for_source_line(
-            &document.source,
-            target_line,
-            document_area.width as usize,
-        )
-        .min(u16::MAX as usize) as u16;
+    {
+        let document = app.document.as_mut().expect("document checked above");
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    document.title.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  Esc back", Style::default().fg(Color::DarkGray)),
+            ])),
+            header,
+        );
+        let lines =
+            crate::markdown::to_lines_at_width(&document.source, document_area.width as usize);
+        if let Some(target_line) = document.target_line.take() {
+            document.scroll = crate::markdown::rendered_row_for_source_line(
+                &document.source,
+                target_line,
+                document_area.width as usize,
+            )
+            .min(u16::MAX as usize) as u16;
+        }
+        let max_scroll = lines.len().saturating_sub(document_area.height as usize);
+        document.scroll = (document.scroll as usize).min(max_scroll) as u16;
+        let visible = visible_line_window(
+            &lines,
+            document.scroll as usize,
+            document_area.height as usize,
+        );
+        frame.render_widget(Paragraph::new(visible), document_area);
     }
-    let max_scroll = lines.len().saturating_sub(document_area.height as usize);
-    document.scroll = (document.scroll as usize).min(max_scroll) as u16;
+    if compose.width > 0 && compose.height > 0 {
+        frame.render_widget(Clear, compose);
+        draw_compose(frame, app, compose, interactive);
+    }
+}
+
+fn draw_notification(frame: &mut Frame, root: Rect, message: &str) {
+    if root.width < 4 || root.height < 3 {
+        return;
+    }
+    let width = root.width.saturating_sub(2).min(44);
+    let text_width = width.saturating_sub(4).max(1) as usize;
+    let rows = wrap_spans_to_width(&[Span::raw(message.to_string())], text_width)
+        .len()
+        .max(1);
+    let height = (rows as u16).saturating_add(2).min(root.height.min(8));
+    let area = Rect::new(
+        root.x + root.width.saturating_sub(width).saturating_sub(1),
+        root.y.saturating_add(1),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).scroll((document.scroll, 0)),
-        document_area,
+        Paragraph::new(message.to_string())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
+                    .title(" Notification ")
+                    .style(Style::default().bg(Color::Indexed(235)))
+                    .border_style(Style::default().fg(Color::LightYellow)),
+            ),
+        area,
     );
 }
 
@@ -867,27 +1074,6 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
     }
 }
 
-fn draw_message_edit(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .padding(Padding::horizontal(PANEL_PADDING))
-        .title(" Edit message · Enter save · Esc cancel ")
-        .border_style(focus_border(true));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    draw_multiline_input(
-        frame,
-        inner,
-        &app.edit_input,
-        app.edit_cursor,
-        "(empty)",
-        interactive && app.focus == Focus::Center,
-    );
-}
-
 fn draw_single_line_input(
     frame: &mut Frame,
     area: Rect,
@@ -925,23 +1111,30 @@ fn draw_multiline_input(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let width = area.width as usize;
     let lines: Vec<Line> = if value.is_empty() {
-        vec![Line::from(Span::styled(
-            placeholder.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ))]
+        wrap_spans_to_width(
+            &[Span::styled(
+                placeholder.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )],
+            width,
+        )
+        .into_iter()
+        .map(Line::from)
+        .collect()
     } else {
         value
             .split('\n')
-            .map(|line| Line::from(Span::raw(line.to_string())))
+            .flat_map(|line| {
+                wrap_spans_to_width(&[Span::raw(line.to_string())], width)
+                    .into_iter()
+                    .map(Line::from)
+            })
             .collect()
     };
-    let width = area.width as usize;
     let logical_widths: Vec<usize> = value.split('\n').map(UnicodeWidthStr::width).collect();
-    let total_rows: usize = logical_widths
-        .iter()
-        .map(|line_width| wrapped_row_count(*line_width, width))
-        .sum();
+    let total_rows = lines.len();
     let (cursor_line, cursor_column) = cursor_row_col(value, cursor);
     let cursor_line = cursor_line.min(logical_widths.len().saturating_sub(1));
     let rows_before: usize = logical_widths[..cursor_line]
@@ -957,18 +1150,27 @@ fn draw_multiline_input(
             .saturating_sub(viewport_height.saturating_sub(1))
             .min(total_rows.saturating_sub(viewport_height))
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let visible = visible_line_window(&lines, scroll, viewport_height);
+    frame.render_widget(Paragraph::new(visible), area);
     if show_cursor {
         let x = area.x + (cursor_column % width.max(1)) as u16;
         let visible_row = wrapped_cursor_row.saturating_sub(scroll);
         let y = area.y + (visible_row as u16).min(area.height.saturating_sub(1));
         frame.set_cursor_position((x.min(area.x + area.width - 1), y));
     }
+}
+
+fn visible_line_window<'a>(
+    lines: &[Line<'a>],
+    scroll: usize,
+    viewport_height: usize,
+) -> Vec<Line<'a>> {
+    lines
+        .iter()
+        .skip(scroll.min(lines.len()))
+        .take(viewport_height)
+        .cloned()
+        .collect()
 }
 
 fn split_last_row(area: Rect) -> (Rect, Rect) {
@@ -985,21 +1187,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mode = match (app.focus, app.center_view, app.files_context) {
-        (Focus::Files, _, FilesContext::Search) => " FILES/SEARCH ",
-        (Focus::Files, _, FilesContext::MoveTarget) => " FILES/MOVE ",
-        (Focus::Files, _, FilesContext::NewTarget) => " FILES/NEW ",
-        (Focus::Files, _, FilesContext::Rename) => " FILES/RENAME ",
-        (Focus::Files, _, _) => " FILES ",
-        (Focus::Todo, _, _) => " TODO ",
-        (_, CenterView::Document, _) => " DOCUMENT ",
-        (_, CenterView::Search, _) => " SEARCH ",
-        (_, CenterView::MessageEdit, _) => " EDIT ",
-        (Focus::Compose, CenterView::Chat, _) => " COMPOSE ",
-        _ => " CHAT ",
+    let surface = match (app.focus, app.center_view, app.files_context) {
+        (Focus::Files, _, FilesContext::Search) => "FILES/SEARCH",
+        (Focus::Files, _, FilesContext::MoveTarget) => "FILES/MOVE",
+        (Focus::Files, _, FilesContext::NewTarget) => "FILES/NEW",
+        (Focus::Files, _, FilesContext::Rename) => "FILES/RENAME",
+        (Focus::Files, _, _) => "FILES",
+        (Focus::Todo, _, _) => "TODO",
+        (Focus::Agent, _, _) => "AGENT",
+        (Focus::Compose, _, _) => "COMPOSE",
+        (_, CenterView::Document, _) => "DOCUMENT",
+        (_, CenterView::Search, _) => "SEARCH",
+        _ => "CHAT",
     };
+    let mode = format!(" {surface} · {} ", app.permission_mode.label());
     let mode_style = Style::default().bg(Color::Blue).fg(Color::Black);
-    frame.render_widget(Paragraph::new(Span::styled(mode, mode_style)), area);
+    frame.render_widget(Paragraph::new(Span::styled(mode.clone(), mode_style)), area);
 
     let hint = footer_hint(app, area.width);
     let mode_width = mode.width() as u16;
@@ -1009,11 +1212,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(hint.width() as u16)
         .saturating_sub(u16::from(!hint.is_empty()));
     if !app.status.is_empty() && available_status > 2 {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
+        let status = if app.ai_running {
+            animated_status_line(&app.status, available_status as usize, app.animation_tick)
+        } else {
+            Line::from(Span::styled(
                 format!(" {}", app.status),
                 Style::default().fg(Color::Yellow),
-            )),
+            ))
+        };
+        frame.render_widget(
+            Paragraph::new(status),
             Rect::new(area.x + mode_width, area.y, available_status, area.height),
         );
     }
@@ -1027,22 +1235,68 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn animated_status_line(status: &str, width: usize, tick: u64) -> Line<'static> {
+    if width == 0 || status.is_empty() {
+        return Line::default();
+    }
+    let mut visible = Vec::new();
+    let mut used = 1usize.min(width);
+    for character in status.chars() {
+        let character = if character == '\n' || character == '\r' {
+            ' '
+        } else {
+            character
+        };
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if character_width == 0 {
+            continue;
+        }
+        if used + character_width > width {
+            break;
+        }
+        visible.push((character, character_width));
+        used += character_width;
+    }
+    if visible.is_empty() {
+        return Line::from(" ".repeat(width.min(1)));
+    }
+    let active = tick as usize % visible.len();
+    let mut spans = vec![Span::raw(" ")];
+    for (index, (character, _)) in visible.into_iter().enumerate() {
+        let style = if index == active {
+            Style::default()
+                .fg(animated_color(index * 8, tick))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(character.to_string(), style));
+    }
+    Line::from(spans)
+}
+
 fn footer_hint(app: &App, width: u16) -> &'static str {
     if width < 28 {
         return "";
     }
     if width < 55 {
-        return match app.focus {
-            Focus::Compose => "Esc chat",
-            Focus::Files => "Esc back · Enter open",
-            Focus::Todo => "Esc back · Enter toggle",
-            Focus::Center => "? help",
+        return match (app.focus, app.center_view) {
+            (Focus::Compose, CenterView::Document) => "Esc document",
+            (Focus::Compose, _) => "Esc chat",
+            (Focus::Files, _) => "Esc back · Enter open",
+            (Focus::Todo, _) => "Esc back · Enter toggle",
+            (Focus::Agent, _) => "Enter add · Esc back",
+            (Focus::Center, _) => "? help",
         };
     }
     match (app.focus, app.center_view) {
-        (Focus::Compose, CenterView::Chat) => "Enter send · Ctrl+J newline · Esc chat",
+        (Focus::Compose, CenterView::Chat) => "Enter send · Ctrl+Enter Agent · Ctrl+J newline",
+        (Focus::Compose, CenterView::Document) => {
+            "Enter record · Ctrl+Enter Agent · Ctrl+J newline"
+        }
         (Focus::Files, _) => "↑↓ select · Enter open · / filter · Esc back",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
+        (Focus::Agent, _) => "Enter add to Chat · ↑↓ scroll · ← center",
         (_, CenterView::Chat) if width >= 95 => "i compose · f files · T todo · / search · ? help",
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {
@@ -1053,7 +1307,6 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
         }
         (_, CenterView::Document) => "↑↓ scroll · e edit message · Esc back",
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
-        (_, CenterView::MessageEdit) => "Enter save · Ctrl+J newline · Esc cancel",
         _ => "f files · T todo · ? help",
     }
 }
@@ -1114,6 +1367,9 @@ fn draw_file_input_modal(frame: &mut Frame, app: &App, root: Rect) -> Rect {
 fn draw_overlay(frame: &mut Frame, app: &mut App, root: Rect, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Help => draw_help(frame, app, root),
+        Overlay::AiPrompt => draw_ai_prompt(frame, app, root),
+        Overlay::Approval => draw_approval(frame, app, root),
+        Overlay::AskUser => draw_ask_user(frame, app, root),
         Overlay::ConfirmDeleteMessage => draw_confirmation(
             frame,
             root,
@@ -1134,13 +1390,219 @@ fn draw_overlay(frame: &mut Frame, app: &mut App, root: Rect, overlay: Overlay) 
                 &format!("Delete {name}? [y/N]"),
             )
         }
-        Overlay::ConfirmDiscardEdit => draw_confirmation(
-            frame,
-            root,
-            " Unsaved changes ",
-            "Discard unsaved changes? [y/N]",
-        ),
     }
+}
+
+fn draw_ai_prompt(frame: &mut Frame, app: &App, root: Rect) -> Rect {
+    let area = centered_rect(root, root.width.min(80), root.height.min(11));
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::uniform(1))
+        .title(" Agent prompt · Enter run · Esc cancel ")
+        .style(Style::default().bg(Color::Indexed(235)))
+        .border_style(Style::default().fg(Color::LightMagenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_multiline_input(
+        frame,
+        inner,
+        &app.ai_prompt_input,
+        app.ai_prompt_cursor,
+        "Optional prompt; empty uses the card content",
+        true,
+    );
+    area
+}
+
+fn draw_approval(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
+    let area = centered_rect(
+        root,
+        root.width.saturating_sub(4).min(110),
+        root.height.saturating_sub(4).min(36),
+    );
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(Clear, area);
+    let title = app
+        .approval_request
+        .as_ref()
+        .map(|request| format!(" {} ", request.title))
+        .unwrap_or_else(|| " Approve change ".to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .title(title)
+        .style(Style::default().bg(Color::Indexed(234)))
+        .border_style(Style::default().fg(Color::LightYellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return area;
+    }
+    let content = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let footer = Rect::new(
+        inner.x,
+        inner.y.saturating_add(inner.height.saturating_sub(1)),
+        inner.width,
+        1.min(inner.height),
+    );
+    if let Some(request) = &app.approval_request {
+        let source = format!("```diff\n{}\n```", request.diff);
+        let lines = crate::markdown::to_lines_at_width(&source, content.width as usize);
+        let max_scroll = lines.len().saturating_sub(content.height as usize) as u16;
+        app.approval_scroll = app.approval_scroll.min(max_scroll);
+        let visible = visible_line_window(
+            &lines,
+            app.approval_scroll as usize,
+            content.height as usize,
+        );
+        frame.render_widget(Paragraph::new(visible), content);
+    }
+    frame.render_widget(
+        Paragraph::new("Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab bypass")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
+    );
+    area
+}
+
+fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
+    let width = ASK_USER_WIDTH.min(root.width.saturating_sub(4));
+    let text_width = width.saturating_sub(4).max(1) as usize;
+    let question_rows = app
+        .ask_user_request
+        .as_ref()
+        .map(|request| {
+            wrap_spans_to_width(&[Span::raw(request.question.clone())], text_width)
+                .len()
+                .clamp(1, 8) as u16
+        })
+        .unwrap_or(1);
+    let option_rows = app
+        .ask_user_request
+        .as_ref()
+        .map_or(0, |request| request.options.len() as u16 + 1);
+    let desired_height = question_rows
+        .saturating_add(option_rows)
+        .saturating_add(4) // Free-text input.
+        .saturating_add(1) // Keyboard hint.
+        .saturating_add(2); // Borders.
+    let height = desired_height
+        .min(ASK_USER_MAX_HEIGHT)
+        .min(root.height.saturating_sub(2));
+    let area = centered_rect(root, width, height);
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .title(" Agent question ")
+        .style(Style::default().bg(Color::Indexed(234)))
+        .border_style(Style::default().fg(Color::LightCyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(request) = &app.ask_user_request else {
+        return area;
+    };
+    if inner.height == 0 {
+        return area;
+    }
+
+    let footer_height = u16::from(inner.height > 0);
+    let input_height = inner.height.saturating_sub(footer_height).min(4);
+    let available = inner
+        .height
+        .saturating_sub(footer_height)
+        .saturating_sub(input_height);
+    let question_height = question_rows.min(available);
+    let option_rows = if request.options.is_empty() {
+        0
+    } else {
+        (request.options.len() as u16 + 1).min(available.saturating_sub(question_height))
+    };
+    let question = Rect::new(inner.x, inner.y, inner.width, question_height);
+    let options = Rect::new(
+        inner.x,
+        question.y.saturating_add(question.height),
+        inner.width,
+        option_rows,
+    );
+    let input = Rect::new(
+        inner.x,
+        options.y.saturating_add(options.height),
+        inner.width,
+        input_height,
+    );
+    let footer = Rect::new(
+        inner.x,
+        input.y.saturating_add(input.height),
+        inner.width,
+        footer_height,
+    );
+
+    frame.render_widget(
+        Paragraph::new(request.question.clone())
+            .wrap(Wrap { trim: false })
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        question,
+    );
+    for (row, label) in request
+        .options
+        .iter()
+        .map(|option| option.as_str())
+        .chain(std::iter::once("Other answer"))
+        .take(options.height as usize)
+        .enumerate()
+    {
+        let selected = app.ask_user_option == row;
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{} {label}", if selected { ">" } else { " " })).style(style),
+            Rect::new(options.x, options.y + row as u16, options.width, 1),
+        );
+    }
+
+    if input.width > 0 && input.height > 0 {
+        let custom_selected = app.ask_user_option >= request.options.len();
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Your answer ")
+            .border_style(focus_border(custom_selected));
+        let input_inner = input_block.inner(input);
+        frame.render_widget(input_block, input);
+        draw_multiline_input(
+            frame,
+            input_inner,
+            &app.ask_user_input,
+            app.ask_user_cursor,
+            "Type a different response",
+            custom_selected,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("↑↓ choose · Enter submit · type for custom answer · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
+    );
+    area
 }
 
 fn draw_confirmation(frame: &mut Frame, root: Rect, title: &str, message: &str) -> Rect {
@@ -1183,7 +1645,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     let lines = help_lines();
     let maximum = lines.len().saturating_sub(inner.height as usize);
     app.help_scroll = (app.help_scroll as usize).min(maximum) as u16;
-    frame.render_widget(Paragraph::new(lines).scroll((app.help_scroll, 0)), inner);
+    let visible = visible_line_window(&lines, app.help_scroll as usize, inner.height as usize);
+    frame.render_widget(Paragraph::new(visible), inner);
     area
 }
 
@@ -1210,18 +1673,21 @@ fn help_lines() -> Vec<Line<'static>> {
     vec![
         heading("Workspace"),
         key("f / T", "focus Files / Todo"),
-        key("Tab / Esc", "return to center"),
+        key("← → / ↑ ↓", "move focus between panes"),
+        key("Tab", "toggle approve / bypass mode"),
+        key("Esc", "return / cancel"),
         key("?", "open this help"),
         Line::default(),
         heading("Chat"),
         key("i / Enter", "focus Compose"),
         key("j k / ↑ ↓", "select message"),
         key("t m a n", "todo · move · archive · new file"),
-        key("v e d", "view · edit · delete"),
+        key("v e d / AI", "view · edit · delete · Agent"),
         key("/ / u", "search · undo"),
         Line::default(),
         heading("Compose / editor"),
         key("Enter", "send / save"),
+        key("Ctrl+Enter", "send prompt directly to Agent"),
         key("Ctrl+J", "insert newline"),
         key("Esc", "leave / cancel"),
         Line::default(),
@@ -1233,6 +1699,18 @@ fn help_lines() -> Vec<Line<'static>> {
         heading("Todo / document"),
         key("Enter / Space", "toggle todo"),
         key("j k / PgUp/Dn", "scroll document"),
+        key("i / Enter", "capture while reading"),
+        Line::default(),
+        heading("Agent approval"),
+        key("Enter / y", "approve displayed diff"),
+        key("n / Esc", "deny displayed diff"),
+        Line::default(),
+        heading("Agent questions"),
+        key("↑ ↓ / Enter", "choose and submit an option"),
+        key("type / Esc", "custom answer / cancel question"),
+        Line::default(),
+        heading("Agent output"),
+        key("Enter", "add final output to Chat"),
     ]
 }
 
@@ -1319,6 +1797,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::agent::ApprovalRequest;
     use crate::app::{Document, DocumentKind, DocumentReturn};
     use crate::model::TodoItem;
     use crate::storage::Storage;
@@ -1388,9 +1867,13 @@ mod tests {
             let files = app.layout.files.unwrap();
             let center = app.layout.center.unwrap();
             let todo = app.layout.todo.unwrap();
+            let agent = app.layout.agent.unwrap();
             assert_eq!(files, Rect::new(0, 0, 30, 23), "width {width}");
             assert_eq!(todo.width, 36, "width {width}");
             assert_eq!(todo.x + todo.width, width, "width {width}");
+            assert_eq!(todo.height, 23u16.div_ceil(3), "width {width}");
+            assert_eq!(agent.y, todo.y + todo.height, "width {width}");
+            assert_eq!(agent.height, 23 - todo.height, "width {width}");
             let region_width = width - FILES_WIDTH - TODO_WIDTH;
             assert_eq!(center, Rect::new(FILES_WIDTH, 0, region_width, 23));
             let content = center_content_axis(center);
@@ -1416,6 +1899,74 @@ mod tests {
         assert!(footer.starts_with(" CHAT "));
         assert!(footer.contains("saved-at-left"));
         assert!(footer.trim_end().ends_with("? help"));
+    }
+
+    #[test]
+    fn running_agent_animates_its_border_and_footer_status() {
+        let (mut app, _directory) = make_app();
+        app.ai_running = true;
+        app.agent_prompt = "Analyze this".to_string();
+        app.status = "AI is working".to_string();
+        app.animation_tick = 0;
+        let first = render(&mut app, 170, 24);
+        let agent = app.layout.agent.unwrap();
+        let first_corner = first.backend().buffer()[(agent.x, agent.y)].fg;
+        let top_colors = (agent.x..agent.x + agent.width)
+            .map(|x| first.backend().buffer()[(x, agent.y)].fg)
+            .collect::<Vec<_>>();
+        assert!(top_colors
+            .iter()
+            .all(|color| matches!(color, Color::Rgb(..))));
+        assert!(top_colors.windows(2).any(|colors| colors[0] != colors[1]));
+        let first_footer = buffer_string(&first).lines().last().unwrap().to_string();
+        let first_highlights = (0..170)
+            .filter(|x| matches!(first.backend().buffer()[(*x, 23)].fg, Color::Rgb(..)))
+            .collect::<Vec<_>>();
+        assert_eq!(first_highlights.len(), 1);
+
+        app.animation_tick = 1;
+        let second = render(&mut app, 170, 24);
+        let second_corner = second.backend().buffer()[(agent.x, agent.y)].fg;
+        let second_footer = buffer_string(&second).lines().last().unwrap().to_string();
+        let second_highlights = (0..170)
+            .filter(|x| matches!(second.backend().buffer()[(*x, 23)].fg, Color::Rgb(..)))
+            .collect::<Vec<_>>();
+        assert_ne!(first_corner, second_corner);
+        assert_eq!(first_footer, second_footer);
+        assert_eq!(second_highlights.len(), 1);
+        assert_ne!(first_highlights, second_highlights);
+    }
+
+    #[test]
+    fn animated_status_line_respects_terminal_cell_width() {
+        let line = animated_status_line("正在调用工具", 19, 4);
+        assert_eq!(line.to_string(), " 正在调用工具");
+        assert_eq!(line.width(), 13);
+        assert_eq!(
+            line.spans
+                .iter()
+                .filter(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
+                .count(),
+            1
+        );
+        assert!(line
+            .spans
+            .iter()
+            .filter(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
+            .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn virtual_line_window_clones_only_visible_rows() {
+        let lines = (0..10_000)
+            .map(|index| Line::from(format!("row {index}")))
+            .collect::<Vec<_>>();
+        let visible = visible_line_window(&lines, 9_990, 5);
+
+        assert_eq!(visible.len(), 5);
+        assert_eq!(visible.first().unwrap().to_string(), "row 9990");
+        assert_eq!(visible.last().unwrap().to_string(), "row 9994");
+        assert!(visible_line_window(&lines, lines.len(), 5).is_empty());
     }
 
     #[test]
@@ -1548,14 +2099,6 @@ mod tests {
             "only the centered searcher should have a border"
         );
         assert_eq!(app.search_hitboxes.len(), 1);
-
-        app.center_view = CenterView::MessageEdit;
-        app.edit_input = "editable".to_string();
-        app.edit_cursor = app.edit_input.chars().count();
-        let terminal = render(&mut app, 80, 18);
-        assert!(buffer_string(&terminal).contains("editable"));
-        assert!(app.layout.files.is_none());
-        assert!(app.layout.todo.is_none());
     }
 
     #[test]
@@ -1607,6 +2150,93 @@ mod tests {
         assert!(app.file_hitboxes.is_empty());
         assert!(app.todo_hitboxes.is_empty());
         assert!(app.search_hitboxes.is_empty());
+    }
+
+    #[test]
+    fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
+        let (mut app, _directory) = make_app();
+        app.overlay = Some(Overlay::AiPrompt);
+        app.ai_prompt_input = "summarize this".to_string();
+        app.ai_prompt_cursor = app.ai_prompt_input.chars().count();
+        let terminal = render(&mut app, 100, 24);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Agent prompt"));
+        assert!(screen.contains("summarize this"));
+
+        app.overlay = Some(Overlay::Approval);
+        app.approval_request = Some(ApprovalRequest {
+            title: "Update data/note.md".to_string(),
+            diff: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        });
+        let terminal = render(&mut app, 100, 24);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Update data/note.md"));
+        assert!(screen.contains("-old value"));
+        assert!(screen.contains("+new value"));
+        assert!(screen.contains("Tab bypass"));
+    }
+
+    #[test]
+    fn ask_user_overlay_renders_choices_and_free_text_input() {
+        let (mut app, _directory) = make_app();
+        app.overlay = Some(Overlay::AskUser);
+        app.ask_user_request = Some(crate::agent::AskUserRequest {
+            question: "Which output format should be used?".to_string(),
+            options: vec!["Markdown".to_string(), "MBDown".to_string()],
+        });
+        app.ask_user_option = 1;
+        let terminal = render(&mut app, 100, 24);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Agent question"));
+        assert!(screen.contains("Which output format should be used?"));
+        assert!(screen.contains("Markdown"));
+        assert!(screen.contains("MBDown"));
+        assert!(screen.contains("Other answer"));
+        assert!(screen.contains("Your answer"));
+        let overlay = app.layout.overlay.expect("ask-user overlay");
+        assert_eq!(overlay.width, ASK_USER_WIDTH);
+        assert_eq!(overlay.height, 11);
+        assert!(app.hitboxes.is_empty());
+    }
+
+    #[test]
+    fn agent_panel_shows_the_user_prompt_above_the_response() {
+        let (mut app, _directory) = make_app();
+        app.agent_prompt = "Explain the selected note".to_string();
+        app.agent_output = vec!["Here is the explanation".to_string()];
+        app.focus = Focus::Agent;
+
+        let terminal = render(&mut app, 170, 24);
+        let screen = buffer_string(&terminal);
+        let prompt = screen.find("Explain the selected note").unwrap();
+        let response = screen.find("Here is the explanation").unwrap();
+        assert!(screen.contains("Prompt"));
+        assert!(screen.contains("Response"));
+        assert!(prompt < response);
+    }
+
+    #[test]
+    fn document_keeps_compose_visible_and_notification_uses_top_right() {
+        let (mut app, _directory) = make_app();
+        app.center_view = CenterView::Document;
+        app.focus = Focus::Center;
+        app.document = Some(Document {
+            kind: DocumentKind::File(app.storage.archive_path.clone()),
+            title: "Article".to_string(),
+            source: "# Reading\n\nUseful paragraph".to_string(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+        });
+        app.notifications.notify("Recorded in Chat");
+        let terminal = render(&mut app, 120, 24);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Reading"));
+        assert!(screen.contains("Compose"));
+        assert!(screen.contains("Notification"));
+        assert!(screen.contains("Recorded in Chat"));
+        let compose = app.layout.compose.expect("document compose");
+        assert!(compose.y > 12);
     }
 
     #[test]
@@ -1756,17 +2386,61 @@ mod tests {
             }),
             "heading should retain Markdown emphasis on the selected card background"
         );
-        let delete = app
+        let ai = app
             .hitboxes
             .iter()
-            .find(|hitbox| hitbox.action == Action::Delete)
-            .expect("delete button");
+            .find(|hitbox| hitbox.action == Action::Ai)
+            .expect("AI button");
         let center = app.layout.center.expect("center");
         assert_eq!(
-            delete.area.x + delete.area.width,
+            ai.area.x + ai.area.width,
             center.x + center.width - 3,
-            "buttons should sit against the card's right padding"
+            "AI button should sit against the card's right padding"
         );
+    }
+
+    #[test]
+    fn message_body_axis_has_symmetric_gutters() {
+        let width = 100;
+        let metadata_and_gap = MESSAGE_PADDING_X + UnicodeWidthStr::width("2026-07-27") + 2;
+        let (start, body_width) = centered_message_body_axis(width, metadata_and_gap);
+        let trailing = width - start - body_width;
+
+        assert_eq!(start, metadata_and_gap);
+        assert_eq!(trailing, start);
+        assert_eq!(body_width, 74);
+        assert_eq!(MESSAGE_BUTTON_RIGHT_MARGIN, 1);
+    }
+
+    #[test]
+    fn oversized_selected_card_keeps_a_stable_scroll_position() {
+        let (mut app, _directory) = make_app();
+        let body = (0..80)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.storage.append_chat_message(&body).unwrap();
+        app.reload();
+        app.selected = app.messages.len() - 1;
+        app.scroll = u16::MAX;
+        app.focus = Focus::Center;
+
+        let first = render(&mut app, 80, 24);
+        let first_scroll = app.scroll;
+        let first_screen = buffer_string(&first);
+        assert!(first_scroll > 0);
+
+        let second = render(&mut app, 80, 24);
+        assert_eq!(app.scroll, first_scroll);
+        assert_eq!(buffer_string(&second), first_screen);
+    }
+
+    #[test]
+    fn oversized_card_scroll_can_rest_anywhere_inside_the_card() {
+        assert_eq!(stable_card_scroll(10, 10, 100, 20), 10);
+        assert_eq!(stable_card_scroll(50, 10, 100, 20), 50);
+        assert_eq!(stable_card_scroll(100, 10, 100, 20), 81);
+        assert_eq!(stable_card_scroll(81, 10, 100, 20), 81);
     }
 
     #[test]
@@ -1811,7 +2485,7 @@ mod tests {
         let terminal = render(&mut app, 80, 18);
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), " ");
-        assert!(!buffer_string(&terminal).contains("┌"));
+        assert!(buffer_string(&terminal).contains("Compose"));
         assert!(buffer_string(&terminal).contains("  Archive"));
         assert_eq!(app.document.as_ref().unwrap().scroll, 0);
         assert_eq!(app.document.as_ref().unwrap().target_line, None);

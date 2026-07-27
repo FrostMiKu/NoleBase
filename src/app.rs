@@ -1,14 +1,24 @@
 //! Application state and event handling.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread;
 
+use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::agent::{
+    Agent, AgentEvent, ApprovalDecision, ApprovalRequest, AskUserRequest, AskUserResponse,
+    PermissionMode,
+};
 use crate::model::{
     Action, ButtonHitbox, FileHitbox, Message, NoteFile, SearchHit, SearchHitbox, TodoHitbox,
     TodoItem,
 };
+use crate::notification::NotificationService;
 use crate::storage::Storage;
 
 fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
@@ -141,6 +151,7 @@ fn move_cursor(buffer: &str, cursor: usize, movement: CursorMove) -> usize {
 pub enum Command {
     Quit,
     Edit(PathBuf),
+    EditMessage { id: String, body: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +182,7 @@ pub enum Focus {
     Compose,
     Files,
     Todo,
+    Agent,
 }
 
 /// Content currently occupying the center pane.
@@ -179,7 +191,6 @@ pub enum CenterView {
     Chat,
     Document,
     Search,
-    MessageEdit,
 }
 
 /// Interaction taking place inside the files pane.
@@ -197,8 +208,10 @@ pub enum FilesContext {
 pub enum Overlay {
     ConfirmDeleteMessage,
     ConfirmDeleteFile,
-    ConfirmDiscardEdit,
     Help,
+    AiPrompt,
+    Approval,
+    AskUser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +248,7 @@ pub struct LayoutSnapshot {
     pub center: Option<Rect>,
     pub compose: Option<Rect>,
     pub todo: Option<Rect>,
+    pub agent: Option<Rect>,
     pub overlay: Option<Rect>,
 }
 
@@ -279,12 +293,9 @@ pub struct App {
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
 
-    pub edit_input: String,
-    pub edit_cursor: usize,
-    pub edit_id: String,
-
     pub help_scroll: u16,
     pub status: String,
+    pub animation_tick: u64,
     pub layout: LayoutSnapshot,
 
     /// Rebuilt every frame by the renderer.
@@ -292,6 +303,26 @@ pub struct App {
     pub file_hitboxes: Vec<FileHitbox>,
     pub todo_hitboxes: Vec<TodoHitbox>,
     pub search_hitboxes: Vec<SearchHitbox>,
+
+    ai_events: Option<Receiver<AgentEvent>>,
+    ai_approval_sender: Option<mpsc::Sender<ApprovalDecision>>,
+    ai_user_sender: Option<mpsc::Sender<AskUserResponse>>,
+    pub ai_running: bool,
+    pub permission_mode: PermissionMode,
+    permission_bypass: Arc<AtomicBool>,
+    pub agent_prompt: String,
+    pub agent_output: Vec<String>,
+    pub agent_scroll: u16,
+    pub ai_prompt_input: String,
+    pub ai_prompt_cursor: usize,
+    ai_source_id: Option<String>,
+    pub approval_request: Option<ApprovalRequest>,
+    pub approval_scroll: u16,
+    pub ask_user_request: Option<AskUserRequest>,
+    pub ask_user_input: String,
+    pub ask_user_cursor: usize,
+    pub ask_user_option: usize,
+    pub notifications: NotificationService,
 
     undo_stack: Vec<UndoOp>,
 }
@@ -330,16 +361,33 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
-            edit_input: String::new(),
-            edit_cursor: 0,
-            edit_id: String::new(),
             help_scroll: 0,
             status: String::new(),
+            animation_tick: 0,
             layout: LayoutSnapshot::default(),
             hitboxes: Vec::new(),
             file_hitboxes: Vec::new(),
             todo_hitboxes: Vec::new(),
             search_hitboxes: Vec::new(),
+            ai_events: None,
+            ai_approval_sender: None,
+            ai_user_sender: None,
+            ai_running: false,
+            permission_mode: PermissionMode::Approve,
+            permission_bypass: Arc::new(AtomicBool::new(false)),
+            agent_prompt: String::new(),
+            agent_output: Vec::new(),
+            agent_scroll: 0,
+            ai_prompt_input: String::new(),
+            ai_prompt_cursor: 0,
+            ai_source_id: None,
+            approval_request: None,
+            approval_scroll: 0,
+            ask_user_request: None,
+            ask_user_input: String::new(),
+            ask_user_cursor: 0,
+            ask_user_option: 0,
+            notifications: NotificationService::default(),
             undo_stack: Vec::new(),
         })
     }
@@ -355,6 +403,12 @@ impl App {
                     .unwrap_or_else(|| self.selected.min(self.messages.len().saturating_sub(1)));
             }
             Err(error) => self.set_status(format!("Reload error: {error}")),
+        }
+    }
+
+    pub fn advance_animation(&mut self) {
+        if self.ai_running {
+            self.animation_tick = self.animation_tick.wrapping_add(1);
         }
     }
 
@@ -410,6 +464,83 @@ impl App {
                     self.set_status(format!("Reload error: {error}"));
                 }
             }
+        }
+    }
+
+    /// Collect background Agent events without blocking the TUI.
+    pub fn poll_agent(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(receiver) = &self.ai_events {
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in events {
+            match event {
+                AgentEvent::Progress(message) => self.set_status(message),
+                AgentEvent::Notification(message) => {
+                    self.notifications.notify(message);
+                    self.set_status("Agent sent a notification");
+                }
+                AgentEvent::Approval(request) => {
+                    if self.permission_mode == PermissionMode::Bypass {
+                        let _ = self.send_approval(ApprovalDecision::Approve);
+                    } else {
+                        self.set_status(format!("Approval required: {}", request.title));
+                        self.approval_request = Some(request);
+                        self.approval_scroll = 0;
+                        self.overlay = Some(Overlay::Approval);
+                    }
+                }
+                AgentEvent::AskUser(request) => {
+                    self.set_status("Agent is waiting for your answer");
+                    self.ask_user_option = 0;
+                    self.ask_user_input.clear();
+                    self.ask_user_cursor = 0;
+                    self.ask_user_request = Some(request);
+                    self.overlay = Some(Overlay::AskUser);
+                }
+                AgentEvent::Finished(result) => {
+                    self.ai_running = false;
+                    match result {
+                        Ok(output) => {
+                            self.agent_output.clear();
+                            self.agent_scroll = 0;
+                            if !output.trim().is_empty() {
+                                self.agent_output.push(output);
+                            }
+                            self.set_status("Agent finished");
+                        }
+                        Err(error) => {
+                            self.agent_output.clear();
+                            self.agent_scroll = 0;
+                            self.set_status(format!("AI error: {error}"));
+                        }
+                    }
+                    self.clear_ask_user();
+                    self.reload_workspace();
+                }
+            }
+        }
+        if disconnected && self.ai_running {
+            self.ai_running = false;
+            self.agent_output.clear();
+            self.agent_scroll = 0;
+            self.clear_ask_user();
+            self.set_status("AI error: worker stopped unexpectedly");
+        }
+        if disconnected && !self.ai_running {
+            self.ai_events = None;
+            self.ai_approval_sender = None;
+            self.ai_user_sender = None;
         }
     }
 
@@ -487,6 +618,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
+        if key.code == KeyCode::Tab {
+            self.toggle_permission_mode();
+            return None;
+        }
         if self.overlay.is_some() {
             return self.handle_overlay(key);
         }
@@ -514,27 +649,35 @@ impl App {
             Focus::Compose => self.handle_compose(key),
             Focus::Files => self.handle_files(key),
             Focus::Todo => self.handle_todo(key),
+            Focus::Agent => self.handle_agent(key),
             Focus::Center => match self.center_view {
                 CenterView::Chat => self.handle_chat(key),
                 CenterView::Document => self.handle_document(key),
                 CenterView::Search => self.handle_search(key),
-                CenterView::MessageEdit => self.handle_message_edit(key),
             },
         }
     }
 
     /// Paste into whichever orthogonal state currently owns a text buffer.
     pub fn handle_paste(&mut self, text: &str) {
+        if self.overlay == Some(Overlay::AiPrompt) {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            paste_into(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor, &text);
+            return;
+        }
+        if self.overlay == Some(Overlay::AskUser) {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.select_custom_answer();
+            paste_into(&mut self.ask_user_input, &mut self.ask_user_cursor, &text);
+            return;
+        }
         if self.overlay.is_some() {
             return;
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match (self.focus, self.center_view, self.files_context) {
-            (Focus::Compose, CenterView::Chat, _) => {
+            (Focus::Compose, CenterView::Chat | CenterView::Document, _) => {
                 paste_into(&mut self.input, &mut self.input_cursor, &text)
-            }
-            (Focus::Center, CenterView::MessageEdit, _) => {
-                paste_into(&mut self.edit_input, &mut self.edit_cursor, &text)
             }
             (Focus::Center, CenterView::Search, _) => {
                 self.search_query.push_str(&text);
@@ -586,11 +729,7 @@ impl App {
 
     fn is_text_entry(&self) -> bool {
         self.focus == Focus::Compose
-            || (self.focus == Focus::Center
-                && matches!(
-                    self.center_view,
-                    CenterView::Search | CenterView::MessageEdit
-                ))
+            || (self.focus == Focus::Center && self.center_view == CenterView::Search)
             || (self.focus == Focus::Files
                 && matches!(
                     self.files_context,
@@ -601,11 +740,11 @@ impl App {
     fn handle_compose(&mut self, key: KeyEvent) -> Option<Command> {
         let modifiers = key.modifiers;
         match key.code {
-            KeyCode::Enter
-                if modifiers.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ) =>
-            {
+            KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.submit_compose_to_agent();
+                None
+            }
+            KeyCode::Enter if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
                 insert_char(&mut self.input, &mut self.input_cursor, '\n');
                 None
             }
@@ -673,6 +812,14 @@ impl App {
                 self.move_message_selection(-1);
                 None
             }
+            KeyCode::Left => {
+                self.open_files();
+                None
+            }
+            KeyCode::Right => {
+                self.open_todo();
+                None
+            }
             KeyCode::Char('g') => {
                 self.selected = 0;
                 None
@@ -730,6 +877,10 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_file_selection(-1);
+                None
+            }
+            KeyCode::Right => {
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Enter | KeyCode::Char('v') => {
@@ -942,11 +1093,24 @@ impl App {
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.move_todo_selection(1);
+                let visible = self.visible_todo_indices();
+                let at_end = visible.is_empty()
+                    || visible
+                        .last()
+                        .is_some_and(|index| *index == self.todo_index);
+                if at_end && (!self.agent_prompt.is_empty() || !self.agent_output.is_empty()) {
+                    self.focus = Focus::Agent;
+                } else {
+                    self.move_todo_selection(1);
+                }
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_todo_selection(-1);
+                None
+            }
+            KeyCode::Left => {
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
@@ -954,6 +1118,69 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn handle_agent(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                self.focus = Focus::Center;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.agent_scroll == 0 => {
+                self.focus = Focus::Todo;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.agent_scroll = self.agent_scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.agent_scroll = self.agent_scroll.saturating_add(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.agent_scroll = self.agent_scroll.saturating_sub(8);
+                None
+            }
+            KeyCode::PageDown => {
+                self.agent_scroll = self.agent_scroll.saturating_add(8);
+                None
+            }
+            KeyCode::Enter => {
+                self.add_agent_output_to_chat();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn add_agent_output_to_chat(&mut self) {
+        let body = self.agent_output.join("\n\n");
+        if body.trim().is_empty() {
+            self.set_status("Agent has no output to add");
+            return;
+        }
+        match self.storage.append_chat_message(&body) {
+            Ok(message) => {
+                self.agent_prompt.clear();
+                self.agent_output.clear();
+                self.agent_scroll = 0;
+                self.reload();
+                if let Some(index) = self
+                    .messages
+                    .iter()
+                    .position(|candidate| candidate.id == message.id)
+                {
+                    self.selected = index;
+                }
+                if self.center_view == CenterView::Chat {
+                    self.scroll = u16::MAX;
+                }
+                self.focus = Focus::Center;
+                self.set_status("Agent output added to Chat");
+            }
+            Err(error) => self.set_status(format!("Error: {error}")),
         }
     }
 
@@ -1003,6 +1230,14 @@ impl App {
                 self.scroll_document(-1);
                 None
             }
+            KeyCode::Left => {
+                self.open_files();
+                None
+            }
+            KeyCode::Right => {
+                self.open_todo();
+                None
+            }
             KeyCode::PageDown => {
                 self.scroll_document(10);
                 None
@@ -1011,79 +1246,27 @@ impl App {
                 self.scroll_document(-10);
                 None
             }
+            KeyCode::Char('i') | KeyCode::Enter => {
+                self.focus = Focus::Compose;
+                None
+            }
             KeyCode::Char('e') => match self.document.as_ref().map(|doc| &doc.kind) {
                 Some(DocumentKind::File(path)) => Some(Command::Edit(path.clone())),
-                Some(DocumentKind::Message(id)) => {
-                    let id = id.clone();
-                    self.open_message_edit(&id);
-                    None
-                }
+                Some(DocumentKind::Message(id)) => self.message_edit_command(id),
                 None => None,
             },
             _ => None,
         }
     }
 
-    fn handle_message_edit(&mut self, key: KeyEvent) -> Option<Command> {
-        let modifiers = key.modifiers;
-        match key.code {
-            KeyCode::Enter
-                if modifiers.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ) =>
-            {
-                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
-                None
-            }
-            KeyCode::Enter => {
-                self.save_edit();
-                None
-            }
-            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_char(&mut self.edit_input, &mut self.edit_cursor, '\n');
-                None
-            }
-            KeyCode::Esc => {
-                if self.edit_has_changes() {
-                    self.overlay = Some(Overlay::ConfirmDiscardEdit);
-                } else {
-                    self.center_view = CenterView::Chat;
-                }
-                None
-            }
-            KeyCode::Backspace => {
-                delete_backward(&mut self.edit_input, &mut self.edit_cursor);
-                None
-            }
-            KeyCode::Delete => {
-                delete_forward(&mut self.edit_input, &mut self.edit_cursor);
-                None
-            }
-            KeyCode::Left => self.move_edit_cursor(CursorMove::Left),
-            KeyCode::Right => self.move_edit_cursor(CursorMove::Right),
-            KeyCode::Up => self.move_edit_cursor(CursorMove::Up),
-            KeyCode::Down => self.move_edit_cursor(CursorMove::Down),
-            KeyCode::Home => self.move_edit_cursor(CursorMove::LineStart),
-            KeyCode::End => self.move_edit_cursor(CursorMove::LineEnd),
-            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_char(&mut self.edit_input, &mut self.edit_cursor, character);
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn move_edit_cursor(&mut self, movement: CursorMove) -> Option<Command> {
-        self.edit_cursor = move_cursor(&self.edit_input, self.edit_cursor, movement);
-        None
-    }
-
     fn handle_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match self.overlay {
             Some(Overlay::ConfirmDeleteMessage) => self.handle_delete_message_overlay(key),
             Some(Overlay::ConfirmDeleteFile) => self.handle_delete_file_overlay(key),
-            Some(Overlay::ConfirmDiscardEdit) => self.handle_discard_overlay(key),
             Some(Overlay::Help) => self.handle_help_overlay(key),
+            Some(Overlay::AiPrompt) => self.handle_ai_prompt_overlay(key),
+            Some(Overlay::Approval) => self.handle_approval_overlay(key),
+            Some(Overlay::AskUser) => self.handle_ask_user_overlay(key),
             None => None,
         }
     }
@@ -1152,21 +1335,6 @@ impl App {
         }
     }
 
-    fn handle_discard_overlay(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.overlay = None;
-                self.center_view = CenterView::Chat;
-                None
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.overlay = None;
-                None
-            }
-            _ => None,
-        }
-    }
-
     fn handle_help_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -1193,15 +1361,306 @@ impl App {
         }
     }
 
+    fn handle_ai_prompt_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Enter
+                if modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ) =>
+            {
+                insert_char(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor, '\n');
+                None
+            }
+            KeyCode::Enter => {
+                self.submit_agent_prompt();
+                None
+            }
+            KeyCode::Esc => {
+                self.overlay = None;
+                self.ai_source_id = None;
+                None
+            }
+            KeyCode::Backspace => {
+                delete_backward(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor);
+                None
+            }
+            KeyCode::Delete => {
+                delete_forward(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.ai_prompt_cursor = move_cursor(
+                    &self.ai_prompt_input,
+                    self.ai_prompt_cursor,
+                    CursorMove::Left,
+                );
+                None
+            }
+            KeyCode::Right => {
+                self.ai_prompt_cursor = move_cursor(
+                    &self.ai_prompt_input,
+                    self.ai_prompt_cursor,
+                    CursorMove::Right,
+                );
+                None
+            }
+            KeyCode::Up => {
+                self.ai_prompt_cursor =
+                    move_cursor(&self.ai_prompt_input, self.ai_prompt_cursor, CursorMove::Up);
+                None
+            }
+            KeyCode::Down => {
+                self.ai_prompt_cursor = move_cursor(
+                    &self.ai_prompt_input,
+                    self.ai_prompt_cursor,
+                    CursorMove::Down,
+                );
+                None
+            }
+            KeyCode::Home => {
+                self.ai_prompt_cursor = move_cursor(
+                    &self.ai_prompt_input,
+                    self.ai_prompt_cursor,
+                    CursorMove::LineStart,
+                );
+                None
+            }
+            KeyCode::End => {
+                self.ai_prompt_cursor = move_cursor(
+                    &self.ai_prompt_input,
+                    self.ai_prompt_cursor,
+                    CursorMove::LineEnd,
+                );
+                None
+            }
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(&mut self.ai_prompt_input, &mut self.ai_prompt_cursor, '\n');
+                None
+            }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char(
+                    &mut self.ai_prompt_input,
+                    &mut self.ai_prompt_cursor,
+                    character,
+                );
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_approval_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let _ = self.send_approval(ApprovalDecision::Approve);
+                None
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                let _ = self.send_approval(ApprovalDecision::Deny);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.approval_scroll = self.approval_scroll.saturating_add(1);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.approval_scroll = self.approval_scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::PageDown => {
+                self.approval_scroll = self.approval_scroll.saturating_add(8);
+                None
+            }
+            KeyCode::PageUp => {
+                self.approval_scroll = self.approval_scroll.saturating_sub(8);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_ask_user_overlay(&mut self, key: KeyEvent) -> Option<Command> {
+        let modifiers = key.modifiers;
+        let option_count = self
+            .ask_user_request
+            .as_ref()
+            .map_or(0, |request| request.options.len());
+        match key.code {
+            KeyCode::Esc => {
+                let _ = self.send_user_response(AskUserResponse::Cancelled);
+                None
+            }
+            KeyCode::Up if option_count > 0 => {
+                self.ask_user_option = self.ask_user_option.saturating_sub(1);
+                None
+            }
+            KeyCode::Down if option_count > 0 => {
+                self.ask_user_option = (self.ask_user_option + 1).min(option_count);
+                None
+            }
+            KeyCode::Enter
+                if modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ) && self.ask_user_option == option_count =>
+            {
+                insert_char(&mut self.ask_user_input, &mut self.ask_user_cursor, '\n');
+                None
+            }
+            KeyCode::Enter => {
+                let answer = self
+                    .ask_user_request
+                    .as_ref()
+                    .and_then(|request| request.options.get(self.ask_user_option))
+                    .cloned()
+                    .unwrap_or_else(|| self.ask_user_input.trim().to_string());
+                if answer.is_empty() {
+                    self.set_status("Enter an answer before submitting");
+                } else {
+                    let _ = self.send_user_response(AskUserResponse::Answer(answer));
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                self.select_custom_answer();
+                delete_backward(&mut self.ask_user_input, &mut self.ask_user_cursor);
+                None
+            }
+            KeyCode::Delete => {
+                self.select_custom_answer();
+                delete_forward(&mut self.ask_user_input, &mut self.ask_user_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.select_custom_answer();
+                self.ask_user_cursor =
+                    move_cursor(&self.ask_user_input, self.ask_user_cursor, CursorMove::Left);
+                None
+            }
+            KeyCode::Right => {
+                self.select_custom_answer();
+                self.ask_user_cursor = move_cursor(
+                    &self.ask_user_input,
+                    self.ask_user_cursor,
+                    CursorMove::Right,
+                );
+                None
+            }
+            KeyCode::Home => {
+                self.select_custom_answer();
+                self.ask_user_cursor = move_cursor(
+                    &self.ask_user_input,
+                    self.ask_user_cursor,
+                    CursorMove::LineStart,
+                );
+                None
+            }
+            KeyCode::End => {
+                self.select_custom_answer();
+                self.ask_user_cursor = move_cursor(
+                    &self.ask_user_input,
+                    self.ask_user_cursor,
+                    CursorMove::LineEnd,
+                );
+                None
+            }
+            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_custom_answer();
+                insert_char(&mut self.ask_user_input, &mut self.ask_user_cursor, '\n');
+                None
+            }
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_custom_answer();
+                insert_char(
+                    &mut self.ask_user_input,
+                    &mut self.ask_user_cursor,
+                    character,
+                );
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn select_custom_answer(&mut self) {
+        self.ask_user_option = self
+            .ask_user_request
+            .as_ref()
+            .map_or(0, |request| request.options.len());
+    }
+
+    fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {
+        let sender = self
+            .ai_user_sender
+            .as_ref()
+            .context("Agent user-response channel is unavailable")?;
+        sender
+            .send(response.clone())
+            .context("sending response to Agent")?;
+        self.set_status(match response {
+            AskUserResponse::Answer(_) => "Answer sent to Agent",
+            AskUserResponse::Cancelled => "Agent question cancelled",
+        });
+        self.clear_ask_user();
+        Ok(())
+    }
+
+    fn clear_ask_user(&mut self) {
+        self.ask_user_request = None;
+        self.ask_user_input.clear();
+        self.ask_user_cursor = 0;
+        self.ask_user_option = 0;
+        if self.overlay == Some(Overlay::AskUser) {
+            self.overlay = None;
+        }
+    }
+
+    fn send_approval(&mut self, decision: ApprovalDecision) -> anyhow::Result<()> {
+        let sender = self
+            .ai_approval_sender
+            .as_ref()
+            .context("Agent approval channel is unavailable")?;
+        sender
+            .send(decision)
+            .context("sending Agent approval decision")?;
+        self.set_status(match decision {
+            ApprovalDecision::Approve => "Change approved",
+            ApprovalDecision::Deny => "Change denied",
+        });
+        self.approval_request = None;
+        if self.overlay == Some(Overlay::Approval) {
+            self.overlay = None;
+        }
+        Ok(())
+    }
+
+    fn toggle_permission_mode(&mut self) {
+        self.permission_mode = self.permission_mode.toggled();
+        self.permission_bypass.store(
+            self.permission_mode == PermissionMode::Bypass,
+            Ordering::Relaxed,
+        );
+        if self.permission_mode == PermissionMode::Bypass && self.overlay == Some(Overlay::Approval)
+        {
+            let _ = self.send_approval(ApprovalDecision::Approve);
+        }
+        self.set_status(format!("Permission mode: {}", self.permission_mode.label()));
+    }
+
     fn route_wheel(&mut self, column: u16, row: u16, delta: i32) {
         if let Some(overlay) = self.overlay {
-            if overlay == Overlay::Help
+            if matches!(overlay, Overlay::Help | Overlay::Approval)
                 && (self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay))
             {
-                self.help_scroll = if delta > 0 {
-                    self.help_scroll.saturating_add(delta as u16)
+                let scroll = if overlay == Overlay::Help {
+                    &mut self.help_scroll
                 } else {
-                    self.help_scroll.saturating_sub(delta.unsigned_abs() as u16)
+                    &mut self.approval_scroll
+                };
+                *scroll = if delta > 0 {
+                    scroll.saturating_add(delta as u16)
+                } else {
+                    scroll.saturating_sub(delta.unsigned_abs() as u16)
                 };
             }
             return;
@@ -1217,6 +1676,13 @@ impl App {
             self.move_file_selection(delta);
         } else if in_area(column, row, self.layout.todo) {
             self.move_todo_selection(delta);
+        } else if in_area(column, row, self.layout.agent) {
+            self.agent_scroll = if delta > 0 {
+                self.agent_scroll.saturating_add(delta as u16)
+            } else {
+                self.agent_scroll
+                    .saturating_sub(delta.unsigned_abs() as u16)
+            };
         } else if in_area(column, row, self.layout.center) {
             match self.center_view {
                 CenterView::Chat => {
@@ -1228,7 +1694,6 @@ impl App {
                 }
                 CenterView::Document => self.scroll_document(delta),
                 CenterView::Search => self.move_search_selection(delta),
-                CenterView::MessageEdit => {}
             }
         }
     }
@@ -1300,12 +1765,16 @@ impl App {
             }
         }
 
-        if in_area(column, row, self.layout.compose) && self.center_view == CenterView::Chat {
+        if in_area(column, row, self.layout.compose)
+            && matches!(self.center_view, CenterView::Chat | CenterView::Document)
+        {
             self.focus = Focus::Compose;
         } else if in_area(column, row, self.layout.files) {
             self.focus = Focus::Files;
         } else if in_area(column, row, self.layout.todo) {
             self.focus = Focus::Todo;
+        } else if in_area(column, row, self.layout.agent) {
+            self.focus = Focus::Agent;
         } else if in_area(column, row, self.layout.center) {
             self.focus = Focus::Center;
         }
@@ -1500,51 +1969,6 @@ impl App {
         }
     }
 
-    fn open_message_edit(&mut self, id: &str) {
-        let Some(message) = self.message_clone(id) else {
-            return;
-        };
-        self.edit_id = message.id;
-        self.edit_input = message.body;
-        self.edit_cursor = self.edit_input.chars().count();
-        self.center_view = CenterView::MessageEdit;
-        self.focus = Focus::Center;
-    }
-
-    fn edit_has_changes(&self) -> bool {
-        self.message_clone(&self.edit_id)
-            .is_none_or(|message| message.body != self.edit_input)
-    }
-
-    fn save_edit(&mut self) {
-        let Some(message) = self.message_clone(&self.edit_id) else {
-            self.set_status("Message not found");
-            self.center_view = CenterView::Chat;
-            return;
-        };
-        let old = message.clone();
-        let mut updated = message;
-        updated.body = self.edit_input.clone();
-        match self.storage.replace_message(&updated) {
-            Ok(true) => {
-                self.record_undo(UndoOp::Edit(old));
-                self.set_status("Saved");
-                self.reload();
-                if let Some(index) = self
-                    .messages
-                    .iter()
-                    .position(|message| message.id == self.edit_id)
-                {
-                    self.selected = index;
-                }
-                self.scroll = u16::MAX;
-                self.center_view = CenterView::Chat;
-            }
-            Ok(false) => self.set_status("Message not found"),
-            Err(error) => self.set_status(format!("Error: {error}")),
-        }
-    }
-
     fn act(&mut self, action: Action) -> Option<Command> {
         let id = self.selected_id()?.to_string();
         self.dispatch_action(&id, action)
@@ -1552,6 +1976,10 @@ impl App {
 
     fn dispatch_action(&mut self, id: &str, action: Action) -> Option<Command> {
         match action {
+            Action::Ai => {
+                self.open_agent_prompt(id);
+                None
+            }
             Action::Todo => {
                 if let Some(message) = self.message_clone(id) {
                     match self.storage.move_to_todo(&message) {
@@ -1607,16 +2035,158 @@ impl App {
                 self.open_message_document(id, DocumentReturn::Chat);
                 None
             }
-            Action::Edit => {
-                self.open_message_edit(id);
-                None
-            }
+            Action::Edit => self.message_edit_command(id),
             Action::Delete => {
                 self.pending_id = Some(id.to_string());
                 self.overlay = Some(Overlay::ConfirmDeleteMessage);
                 None
             }
         }
+    }
+
+    fn open_agent_prompt(&mut self, id: &str) {
+        if self.ai_running {
+            self.set_status("AI is already working");
+            return;
+        }
+        if self.message_clone(id).is_none() {
+            self.set_status("Message not found");
+            return;
+        }
+        self.ai_source_id = Some(id.to_string());
+        self.ai_prompt_input.clear();
+        self.ai_prompt_cursor = 0;
+        self.overlay = Some(Overlay::AiPrompt);
+    }
+
+    fn message_edit_command(&self, id: &str) -> Option<Command> {
+        self.message_clone(id).map(|message| Command::EditMessage {
+            id: message.id,
+            body: message.body,
+        })
+    }
+
+    pub fn apply_external_message_edit(&mut self, id: &str, body: String) {
+        let Some(message) = self.message_clone(id) else {
+            self.set_status("Message not found");
+            return;
+        };
+        if message.body == body {
+            self.set_status("Message unchanged");
+            return;
+        }
+        let old = message.clone();
+        let mut updated = message;
+        updated.body = body;
+        match self.storage.replace_message(&updated) {
+            Ok(true) => {
+                self.record_undo(UndoOp::Edit(old));
+                self.reload();
+                if let Some(index) = self.messages.iter().position(|message| message.id == id) {
+                    self.selected = index;
+                }
+                if let Some(document) = self.document.as_mut().filter(|document| {
+                    matches!(&document.kind, DocumentKind::Message(message_id) if message_id == id)
+                }) {
+                    document.source = updated.body;
+                }
+                self.set_status("Message updated in editor");
+            }
+            Ok(false) => self.set_status("Message not found"),
+            Err(error) => self.set_status(format!("Error: {error}")),
+        }
+    }
+
+    fn submit_agent_prompt(&mut self) {
+        let Some(id) = self.ai_source_id.take() else {
+            self.overlay = None;
+            return;
+        };
+        let Some(message) = self.message_clone(&id) else {
+            self.overlay = None;
+            self.set_status("Message not found");
+            return;
+        };
+        let requested = self.ai_prompt_input.trim();
+        let content = if requested.is_empty() {
+            message.body
+        } else {
+            requested.to_string()
+        };
+        let prompt = format!("Source Nole message id: {id}\n\n{content}");
+        self.overlay = None;
+        self.start_agent(prompt, content);
+    }
+
+    fn submit_compose_to_agent(&mut self) {
+        let Some(prompt) = self.compose_agent_prompt() else {
+            self.set_status("Enter a prompt for Agent");
+            return;
+        };
+        let display_prompt = self.input.trim().to_string();
+        if self.start_agent(prompt, display_prompt) {
+            self.input.clear();
+            self.input_cursor = 0;
+        }
+    }
+
+    fn compose_agent_prompt(&self) -> Option<String> {
+        let content = self.input.trim();
+        if content.is_empty() {
+            return None;
+        }
+        let note = self
+            .document
+            .as_ref()
+            .filter(|_| self.center_view == CenterView::Document)
+            .and_then(|document| match &document.kind {
+                DocumentKind::File(path) => Some(path),
+                DocumentKind::Message(_) => None,
+            });
+        Some(if let Some(path) = note {
+            let display = path
+                .strip_prefix(&self.storage.root)
+                .unwrap_or(path)
+                .to_string_lossy();
+            format!("The user is currently viewing note: {display}\n\n{content}")
+        } else {
+            content.to_string()
+        })
+    }
+
+    fn start_agent(&mut self, prompt: String, display_prompt: String) -> bool {
+        if self.ai_running {
+            self.set_status("AI is already working");
+            return false;
+        }
+        let config_path = self.storage.ai_config_path.clone();
+        let root = self.storage.root.clone();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (approval_sender, approval_receiver) = mpsc::channel();
+        let (user_sender, user_receiver) = mpsc::channel();
+        self.ai_events = Some(event_receiver);
+        self.ai_approval_sender = Some(approval_sender);
+        self.ai_user_sender = Some(user_sender);
+        self.ai_running = true;
+        self.agent_prompt = display_prompt;
+        self.agent_output.clear();
+        self.agent_scroll = 0;
+        self.set_status("AI is working...");
+        let bypass = self.permission_bypass.clone();
+        thread::spawn(move || {
+            let result = Agent::from_config(
+                &config_path,
+                &root,
+                event_sender.clone(),
+                approval_receiver,
+                user_receiver,
+                bypass,
+            )
+            .and_then(|agent| agent.run(&prompt))
+            .map_err(|error| error.to_string());
+            let _ = event_sender.send(AgentEvent::Finished(result));
+        });
+        true
     }
 
     fn cancel_file_context(&mut self) {
@@ -1667,12 +2237,18 @@ impl App {
         }
         match self.storage.append_chat_message(body) {
             Ok(_) => {
+                let recorded_from_document = self.center_view == CenterView::Document;
                 self.input.clear();
                 self.input_cursor = 0;
                 self.reload();
                 self.selected = self.messages.len().saturating_sub(1);
                 self.scroll = u16::MAX;
-                self.set_status("Saved");
+                if recorded_from_document {
+                    self.notifications.notify("Recorded in Chat");
+                    self.set_status("Recorded without leaving the document");
+                } else {
+                    self.set_status("Saved");
+                }
             }
             Err(error) => self.set_status(format!("Error: {error}")),
         }
@@ -1772,6 +2348,150 @@ mod tests {
         assert_eq!(app.center_view, CenterView::Chat);
         assert_eq!(app.files_context, FilesContext::Browse);
         assert_eq!(app.overlay, None);
+        assert_eq!(app.permission_mode, PermissionMode::Approve);
+    }
+
+    #[test]
+    fn animation_phase_advances_only_while_agent_runs() {
+        let (mut app, _directory) = make_app();
+        app.advance_animation();
+        assert_eq!(app.animation_tick, 0);
+        app.ai_running = true;
+        app.advance_animation();
+        app.advance_animation();
+        assert_eq!(app.animation_tick, 2);
+        app.ai_running = false;
+        app.advance_animation();
+        assert_eq!(app.animation_tick, 2);
+    }
+
+    #[test]
+    fn tab_switches_permission_mode_without_changing_focus() {
+        let (mut app, _directory) = make_app();
+        assert_eq!(app.focus, Focus::Compose);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.permission_mode, PermissionMode::Bypass);
+        assert_eq!(app.focus, Focus::Compose);
+        assert!(app.permission_bypass.load(Ordering::Relaxed));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.permission_mode, PermissionMode::Approve);
+        assert!(!app.permission_bypass.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ai_action_opens_an_optional_prompt_overlay() {
+        let (mut app, _directory) = make_app();
+        add_message(&mut app, "card body");
+        let id = app.selected_id().unwrap().to_string();
+        app.dispatch_action(&id, Action::Ai);
+        assert_eq!(app.overlay, Some(Overlay::AiPrompt));
+        assert_eq!(app.ai_source_id.as_deref(), Some(id.as_str()));
+        app.handle_paste("custom prompt");
+        assert_eq!(app.ai_prompt_input, "custom prompt");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn approval_overlay_sends_the_user_decision() {
+        let (mut app, _directory) = make_app();
+        let (sender, receiver) = mpsc::channel();
+        app.ai_approval_sender = Some(sender);
+        app.approval_request = Some(ApprovalRequest {
+            title: "Update note".to_string(),
+            diff: "--- old\n+++ new\n-old\n+new\n".to_string(),
+        });
+        app.overlay = Some(Overlay::Approval);
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Approve);
+        assert_eq!(app.overlay, None);
+        assert!(app.approval_request.is_none());
+    }
+
+    #[test]
+    fn ask_user_overlay_accepts_options_and_custom_text() {
+        let (mut app, _directory) = make_app();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (answer_sender, answer_receiver) = mpsc::channel();
+        app.ai_events = Some(event_receiver);
+        app.ai_user_sender = Some(answer_sender);
+        event_sender
+            .send(AgentEvent::AskUser(AskUserRequest {
+                question: "Choose a format".to_string(),
+                options: vec!["Markdown".to_string(), "MBDown".to_string()],
+            }))
+            .unwrap();
+        app.poll_agent();
+        assert_eq!(app.overlay, Some(Overlay::AskUser));
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            answer_receiver.try_recv().unwrap(),
+            AskUserResponse::Answer("MBDown".to_string())
+        );
+        assert_eq!(app.overlay, None);
+
+        event_sender
+            .send(AgentEvent::AskUser(AskUserRequest {
+                question: "Anything else?".to_string(),
+                options: vec!["No".to_string()],
+            }))
+            .unwrap();
+        app.poll_agent();
+        app.handle_key(key(KeyCode::Char('Y')));
+        app.handle_paste("es, use colors");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            answer_receiver.try_recv().unwrap(),
+            AskUserResponse::Answer("Yes, use colors".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_panel_keeps_only_the_final_reply() {
+        let (mut app, _directory) = make_app();
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+        app.ai_running = true;
+        sender
+            .send(AgentEvent::Progress("Using read_file".to_string()))
+            .unwrap();
+        app.poll_agent();
+        assert_eq!(app.status, "Using read_file");
+        assert!(app.agent_output.is_empty());
+
+        sender
+            .send(AgentEvent::Finished(Ok("final reply".to_string())))
+            .unwrap();
+        app.poll_agent();
+        assert_eq!(app.agent_output, ["final reply"]);
+        assert_eq!(app.status, "Agent finished");
+    }
+
+    #[test]
+    fn recording_from_a_document_keeps_the_document_open_and_notifies() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Article.md");
+        fs::write(&path, "# Article\n\nInspiration\n").unwrap();
+        app.open_file_document(&path, DocumentReturn::Chat);
+        app.document.as_mut().unwrap().scroll = 1;
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.focus, Focus::Compose);
+        app.handle_paste("new idea");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(path))
+        );
+        assert_eq!(app.document.as_ref().unwrap().scroll, 1);
+        assert_eq!(app.messages.last().unwrap().body, "new idea");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Recorded in Chat")
+        );
     }
 
     #[test]
@@ -1803,6 +2523,61 @@ mod tests {
     }
 
     #[test]
+    fn compose_agent_prompt_includes_the_current_note_path() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Reference.md");
+        fs::write(&path, "# Reference\n").unwrap();
+        app.open_file_document(&path, DocumentReturn::Chat);
+        app.input = "Summarize the key point".to_string();
+
+        let prompt = app.compose_agent_prompt().unwrap();
+        assert!(prompt.contains("currently viewing note: data/Reference.md"));
+        assert!(prompt.ends_with("Summarize the key point"));
+
+        app.document = Some(Document {
+            kind: DocumentKind::Message("msg-1".to_string()),
+            title: "Message".to_string(),
+            source: String::new(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+        });
+        assert_eq!(
+            app.compose_agent_prompt().as_deref(),
+            Some("Summarize the key point")
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_sends_compose_to_agent_without_creating_a_chat_card() {
+        let (mut app, _directory) = make_app();
+        let message_count = app.messages.len();
+        app.input = "Direct Agent prompt".to_string();
+        app.input_cursor = app.input.chars().count();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert!(app.ai_running);
+        assert_eq!(app.agent_prompt, "Direct Agent prompt");
+        assert!(app.input.is_empty());
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(app.messages.len(), message_count);
+    }
+
+    #[test]
+    fn ctrl_enter_preserves_compose_while_agent_is_busy() {
+        let (mut app, _directory) = make_app();
+        app.ai_running = true;
+        app.input = "Keep this prompt".to_string();
+        app.input_cursor = app.input.chars().count();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert_eq!(app.input, "Keep this prompt");
+        assert_eq!(app.status, "AI is already working");
+    }
+
+    #[test]
     fn f_and_t_change_only_focus() {
         let (mut app, _directory) = make_app();
         app.focus = Focus::Center;
@@ -1812,6 +2587,72 @@ mod tests {
         app.handle_key(key(KeyCode::Char('T')));
         assert_eq!(app.focus, Focus::Todo);
         assert_eq!(app.center_view, CenterView::Chat);
+    }
+
+    #[test]
+    fn arrows_move_focus_across_the_workspace() {
+        let (mut app, _directory) = make_app();
+        add_message(&mut app, "selected card");
+        app.focus = Focus::Center;
+
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.focus, Focus::Files);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Center);
+        assert_eq!(app.center_view, CenterView::Chat);
+
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Todo);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.focus, Focus::Center);
+
+        app.todo_items.clear();
+        app.agent_output = vec!["final reply".to_string()];
+        app.focus = Focus::Todo;
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Agent);
+    }
+
+    #[test]
+    fn todo_and_agent_form_a_navigable_right_sidebar() {
+        let (mut app, _directory) = make_app();
+        app.todo_items = vec![TodoItem {
+            checked: false,
+            text: "only task".to_string(),
+        }];
+        app.todo_index = 0;
+        app.agent_output = vec!["final reply".to_string()];
+        app.focus = Focus::Todo;
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Agent);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.focus, Focus::Todo);
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.focus, Focus::Center);
+    }
+
+    #[test]
+    fn enter_on_agent_output_adds_exactly_one_chat_card() {
+        let (mut app, _directory) = make_app();
+        let original_count = app.messages.len();
+        app.agent_prompt = "User prompt".to_string();
+        app.agent_output = vec!["Agent final reply".to_string()];
+        app.focus = Focus::Agent;
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.messages.len(), original_count + 1);
+        assert_eq!(app.messages.last().unwrap().body, "Agent final reply");
+        assert!(app.agent_prompt.is_empty());
+        assert!(app.agent_output.is_empty());
+        assert_eq!(app.focus, Focus::Center);
+
+        app.add_agent_output_to_chat();
+        assert_eq!(app.messages.len(), original_count + 1);
+        assert_eq!(app.status, "Agent has no output to add");
     }
 
     #[test]
@@ -1916,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn search_and_message_edit_are_center_views() {
+    fn search_result_message_edit_returns_external_editor_command() {
         let (mut app, _directory) = make_app();
         add_message(&mut app, "needle");
         app.handle_key(key(KeyCode::Char('/')));
@@ -1929,11 +2770,15 @@ mod tests {
             app.document.as_ref().map(|document| document.return_to),
             Some(DocumentReturn::Search)
         );
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.center_view, CenterView::Search);
-        app.handle_key(key(KeyCode::Esc));
-        app.handle_key(key(KeyCode::Char('e')));
-        assert_eq!(app.center_view, CenterView::MessageEdit);
+        let id = app.messages[0].id.clone();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Some(Command::EditMessage {
+                id,
+                body: "needle".to_string(),
+            })
+        );
+        assert_eq!(app.center_view, CenterView::Document);
     }
 
     #[test]
@@ -1953,17 +2798,21 @@ mod tests {
     }
 
     #[test]
-    fn discard_overlay_preserves_editor_beneath_it() {
+    fn external_message_edit_writes_by_id_and_remains_undoable() {
         let (mut app, _directory) = make_app();
         add_message(&mut app, "before");
-        app.handle_key(key(KeyCode::Char('e')));
-        app.handle_key(key(KeyCode::Char('!')));
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.overlay, Some(Overlay::ConfirmDiscardEdit));
-        assert_eq!(app.center_view, CenterView::MessageEdit);
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.overlay, None);
-        assert_eq!(app.center_view, CenterView::MessageEdit);
+        let id = app.messages[0].id.clone();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Some(Command::EditMessage {
+                id: id.clone(),
+                body: "before".to_string(),
+            })
+        );
+        app.apply_external_message_edit(&id, "after".to_string());
+        assert_eq!(app.messages[0].body, "after");
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.messages[0].body, "before");
     }
 
     #[test]
