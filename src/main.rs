@@ -2,6 +2,7 @@
 
 mod agent;
 mod app;
+mod backend;
 mod markdown;
 mod model;
 mod notification;
@@ -26,12 +27,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::{App, Command};
+use backend::PositionedBackend;
 
-type Tui = Terminal<CrosstermBackend<Stdout>>;
+type Tui = Terminal<PositionedBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -285,7 +286,7 @@ fn main() -> Result<()> {
 
     enter_tui()?;
     let _guard = TerminalGuard;
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = PositionedBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
