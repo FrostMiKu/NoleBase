@@ -12,14 +12,13 @@ use crate::app::{App, CenterView, FilesContext, Focus, LayoutSnapshot, Overlay};
 use crate::model::{Action, ButtonHitbox, FileHitbox, SearchHit, SearchHitbox, TodoHitbox};
 
 const DATE_FMT: &str = "%Y-%m-%d";
-const TIME_FMT: &str = "%H:%M";
 const WIDE_BREAKPOINT: u16 = 170;
 const FILES_WIDTH: u16 = 30;
 const TODO_WIDTH: u16 = 36;
 const CENTER_MAX_WIDTH: u16 = 120;
 const PANEL_PADDING: u16 = 1;
 const MESSAGE_PADDING_X: usize = 1;
-const MESSAGE_BUTTON_RIGHT_MARGIN: usize = 1;
+const PAGE_PADDING_X: usize = MESSAGE_PADDING_X + 12;
 const ASK_USER_WIDTH: u16 = 80;
 const ASK_USER_MAX_HEIGHT: u16 = 32;
 
@@ -523,7 +522,9 @@ fn draw_center(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
     match app.center_view {
         CenterView::Chat => draw_chat(frame, app, area, content, interactive),
         CenterView::Document => draw_document(frame, app, content, interactive),
-        CenterView::Search => draw_search(frame, app, content, interactive),
+        CenterView::Search | CenterView::DocumentSearch => {
+            draw_search(frame, app, content, interactive)
+        }
     }
 }
 
@@ -537,7 +538,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, surface: Rect, content: Rect, int
     }
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "Chat",
+            "Daily",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -611,46 +612,46 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         });
         let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
         lines.push(line_with_background(Vec::new(), width, card_style));
+        lines.push(line_with_background(Vec::new(), width, card_style));
         let date = message.created_at.format(DATE_FMT).to_string();
-        let time = message.created_at.format(TIME_FMT).to_string();
-        let metadata_width = UnicodeWidthStr::width(date.as_str());
-        let column_gap = 2;
-        let body_start = horizontal_padding + metadata_width + column_gap;
+        let body_start = horizontal_padding + UnicodeWidthStr::width(date.as_str()) + 2;
         let (body_start, body_width) = centered_message_body_axis(width, body_start);
+        lines.push(line_with_background(
+            vec![
+                Span::raw(" ".repeat(body_start)),
+                Span::styled(
+                    date,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+            ],
+            width,
+            card_style,
+        ));
+        lines.push(line_with_background(Vec::new(), width, card_style));
         let markdown_lines = crate::markdown::to_lines_at_width(&message.body, body_width);
         let mut body_rows = Vec::new();
         for markdown_line in markdown_lines {
             body_rows.extend(wrap_spans_to_width(&markdown_line.spans, body_width));
         }
-        for row in 0..body_rows.len().max(2) {
-            let metadata = match row {
-                0 => format!("{date:>metadata_width$}"),
-                1 => format!("{time:>metadata_width$}"),
-                _ => " ".repeat(metadata_width),
-            };
-            let mut spans = Vec::with_capacity(body_rows.get(row).map_or(3, |body| body.len() + 3));
-            spans.push(Span::raw(" ".repeat(horizontal_padding)));
-            spans.push(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
-            spans.push(Span::raw(" ".repeat(
-                body_start.saturating_sub(horizontal_padding + metadata_width),
-            )));
-            if let Some(body) = body_rows.get(row) {
-                spans.extend(body.iter().cloned());
-            }
+        for body in &body_rows {
+            let mut spans = Vec::with_capacity(body.len() + 1);
+            spans.push(Span::raw(" ".repeat(body_start)));
+            spans.extend(body.iter().cloned());
             lines.push(line_with_background(spans, width, card_style));
         }
-        if body_rows.len() >= 2 {
-            lines.push(line_with_background(Vec::new(), width, card_style));
-        }
+        lines.push(line_with_background(Vec::new(), width, card_style));
         let button_width = action_buttons_width();
         let button_start = width
-            .saturating_sub(MESSAGE_BUTTON_RIGHT_MARGIN)
+            .saturating_sub(body_start)
             .saturating_sub(button_width);
         button_lines.push(lines.len());
         button_starts.push(button_start);
         let mut button_spans = vec![Span::raw(" ".repeat(button_start))];
         button_spans.extend(render_button_line(selected).spans);
         lines.push(line_with_background(button_spans, width, card_style));
+        lines.push(line_with_background(Vec::new(), width, card_style));
         lines.push(line_with_background(Vec::new(), width, card_style));
         lines.push(Line::default());
     }
@@ -659,11 +660,14 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     let view_height = area.height as usize;
     let max_scroll = total.saturating_sub(view_height);
     let mut scroll = (app.scroll as usize).min(max_scroll).min(u16::MAX as usize);
-    if let (Some(first), Some(button)) = (
-        card_first.get(app.selected).copied(),
-        button_lines.get(app.selected).copied(),
-    ) {
-        scroll = stable_card_scroll(scroll, first, button, view_height);
+    if app.reveal_selected_message {
+        if let (Some(first), Some(button)) = (
+            card_first.get(app.selected).copied(),
+            button_lines.get(app.selected).copied(),
+        ) {
+            scroll = stable_card_scroll(scroll, first, button, view_height);
+        }
+        app.reveal_selected_message = false;
     }
     scroll = scroll.min(max_scroll).min(u16::MAX as usize);
     app.scroll = scroll as u16;
@@ -835,7 +839,7 @@ fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
         let count = format!("{lines}l · {}c", app.input.chars().count());
         let hint = if focused && toolbar.width >= 62 {
             match app.center_view {
-                CenterView::Document => "Enter record · Ctrl+Enter Agent · Ctrl+J newline",
+                CenterView::Document => "Enter append · Ctrl+Enter Agent · Ctrl+J newline",
                 _ => "Enter send · Ctrl+Enter Agent · Ctrl+J newline",
             }
         } else if focused && toolbar.width >= 25 {
@@ -866,11 +870,25 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     app.layout.compose = non_empty(compose);
     let document_bottom = compose.y.saturating_sub(1);
     let header = Rect::new(content.x, content.y, content.width, 1);
-    let document_area = Rect::new(
+    let page_area = Rect::new(
         content.x,
         content.y.saturating_add(2),
         content.width,
         document_bottom.saturating_sub(content.y.saturating_add(2)),
+    );
+    let page_style = Style::default().bg(Color::Indexed(235));
+    frame.render_widget(Block::default().style(page_style), page_area);
+    let horizontal_padding = (PAGE_PADDING_X as u16).min(page_area.width.saturating_sub(1) / 2);
+    let vertical_padding = 2.min(page_area.height / 2);
+    let document_area = Rect::new(
+        page_area.x.saturating_add(horizontal_padding),
+        page_area.y.saturating_add(vertical_padding),
+        page_area
+            .width
+            .saturating_sub(horizontal_padding.saturating_mul(2)),
+        page_area
+            .height
+            .saturating_sub(vertical_padding.saturating_mul(2)),
     );
     {
         let document = app.document.as_mut().expect("document checked above");
@@ -903,7 +921,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             document.scroll as usize,
             document_area.height as usize,
         );
-        frame.render_widget(Paragraph::new(visible), document_area);
+        frame.render_widget(Paragraph::new(visible).style(page_style), document_area);
     }
     if compose.width > 0 && compose.height > 0 {
         frame.render_widget(Clear, compose);
@@ -1057,6 +1075,13 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
                     Span::raw(text.clone()),
                 ]
             }
+            SearchHit::DocumentLine { line_no, text } => vec![
+                Span::styled(
+                    format!("line {line_no} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(text.clone()),
+            ],
         };
         let style = if index == selected {
             Style::default().bg(Color::DarkGray)
@@ -1198,7 +1223,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (Focus::Compose, _, _) => "COMPOSE",
         (_, CenterView::Document, _) => "DOCUMENT",
         (_, CenterView::Search, _) => "SEARCH",
-        _ => "CHAT",
+        (_, CenterView::DocumentSearch, _) => "FIND",
+        _ => "DAILY",
     };
     let mode = format!(" {surface} · {} ", app.permission_mode.label());
     let mode_style = Style::default().bg(Color::Blue).fg(Color::Black);
@@ -1282,7 +1308,7 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
     if width < 55 {
         return match (app.focus, app.center_view) {
             (Focus::Compose, CenterView::Document) => "Esc document",
-            (Focus::Compose, _) => "Esc chat",
+            (Focus::Compose, _) => "Esc daily",
             (Focus::Files, _) => "Esc back · Enter open",
             (Focus::Todo, _) => "Esc back · Enter toggle",
             (Focus::Agent, _) => "Enter add · Esc back",
@@ -1292,21 +1318,22 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
     match (app.focus, app.center_view) {
         (Focus::Compose, CenterView::Chat) => "Enter send · Ctrl+Enter Agent · Ctrl+J newline",
         (Focus::Compose, CenterView::Document) => {
-            "Enter record · Ctrl+Enter Agent · Ctrl+J newline"
+            "Enter append · Ctrl+Enter Agent · Ctrl+J newline"
         }
-        (Focus::Files, _) => "↑↓ select · Enter open · / filter · Esc back",
+        (Focus::Files, _) => "↑↓ select · Enter open · e edit · / filter · Esc back",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
-        (Focus::Agent, _) => "Enter add to Chat · ↑↓ scroll · ← center",
+        (Focus::Agent, _) => "Enter add to Daily · ↑↓ scroll · ← center",
         (_, CenterView::Chat) if width >= 95 => "i compose · f files · T todo · / search · ? help",
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {
                 matches!(document.kind, crate::app::DocumentKind::File(_))
             }) =>
         {
-            "↑↓ scroll · e editor · Esc back"
+            "↑↓ scroll · e editor · / find · Esc back"
         }
-        (_, CenterView::Document) => "↑↓ scroll · e edit message · Esc back",
+        (_, CenterView::Document) => "↑↓ scroll · e edit message · / find · Esc back",
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
+        (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
         _ => "f files · T todo · ? help",
     }
 }
@@ -1678,10 +1705,10 @@ fn help_lines() -> Vec<Line<'static>> {
         key("Esc", "return / cancel"),
         key("?", "open this help"),
         Line::default(),
-        heading("Chat"),
+        heading("Daily"),
         key("i / Enter", "focus Compose"),
         key("j k / ↑ ↓", "select message"),
-        key("t m a n", "todo · move · archive · new file"),
+        key("m a n", "move · archive · new file"),
         key("v e d / AI", "view · edit · delete · Agent"),
         key("/ / u", "search · undo"),
         Line::default(),
@@ -1699,7 +1726,7 @@ fn help_lines() -> Vec<Line<'static>> {
         heading("Todo / document"),
         key("Enter / Space", "toggle todo"),
         key("j k / PgUp/Dn", "scroll document"),
-        key("i / Enter", "capture while reading"),
+        key("i / Enter", "append while reading"),
         Line::default(),
         heading("Agent approval"),
         key("Enter / y", "approve displayed diff"),
@@ -1710,7 +1737,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("type / Esc", "custom answer / cancel question"),
         Line::default(),
         heading("Agent output"),
-        key("Enter", "add final output to Chat"),
+        key("Enter", "add final output to Daily"),
     ]
 }
 
@@ -1854,7 +1881,7 @@ mod tests {
             assert!(app.layout.files.is_none());
             assert!(app.layout.todo.is_none());
             assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
-            assert!(buffer_string(&terminal).contains("Chat"));
+            assert!(buffer_string(&terminal).contains("Daily"));
         }
     }
 
@@ -1896,7 +1923,7 @@ mod tests {
         let footer: String = (0..220)
             .map(|x| buffer[(x, 11)].symbol().to_string())
             .collect();
-        assert!(footer.starts_with(" CHAT "));
+        assert!(footer.starts_with(" DAILY "));
         assert!(footer.contains("saved-at-left"));
         assert!(footer.trim_end().ends_with("? help"));
     }
@@ -2221,20 +2248,20 @@ mod tests {
         app.center_view = CenterView::Document;
         app.focus = Focus::Center;
         app.document = Some(Document {
-            kind: DocumentKind::File(app.storage.archive_path.clone()),
+            kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
             title: "Article".to_string(),
             source: "# Reading\n\nUseful paragraph".to_string(),
             scroll: 0,
             target_line: None,
             return_to: DocumentReturn::Chat,
         });
-        app.notifications.notify("Recorded in Chat");
+        app.notifications.notify("Recorded in Daily");
         let terminal = render(&mut app, 120, 24);
         let screen = buffer_string(&terminal);
         assert!(screen.contains("Reading"));
         assert!(screen.contains("Compose"));
         assert!(screen.contains("Notification"));
-        assert!(screen.contains("Recorded in Chat"));
+        assert!(screen.contains("Recorded in Daily"));
         let compose = app.layout.compose.expect("document compose");
         assert!(compose.y > 12);
     }
@@ -2273,7 +2300,7 @@ mod tests {
         app.input_cursor = app.input.chars().count();
         let terminal = render(&mut app, 120, 24);
         let screen = buffer_string(&terminal);
-        for expected in ["alpha", "beta bold", "first", "second", "[todo]"] {
+        for expected in ["alpha", "beta bold", "first", "second"] {
             assert!(screen.contains(expected), "missing {expected}");
         }
     }
@@ -2319,7 +2346,7 @@ mod tests {
                 .map(|hitbox| hitbox.index)
                 .collect::<Vec<_>>(),
             vec![1, 0],
-            "hitboxes must retain TODO.md source indices"
+            "hitboxes must retain daily task source indices"
         );
     }
 
@@ -2338,7 +2365,6 @@ mod tests {
             .unwrap();
         app.reload();
         let date = app.messages[0].created_at.format("%Y-%m-%d").to_string();
-        let time = app.messages[0].created_at.format("%H:%M").to_string();
         let terminal = render(&mut app, 170, 40);
         let screen = buffer_string(&terminal);
         let screen_lines = screen.lines().collect::<Vec<_>>();
@@ -2346,21 +2372,26 @@ mod tests {
             .iter()
             .position(|line| line.contains(&date))
             .expect("missing message date");
-        let date_line = screen_lines[date_row];
-        let time_line = screen_lines
-            .get(date_row + 1)
-            .filter(|line| line.contains(&time))
-            .expect("message time should be directly below its date");
+        let heading_row = screen_lines
+            .iter()
+            .position(|line| line.contains("Heading"))
+            .expect("missing body heading");
         assert_eq!(
-            date_line.find(&date).unwrap() + date.len(),
-            time_line.rfind(&time).unwrap() + time.len(),
-            "date and time should share a right edge"
+            heading_row,
+            date_row + 2,
+            "date and body need one blank row"
         );
         assert!(
-            date_line.find("Heading").unwrap() > date_line.find(&date).unwrap() + date.len(),
-            "message body should be left-aligned in the column after the timestamp"
+            screen_lines[heading_row].find("Heading").unwrap()
+                >= screen_lines[date_row].find(&date).unwrap(),
+            "date and body should use the same centered content axis"
         );
         let buffer = terminal.backend().buffer();
+        assert!(buffer.content().iter().any(|cell| {
+            cell.symbol() == date.chars().next().unwrap().to_string()
+                && cell.modifier.contains(Modifier::BOLD)
+                && cell.modifier.contains(Modifier::UNDERLINED)
+        }));
         for expected in ["Heading", "• first", "• second", "code"] {
             assert!(screen.contains(expected), "missing {expected}");
         }
@@ -2392,10 +2423,11 @@ mod tests {
             .find(|hitbox| hitbox.action == Action::Ai)
             .expect("AI button");
         let center = app.layout.center.expect("center");
+        let message_area = inset_horizontal(center_content_axis(center), 2);
         assert_eq!(
             ai.area.x + ai.area.width,
-            center.x + center.width - 3,
-            "AI button should sit against the card's right padding"
+            message_area.x + message_area.width - PAGE_PADDING_X as u16,
+            "AI button should share the body content axis"
         );
     }
 
@@ -2409,7 +2441,7 @@ mod tests {
         assert_eq!(start, metadata_and_gap);
         assert_eq!(trailing, start);
         assert_eq!(body_width, 74);
-        assert_eq!(MESSAGE_BUTTON_RIGHT_MARGIN, 1);
+        assert_eq!(PAGE_PADDING_X, metadata_and_gap);
     }
 
     #[test]
@@ -2444,21 +2476,46 @@ mod tests {
     }
 
     #[test]
-    fn single_line_message_uses_the_time_row_as_button_spacing() {
+    fn manual_scroll_can_cross_an_oversized_selected_card_boundary() {
+        let (mut app, _directory) = make_app();
+        app.storage
+            .append_daily("2026-07-26", "previous day")
+            .unwrap();
+        let long_body = (0..80)
+            .map(|line| format!("long line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.storage.append_daily("2026-07-27", &long_body).unwrap();
+        app.reload();
+        app.selected = 1;
+        app.scroll = u16::MAX;
+        app.reveal_selected_message = true;
+        render(&mut app, 80, 24);
+        assert!(app.scroll > 0);
+
+        app.scroll = 0;
+        app.reveal_selected_message = false;
+        let terminal = render(&mut app, 80, 24);
+        assert_eq!(app.scroll, 0);
+        assert!(buffer_string(&terminal).contains("previous day"));
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn single_line_daily_card_spaces_date_body_and_buttons() {
         let (mut app, _directory) = make_app();
         app.storage.append_chat_message("one line").unwrap();
         app.reload();
         let date = app.messages[0].created_at.format(DATE_FMT).to_string();
-        let time = app.messages[0].created_at.format(TIME_FMT).to_string();
 
-        let terminal = render(&mut app, 170, 20);
+        let terminal = render(&mut app, 170, 30);
         let screen = buffer_string(&terminal);
         let rows = screen.lines().collect::<Vec<_>>();
         let date_row = rows
             .iter()
-            .position(|line| line.contains(&date) && line.contains("one line"))
-            .expect("date and body row");
-        assert!(rows[date_row + 1].contains(&time));
+            .position(|line| line.contains(&date))
+            .expect("date row");
+        assert!(rows[date_row + 2].contains("one line"));
         let button_row = app
             .hitboxes
             .iter()
@@ -2466,23 +2523,43 @@ mod tests {
             .expect("delete button")
             .area
             .y as usize;
-        assert_eq!(button_row, date_row + 2);
+        assert_eq!(button_row, date_row + 4);
+        let buffer = terminal.backend().buffer();
+        let center = app.layout.center.expect("center area");
+        let sample_x = center.x + center.width / 2;
+        assert!(date_row >= 2);
+        assert_eq!(
+            buffer[(sample_x, date_row as u16 - 1)].bg,
+            Color::Indexed(238)
+        );
+        assert_eq!(
+            buffer[(sample_x, date_row as u16 - 2)].bg,
+            Color::Indexed(238)
+        );
+        assert_eq!(
+            buffer[(sample_x, button_row as u16 + 1)].bg,
+            Color::Indexed(238)
+        );
+        assert_eq!(
+            buffer[(sample_x, button_row as u16 + 2)].bg,
+            Color::Indexed(238)
+        );
     }
 
     #[test]
-    fn document_view_has_padding_without_an_outer_border() {
+    fn document_view_uses_a_padded_page_background_without_an_outer_border() {
         let (mut app, _directory) = make_app();
         app.focus = Focus::Center;
         app.center_view = CenterView::Document;
         app.document = Some(Document {
-            kind: DocumentKind::File(app.storage.archive_path.clone()),
+            kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
             title: "Archive".to_string(),
             source: "# Heading\n\nintro\n\nneedle".to_string(),
             scroll: 0,
             target_line: Some(5),
             return_to: DocumentReturn::Chat,
         });
-        let terminal = render(&mut app, 80, 18);
+        let terminal = render(&mut app, 80, 30);
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert!(buffer_string(&terminal).contains("Compose"));
@@ -2490,9 +2567,13 @@ mod tests {
         assert_eq!(app.document.as_ref().unwrap().scroll, 0);
         assert_eq!(app.document.as_ref().unwrap().target_line, None);
         let first_document_row: String = (0..80)
-            .map(|x| buffer[(x, 2)].symbol().to_string())
+            .map(|x| buffer[(x, 4)].symbol().to_string())
             .collect();
         assert!(first_document_row.contains("Heading"));
+        assert_eq!(buffer[(2, 2)].bg, Color::Indexed(235));
+        assert_eq!(buffer[(2, 3)].bg, Color::Indexed(235));
+        let heading_x = first_document_row.find("Heading").unwrap() as u16;
+        assert!(heading_x >= 2 + PAGE_PADDING_X as u16);
         assert!(buffer_string(&terminal).contains("needle"));
     }
 
@@ -2502,7 +2583,7 @@ mod tests {
         app.focus = Focus::Center;
         app.center_view = CenterView::Document;
         app.document = Some(Document {
-            kind: DocumentKind::File(app.storage.archive_path.clone()),
+            kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
             title: "Code".to_string(),
             source: "```rust\nfn main() {\n    println!(\"hello\");\n}\n```".to_string(),
             scroll: 0,
@@ -2510,7 +2591,7 @@ mod tests {
             return_to: DocumentReturn::Chat,
         });
 
-        let terminal = render(&mut app, 80, 20);
+        let terminal = render(&mut app, 80, 30);
         let buffer = terminal.backend().buffer();
         let background = Color::Rgb(32, 36, 43);
         let rows = (0..buffer.area().height)

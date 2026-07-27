@@ -323,7 +323,9 @@ mod tests {
         });
 
         app.storage.append_chat_message("external message").unwrap();
-        fs::write(&app.storage.todo_path, "# TODO\n\n- [ ] external task\n").unwrap();
+        app.storage
+            .append_chat_message("- [ ] external task")
+            .unwrap();
         fs::write(&document_path, "after").unwrap();
 
         let (sender, receiver) = mpsc::channel();

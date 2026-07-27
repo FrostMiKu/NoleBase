@@ -1,25 +1,15 @@
 //! Markdown persistence for Nole.
 //!
-//! `CHAT.md` stores each message as a hidden HTML-comment block so that
-//! delete/move stay reliable even when pasted content contains blank lines or
-//! markdown:
-//!
-//! ```text
-//! <!-- nole-msg id="<uuid>" created_at="<rfc3339>" -->
-//! message body (may be multi-line)
-//! <!-- /nole-msg -->
-//! ```
-//!
-//! Mutations are *surgical* (append a block, or remove the exact block for an
-//! id) rather than full rewrites, so manual edits made via `$EDITOR` are never
-//! clobbered.
+//! Chat is persisted as one Markdown file per day under `daily/`. Sending the
+//! first message of a day creates `YYYY-MM-DD.md`; later messages append to it.
+//! Archived cards are whole daily files moved into `archives/`.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate, TimeZone};
 
 use crate::model::{Message, NoteFile, SearchHit, TodoItem};
 
@@ -27,12 +17,14 @@ const OPEN_PREFIX: &str = "<!-- nole-msg";
 const OPEN_SUFFIX: &str = "-->";
 const CLOSE_MARKER: &str = "<!-- /nole-msg -->";
 
-const CHAT_FILE: &str = "CHAT.md";
-const TODO_FILE: &str = "TODO.md";
-const ARCHIVE_FILE: &str = "ARCHIVE.md";
+const LEGACY_CHAT_FILE: &str = "CHAT.md";
+const LEGACY_TODO_FILE: &str = "TODO.md";
+const LEGACY_ARCHIVE_FILE: &str = "ARCHIVE.md";
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
 const DATA_DIR: &str = "data";
+const DAILY_DIR: &str = "daily";
+const ARCHIVES_DIR: &str = "archives";
 
 /// Filesystem locations backing the notes.
 #[derive(Debug, Clone)]
@@ -40,9 +32,8 @@ pub struct Storage {
     pub root: PathBuf,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
-    pub chat_path: PathBuf,
-    pub todo_path: PathBuf,
-    pub archive_path: PathBuf,
+    pub daily_dir: PathBuf,
+    pub archives_dir: PathBuf,
     pub ai_config_path: PathBuf,
 }
 
@@ -60,9 +51,8 @@ impl Storage {
         Ok(Self {
             config_dir: root.join(CONFIG_DIR),
             data_dir: root.join(DATA_DIR),
-            chat_path: root.join(CHAT_FILE),
-            todo_path: root.join(TODO_FILE),
-            archive_path: root.join(ARCHIVE_FILE),
+            daily_dir: root.join(DAILY_DIR),
+            archives_dir: root.join(ARCHIVES_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
             root,
         })
@@ -76,19 +66,73 @@ impl Storage {
             .with_context(|| format!("creating {}", self.config_dir.display()))?;
         fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("creating {}", self.data_dir.display()))?;
-        if !self.chat_path.exists() {
-            fs::write(&self.chat_path, "")?;
-        }
-        if !self.todo_path.exists() {
-            fs::write(&self.todo_path, "# TODO\n\n")?;
-        }
-        if !self.archive_path.exists() {
-            fs::write(&self.archive_path, "# Archive\n\n")?;
-        }
+        fs::create_dir_all(&self.daily_dir)
+            .with_context(|| format!("creating {}", self.daily_dir.display()))?;
+        fs::create_dir_all(&self.archives_dir)
+            .with_context(|| format!("creating {}", self.archives_dir.display()))?;
         if !self.ai_config_path.exists() {
             self.write_default_ai_config()?;
         }
         self.migrate_legacy_root_notes()?;
+        self.migrate_legacy_chat_files()?;
+        Ok(())
+    }
+
+    fn migrate_legacy_chat_files(&self) -> Result<()> {
+        let chat = self.root.join(LEGACY_CHAT_FILE);
+        if chat.is_file() {
+            let text = fs::read_to_string(&chat)?;
+            for message in parse_messages(&text) {
+                self.append_daily_for_date(message.created_at.date_naive(), &message.body)?;
+            }
+            self.back_up_legacy_file(&chat)?;
+        }
+
+        let todo = self.root.join(LEGACY_TODO_FILE);
+        if todo.is_file() {
+            let text = fs::read_to_string(&todo)?;
+            let tasks = text
+                .lines()
+                .filter(|line| parse_task_line(line).is_some() || line.starts_with("    "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !tasks.trim().is_empty() {
+                if let Some(date) = self.daily_dates()?.last().copied() {
+                    self.append_daily_for_date(date, &tasks)?;
+                }
+            }
+            self.back_up_legacy_file(&todo)?;
+        }
+
+        let archive = self.root.join(LEGACY_ARCHIVE_FILE);
+        if archive.is_file() {
+            let text = fs::read_to_string(&archive)?;
+            if !text.trim().is_empty() {
+                let modified = fs::metadata(&archive)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .map(DateTime::<Local>::from)
+                    .unwrap_or_else(Local::now)
+                    .date_naive();
+                let destination = self.archives_dir.join(date_file_name(modified));
+                if !destination.exists() {
+                    fs::write(&destination, text)?;
+                }
+            }
+            self.back_up_legacy_file(&archive)?;
+        }
+        Ok(())
+    }
+
+    fn back_up_legacy_file(&self, path: &Path) -> Result<()> {
+        let backup_dir = self.config_dir.join("legacy");
+        fs::create_dir_all(&backup_dir)?;
+        let destination = backup_dir.join(path.file_name().unwrap_or_default());
+        if destination.exists() {
+            fs::remove_file(path)?;
+        } else {
+            fs::rename(path, destination)?;
+        }
         Ok(())
     }
 
@@ -122,7 +166,7 @@ impl Storage {
                 continue;
             }
             let path = entry.path();
-            if !is_note_path(&path) || is_protected_note_name(&path) {
+            if !is_note_path(&path) || is_legacy_root_file(&path) {
                 continue;
             }
             let destination = self.data_dir.join(entry.file_name());
@@ -140,107 +184,131 @@ impl Storage {
         Ok(())
     }
 
-    /// Parse all message blocks from `CHAT.md`.
+    /// Load one card per daily file, oldest first.
     pub fn load_messages(&self) -> Result<Vec<Message>> {
-        let text = fs::read_to_string(&self.chat_path).unwrap_or_default();
-        Ok(parse_messages(&text))
+        self.daily_dates()?
+            .into_iter()
+            .map(|date| self.read_daily(date))
+            .collect()
     }
 
-    /// Append a new message block and return the constructed message.
+    /// Append a message to today's daily card, creating it on first send.
     pub fn append_chat_message(&self, body: &str) -> Result<Message> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let created_at = Local::now();
-        let msg = Message {
-            id,
-            created_at,
-            body: body.to_string(),
-        };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.chat_path)
-            .with_context(|| format!("opening {}", self.chat_path.display()))?;
-        file.write_all(render_block(&msg).as_bytes())?;
-        Ok(msg)
+        let date = Local::now().date_naive();
+        self.append_daily_for_date(date, body)?;
+        self.read_daily(date)
     }
 
-    /// Remove the message block matching `id`. Returns `true` if found.
-    pub fn remove_message_by_id(&self, id: &str) -> Result<bool> {
-        let text = fs::read_to_string(&self.chat_path).unwrap_or_default();
-        let Some((start, end)) = find_block_range(&text, id) else {
-            return Ok(false);
-        };
-        // Consume one trailing newline so we don't leave a blank line behind.
-        let mut end = end;
-        if text[end..].starts_with('\n') {
-            end += 1;
+    pub fn append_daily(&self, date: &str, body: &str) -> Result<Message> {
+        let date = parse_daily_date(date)?;
+        self.append_daily_for_date(date, body)?;
+        self.read_daily(date)
+    }
+
+    fn append_daily_for_date(&self, date: NaiveDate, body: &str) -> Result<()> {
+        if body.trim().is_empty() {
+            bail!("daily content must not be empty");
         }
-        let mut out = String::with_capacity(text.len());
-        out.push_str(&text[..start]);
-        out.push_str(&text[end..]);
-        fs::write(&self.chat_path, out)?;
-        Ok(true)
+        fs::create_dir_all(&self.daily_dir)?;
+        let path = self.daily_path(date);
+        let content = if path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            format!("\n{body}\n")
+        } else {
+            format!("{body}\n")
+        };
+        append_text(&path, &content)
     }
 
-    /// Append a message to `TODO.md` as a markdown task, then remove it from
-    /// the chat. Append happens first so a failure cannot lose data. Returns
-    /// the bytes appended to `TODO.md` (used by undo).
-    pub fn move_to_todo(&self, msg: &Message) -> Result<String> {
-        let content = append_todo_task(&self.todo_path, msg)?;
-        let removed = self.remove_message_by_id(&msg.id)?;
-        debug_assert!(removed, "moved message not found in chat after append");
-        Ok(content)
+    pub fn read_daily_by_date(&self, date: &str) -> Result<Message> {
+        self.read_daily(parse_daily_date(date)?)
     }
 
-    /// Parse the `- [ ]` / `- [x]` tasks out of `TODO.md`, in order.
-    /// Continuation lines fold into the preceding task's text.
+    fn read_daily(&self, date: NaiveDate) -> Result<Message> {
+        let path = self.daily_path(date);
+        let mut body = fs::read_to_string(&path)
+            .with_context(|| format!("reading daily note {}", path.display()))?;
+        if body.ends_with('\n') {
+            body.pop();
+        }
+        Ok(Message {
+            id: date.format("%Y-%m-%d").to_string(),
+            created_at: date_at_local_midnight(date)?,
+            body,
+        })
+    }
+
+    pub fn remove_message_by_id(&self, date: &str) -> Result<bool> {
+        let path = self.daily_path(parse_daily_date(date)?);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("deleting {}", path.display())),
+        }
+    }
+
+    /// Scan task-list items from every daily file, newest day first.
     pub fn load_todo_tasks(&self) -> Vec<TodoItem> {
-        let text = fs::read_to_string(&self.todo_path).unwrap_or_default();
         let mut items: Vec<TodoItem> = Vec::new();
-        for line in text.lines() {
-            if let Some((checked, body)) = parse_task_line(line) {
-                items.push(TodoItem {
-                    checked,
-                    text: body.to_string(),
-                });
-            } else if !line.trim().is_empty() {
-                // A non-blank line that isn't a task belongs to the task above.
-                if let Some(item) = items.last_mut() {
-                    item.text.push('\n');
-                    item.text.push_str(line.trim());
+        let mut dates = self.daily_dates().unwrap_or_default();
+        dates.reverse();
+        for date in dates {
+            let text = fs::read_to_string(self.daily_path(date)).unwrap_or_default();
+            let mut active_task = None;
+            for line in text.lines() {
+                if let Some((checked, body)) = parse_task_line(line) {
+                    items.push(TodoItem {
+                        checked,
+                        text: body.to_string(),
+                    });
+                    active_task = Some(items.len() - 1);
+                } else if !line.trim().is_empty()
+                    && (line.starts_with(' ') || line.starts_with('\t'))
+                {
+                    if let Some(item) = active_task.and_then(|index| items.get_mut(index)) {
+                        item.text.push('\n');
+                        item.text.push_str(line.trim());
+                    }
+                } else if !line.trim().is_empty() {
+                    active_task = None;
                 }
             }
         }
         items
     }
 
-    /// Flip the completion state of the `index`-th task in `TODO.md`.
+    /// Flip the completion state of the indexed task across all daily files.
     /// Returns `true` if a task at that index was toggled.
     pub fn toggle_todo_task(&self, index: usize) -> Result<bool> {
-        let text = fs::read_to_string(&self.todo_path).unwrap_or_default();
-        let mut out = String::with_capacity(text.len());
+        let mut dates = self.daily_dates()?;
+        dates.reverse();
         let mut count = 0usize;
-        let mut toggled = false;
-        for line in text.split_inclusive('\n') {
-            let is_task = parse_task_line(line.trim_end_matches('\n')).is_some();
-            if is_task && count == index {
-                if let Some(flip) = flip_task_line(line) {
-                    out.push_str(&flip);
-                    toggled = true;
+        for date in dates {
+            let path = self.daily_path(date);
+            let text = fs::read_to_string(&path)?;
+            let mut out = String::with_capacity(text.len());
+            let mut toggled = false;
+            for line in text.split_inclusive('\n') {
+                let is_task = parse_task_line(line.trim_end_matches('\n')).is_some();
+                if is_task && count == index {
+                    if let Some(flip) = flip_task_line(line) {
+                        out.push_str(&flip);
+                        toggled = true;
+                    } else {
+                        out.push_str(line);
+                    }
                 } else {
                     out.push_str(line);
                 }
-            } else {
-                out.push_str(line);
+                if is_task {
+                    count += 1;
+                }
             }
-            if is_task {
-                count += 1;
+            if toggled {
+                fs::write(path, out)?;
+                return Ok(true);
             }
         }
-        if toggled {
-            fs::write(&self.todo_path, out)?;
-        }
-        Ok(toggled)
+        Ok(false)
     }
 
     /// Case-insensitive substring search across every managed `.md`/`.mb` file
@@ -277,21 +345,55 @@ impl Storage {
         out
     }
 
-    /// Append a message to a managed data note or the root archive, then remove
-    /// it from chat. Append happens first. Returns the bytes appended to the
-    /// target (used by undo).
+    /// Append a daily card to a managed data note, then remove its daily file.
     pub fn move_to_markdown(&self, target: &Path, msg: &Message) -> Result<String> {
         let safe = self.validate_target(target)?;
         let content = append_markdown_section(&safe, msg)?;
         let removed = self.remove_message_by_id(&msg.id)?;
-        debug_assert!(removed, "moved message not found in chat after append");
+        debug_assert!(removed, "moved daily card not found after append");
         Ok(content)
     }
 
-    /// Re-insert a previously removed message block into `CHAT.md` (used by
-    /// undo). Keeps the original id and timestamp.
+    /// Move one daily file into archives without rewriting its contents.
+    pub fn archive_daily(&self, date: &str) -> Result<PathBuf> {
+        let date = parse_daily_date(date)?;
+        let source = self.daily_path(date);
+        let destination = self.archives_dir.join(date_file_name(date));
+        if destination.exists() {
+            bail!("archive already exists for {date}");
+        }
+        fs::rename(&source, &destination).with_context(|| {
+            format!(
+                "archiving daily note {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        Ok(destination)
+    }
+
+    pub fn restore_archived_daily(&self, date: &str) -> Result<()> {
+        let date = parse_daily_date(date)?;
+        let source = self.archives_dir.join(date_file_name(date));
+        let destination = self.daily_path(date);
+        if destination.exists() {
+            bail!("daily note already exists for {date}");
+        }
+        fs::rename(source, destination)?;
+        Ok(())
+    }
+
+    /// Restore a deleted or filed daily card.
     pub fn restore_message_to_chat(&self, msg: &Message) -> Result<()> {
-        append_text(&self.chat_path, &render_block(msg))?;
+        let path = self.daily_path(parse_daily_date(&msg.id)?);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(msg.body.as_bytes())?;
+        if !msg.body.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
         Ok(())
     }
 
@@ -310,32 +412,43 @@ impl Storage {
         }
     }
 
-    /// Rewrite the block for `msg.id` with `msg`'s current body, preserving the
-    /// id and timestamp. Returns `false` if no block matches. Used by in-app
-    /// message editing (and undo of an edit).
+    /// Replace a daily file's complete card body.
     pub fn replace_message(&self, msg: &Message) -> Result<bool> {
-        let text = fs::read_to_string(&self.chat_path).unwrap_or_default();
-        let Some((start, mut end)) = find_block_range(&text, &msg.id) else {
+        let path = self.daily_path(parse_daily_date(&msg.id)?);
+        if !path.is_file() {
             return Ok(false);
-        };
-        if text[end..].starts_with('\n') {
-            end += 1;
         }
-        let mut out = String::with_capacity(text.len());
-        out.push_str(&text[..start]);
-        out.push_str(&render_block(msg));
-        out.push_str(&text[end..]);
-        fs::write(&self.chat_path, out)?;
+        let mut body = msg.body.clone();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        fs::write(path, body)?;
         Ok(true)
+    }
+
+    fn daily_path(&self, date: NaiveDate) -> PathBuf {
+        self.daily_dir.join(date_file_name(date))
+    }
+
+    fn daily_dates(&self) -> Result<Vec<NaiveDate>> {
+        let mut dates = Vec::new();
+        for entry in fs::read_dir(&self.daily_dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_file() && !file_type.is_symlink() {
+                if let Some(date) = date_from_path(&entry.path()) {
+                    dates.push(date);
+                }
+            }
+        }
+        dates.sort_unstable();
+        Ok(dates)
     }
 
     /// Create a new note in `data/` from a user-entered name, returning its path.
     /// Existing filesystem entries are never overwritten.
     pub fn create_named_file(&self, name: &str) -> Result<PathBuf> {
         let file_name = normalize_new_name(name)?;
-        if is_protected_note_name(Path::new(&file_name)) {
-            bail!("{file_name} is reserved and cannot be created");
-        }
 
         fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("creating {}", self.data_dir.display()))?;
@@ -353,14 +466,8 @@ impl Storage {
     /// new path. Refuses protected names and never overwrites an existing entry.
     pub fn rename_file(&self, from: &Path, new_name: &str) -> Result<PathBuf> {
         let from = self.validate_target(from)?;
-        if is_protected_note_name(&from) {
-            bail!("{} is protected and cannot be renamed", from.display());
-        }
 
         let name = normalize_new_name(new_name)?;
-        if is_protected_note_name(Path::new(&name)) {
-            bail!("{name} is reserved and cannot be used as a rename target");
-        }
         let to = self.data_dir.join(&name);
         if to.file_name() == from.file_name() {
             return Ok(from);
@@ -382,9 +489,6 @@ impl Storage {
     /// Delete a managed data note. Protected files cannot be deleted.
     pub fn delete_file(&self, path: &Path) -> Result<()> {
         let path = self.validate_target(path)?;
-        if is_protected_note_name(&path) {
-            bail!("{} is protected and cannot be deleted", path.display());
-        }
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
         Ok(())
     }
@@ -394,6 +498,20 @@ impl Storage {
     pub fn read_note_file(&self, path: &Path) -> Result<String> {
         let path = self.validate_target(path)?;
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+    }
+
+    /// Append a paragraph to an existing managed data note.
+    pub fn append_note(&self, path: &Path, body: &str) -> Result<()> {
+        if body.trim().is_empty() {
+            bail!("note content must not be empty");
+        }
+        let path = self.validate_target(path)?;
+        let content = if path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            format!("\n{body}\n")
+        } else {
+            format!("{body}\n")
+        };
+        append_text(&path, &content)
     }
 
     /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
@@ -436,7 +554,7 @@ impl Storage {
             .collect())
     }
 
-    /// Ensure a target is a flat data note or one of the protected root files.
+    /// Ensure a target is a flat data note.
     /// Existing targets are canonicalized in full; symlinks are always rejected.
     pub fn validate_target(&self, target: &Path) -> Result<PathBuf> {
         if !is_note_path(target) {
@@ -446,8 +564,6 @@ impl Storage {
             );
         }
 
-        let canonical_root = fs::canonicalize(&self.root)
-            .with_context(|| format!("resolving note root {}", self.root.display()))?;
         let canonical_data = fs::canonicalize(&self.data_dir).with_context(|| {
             format!("resolving note data directory {}", self.data_dir.display())
         })?;
@@ -463,9 +579,7 @@ impl Storage {
                     .with_context(|| format!("resolving note target {}", target.display()))?;
                 let parent = canonical_target.parent();
                 let is_data_note = parent == Some(canonical_data.as_path());
-                let is_special = parent == Some(canonical_root.as_path())
-                    && is_protected_note_name(&canonical_target);
-                if !is_data_note && !is_special {
+                if !is_data_note {
                     bail!(
                         "target must be a direct child of {}: {}",
                         self.data_dir.display(),
@@ -481,9 +595,7 @@ impl Storage {
                 let canonical_parent = fs::canonicalize(parent)
                     .with_context(|| format!("resolving target parent {}", parent.display()))?;
                 let is_data_note = canonical_parent == canonical_data;
-                let is_special =
-                    canonical_parent == canonical_root && is_protected_note_name(target);
-                if !is_data_note && !is_special {
+                if !is_data_note {
                     bail!(
                         "target must be a direct child of {}: {}",
                         self.data_dir.display(),
@@ -499,6 +611,33 @@ impl Storage {
     }
 }
 
+fn parse_daily_date(value: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .with_context(|| format!("invalid daily date {value}; expected YYYY-MM-DD"))
+}
+
+fn date_file_name(date: NaiveDate) -> String {
+    format!("{}.md", date.format("%Y-%m-%d"))
+}
+
+fn date_from_path(path: &Path) -> Option<NaiveDate> {
+    let stem = path.file_stem()?.to_str()?;
+    if path.extension()?.to_str()? != "md" {
+        return None;
+    }
+    NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()
+}
+
+fn date_at_local_midnight(date: NaiveDate) -> Result<DateTime<Local>> {
+    let naive = date
+        .and_hms_opt(0, 0, 0)
+        .context("daily date is outside the supported time range")?;
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .context("daily date has no corresponding local time")
+}
+
 fn is_note_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -507,16 +646,14 @@ fn is_note_path(path: &Path) -> bool {
         })
 }
 
-fn is_protected_note_name(path: &Path) -> bool {
-    is_note_path(path)
-        && path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| {
-                ["CHAT", "TODO", "ARCHIVE"]
-                    .iter()
-                    .any(|protected| stem.eq_ignore_ascii_case(protected))
-            })
+fn is_legacy_root_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            [LEGACY_CHAT_FILE, LEGACY_TODO_FILE, LEGACY_ARCHIVE_FILE]
+                .iter()
+                .any(|legacy| name.eq_ignore_ascii_case(legacy))
+        })
 }
 
 /// Normalize a user-entered file name: trim, default to `.md`, reject traversal.
@@ -544,23 +681,6 @@ fn stem(file_name: &str) -> &str {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(file_name)
-}
-
-/// Render a message as its persisted block.
-pub fn render_block(msg: &Message) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "<!-- nole-msg id=\"{}\" created_at=\"{}\" -->\n",
-        msg.id,
-        msg.created_at.to_rfc3339()
-    ));
-    out.push_str(&msg.body);
-    if !msg.body.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(CLOSE_MARKER);
-    out.push('\n');
-    out
 }
 
 /// Parse all message blocks out of raw `CHAT.md` text.
@@ -618,36 +738,6 @@ fn extract_attr(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Return the byte range `[start, end)` of the block for `id`, markers included.
-fn find_block_range(text: &str, id: &str) -> Option<(usize, usize)> {
-    let needle_open = format!("<!-- nole-msg id=\"{id}\"");
-    let open_start = text.find(&needle_open)?;
-    // End of the open marker line (including its newline).
-    let after_open = &text[open_start..];
-    let open_line_end = after_open.find('\n').map(|n| open_start + n + 1)?;
-    let rest = &text[open_line_end..];
-    let close_rel = rest.find(CLOSE_MARKER)?;
-    let close_start = open_line_end + close_rel;
-    let close_end = close_start + CLOSE_MARKER.len();
-    Some((open_start, close_end))
-}
-
-fn append_todo_task(todo_path: &Path, msg: &Message) -> Result<String> {
-    let mut content = String::new();
-    content.push('\n');
-    let mut lines = msg.body.lines();
-    if let Some(first) = lines.next() {
-        content.push_str(&format!("- [ ] {first}\n"));
-    } else {
-        content.push_str("- [ ] \n");
-    }
-    for cont in lines {
-        content.push_str(&format!("      {cont}\n"));
-    }
-    append_text(todo_path, &content)?;
-    Ok(content)
-}
-
 /// If `line` is a `- [ ]` / `- [x]` task, return `(checked, body_text)`.
 fn parse_task_line(line: &str) -> Option<(bool, &str)> {
     let after_bullet = line.trim_start().strip_prefix("- ")?;
@@ -679,9 +769,9 @@ fn flip_task_line(line: &str) -> Option<String> {
 }
 
 fn append_markdown_section(path: &Path, msg: &Message) -> Result<String> {
-    let ts = msg.created_at.format("%Y-%m-%d %H:%M");
+    let date = msg.created_at.format("%Y-%m-%d");
     let mut content = String::new();
-    content.push_str(&format!("\n## {ts}\n\n"));
+    content.push_str(&format!("\n## {date}\n\n"));
     content.push_str(&msg.body);
     if !msg.body.ends_with('\n') {
         content.push('\n');
@@ -718,16 +808,7 @@ fn append_text(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use tempfile::tempdir;
-
-    fn msg(id: &str, body: &str) -> Message {
-        Message {
-            id: id.to_string(),
-            created_at: Local.with_ymd_and_hms(2026, 6, 18, 17, 20, 0).unwrap(),
-            body: body.to_string(),
-        }
-    }
 
     fn fresh() -> (tempfile::TempDir, Storage) {
         let dir = tempdir().unwrap();
@@ -755,61 +836,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_messages() {
+    fn multiple_sends_append_to_one_daily_card() {
         let (_dir, st) = fresh();
         st.append_chat_message("first").unwrap();
         st.append_chat_message("second").unwrap();
         st.append_chat_message("third").unwrap();
         let msgs = st.load_messages().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].body, "first");
-        assert_eq!(msgs[2].body, "third");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "first\n\nsecond\n\nthird");
     }
 
     #[test]
-    fn remove_by_id_preserves_others() {
+    fn daily_cards_are_sorted_and_removed_by_date() {
         let (_dir, st) = fresh();
-        let a = st.append_chat_message("keep").unwrap();
-        st.append_chat_message("drop").unwrap();
-        assert!(st.remove_message_by_id(&a.id).unwrap());
+        st.append_daily("2026-07-26", "keep").unwrap();
+        st.append_daily("2026-07-27", "drop").unwrap();
+        assert!(st.remove_message_by_id("2026-07-27").unwrap());
         let msgs = st.load_messages().unwrap();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].body, "drop");
+        assert_eq!(msgs[0].id, "2026-07-26");
     }
 
     #[test]
-    fn move_to_todo_writes_checkbox() {
+    fn archive_moves_the_complete_daily_file_and_can_restore_it() {
         let (_dir, st) = fresh();
-        let m = st.append_chat_message("buy milk\nsecond line").unwrap();
-        st.move_to_todo(&m).unwrap();
-        let todo = fs::read_to_string(&st.todo_path).unwrap();
-        assert!(todo.contains("- [ ] buy milk"));
-        assert!(todo.contains("      second line"));
-        assert!(st.load_messages().unwrap().is_empty());
+        st.append_daily("2026-07-27", "first\n\n- [ ] task")
+            .unwrap();
+        let source = st.daily_dir.join("2026-07-27.md");
+        let original = fs::read_to_string(&source).unwrap();
+
+        let archived = st.archive_daily("2026-07-27").unwrap();
+        assert!(!source.exists());
+        assert_eq!(archived, st.archives_dir.join("2026-07-27.md"));
+        assert_eq!(fs::read_to_string(&archived).unwrap(), original);
+
+        st.restore_archived_daily("2026-07-27").unwrap();
+        assert_eq!(fs::read_to_string(source).unwrap(), original);
+        assert!(!archived.exists());
     }
 
     #[test]
     fn load_and_toggle_todo_tasks() {
         let (_dir, st) = fresh();
-        st.append_chat_message("first").unwrap();
-        st.append_chat_message("second").unwrap();
-        // move_to_todo consumes the message; append fresh ones for each task.
-        let m1 = st.append_chat_message("buy milk").unwrap();
-        let m2 = st.append_chat_message("write docs").unwrap();
-        st.move_to_todo(&m1).unwrap();
-        st.move_to_todo(&m2).unwrap();
+        st.append_daily("2026-07-26", "- [ ] older task").unwrap();
+        st.append_daily("2026-07-27", "- [ ] buy milk\n- [x] write docs")
+            .unwrap();
 
         let items = st.load_todo_tasks();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert!(!items[0].checked);
         assert_eq!(items[0].text, "buy milk");
-        assert_eq!(items[1].text, "write docs");
+        assert!(items[1].checked);
+        assert_eq!(items[2].text, "older task");
 
         // Toggle the first task on, then back off.
         assert!(st.toggle_todo_task(0).unwrap());
         let on = st.load_todo_tasks();
         assert!(on[0].checked);
-        assert!(!on[1].checked, "other tasks untouched");
+        assert!(on[1].checked, "other tasks untouched");
 
         assert!(st.toggle_todo_task(0).unwrap());
         let off = st.load_todo_tasks();
@@ -834,23 +918,16 @@ mod tests {
         assert!(!hi.is_empty());
         // Empty query returns nothing.
         assert!(st.search_file_lines("").is_empty());
-        // Skips CHAT.md (no markers leak into results).
-        assert!(hits.iter().all(|h| !matches!(h,
-            SearchHit::FileLine { path, .. } if path.file_name().unwrap() == "CHAT.md")));
     }
 
     #[test]
     fn move_to_markdown_writes_section() {
         let (_dir, st) = fresh();
-        // First seed the chat so we can verify removal afterwards.
-        let _seed = st.append_chat_message("idea!").unwrap();
-        let m = msg("fixed-id", "idea!");
-        // Drop a block with the fixed id into the chat file manually.
-        fs::write(&st.chat_path, render_block(&m)).unwrap();
+        let m = st.append_daily("2026-06-18", "idea!").unwrap();
         let target = st.create_named_file("工作记录").unwrap();
         st.move_to_markdown(&target, &m).unwrap();
         let body = fs::read_to_string(&target).unwrap();
-        assert!(body.contains("## 2026-06-18 17:20"));
+        assert!(body.contains("## 2026-06-18"));
         assert!(body.contains("idea!"));
         assert!(st.load_messages().unwrap().is_empty());
     }
@@ -931,7 +1008,7 @@ mod tests {
     fn replace_message_updates_body_preserving_id() {
         let (_dir, st) = fresh();
         let m = st.append_chat_message("original").unwrap();
-        let _other = st.append_chat_message("keep me").unwrap();
+        st.append_daily("2026-06-17", "keep me").unwrap();
 
         let mut updated = m.clone();
         updated.body = "edited body".to_string();
@@ -946,7 +1023,7 @@ mod tests {
 
         // Unknown id is a no-op.
         let unknown = Message {
-            id: "nope".to_string(),
+            id: "2026-01-01".to_string(),
             created_at: m.created_at,
             body: "x".to_string(),
         };
@@ -982,46 +1059,11 @@ mod tests {
     }
 
     #[test]
-    fn create_and_rename_reject_protected_names_case_insensitively() {
+    fn data_notes_no_longer_reserve_legacy_file_names() {
         let (_dir, st) = fresh();
-        for name in [
-            "chat",
-            "Chat.MB",
-            "todo.Md",
-            "TODO.mb",
-            "archive",
-            "Archive.MD",
-        ] {
-            assert!(
-                st.create_named_file(name).is_err(),
-                "protected name was created: {name}"
-            );
+        for name in ["chat", "todo.Md", "Archive.MD"] {
+            assert!(st.create_named_file(name).unwrap().is_file());
         }
-
-        let source = st.create_named_file("source").unwrap();
-        for name in ["chat.md", "TODO.MB", "archive.MD"] {
-            assert!(
-                st.rename_file(&source, name).is_err(),
-                "protected rename target was accepted: {name}"
-            );
-            assert!(source.exists());
-        }
-    }
-
-    #[test]
-    fn rename_and_delete_reject_protected_source_files() {
-        let (_dir, st) = fresh();
-        for path in [&st.chat_path, &st.todo_path, &st.archive_path] {
-            assert!(st.rename_file(path, "ordinary.md").is_err());
-            assert!(st.delete_file(path).is_err());
-            assert!(path.exists());
-        }
-
-        let mixed_case = st.root.join("tOdO.mB");
-        fs::write(&mixed_case, "protected").unwrap();
-        assert!(st.rename_file(&mixed_case, "ordinary.md").is_err());
-        assert!(st.delete_file(&mixed_case).is_err());
-        assert!(mixed_case.exists());
     }
 
     #[test]
@@ -1045,6 +1087,20 @@ mod tests {
             fs::canonicalize(&path).unwrap()
         );
         assert_eq!(st.read_note_file(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn append_note_adds_to_an_existing_managed_article_only() {
+        let (_dir, st) = fresh();
+        let path = st.create_named_file("Article").unwrap();
+        fs::write(&path, "# Article\n").unwrap();
+        st.append_note(&path, "new paragraph").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Article\n\nnew paragraph\n"
+        );
+        assert!(st.append_note(Path::new("/tmp/outside.md"), "no").is_err());
+        assert!(st.append_note(&path, "   ").is_err());
     }
 
     #[test]
@@ -1127,11 +1183,11 @@ mod tests {
         let (_dir, st) = fresh();
         assert!(st.config_dir.is_dir());
         assert!(st.data_dir.is_dir());
-        assert_eq!(st.chat_path.parent(), Some(st.root.as_path()));
-        assert_eq!(st.todo_path.parent(), Some(st.root.as_path()));
-        assert!(st.archive_path.exists());
-        assert_eq!(st.archive_path.parent(), Some(st.root.as_path()));
-        assert_eq!(st.archive_path.file_name().unwrap(), "ARCHIVE.md");
+        assert!(st.daily_dir.is_dir());
+        assert!(st.archives_dir.is_dir());
+        assert!(fs::read_dir(&st.daily_dir).unwrap().next().is_none());
+        assert!(st.append_daily("2026-07-27", "   ").is_err());
+        assert!(!st.daily_dir.join("2026-07-27.md").exists());
         assert!(st.ai_config_path.exists());
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
         assert!(fs::read_to_string(&st.ai_config_path)
@@ -1172,16 +1228,29 @@ mod tests {
     }
 
     #[test]
-    fn surgical_edit_preserves_unmanaged_text() {
-        // Even if a user hand-edits content around blocks, removals must not
-        // eat unrelated lines.
-        let (_dir, st) = fresh();
-        let text = "free text at top\n<!-- nole-msg id=\"abc\" created_at=\"2026-06-18T17:20:00+08:00\" -->\nbody\n<!-- /nole-msg -->\ntrailing\n";
-        fs::write(&st.chat_path, text).unwrap();
-        assert!(st.remove_message_by_id("abc").unwrap());
-        let after = fs::read_to_string(&st.chat_path).unwrap();
-        assert!(after.contains("free text at top"));
-        assert!(after.contains("trailing"));
-        assert!(!after.contains("nole-msg"));
+    fn ensure_files_migrates_legacy_chat_and_keeps_a_backup() {
+        let root = tempdir().unwrap();
+        let st = Storage::new(root.path()).unwrap();
+        fs::create_dir_all(&st.root).unwrap();
+        let text = "<!-- nole-msg id=\"abc\" created_at=\"2026-06-18T17:20:00+08:00\" -->\nbody\n<!-- /nole-msg -->\n";
+        fs::write(st.root.join("CHAT.md"), text).unwrap();
+        st.ensure_files().unwrap();
+
+        let daily = st.read_daily_by_date("2026-06-18").unwrap();
+        assert_eq!(daily.body, "body");
+        assert!(!st.root.join("CHAT.md").exists());
+        assert!(st.config_dir.join("legacy/CHAT.md").is_file());
+    }
+
+    #[test]
+    fn todo_only_legacy_workspace_does_not_create_a_daily_file() {
+        let root = tempdir().unwrap();
+        let st = Storage::new(root.path()).unwrap();
+        fs::create_dir_all(&st.root).unwrap();
+        fs::write(st.root.join("TODO.md"), "# TODO\n\n- [ ] old task\n").unwrap();
+        st.ensure_files().unwrap();
+
+        assert!(fs::read_dir(&st.daily_dir).unwrap().next().is_none());
+        assert!(st.config_dir.join("legacy/TODO.md").is_file());
     }
 }
