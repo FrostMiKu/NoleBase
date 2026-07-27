@@ -5,14 +5,15 @@
 use std::sync::OnceLock;
 
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
-use mbtui::{Renderer, Theme};
+use mbtui::{CornerStyle, Renderer, Theme};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use unicode_width::UnicodeWidthChar;
 
 use crate::model::LinkTarget;
+use crate::theme::catppuccin as ctp;
 
-const LINK_UNDERLINE_COLOR: Color = Color::LightBlue;
+const LINK_UNDERLINE_COLOR: Color = ctp::BLUE;
 
 pub struct RenderedMarkup {
     pub lines: Vec<Line<'static>>,
@@ -242,24 +243,16 @@ fn link_segments(cells: &[RenderedCell], target: &LinkTarget) -> Vec<RenderedLin
 fn note_theme() -> &'static Theme {
     static THEME: OnceLock<Theme> = OnceLock::new();
     THEME.get_or_init(|| {
-        let mut theme = Theme::default();
-        theme.quote = Style::default().fg(Color::Magenta);
-        theme.list = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        theme.rule = Style::default().fg(Color::DarkGray);
-        theme.code = Style::default().fg(Color::Cyan);
+        let mut theme = Theme::default().with_corner_style(CornerStyle::Rounded);
         theme.link = Style::default()
+            .fg(ctp::BLUE)
             .underline_color(LINK_UNDERLINE_COLOR)
             .add_modifier(Modifier::UNDERLINED);
-        theme.hashtag = Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD);
         theme.wikilink = Style::default()
-            .fg(Color::LightCyan)
+            .fg(ctp::SKY)
             .underline_color(LINK_UNDERLINE_COLOR)
             .add_modifier(Modifier::UNDERLINED);
-        theme.insert("markdown-box", Style::default().fg(Color::DarkGray));
+        theme.insert("markdown-box", Style::default().fg(ctp::OVERLAY_0));
         theme
     })
 }
@@ -402,12 +395,9 @@ mod tests {
     #[test]
     fn renders_mbdown_hashtags_and_wikilinks() {
         let lines = to_lines_at_width("See #开发/日志 and [[项目计划]]", WIDTH);
-        assert_eq!(
-            span_with(&lines, "#开发/日志").style.fg,
-            Some(Color::LightMagenta)
-        );
+        assert_eq!(span_with(&lines, "#开发/日志").style.fg, Some(ctp::PINK));
         let wikilink = span_with(&lines, "[[项目计划]]");
-        assert_eq!(wikilink.style.fg, Some(Color::LightCyan));
+        assert_eq!(wikilink.style.fg, Some(ctp::SKY));
         assert!(wikilink.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
@@ -455,9 +445,10 @@ mod tests {
             40,
         );
         let boxed = text(&box_lines);
-        assert!(boxed.contains("┌─ Info"));
+        assert!(boxed.contains("╭─ Info"));
         assert!(boxed.contains("Hello"));
         assert!(boxed.lines().any(|line| line.starts_with('│')));
+        assert!(boxed.lines().any(|line| line.starts_with('╰')));
         assert!(box_lines
             .iter()
             .flat_map(|line| &line.spans)

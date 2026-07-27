@@ -13,9 +13,10 @@ use crate::app::{
     Overlay,
 };
 use crate::model::{
-    Action, ButtonHitbox, FileHitbox, LinkHitbox, SearchHit, SearchHitbox, TodoHitbox,
-    WikiLinkHitbox,
+    Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
+    SearchHit, SearchHitbox, TodoHitbox, WikiLinkHitbox,
 };
+use crate::theme::catppuccin as ctp;
 
 const DATE_FMT: &str = "%Y-%m-%d";
 const WIDE_BREAKPOINT: u16 = 170;
@@ -69,6 +70,7 @@ fn clear_hitboxes(app: &mut App) {
     app.wiki_link_hitboxes.clear();
     app.dialog_hitboxes.clear();
     app.file_hitboxes.clear();
+    app.file_group_hitboxes.clear();
     app.todo_hitboxes.clear();
     app.search_hitboxes.clear();
 }
@@ -130,6 +132,7 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
         .title(" Agent ")
+        .style(Style::default().bg(ctp::MANTLE))
         .border_style(focus_border(app.focus == Focus::Agent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -148,7 +151,7 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(Span::styled(
             "Prompt",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ctp::SAPPHIRE)
                 .add_modifier(Modifier::BOLD),
         )));
         let row = lines.len();
@@ -169,9 +172,7 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "Activity"
             },
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD),
         )));
         if app.agent_output_final {
             let row = lines.len();
@@ -258,16 +259,17 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
 
     let focused = app.focus == Focus::Files;
     let title = match app.files_context {
-        FilesContext::Browse => " Files ",
-        FilesContext::Search => " Files · search ",
-        FilesContext::MoveTarget => " Files · move to ",
-        FilesContext::NewTarget => " Files · new ",
-        FilesContext::Rename => " Files · rename ",
+        FilesContext::Browse => " NoleBase ",
+        FilesContext::Search => " NoleBase · search ",
+        FilesContext::MoveTarget => " NoleBase · move to ",
+        FilesContext::NewTarget => " NoleBase · new ",
+        FilesContext::Rename => " NoleBase · rename ",
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
         .title(title)
+        .style(Style::default().bg(ctp::MANTLE))
         .border_style(focus_border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -277,9 +279,9 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             Some(Rect::new(inner.x, inner.y, inner.width, 1)),
             Rect::new(
                 inner.x,
-                inner.y.saturating_add(1),
+                inner.y.saturating_add(2),
                 inner.width,
-                inner.height.saturating_sub(1),
+                inner.height.saturating_sub(2),
             ),
         ),
         _ => (None, inner),
@@ -298,18 +300,25 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             value.chars().count(),
             focused && interactive,
         );
+        if inner.height > 1 {
+            frame.render_widget(
+                Paragraph::new("─".repeat(usize::from(inner.width)))
+                    .style(Style::default().fg(ctp::OVERLAY_0)),
+                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            );
+        }
     }
 
     if list_area.width == 0 || list_area.height == 0 {
         return;
     }
 
-    let visible_indices = app.visible_file_indices();
-    if visible_indices.is_empty() {
+    let rows = app.visible_file_rows();
+    if rows.is_empty() {
         let message = if app.files_context == FilesContext::Search && !app.file_query.is_empty() {
-            "No matching files"
+            "No matching notes"
         } else {
-            "No files yet"
+            "No notes yet"
         };
         frame.render_widget(
             Paragraph::new(message).alignment(Alignment::Center),
@@ -318,75 +327,156 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         return;
     }
 
-    // File order comes from App/Storage and is recent-first. Each two-line row
-    // reads like a compact conversation: name first, timestamp beneath it.
-    let slots = usize::from(list_area.height.div_ceil(2));
-    let selected_position = visible_indices
-        .iter()
-        .position(|index| *index == app.file_index)
-        .unwrap_or(0);
-    let start = selected_position
-        .saturating_sub(slots.saturating_sub(1))
-        .min(visible_indices.len().saturating_sub(slots));
+    let notes_count = app.note_files.iter().filter(|file| !file.archived).count();
+    let archives_count = app.note_files.iter().filter(|file| file.archived).count();
+    let searching = app.files_context == FilesContext::Search && !app.file_query.is_empty();
+    let row_height = |row: &FileListRow| match row {
+        FileListRow::Group(group) => {
+            let has_visible_children = match group {
+                FileGroup::Notes => (app.notes_expanded || searching) && notes_count > 0,
+                FileGroup::Archives => (app.archives_expanded || searching) && archives_count > 0,
+            };
+            if has_visible_children {
+                2
+            } else {
+                1
+            }
+        }
+        FileListRow::File(_) => 3u16,
+    };
+    let selected_row = app.file_row.min(rows.len().saturating_sub(1));
+    let mut start = selected_row;
+    let mut used = row_height(&rows[selected_row]);
+    while start > 0 {
+        let previous = row_height(&rows[start - 1]);
+        if used.saturating_add(previous) > list_area.height {
+            break;
+        }
+        start -= 1;
+        used = used.saturating_add(previous);
+    }
 
-    for (slot, absolute_index) in visible_indices
-        .iter()
-        .copied()
-        .skip(start)
-        .take(slots)
-        .enumerate()
-    {
-        let Some(file) = app.note_files.get(absolute_index) else {
-            continue;
-        };
-        let y = list_area.y.saturating_add((slot as u16).saturating_mul(2));
+    let mut y = list_area.y;
+    for (row_index, row) in rows.iter().copied().enumerate().skip(start) {
         if y >= list_area.y.saturating_add(list_area.height) {
             break;
         }
-        let row_height = 2.min(list_area.y + list_area.height - y);
-        let selected = absolute_index == app.file_index;
+        let layout_height = row_height(&row).min(list_area.y + list_area.height - y);
+        let selected = row_index == selected_row;
         let row_style = if selected {
             Style::default()
                 .bg(if focused {
-                    Color::DarkGray
+                    ctp::SURFACE_1
                 } else {
-                    Color::Indexed(235)
+                    ctp::SURFACE_0
                 })
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let name = file
-            .path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("?");
-        frame.render_widget(
-            Paragraph::new(Line::from(format!(" {name}"))).style(row_style),
-            Rect::new(list_area.x, y, list_area.width, 1),
-        );
-        if row_height > 1 {
-            let modified: DateTime<Local> = file.modified.into();
-            let modified_style = Style::default().fg(if selected {
-                Color::Gray
-            } else {
-                Color::DarkGray
-            });
+        if selected && matches!(row, FileListRow::File(_)) {
+            let selection_y = y.saturating_sub(1).max(list_area.y);
+            let selection_end = y
+                .saturating_add(3)
+                .min(list_area.y.saturating_add(list_area.height));
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {}", modified.format("%m-%d %H:%M")),
-                    modified_style,
-                )))
-                .style(row_style),
-                Rect::new(list_area.x, y + 1, list_area.width, 1),
+                Block::default().style(row_style),
+                Rect::new(
+                    list_area.x,
+                    selection_y,
+                    list_area.width,
+                    selection_end.saturating_sub(selection_y),
+                ),
             );
         }
-        if interactive {
-            app.file_hitboxes.push(FileHitbox {
-                path: file.path.clone(),
-                area: Rect::new(list_area.x, y, list_area.width, row_height),
-            });
+        match row {
+            FileListRow::Group(group) => {
+                let (label, expanded, count) = match group {
+                    FileGroup::Notes => ("Notes", app.notes_expanded || searching, notes_count),
+                    FileGroup::Archives => (
+                        "Archives",
+                        app.archives_expanded || searching,
+                        archives_count,
+                    ),
+                };
+                let marker = if expanded { "▼" } else { "▶" };
+                let group_area = Rect::new(list_area.x, y, list_area.width, 1);
+                frame.render_widget(Paragraph::new("").style(row_style), group_area);
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(ctp::TEAL)),
+                        Span::raw(format!(" {label}")),
+                    ]))
+                    .style(row_style),
+                    group_area,
+                );
+                let count = count.to_string();
+                let count_width = (count.width() as u16).min(group_area.width);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(count, Style::default().fg(ctp::OVERLAY_0)))
+                        .alignment(Alignment::Right),
+                    Rect::new(
+                        group_area.x + group_area.width.saturating_sub(count_width),
+                        group_area.y,
+                        count_width,
+                        1,
+                    ),
+                );
+                if interactive {
+                    app.file_group_hitboxes.push(FileGroupHitbox {
+                        group,
+                        area: Rect::new(list_area.x, y, list_area.width, 1),
+                    });
+                }
+            }
+            FileListRow::File(absolute_index) => {
+                let Some(file) = app.note_files.get(absolute_index) else {
+                    continue;
+                };
+                let name = file
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?");
+                let base_style = if file.archived && !selected {
+                    row_style.fg(ctp::OVERLAY_0).add_modifier(Modifier::DIM)
+                } else {
+                    row_style
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(format!("  {name}"))).style(base_style),
+                    Rect::new(list_area.x, y, list_area.width, 1),
+                );
+                let content_height = 2.min(layout_height);
+                if content_height > 1 {
+                    let modified: DateTime<Local> = file.modified.into();
+                    let prefix = if file.archived {
+                        "  Archived · "
+                    } else {
+                        "  "
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            format!("{prefix}{}", modified.format("%y/%m/%d %H:%M")),
+                            Style::default().fg(if selected {
+                                ctp::SUBTEXT_1
+                            } else {
+                                ctp::OVERLAY_0
+                            }),
+                        )))
+                        .style(row_style),
+                        Rect::new(list_area.x, y + 1, list_area.width, 1),
+                    );
+                }
+                if interactive {
+                    app.file_hitboxes.push(FileHitbox {
+                        path: file.path.clone(),
+                        area: Rect::new(list_area.x, y, list_area.width, content_height),
+                    });
+                }
+            }
         }
+        y = y.saturating_add(layout_height);
     }
 }
 
@@ -400,6 +490,7 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
         .title(format!(" Todo {done}/{} ", app.todo_items.len()))
+        .style(Style::default().bg(ctp::MANTLE))
         .border_style(focus_border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -446,11 +537,9 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         };
         let checked = if item.checked { "[x]" } else { "[ ]" };
         let marker_style = if item.checked {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ctp::TEAL)
         };
         let mut text_style = if item.checked {
             Style::default().add_modifier(Modifier::CROSSED_OUT)
@@ -458,7 +547,7 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             Style::default()
         };
         if focused && index == selected {
-            text_style = text_style.bg(Color::DarkGray);
+            text_style = text_style.bg(ctp::SURFACE_1);
         }
         let wrapped = wrap_spans_to_width(
             &[Span::styled(item.text.replace('\n', " "), text_style)],
@@ -494,21 +583,17 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
 }
 
 fn focus_border(focused: bool) -> Style {
-    Style::default().fg(if focused {
-        Color::Green
-    } else {
-        Color::DarkGray
-    })
+    Style::default().fg(if focused { ctp::GREEN } else { ctp::OVERLAY_0 })
 }
 
 fn animated_color(position: usize, tick: u64) -> Color {
     const STOPS: [(u8, u8, u8); 6] = [
-        (50, 220, 255),
-        (70, 120, 255),
-        (210, 80, 255),
-        (255, 80, 150),
-        (255, 210, 70),
-        (80, 240, 160),
+        (137, 220, 235),
+        (137, 180, 250),
+        (203, 166, 247),
+        (245, 194, 231),
+        (249, 226, 175),
+        (166, 227, 161),
     ];
     const STEPS: usize = 24;
     let phase = (position + tick as usize * 3) % (STOPS.len() * STEPS);
@@ -555,7 +640,7 @@ fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'sta
                         .fg(animated_color(index * 8, tick))
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(ctp::OVERLAY_0)
                 };
                 Span::styled(character.to_string(), style)
             })
@@ -572,7 +657,7 @@ fn activity_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         activity_marker(),
         Span::styled(
             text.replace(['\n', '\r'], " "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(ctp::OVERLAY_0),
         ),
     ];
     wrap_spans_to_width(&spans, width)
@@ -584,9 +669,7 @@ fn activity_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 fn activity_marker() -> Span<'static> {
     Span::styled(
         " • ",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(ctp::TEAL).add_modifier(Modifier::BOLD),
     )
 }
 
@@ -644,7 +727,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, surface: Rect, content: Rect, int
         Paragraph::new(Span::styled(
             "Daily",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ctp::LAVENDER)
                 .add_modifier(Modifier::BOLD),
         )),
         Rect::new(content.x, content.y, content.width, 1),
@@ -711,9 +794,9 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         card_first.push(lines.len());
         let selected = index == app.selected;
         let card_style = Style::default().bg(if selected {
-            Color::Indexed(238)
+            ctp::SURFACE_1
         } else {
-            Color::Indexed(235)
+            ctp::MANTLE
         });
         let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
         lines.push(line_with_background(Vec::new(), width, card_style));
@@ -727,7 +810,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
                 Span::styled(
                     date,
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(ctp::OVERLAY_1)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ),
             ],
@@ -878,16 +961,16 @@ fn render_button_line(selected: bool) -> Line<'static> {
         }
         let style = if *action == Action::Ai {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightMagenta)
+                .fg(ctp::CRUST)
+                .bg(ctp::PINK)
                 .add_modifier(Modifier::BOLD)
         } else if selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ctp::CRUST)
+                .bg(ctp::TEAL)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ctp::TEAL)
         };
         spans.push(Span::styled(format!("[{}]", action.label()), style));
     }
@@ -989,7 +1072,7 @@ fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
         } else {
             ""
         };
-        draw_left_right_line(frame, toolbar, &count, hint, Color::DarkGray);
+        draw_left_right_line(frame, toolbar, &count, hint, ctp::OVERLAY_0);
     }
 }
 
@@ -1018,7 +1101,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         content.width,
         document_bottom.saturating_sub(content.y.saturating_add(2)),
     );
-    let page_style = Style::default().bg(Color::Indexed(235));
+    let page_style = Style::default().bg(ctp::MANTLE);
     frame.render_widget(Block::default().style(page_style), page_area);
     let horizontal_padding = (PAGE_PADDING_X as u16).min(page_area.width.saturating_sub(1) / 2);
     let vertical_padding = 2.min(page_area.height / 2);
@@ -1039,10 +1122,10 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
                 Span::styled(
                     document.title.clone(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(ctp::LAVENDER)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  Esc back", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Esc back", Style::default().fg(ctp::OVERLAY_0)),
             ])),
             header,
         );
@@ -1108,8 +1191,8 @@ fn draw_notification(frame: &mut Frame, root: Rect, message: &str) {
                     .borders(Borders::ALL)
                     .padding(Padding::horizontal(1))
                     .title(" Notification ")
-                    .style(Style::default().bg(Color::Indexed(235)))
-                    .border_style(Style::default().fg(Color::LightYellow)),
+                    .style(Style::default().bg(ctp::MANTLE))
+                    .border_style(Style::default().fg(ctp::YELLOW)),
             ),
         area,
     );
@@ -1136,7 +1219,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
         input_width,
         input_height,
     );
-    let input_style = Style::default().bg(Color::Indexed(235));
+    let input_style = Style::default().bg(ctp::MANTLE);
     if input_height >= 3 {
         frame.render_widget(Clear, input_box);
         let block = Block::default()
@@ -1209,7 +1292,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
     {
         let spans = match hit {
             SearchHit::Message { text, .. } => vec![
-                Span::styled("• ", Style::default().fg(Color::Cyan)),
+                Span::styled("• ", Style::default().fg(ctp::TEAL)),
                 Span::raw(text.clone()),
             ],
             SearchHit::FileLine {
@@ -1224,7 +1307,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
                 vec![
                     Span::styled(
                         format!("{name}:{line_no} "),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(ctp::OVERLAY_0),
                     ),
                     Span::raw(text.clone()),
                 ]
@@ -1232,13 +1315,13 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
             SearchHit::DocumentLine { line_no, text } => vec![
                 Span::styled(
                     format!("line {line_no} "),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(ctp::OVERLAY_0),
                 ),
                 Span::raw(text.clone()),
             ],
         };
         let style = if index == selected {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(ctp::SURFACE_1)
         } else {
             Style::default()
         };
@@ -1266,7 +1349,7 @@ fn draw_single_line_input(
     }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(prompt.to_string(), Style::default().fg(Color::Green)),
+            Span::styled(prompt.to_string(), Style::default().fg(ctp::GREEN)),
             Span::raw(value.to_string()),
         ])),
         area,
@@ -1295,7 +1378,7 @@ fn draw_multiline_input(
         wrap_spans_to_width(
             &[Span::styled(
                 placeholder.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(ctp::OVERLAY_0),
             )],
             width,
         )
@@ -1381,7 +1464,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         _ => "DAILY",
     };
     let mode = format!(" {surface} · {} ", app.permission_mode.label());
-    let mode_style = Style::default().bg(Color::Blue).fg(Color::Black);
+    let mode_style = Style::default().bg(ctp::BLUE).fg(ctp::CRUST);
     frame.render_widget(Paragraph::new(Span::styled(mode.clone(), mode_style)), area);
 
     let hint = footer_hint(app, area.width);
@@ -1394,7 +1477,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if !app.status.is_empty() && available_status > 2 {
         let status = Line::from(Span::styled(
             format!(" {}", app.status),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(ctp::YELLOW),
         ));
         frame.render_widget(
             Paragraph::new(status),
@@ -1404,7 +1487,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if !hint.is_empty() {
         let width = (hint.width() as u16).min(area.width);
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+            Paragraph::new(Span::styled(hint, Style::default().fg(ctp::OVERLAY_0)))
                 .alignment(Alignment::Right),
             Rect::new(area.x + area.width - width, area.y, width, area.height),
         );
@@ -1431,7 +1514,7 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
         (Focus::Compose, CenterView::Document) => {
             "Enter append · Ctrl+Enter Agent · Ctrl+J newline"
         }
-        (Focus::Files, _) => "↑↓ select · Enter open · e edit · / filter · Esc back",
+        (Focus::Files, _) => "↑↓ select · Enter open · a/u archive/restore · e edit · / filter",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
         (Focus::Agent, _) if app.ai_running => "c cancel · ↑↓ scroll · ← center",
         (Focus::Agent, _) => "Enter add to Daily · ↑↓ scroll · ← center",
@@ -1490,7 +1573,7 @@ fn draw_file_input_modal(frame: &mut Frame, app: &App, root: Rect) -> Rect {
         _ => return Rect::new(area.x, area.y, 0, 0),
     };
     frame.render_widget(Clear, area);
-    let modal_style = Style::default().bg(Color::Indexed(235));
+    let modal_style = Style::default().bg(ctp::MANTLE);
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::uniform(1))
@@ -1566,20 +1649,18 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     }
     frame.render_widget(Clear, area);
     let border = match dialog.mode {
-        DialogMode::Approval => Color::LightYellow,
-        DialogMode::FreeText => Color::LightMagenta,
-        DialogMode::SelectOrInput | DialogMode::SingleSelect | DialogMode::MultiSelect => {
-            Color::LightCyan
-        }
-        _ => Color::Gray,
+        DialogMode::Approval => ctp::YELLOW,
+        DialogMode::FreeText => ctp::MAUVE,
+        DialogMode::SelectOrInput | DialogMode::SingleSelect | DialogMode::MultiSelect => ctp::SKY,
+        _ => ctp::SUBTEXT_0,
     };
     let modal_background = if matches!(
         dialog.purpose,
         DialogPurpose::NewFile | DialogPurpose::RenameFile
     ) {
-        Color::Indexed(235)
+        ctp::MANTLE
     } else {
-        Color::Indexed(234)
+        ctp::CRUST
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1705,7 +1786,7 @@ fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(ctp::OVERLAY_0)),
         footer,
     );
 }
@@ -1782,9 +1863,9 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
         let row = index - list_start;
         let selected = dialog.selected == index;
         let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default().fg(ctp::CRUST).bg(ctp::TEAL)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(ctp::SUBTEXT_0)
         };
         let marker = if dialog.mode == DialogMode::MultiSelect {
             if dialog.checked.get(index).copied().unwrap_or(false) {
@@ -1804,7 +1885,7 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
                 if selected {
                     style.add_modifier(Modifier::DIM)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(ctp::OVERLAY_0)
                 },
             ));
         }
@@ -1845,9 +1926,9 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
                 Paragraph::new(Line::from(Span::styled(
                     "> Other answer",
                     if custom_selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                        Style::default().fg(ctp::CRUST).bg(ctp::TEAL)
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(ctp::SUBTEXT_0)
                     },
                 ))),
                 row_area,
@@ -1877,8 +1958,8 @@ fn draw_ai_prompt(frame: &mut Frame, app: &App, root: Rect) -> Rect {
         .borders(Borders::ALL)
         .padding(Padding::uniform(1))
         .title(" Agent prompt · Enter run · Esc cancel ")
-        .style(Style::default().bg(Color::Indexed(235)))
-        .border_style(Style::default().fg(Color::LightMagenta));
+        .style(Style::default().bg(ctp::MANTLE))
+        .border_style(Style::default().fg(ctp::MAUVE));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     draw_multiline_input(
@@ -1912,8 +1993,8 @@ fn draw_approval(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .title(title)
-        .style(Style::default().bg(Color::Indexed(234)))
-        .border_style(Style::default().fg(Color::LightYellow));
+        .style(Style::default().bg(ctp::CRUST))
+        .border_style(Style::default().fg(ctp::YELLOW));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -1946,7 +2027,7 @@ fn draw_approval(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     frame.render_widget(
         Paragraph::new("Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab bypass")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(ctp::OVERLAY_0)),
         footer,
     );
     area
@@ -1986,8 +2067,8 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .title(" Agent question ")
-        .style(Style::default().bg(Color::Indexed(234)))
-        .border_style(Style::default().fg(Color::LightCyan));
+        .style(Style::default().bg(ctp::CRUST))
+        .border_style(Style::default().fg(ctp::SKY));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(request) = &app.ask_user_request else {
@@ -2045,9 +2126,9 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     {
         let selected = app.ask_user_option == row;
         let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default().fg(ctp::CRUST).bg(ctp::TEAL)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(ctp::SUBTEXT_0)
         };
         frame.render_widget(
             Paragraph::new(format!("{} {label}", if selected { ">" } else { " " })).style(style),
@@ -2075,7 +2156,7 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     frame.render_widget(
         Paragraph::new("↑↓ choose · Enter submit · type for custom answer · Esc cancel")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(ctp::OVERLAY_0)),
         footer,
     );
     area
@@ -2097,8 +2178,8 @@ fn draw_wiki_link_choice(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .title(format!(" Choose wikilink · [[{target}]] "))
-        .style(Style::default().bg(Color::Indexed(234)))
-        .border_style(Style::default().fg(Color::LightCyan));
+        .style(Style::default().bg(ctp::CRUST))
+        .border_style(Style::default().fg(ctp::SKY));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -2124,7 +2205,7 @@ fn draw_wiki_link_choice(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
             1,
         );
         let row_style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default().fg(ctp::CRUST).bg(ctp::TEAL)
         } else {
             Style::default()
         };
@@ -2152,7 +2233,7 @@ fn draw_wiki_link_choice(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
             if selected {
                 row_style.add_modifier(Modifier::DIM)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(ctp::OVERLAY_0)
             },
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
@@ -2170,7 +2251,7 @@ fn draw_wiki_link_choice(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     frame.render_widget(
         Paragraph::new("↑↓ choose · Enter open · Esc cancel")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(ctp::OVERLAY_0)),
         footer,
     );
     area
@@ -2228,7 +2309,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(Span::styled(
             text.to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ctp::SAPPHIRE)
                 .add_modifier(Modifier::BOLD),
         ))
     };
@@ -2236,9 +2317,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled(
                 format!(" {keys:<16}"),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD),
             ),
             Span::raw(description.to_string()),
         ])
@@ -2497,15 +2576,13 @@ mod tests {
             .all(|color| matches!(color, Color::Rgb(..))));
         assert!(top_colors.windows(2).any(|colors| colors[0] != colors[1]));
         let first_footer = buffer_string(&first).lines().last().unwrap().to_string();
-        let first_footer_highlights = (0..170)
-            .filter(|x| matches!(first.backend().buffer()[(*x, 23)].fg, Color::Rgb(..)))
+        let first_footer_colors = (0..170)
+            .map(|x| first.backend().buffer()[(x, 23)].fg)
             .collect::<Vec<_>>();
-        assert!(first_footer_highlights.is_empty());
-        let first_activity_highlights = (agent.y + 1..agent.y + agent.height - 1)
+        let first_activity_colors = (agent.y + 1..agent.y + agent.height - 1)
             .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
-            .filter(|(x, y)| matches!(first.backend().buffer()[(*x, *y)].fg, Color::Rgb(..)))
-            .count();
-        assert_eq!(first_activity_highlights, 1);
+            .map(|(x, y)| first.backend().buffer()[(x, y)].fg)
+            .collect::<Vec<_>>();
         assert!(buffer_string(&first).contains("• Completed read_file"));
         assert!(buffer_string(&first).contains("• Using web_fetch"));
 
@@ -2513,12 +2590,17 @@ mod tests {
         let second = render(&mut app, 170, 24);
         let second_corner = second.backend().buffer()[(agent.x, agent.y)].fg;
         let second_footer = buffer_string(&second).lines().last().unwrap().to_string();
-        let second_footer_highlights = (0..170)
-            .filter(|x| matches!(second.backend().buffer()[(*x, 23)].fg, Color::Rgb(..)))
+        let second_footer_colors = (0..170)
+            .map(|x| second.backend().buffer()[(x, 23)].fg)
+            .collect::<Vec<_>>();
+        let second_activity_colors = (agent.y + 1..agent.y + agent.height - 1)
+            .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
+            .map(|(x, y)| second.backend().buffer()[(x, y)].fg)
             .collect::<Vec<_>>();
         assert_ne!(first_corner, second_corner);
         assert_eq!(first_footer, second_footer);
-        assert!(second_footer_highlights.is_empty());
+        assert_eq!(first_footer_colors, second_footer_colors);
+        assert_ne!(first_activity_colors, second_activity_colors);
     }
 
     #[test]
@@ -2531,14 +2613,15 @@ mod tests {
             lines[0]
                 .spans
                 .iter()
-                .filter(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
+                .skip(1)
+                .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
                 .count(),
             1
         );
         assert!(lines[0]
             .spans
             .iter()
-            .filter(|span| matches!(span.style.fg, Some(Color::Rgb(..))))
+            .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
             .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
     }
 
@@ -2565,7 +2648,7 @@ mod tests {
         assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 17)));
         assert!(app.layout.center.is_none());
         assert!(app.layout.todo.is_none());
-        assert_eq!(buffer_string(&terminal).matches("Files").count(), 1);
+        assert_eq!(buffer_string(&terminal).matches("NoleBase").count(), 1);
         assert!(!app.file_hitboxes.is_empty());
         assert!(app
             .file_hitboxes
@@ -2588,13 +2671,36 @@ mod tests {
     }
 
     #[test]
+    fn sidebars_use_mantle_background_with_square_ui_borders() {
+        let (mut app, _directory) = make_app();
+        let terminal = render(&mut app, 170, 24);
+        let buffer = terminal.backend().buffer();
+        let files = app.layout.files.expect("files panel");
+        let todo = app.layout.todo.expect("todo panel");
+        let agent = app.layout.agent.expect("agent panel");
+        let center = app.layout.center.expect("center region");
+
+        for area in [files, todo, agent] {
+            assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
+            assert_eq!(
+                buffer[(area.x + 2, area.y + area.height - 2)].bg,
+                ctp::MANTLE
+            );
+        }
+        assert_eq!(buffer[(center.x, center.y)].bg, Color::Reset);
+    }
+
+    #[test]
     fn selected_file_background_covers_name_and_modified_time_rows() {
         let (mut app, _directory) = make_app();
         fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
         app.reload_files();
         app.focus = Focus::Files;
+        let modified: DateTime<Local> = app.note_files[app.file_index].modified.into();
+        let expected_timestamp = modified.format("%y/%m/%d %H:%M").to_string();
 
         let terminal = render(&mut app, 170, 18);
+        assert!(buffer_string(&terminal).contains(&expected_timestamp));
         let selected_path = app.note_files[app.file_index].path.clone();
         let selected_area = app
             .file_hitboxes
@@ -2606,13 +2712,82 @@ mod tests {
         let buffer = terminal.backend().buffer();
         for y in selected_area.y..selected_area.y + selected_area.height {
             for x in selected_area.x..selected_area.x + selected_area.width {
-                assert_eq!(buffer[(x, y)].bg, Color::DarkGray);
+                assert_eq!(buffer[(x, y)].bg, ctp::SURFACE_1);
             }
         }
         assert_eq!(
             buffer[(selected_area.x + 1, selected_area.y + 1)].fg,
-            Color::Gray,
+            ctp::SUBTEXT_1,
             "modified time must remain legible on the selected background"
+        );
+    }
+
+    #[test]
+    fn file_selection_includes_both_shared_spacing_lines() {
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("First.md"), "first").unwrap();
+        fs::write(app.storage.data_dir.join("Second.md"), "second").unwrap();
+        app.reload_files();
+        app.focus = Focus::Files;
+
+        let terminal = render(&mut app, 170, 22);
+        let mut files = app.file_hitboxes.clone();
+        files.sort_by_key(|hitbox| hitbox.area.y);
+        let notes = app
+            .file_group_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.group == FileGroup::Notes)
+            .expect("Notes group")
+            .area;
+        let archives = app
+            .file_group_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.group == FileGroup::Archives)
+            .expect("Archives group")
+            .area;
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].area.y, notes.y + 2);
+        assert_eq!(files[1].area.y, files[0].area.y + 3);
+        assert_eq!(archives.y, files[1].area.y + 3);
+        assert_eq!(files[0].area.height, 2);
+        assert_eq!(files[1].area.height, 2);
+        let buffer = terminal.backend().buffer();
+        let selected = files
+            .iter()
+            .find(|hitbox| Some(&hitbox.path) == app.selected_file.as_ref())
+            .expect("selected file");
+        assert_eq!(
+            buffer[(selected.area.x, selected.area.y.saturating_sub(1))].bg,
+            ctp::SURFACE_1,
+            "selected background must include the upper shared spacing"
+        );
+        assert_eq!(
+            buffer[(selected.area.x, selected.area.y + 2)].bg,
+            ctp::SURFACE_1,
+            "selected background must include the lower shared spacing"
+        );
+    }
+
+    #[test]
+    fn file_groups_use_teal_markers_and_muted_counts() {
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+        app.reload_files();
+        app.focus = Focus::Files;
+
+        let terminal = render(&mut app, 170, 18);
+        let notes = app
+            .file_group_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.group == FileGroup::Notes)
+            .expect("Notes group hitbox")
+            .area;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(notes.x, notes.y)].fg, ctp::TEAL);
+        assert_eq!(
+            buffer[(notes.x + notes.width - 1, notes.y)].fg,
+            ctp::OVERLAY_0
         );
     }
 
@@ -2634,7 +2809,7 @@ mod tests {
         let modal = app.layout.overlay.unwrap();
         assert_eq!(
             terminal.backend().buffer()[(modal.x + 1, modal.y + 1)].bg,
-            Color::Indexed(235),
+            ctp::MANTLE,
             "modal padding should have an opaque background"
         );
 
@@ -2649,6 +2824,10 @@ mod tests {
         app.file_query = "work".to_string();
         let terminal = render(&mut app, 80, 16);
         assert!(buffer_string(&terminal).contains("/ work"));
+        let files = app.layout.files.unwrap();
+        let underline = &terminal.backend().buffer()[(files.x + 2, files.y + 2)];
+        assert_eq!(underline.symbol(), "─");
+        assert_eq!(underline.fg, ctp::OVERLAY_0);
         assert!(app.layout.overlay.is_none());
     }
 
@@ -3034,7 +3213,7 @@ mod tests {
             buffer.content().iter().any(|cell| {
                 cell.symbol() == "H"
                     && cell.modifier.contains(Modifier::BOLD)
-                    && cell.bg == Color::Indexed(238)
+                    && cell.bg == ctp::SURFACE_1
             }),
             "heading should retain Markdown emphasis on the selected card background"
         );
@@ -3149,22 +3328,10 @@ mod tests {
         let center = app.layout.center.expect("center area");
         let sample_x = center.x + center.width / 2;
         assert!(date_row >= 2);
-        assert_eq!(
-            buffer[(sample_x, date_row as u16 - 1)].bg,
-            Color::Indexed(238)
-        );
-        assert_eq!(
-            buffer[(sample_x, date_row as u16 - 2)].bg,
-            Color::Indexed(238)
-        );
-        assert_eq!(
-            buffer[(sample_x, button_row as u16 + 1)].bg,
-            Color::Indexed(238)
-        );
-        assert_eq!(
-            buffer[(sample_x, button_row as u16 + 2)].bg,
-            Color::Indexed(238)
-        );
+        assert_eq!(buffer[(sample_x, date_row as u16 - 1)].bg, ctp::SURFACE_1);
+        assert_eq!(buffer[(sample_x, date_row as u16 - 2)].bg, ctp::SURFACE_1);
+        assert_eq!(buffer[(sample_x, button_row as u16 + 1)].bg, ctp::SURFACE_1);
+        assert_eq!(buffer[(sample_x, button_row as u16 + 2)].bg, ctp::SURFACE_1);
     }
 
     #[test]
@@ -3191,8 +3358,8 @@ mod tests {
             .map(|x| buffer[(x, 4)].symbol().to_string())
             .collect();
         assert!(first_document_row.contains("Heading"));
-        assert_eq!(buffer[(2, 2)].bg, Color::Indexed(235));
-        assert_eq!(buffer[(2, 3)].bg, Color::Indexed(235));
+        assert_eq!(buffer[(2, 2)].bg, ctp::MANTLE);
+        assert_eq!(buffer[(2, 3)].bg, ctp::MANTLE);
         let heading_x = first_document_row.find("Heading").unwrap() as u16;
         assert!(heading_x >= 2 + PAGE_PADDING_X as u16);
         assert!(buffer_string(&terminal).contains("needle"));
@@ -3214,7 +3381,10 @@ mod tests {
 
         let terminal = render(&mut app, 80, 30);
         let buffer = terminal.backend().buffer();
-        let background = Color::Rgb(32, 36, 43);
+        let background = mbtui::Theme::default()
+            .code_block
+            .bg
+            .expect("the default code block theme has a background");
         let rows = (0..buffer.area().height)
             .filter(|y| (0..buffer.area().width).any(|x| buffer[(x, *y)].bg == background))
             .collect::<Vec<_>>();

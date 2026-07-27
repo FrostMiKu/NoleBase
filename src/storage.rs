@@ -393,9 +393,43 @@ impl Storage {
         Ok(to)
     }
 
+    /// Rename a direct archived note without overwriting an existing entry.
+    pub fn rename_archived_file(&self, from: &Path, new_name: &str) -> Result<PathBuf> {
+        let from = self.validate_archived_target(from)?;
+        let name = normalize_new_name(new_name)?;
+        let to = self.archives_dir.join(&name);
+        rename_without_overwrite(&from, &to, &name)
+    }
+
+    /// Move a data note into `archives/` without overwriting an existing entry.
+    pub fn archive_note(&self, path: &Path) -> Result<PathBuf> {
+        let source = self.validate_target(path)?;
+        let name = source.file_name().context("note has no file name")?;
+        let destination = self.archives_dir.join(name);
+        move_without_overwrite(&source, &destination)?;
+        Ok(destination)
+    }
+
+    /// Restore an archived note into `data/` without overwriting an existing entry.
+    pub fn restore_archived_note(&self, path: &Path) -> Result<PathBuf> {
+        let source = self.validate_archived_target(path)?;
+        let name = source
+            .file_name()
+            .context("archived note has no file name")?;
+        let destination = self.data_dir.join(name);
+        move_without_overwrite(&source, &destination)?;
+        Ok(destination)
+    }
+
     /// Delete a managed data note. Protected files cannot be deleted.
     pub fn delete_file(&self, path: &Path) -> Result<()> {
         let path = self.validate_target(path)?;
+        fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn delete_archived_file(&self, path: &Path) -> Result<()> {
+        let path = self.validate_archived_target(path)?;
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
         Ok(())
     }
@@ -407,31 +441,31 @@ impl Storage {
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
     }
 
-    /// Append a paragraph to an existing managed data note.
-    pub fn append_note(&self, path: &Path, body: &str) -> Result<()> {
+    /// Append to an article in either `data/` or `archives/`.
+    pub fn append_document(&self, path: &Path, body: &str) -> Result<()> {
         if body.trim().is_empty() {
             bail!("note content must not be empty");
         }
-        let path = self.validate_target(path)?;
+        self.read_document_file(path)?;
         let content = if path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
             format!("\n{body}\n")
         } else {
             format!("{body}\n")
         };
-        append_text(&path, &content)
+        append_text(path, &content)
     }
 
     /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
     pub fn list_note_files(&self) -> Result<Vec<NoteFile>> {
-        self.list_note_files_in(&self.data_dir)
+        self.list_note_files_in(&self.data_dir, false)
     }
 
     /// List flat `.md` and `.mb` files under `archives/`, most recently modified first.
     pub fn list_archived_note_files(&self) -> Result<Vec<NoteFile>> {
-        self.list_note_files_in(&self.archives_dir)
+        self.list_note_files_in(&self.archives_dir, true)
     }
 
-    fn list_note_files_in(&self, directory: &Path) -> Result<Vec<NoteFile>> {
+    fn list_note_files_in(&self, directory: &Path, archived: bool) -> Result<Vec<NoteFile>> {
         let mut files = Vec::new();
         fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
@@ -450,7 +484,11 @@ impl Storage {
                     .metadata()
                     .and_then(|metadata| metadata.modified())
                     .unwrap_or(std::time::UNIX_EPOCH);
-                files.push(NoteFile { path, modified });
+                files.push(NoteFile {
+                    path,
+                    modified,
+                    archived,
+                });
             }
         }
         files.sort_by(|a, b| {
@@ -464,23 +502,12 @@ impl Storage {
     /// Read a regular note from `archives/` after rejecting symlinks and paths
     /// outside that directory.
     pub fn read_archived_note_file(&self, path: &Path) -> Result<String> {
-        let canonical_archives = fs::canonicalize(&self.archives_dir).with_context(|| {
-            format!(
-                "resolving archive directory {}",
-                self.archives_dir.display()
-            )
-        })?;
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("checking archived note {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            bail!("archived note must be a regular file: {}", path.display());
-        }
-        let canonical = fs::canonicalize(path)
-            .with_context(|| format!("resolving archived note {}", path.display()))?;
-        if canonical.parent() != Some(canonical_archives.as_path()) || !is_note_path(&canonical) {
-            bail!("archived note must be a direct .md or .mb file in archives");
-        }
+        let canonical = self.validate_archived_target(path)?;
         fs::read_to_string(canonical).context("reading archived note")
+    }
+
+    pub fn validate_archived_target(&self, target: &Path) -> Result<PathBuf> {
+        validate_direct_note(&self.archives_dir, target, "archives")
     }
 
     /// Read an open article after it has been moved anywhere within the Nole
@@ -610,6 +637,54 @@ fn is_note_path(path: &Path) -> bool {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
         })
+}
+
+fn validate_direct_note(directory: &Path, target: &Path, label: &str) -> Result<PathBuf> {
+    if !is_note_path(target) {
+        bail!(
+            "target must have a .md or .mb extension: {}",
+            target.display()
+        );
+    }
+    let canonical_directory = fs::canonicalize(directory)
+        .with_context(|| format!("resolving {label} directory {}", directory.display()))?;
+    let metadata = fs::symlink_metadata(target)
+        .with_context(|| format!("checking {label} note {}", target.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("{label} note must be a regular file: {}", target.display());
+    }
+    let canonical = fs::canonicalize(target)
+        .with_context(|| format!("resolving {label} note {}", target.display()))?;
+    if canonical.parent() != Some(canonical_directory.as_path()) {
+        bail!(
+            "{label} note must be a direct child of {}",
+            directory.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn move_without_overwrite(from: &Path, to: &Path) -> Result<()> {
+    match fs::symlink_metadata(to) {
+        Ok(_) => bail!(
+            "a file named {} already exists",
+            to.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", to.display())),
+    }
+    fs::rename(from, to)
+        .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    Ok(())
+}
+
+fn rename_without_overwrite(from: &Path, to: &Path, name: &str) -> Result<PathBuf> {
+    if to.file_name() == from.file_name() {
+        return Ok(from.to_path_buf());
+    }
+    move_without_overwrite(from, to)
+        .with_context(|| format!("renaming archived note to {name}"))?;
+    Ok(to.to_path_buf())
 }
 
 /// Normalize a user-entered file name: trim, default to `.md`, reject traversal.
@@ -991,17 +1066,19 @@ mod tests {
     }
 
     #[test]
-    fn append_note_adds_to_an_existing_managed_article_only() {
+    fn append_document_adds_to_an_existing_managed_article_only() {
         let (_dir, st) = fresh();
         let path = st.create_named_file("Article").unwrap();
         fs::write(&path, "# Article\n").unwrap();
-        st.append_note(&path, "new paragraph").unwrap();
+        st.append_document(&path, "new paragraph").unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# Article\n\nnew paragraph\n"
         );
-        assert!(st.append_note(Path::new("/tmp/outside.md"), "no").is_err());
-        assert!(st.append_note(&path, "   ").is_err());
+        assert!(st
+            .append_document(Path::new("/tmp/outside.md"), "no")
+            .is_err());
+        assert!(st.append_document(&path, "   ").is_err());
     }
 
     #[test]
@@ -1074,6 +1151,37 @@ mod tests {
             "archived"
         );
         assert!(storage.read_note_file(&archived).is_err());
+    }
+
+    #[test]
+    fn archive_restore_and_archived_rename_never_overwrite() {
+        let (_directory, storage) = fresh();
+        let note = storage.create_named_file("Project").unwrap();
+        fs::write(&note, "active").unwrap();
+        let archived = storage.archive_note(&note).unwrap();
+        assert!(!note.exists());
+        assert_eq!(fs::read_to_string(&archived).unwrap(), "active");
+
+        fs::write(&note, "replacement").unwrap();
+        assert!(storage.restore_archived_note(&archived).is_err());
+        assert_eq!(fs::read_to_string(&note).unwrap(), "replacement");
+        fs::remove_file(&note).unwrap();
+
+        let restored = storage.restore_archived_note(&archived).unwrap();
+        assert_eq!(restored, note);
+        let archived = storage.archive_note(&restored).unwrap();
+        fs::write(storage.archives_dir.join("Taken.md"), "keep").unwrap();
+        assert!(storage.rename_archived_file(&archived, "Taken").is_err());
+        assert_eq!(fs::read_to_string(&archived).unwrap(), "active");
+    }
+
+    #[test]
+    fn append_document_accepts_archived_articles() {
+        let (_directory, storage) = fresh();
+        let note = storage.create_named_file("Journal").unwrap();
+        let archived = storage.archive_note(&note).unwrap();
+        storage.append_document(&archived, "later").unwrap();
+        assert!(fs::read_to_string(archived).unwrap().ends_with("\nlater\n"));
     }
 
     #[cfg(unix)]

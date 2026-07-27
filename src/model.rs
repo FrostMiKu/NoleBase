@@ -100,12 +100,31 @@ pub struct LinkHitbox {
 pub struct NoteFile {
     pub path: PathBuf,
     pub modified: SystemTime,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileGroup {
+    Notes,
+    Archives,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileListRow {
+    Group(FileGroup),
+    File(usize),
 }
 
 /// A recorded screen rectangle for a clickable file row in the sidebar.
 #[derive(Debug, Clone)]
 pub struct FileHitbox {
     pub path: PathBuf,
+    pub area: Rect,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileGroupHitbox {
+    pub group: FileGroup,
     pub area: Rect,
 }
 

@@ -6,6 +6,7 @@ mod markdown;
 mod model;
 mod notification;
 mod storage;
+mod theme;
 mod ui;
 
 use std::fs;
