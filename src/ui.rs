@@ -1,13 +1,16 @@
 //! Terminal rendering for the full-width workspace.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Local};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{block::Padding, Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agent::{AskUserKind, PermissionMode};
 use crate::app::{
     App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus, LayoutSnapshot,
     Overlay,
@@ -128,16 +131,10 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let title = if app.agent_round_limit == 0 && app.agent_usage.is_empty() {
+    let title = if app.agent_round_limit == 0 {
         " Agent ".to_string()
     } else {
-        format!(
-            " Agent · ↻{}/{} · ↑{} ↓{} ",
-            app.agent_round,
-            app.agent_round_limit,
-            human_token_count(app.agent_usage.total_input()),
-            human_token_count(app.agent_usage.output_tokens)
-        )
+        format!(" Agent · ↻{}/{} ", app.agent_round, app.agent_round_limit,)
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -145,7 +142,7 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         .title(title)
         .style(Style::default().bg(ctp::MANTLE))
         .border_style(focus_border(app.focus == Focus::Agent));
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     frame.render_widget(block, area);
     if app.ai_running {
         draw_animated_border(frame, area, app.animation_tick);
@@ -153,73 +150,260 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    if app.agent_prompt.is_empty() && app.agent_output.is_empty() {
+    if let Some(stats) = agent_stats_line(app, inner.width) {
+        frame.render_widget(
+            Paragraph::new(stats),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        inner.y = inner.y.saturating_add(1);
+        inner.height = inner.height.saturating_sub(1);
+    }
+    if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let mut lines = Vec::new();
-    let mut rendered_links = Vec::new();
-    if !app.agent_prompt.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Prompt",
-            Style::default()
-                .fg(ctp::SAPPHIRE)
-                .add_modifier(Modifier::BOLD),
-        )));
-        let row = lines.len();
-        let rendered = crate::markdown::render_at_width(&app.agent_prompt, inner.width as usize);
-        rendered_links.extend(rendered.links.into_iter().map(|mut link| {
-            link.row += row;
-            link
-        }));
-        lines.extend(rendered.lines);
+    if app.agent_panel.is_empty() {
+        app.agent_vlist.caches.clear();
+        app.agent_vlist.geometry.resize(0);
+        return;
     }
-    if !app.agent_output.is_empty() {
-        if !lines.is_empty() {
-            lines.push(Line::default());
+    let width = inner.width as usize;
+    let view_height = inner.height as usize;
+    sync_agent_vlist(app, width);
+    let tail_pinned = app.agent_scroll == u16::MAX;
+    let mut scroll =
+        (app.agent_scroll as usize).min(app.agent_vlist.geometry.max_scroll(view_height));
+    scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
+    app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
+    let (visible, rendered_links) = visible_agent_lines(app, scroll, view_height);
+    frame.render_widget(Paragraph::new(visible), inner);
+    register_link_hitboxes(&mut app.link_hitboxes, &rendered_links, inner, scroll);
+}
+
+fn sync_agent_vlist(app: &mut App, width: usize) {
+    if app.agent_vlist.width != width {
+        app.agent_vlist.width = width;
+        app.agent_vlist.geometry = crate::vlist::VList::new(4);
+        app.agent_vlist.caches.clear();
+    }
+    app.agent_vlist.caches.resize(app.agent_panel.len(), None);
+    app.agent_vlist.geometry.resize(app.agent_panel.len());
+    for (index, cache) in app.agent_vlist.caches.iter_mut().enumerate() {
+        if cache
+            .as_ref()
+            .is_some_and(|cached| cached.entry != app.agent_panel[index])
+        {
+            *cache = None;
+            app.agent_vlist.geometry.invalidate(index);
         }
-        lines.push(Line::from(Span::styled(
-            if app.agent_output_final {
-                "Response"
+    }
+}
+
+fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
+    if app.agent_vlist.caches[index].is_some() {
+        return;
+    }
+    let entry = app.agent_panel[index].clone();
+    let (lines, links) =
+        render_agent_entry(&entry, app.agent_vlist.width, app.animation_tick, false);
+    let height = lines.len().saturating_add(usize::from(index > 0));
+    app.agent_vlist.caches[index] = Some(crate::app::AgentEntryRenderCache {
+        width: app.agent_vlist.width,
+        entry,
+        lines,
+        links,
+    });
+    app.agent_vlist.geometry.set_height(index, height);
+}
+
+fn measure_visible_agent_entries(
+    app: &mut App,
+    mut scroll: usize,
+    view_height: usize,
+    tail_pinned: bool,
+) -> usize {
+    loop {
+        let range = app.agent_vlist.geometry.visible_range(scroll, view_height);
+        if range.is_empty() {
+            return 0;
+        }
+        let anchor = range.start;
+        let anchor_offset = scroll.saturating_sub(app.agent_vlist.geometry.item_top(anchor));
+        let missing = range
+            .clone()
+            .filter(|index| !app.agent_vlist.geometry.is_measured(*index))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            let maximum = app.agent_vlist.geometry.max_scroll(view_height);
+            return if tail_pinned {
+                maximum
             } else {
-                "Activity"
-            },
-            Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD),
-        )));
-        if app.agent_output_final {
+                scroll.min(maximum)
+            };
+        }
+        for index in missing {
+            ensure_agent_entry_rendered(app, index);
+        }
+        scroll = if tail_pinned {
+            app.agent_vlist.geometry.max_scroll(view_height)
+        } else {
+            let height = app.agent_vlist.geometry.height(anchor);
+            app.agent_vlist.geometry.item_top(anchor) + anchor_offset.min(height.saturating_sub(1))
+        };
+        scroll = scroll.min(app.agent_vlist.geometry.max_scroll(view_height));
+    }
+}
+
+fn render_agent_entry(
+    entry: &crate::app::AgentPanelEntry,
+    width: usize,
+    tick: u64,
+    animate: bool,
+) -> (Vec<Line<'static>>, Vec<crate::markdown::RenderedLink>) {
+    let mut lines = Vec::new();
+    let mut links = Vec::new();
+    match entry {
+        crate::app::AgentPanelEntry::Prompt { text, muted } => {
+            lines.push(Line::from(Span::styled(
+                "Prompt",
+                Style::default()
+                    .fg(if *muted {
+                        ctp::OVERLAY_0
+                    } else {
+                        ctp::SAPPHIRE
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )));
             let row = lines.len();
-            let rendered = crate::markdown::render_at_width(
-                &app.agent_output.join("\n\n"),
-                inner.width as usize,
-            );
-            rendered_links.extend(rendered.links.into_iter().map(|mut link| {
+            let mut rendered = crate::markdown::render_at_width(text, width);
+            if *muted {
+                for line in &mut rendered.lines {
+                    for span in &mut line.spans {
+                        span.style = span.style.fg(ctp::OVERLAY_0);
+                    }
+                }
+            }
+            links.extend(rendered.links.into_iter().map(|mut link| {
                 link.row += row;
                 link
             }));
             lines.extend(rendered.lines);
-        } else {
-            for (index, entry) in app.agent_output.iter().enumerate() {
-                if app.ai_running && index + 1 == app.agent_output.len() {
-                    lines.extend(animated_activity_lines(
-                        entry,
-                        inner.width as usize,
-                        app.animation_tick,
-                    ));
-                } else {
-                    lines.extend(activity_lines(entry, inner.width as usize));
-                }
-            }
         }
+        crate::app::AgentPanelEntry::Assistant {
+            text, final_output, ..
+        } => {
+            lines.push(Line::from(Span::styled(
+                if *final_output { "Response" } else { "Agent" },
+                Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD),
+            )));
+            let row = lines.len();
+            let rendered = crate::markdown::render_at_width(text, width);
+            links.extend(rendered.links.into_iter().map(|mut link| {
+                link.row += row;
+                link
+            }));
+            lines.extend(rendered.lines);
+        }
+        crate::app::AgentPanelEntry::Tool { text, active } => {
+            lines.extend(if *active && animate {
+                animated_activity_lines(text, width, tick)
+            } else {
+                activity_lines(text, width)
+            });
+        }
+        crate::app::AgentPanelEntry::Error(text) => lines.push(Line::from(Span::styled(
+            text.clone(),
+            Style::default().fg(ctp::PINK),
+        ))),
     }
-    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
-    app.agent_scroll = app.agent_scroll.min(max_scroll);
-    let visible = visible_line_window(&lines, app.agent_scroll as usize, inner.height as usize);
-    frame.render_widget(Paragraph::new(visible), inner);
-    register_link_hitboxes(
-        &mut app.link_hitboxes,
-        &rendered_links,
-        inner,
-        app.agent_scroll as usize,
-    );
+    (lines, links)
+}
+
+fn visible_agent_lines(
+    app: &mut App,
+    scroll: usize,
+    view_height: usize,
+) -> (Vec<Line<'static>>, Vec<crate::markdown::RenderedLink>) {
+    let end = scroll.saturating_add(view_height);
+    let mut visible = Vec::with_capacity(view_height);
+    let mut links = Vec::new();
+    let range = app.agent_vlist.geometry.visible_range(scroll, view_height);
+    for index in range {
+        let item_top = app.agent_vlist.geometry.item_top(index);
+        let height = app.agent_vlist.geometry.height(index);
+        let cached = app.agent_vlist.caches[index]
+            .as_ref()
+            .expect("visible Agent entries are measured before rendering");
+        let separator = usize::from(index > 0);
+        let active = matches!(
+            cached.entry,
+            crate::app::AgentPanelEntry::Tool { active: true, .. }
+        );
+        let from = scroll.saturating_sub(item_top);
+        let to = height.min(end.saturating_sub(item_top));
+        if separator > 0 && from == 0 && to > 0 {
+            visible.push(Line::default());
+        }
+        let content_from = from.saturating_sub(separator);
+        let content_to = to.saturating_sub(separator).min(cached.lines.len());
+        if active {
+            let animated =
+                render_agent_entry(&cached.entry, cached.width, app.animation_tick, true).0;
+            visible.extend(
+                animated[content_from.min(content_to)..content_to]
+                    .iter()
+                    .cloned(),
+            );
+        } else {
+            visible.extend(
+                cached.lines[content_from.min(content_to)..content_to]
+                    .iter()
+                    .cloned(),
+            );
+        }
+        links.extend(cached.links.iter().filter_map(|link| {
+            let global_row = item_top + separator + link.row;
+            (global_row >= scroll && global_row < end).then(|| {
+                let mut link = link.clone();
+                link.row = global_row;
+                link
+            })
+        }));
+    }
+    (visible, links)
+}
+
+fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
+    if app.agent_usage.is_empty() {
+        return None;
+    }
+    let input = human_token_count(app.agent_usage.total_input());
+    let output = human_token_count(app.agent_usage.output_tokens);
+    let cache_read = human_token_count(app.agent_usage.cache_read_input_tokens);
+    let cache_rate = if app.agent_usage.total_input() == 0 {
+        0.0
+    } else {
+        app.agent_usage.cache_read_input_tokens as f64 * 100.0
+            / app.agent_usage.total_input() as f64
+    };
+    let tps = if app.agent_response_duration.is_zero() {
+        "--".to_string()
+    } else {
+        format!(
+            "{:.1}",
+            app.agent_timed_output_tokens as f64 / app.agent_response_duration.as_secs_f64()
+        )
+    };
+    let text = if width >= 44 {
+        format!("↑{input} ↓{output} · {tps} t/s · Cache {cache_read} {cache_rate:.0}%")
+    } else if width >= 30 {
+        format!("↑{input} ↓{output} · {tps}t/s · C{cache_read} {cache_rate:.0}%")
+    } else {
+        format!("↑{input} ↓{output}")
+    };
+    Some(Line::from(Span::styled(
+        text,
+        Style::default().fg(ctp::OVERLAY_1),
+    )))
 }
 
 fn human_token_count(tokens: u64) -> String {
@@ -540,17 +724,21 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         .iter()
         .filter_map(|index| app.todo_items.get(*index))
         .map(|item| {
-            wrap_spans_to_width(&[Span::raw(item.text.replace('\n', " "))], text_width).len()
+            wrap_spans_to_width(&[Span::raw(item.text.replace('\n', " "))], text_width).len() + 1
         })
         .collect();
+    let viewport_height = inner.height.saturating_sub(1) as usize;
+    if viewport_height == 0 {
+        return;
+    }
     let mut start = selected_position;
     let mut used = item_heights[selected_position];
-    while start > 0 && used + item_heights[start - 1] <= inner.height as usize {
+    while start > 0 && used + item_heights[start - 1] <= viewport_height {
         start -= 1;
         used += item_heights[start];
     }
 
-    let mut y = inner.y;
+    let mut y = inner.y.saturating_add(1);
     for index in visible_indices.iter().copied().skip(start) {
         if y >= inner.y.saturating_add(inner.height) {
             break;
@@ -576,8 +764,26 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             &[Span::styled(item.text.replace('\n', " "), text_style)],
             text_width,
         );
-        let visible_height =
-            (wrapped.len() as u16).min(inner.y.saturating_add(inner.height).saturating_sub(y));
+        let content_height = wrapped.len() as u16;
+        let layout_height = content_height
+            .saturating_add(1)
+            .min(inner.y.saturating_add(inner.height).saturating_sub(y));
+        let visible_height = content_height.min(layout_height);
+        if focused && index == selected {
+            let selection_y = y.saturating_sub(1).max(inner.y);
+            let selection_end = y
+                .saturating_add(layout_height)
+                .min(inner.y.saturating_add(inner.height));
+            frame.render_widget(
+                Block::default().style(Style::default().bg(ctp::SURFACE_1)),
+                Rect::new(
+                    inner.x,
+                    selection_y,
+                    inner.width,
+                    selection_end.saturating_sub(selection_y),
+                ),
+            );
+        }
         for (row, mut spans) in wrapped
             .into_iter()
             .take(visible_height as usize)
@@ -590,18 +796,18 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             };
             line.append(&mut spans);
             frame.render_widget(
-                Paragraph::new(Line::from(line)).style(text_style),
+                Paragraph::new(Line::from(line)),
                 Rect::new(inner.x, y + row as u16, inner.width, 1),
             );
         }
-        let item_area = Rect::new(inner.x, y, inner.width, visible_height);
+        let item_area = Rect::new(inner.x, y, inner.width, layout_height);
         if interactive {
             app.todo_hitboxes.push(TodoHitbox {
                 index,
                 area: item_area,
             });
         }
-        y = y.saturating_add(visible_height);
+        y = y.saturating_add(layout_height);
     }
 }
 
@@ -651,21 +857,18 @@ fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'sta
     if characters.is_empty() {
         return vec![Line::default()];
     }
-    let active = tick as usize % characters.len();
     let mut spans = vec![activity_marker()];
     spans.extend(
         characters
             .into_iter()
             .enumerate()
             .map(|(index, character)| {
-                let style = if index == active {
+                Span::styled(
+                    character.to_string(),
                     Style::default()
                         .fg(animated_color(index * 8, tick))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(ctp::OVERLAY_0)
-                };
-                Span::styled(character.to_string(), style)
+                        .add_modifier(Modifier::BOLD),
+                )
             })
             .collect::<Vec<_>>(),
     );
@@ -798,6 +1001,8 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let width = area.width as usize;
+    sync_daily_vlist(app, width);
     if app.messages.is_empty() {
         frame.render_widget(
             Paragraph::new("No notes yet").alignment(Alignment::Center),
@@ -806,32 +1011,230 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         return;
     }
 
-    let width = area.width as usize;
-    let mut lines = Vec::new();
-    let mut card_first = Vec::with_capacity(app.messages.len());
-    let mut button_lines = Vec::with_capacity(app.messages.len());
-    let mut button_starts = Vec::with_capacity(app.messages.len());
-    let mut rendered_links = Vec::new();
+    let view_height = area.height as usize;
+    let tail_pinned = app.scroll == u16::MAX;
+    let mut scroll = (app.scroll as usize)
+        .min(app.daily_vlist.geometry.max_scroll(view_height))
+        .min(u16::MAX as usize);
+    if app.reveal_selected_message {
+        if app.selected < app.messages.len() {
+            ensure_daily_card_rendered(app, app.selected);
+            let first = app.daily_vlist.geometry.item_top(app.selected);
+            let button = first
+                + app.daily_vlist.items[app.selected]
+                    .cache
+                    .as_ref()
+                    .expect("selected Daily card was rendered")
+                    .button_line;
+            scroll = stable_card_scroll(scroll, first, button, view_height);
+        }
+        app.reveal_selected_message = false;
+    }
+    scroll = measure_visible_daily_cards(app, scroll, view_height, tail_pinned);
+    scroll = scroll
+        .min(app.daily_vlist.geometry.max_scroll(view_height))
+        .min(u16::MAX as usize);
+    app.scroll = scroll as u16;
 
-    for (index, message) in app.messages.iter().enumerate() {
-        card_first.push(lines.len());
-        let selected = index == app.selected;
-        let card_style = Style::default().bg(if selected {
-            ctp::SURFACE_1
+    let end = scroll.saturating_add(view_height);
+    let mut visible = Vec::with_capacity(view_height);
+    let mut rendered_links = Vec::new();
+    let visible_range = app.daily_vlist.geometry.visible_range(scroll, view_height);
+    for index in visible_range.clone() {
+        let first = app.daily_vlist.geometry.item_top(index);
+        let cached = app.daily_vlist.items[index]
+            .cache
+            .as_ref()
+            .expect("visible Daily cards are measured before rendering");
+        let from = scroll.saturating_sub(first);
+        let to = cached.lines.len().min(end.saturating_sub(first));
+        for (local_row, line) in cached.lines[from.min(to)..to].iter().enumerate() {
+            let actual_row = from + local_row;
+            if actual_row == cached.button_line {
+                visible.push(daily_button_line(
+                    width,
+                    cached.button_start,
+                    index == app.selected,
+                ));
+            } else {
+                visible.push(line.clone());
+            }
+        }
+        rendered_links.extend(cached.links.iter().filter_map(|link| {
+            let global_row = first + link.row;
+            (global_row >= scroll && global_row < end).then(|| {
+                let mut link = link.clone();
+                link.row = global_row;
+                link
+            })
+        }));
+    }
+
+    if interactive {
+        register_link_hitboxes(&mut app.link_hitboxes, &rendered_links, area, scroll);
+        for index in visible_range {
+            let first = app.daily_vlist.geometry.item_top(index);
+            let cached = app.daily_vlist.items[index]
+                .cache
+                .as_ref()
+                .expect("visible Daily cards are rendered");
+            let button_line = first + cached.button_line;
+            if button_line < scroll || button_line >= scroll.saturating_add(view_height) {
+                continue;
+            }
+            let y = area.y + (button_line - scroll) as u16;
+            register_buttons_clipped(
+                &mut app.hitboxes,
+                &app.messages[index].id,
+                area.x.saturating_add(cached.button_start as u16),
+                y,
+                area,
+            );
+        }
+    }
+
+    frame.render_widget(Paragraph::new(visible), area);
+    if let Some(cached) = app
+        .daily_vlist
+        .items
+        .get(app.selected)
+        .and_then(|item| item.cache.as_ref())
+    {
+        let first = app.daily_vlist.geometry.item_top(app.selected);
+        let last = first + cached.lines.len().saturating_sub(2);
+        draw_selected_card_border(frame, area, scroll, first, last, app.animation_tick);
+    }
+}
+
+fn sync_daily_vlist(app: &mut App, width: usize) {
+    let width_changed = app.daily_vlist.width != width;
+    let same_items = !width_changed
+        && app.daily_vlist.items.len() == app.messages.len()
+        && app
+            .daily_vlist
+            .items
+            .iter()
+            .zip(&app.messages)
+            .all(|(item, message)| item.id == message.id);
+    if !same_items {
+        let old_items = if width_changed {
+            Vec::new()
         } else {
-            ctp::MANTLE
-        });
-        let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
-        lines.push(line_with_background(Vec::new(), width, card_style));
-        lines.push(line_with_background(Vec::new(), width, card_style));
+            std::mem::take(&mut app.daily_vlist.items)
+        };
+        let mut by_id = old_items
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        app.daily_vlist.items = app
+            .messages
+            .iter()
+            .map(|message| {
+                by_id
+                    .remove(&message.id)
+                    .unwrap_or_else(|| crate::app::DailyVirtualItem {
+                        id: message.id.clone(),
+                        cache: None,
+                    })
+            })
+            .collect();
+        app.daily_vlist.geometry = crate::vlist::VList::new(12);
+        app.daily_vlist.geometry.resize(app.messages.len());
+        for (index, item) in app.daily_vlist.items.iter().enumerate() {
+            if let Some(cache) = &item.cache {
+                app.daily_vlist
+                    .geometry
+                    .set_height(index, cache.lines.len());
+            }
+        }
+        app.daily_vlist.width = width;
+    } else {
+        app.daily_vlist.geometry.resize(app.messages.len());
+    }
+
+    for (index, (item, message)) in app
+        .daily_vlist
+        .items
+        .iter_mut()
+        .zip(&app.messages)
+        .enumerate()
+    {
         let date = message.created_at.format(DATE_FMT).to_string();
-        let body_start = horizontal_padding + UnicodeWidthStr::width(date.as_str()) + 2;
-        let (body_start, body_width) = centered_message_body_axis(width, body_start);
-        lines.push(line_with_background(
+        if item.cache.as_ref().is_some_and(|cached| {
+            cached.width != width || cached.date != date || cached.body != message.body
+        }) {
+            item.cache = None;
+            app.daily_vlist.geometry.invalidate(index);
+        }
+    }
+}
+
+fn ensure_daily_card_rendered(app: &mut App, index: usize) {
+    if app.daily_vlist.items[index].cache.is_some() {
+        return;
+    }
+    let date = app.messages[index].created_at.format(DATE_FMT).to_string();
+    let cached = render_daily_card(&app.messages[index], date, app.daily_vlist.width);
+    let height = cached.lines.len();
+    app.daily_vlist.items[index].cache = Some(cached);
+    app.daily_vlist.geometry.set_height(index, height);
+}
+
+fn measure_visible_daily_cards(
+    app: &mut App,
+    mut scroll: usize,
+    view_height: usize,
+    tail_pinned: bool,
+) -> usize {
+    loop {
+        let range = app.daily_vlist.geometry.visible_range(scroll, view_height);
+        if range.is_empty() {
+            return 0;
+        }
+        let anchor = range.start;
+        let anchor_offset = scroll.saturating_sub(app.daily_vlist.geometry.item_top(anchor));
+        let missing = range
+            .clone()
+            .filter(|index| !app.daily_vlist.geometry.is_measured(*index))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            let maximum = app.daily_vlist.geometry.max_scroll(view_height);
+            return if tail_pinned {
+                maximum
+            } else {
+                scroll.min(maximum)
+            };
+        }
+        for index in missing {
+            ensure_daily_card_rendered(app, index);
+        }
+        scroll = if tail_pinned {
+            app.daily_vlist.geometry.max_scroll(view_height)
+        } else {
+            let height = app.daily_vlist.geometry.height(anchor);
+            app.daily_vlist.geometry.item_top(anchor) + anchor_offset.min(height.saturating_sub(1))
+        };
+        scroll = scroll.min(app.daily_vlist.geometry.max_scroll(view_height));
+    }
+}
+
+fn render_daily_card(
+    message: &crate::model::Message,
+    date: String,
+    width: usize,
+) -> crate::app::DailyCardRenderCache {
+    let card_style = Style::default().bg(ctp::MANTLE);
+    let horizontal_padding = MESSAGE_PADDING_X.min(width.saturating_sub(1) / 2);
+    let body_start = horizontal_padding + UnicodeWidthStr::width(date.as_str()) + 2;
+    let (body_start, body_width) = centered_message_body_axis(width, body_start);
+    let mut lines = vec![
+        line_with_background(Vec::new(), width, card_style),
+        line_with_background(Vec::new(), width, card_style),
+        line_with_background(
             vec![
                 Span::raw(" ".repeat(body_start)),
                 Span::styled(
-                    date,
+                    date.clone(),
                     Style::default()
                         .fg(ctp::OVERLAY_1)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -839,81 +1242,128 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             ],
             width,
             card_style,
-        ));
-        lines.push(line_with_background(Vec::new(), width, card_style));
-        let markdown = crate::markdown::render_at_width(&message.body, body_width);
-        let body_line_start = lines.len();
-        rendered_links.extend(markdown.links.into_iter().map(|mut link| {
+        ),
+        line_with_background(Vec::new(), width, card_style),
+    ];
+    let markdown = crate::markdown::render_at_width(&message.body, body_width);
+    let body_line_start = lines.len();
+    let links = markdown
+        .links
+        .into_iter()
+        .map(|mut link| {
             link.row += body_line_start;
             link.column += body_start;
             link
-        }));
-        let mut body_rows = Vec::new();
-        for markdown_line in markdown.lines {
-            body_rows.extend(wrap_spans_to_width(&markdown_line.spans, body_width));
-        }
-        for body in &body_rows {
+        })
+        .collect();
+    for markdown_line in markdown.lines {
+        for body in wrap_spans_to_width(&markdown_line.spans, body_width) {
             let mut spans = Vec::with_capacity(body.len() + 1);
             spans.push(Span::raw(" ".repeat(body_start)));
-            spans.extend(body.iter().cloned());
+            spans.extend(body);
             lines.push(line_with_background(spans, width, card_style));
         }
-        lines.push(line_with_background(Vec::new(), width, card_style));
-        let button_width = action_buttons_width();
-        let button_start = width
-            .saturating_sub(body_start)
-            .saturating_sub(button_width);
-        button_lines.push(lines.len());
-        button_starts.push(button_start);
-        let mut button_spans = vec![Span::raw(" ".repeat(button_start))];
-        button_spans.extend(render_button_line(selected).spans);
-        lines.push(line_with_background(button_spans, width, card_style));
-        lines.push(line_with_background(Vec::new(), width, card_style));
-        lines.push(line_with_background(Vec::new(), width, card_style));
-        lines.push(Line::default());
     }
-
-    let total = lines.len();
-    let view_height = area.height as usize;
-    let max_scroll = total.saturating_sub(view_height);
-    let mut scroll = (app.scroll as usize).min(max_scroll).min(u16::MAX as usize);
-    if app.reveal_selected_message {
-        if let (Some(first), Some(button)) = (
-            card_first.get(app.selected).copied(),
-            button_lines.get(app.selected).copied(),
-        ) {
-            scroll = stable_card_scroll(scroll, first, button, view_height);
-        }
-        app.reveal_selected_message = false;
+    lines.push(line_with_background(Vec::new(), width, card_style));
+    let button_start = width
+        .saturating_sub(body_start)
+        .saturating_sub(action_buttons_width());
+    let button_line = lines.len();
+    lines.push(daily_button_line(width, button_start, false));
+    lines.push(line_with_background(Vec::new(), width, card_style));
+    lines.push(line_with_background(Vec::new(), width, card_style));
+    lines.push(Line::default());
+    crate::app::DailyCardRenderCache {
+        width,
+        id: message.id.clone(),
+        date,
+        body: message.body.clone(),
+        lines,
+        links,
+        button_line,
+        button_start,
     }
-    scroll = scroll.min(max_scroll).min(u16::MAX as usize);
-    app.scroll = scroll as u16;
+}
 
-    if interactive {
-        register_link_hitboxes(&mut app.link_hitboxes, &rendered_links, area, scroll);
-        for (index, message) in app.messages.iter().enumerate() {
-            let Some(button_line) = button_lines.get(index).copied() else {
-                continue;
-            };
-            let Some(button_start) = button_starts.get(index).copied() else {
-                continue;
-            };
-            if button_line < scroll || button_line >= scroll.saturating_add(view_height) {
-                continue;
+fn daily_button_line(width: usize, button_start: usize, selected: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(button_start))];
+    spans.extend(render_button_line(selected).spans);
+    line_with_background(spans, width, Style::default().bg(ctp::MANTLE))
+}
+
+fn draw_selected_card_border(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    first: usize,
+    last: usize,
+    tick: u64,
+) {
+    if area.width < 2 || first > last {
+        return;
+    }
+    let visible_end = scroll.saturating_add(area.height as usize);
+    let start = first.max(scroll);
+    let end = last.min(visible_end.saturating_sub(1));
+    if start > end {
+        return;
+    }
+    let left = area.x;
+    let right = area.x + area.width - 1;
+    let width = area.width as usize;
+    let height = last.saturating_sub(first).saturating_add(1);
+    for row in start..=end {
+        let y = area.y + (row - scroll) as u16;
+        if row == first {
+            for x in left..=right {
+                let symbol = if x == left {
+                    "┌"
+                } else if x == right {
+                    "┐"
+                } else {
+                    "─"
+                };
+                let position = (x - left) as usize;
+                frame.buffer_mut()[(x, y)]
+                    .set_symbol(symbol)
+                    .set_style(animated_card_border_style(position, tick));
             }
-            let y = area.y + (button_line - scroll) as u16;
-            register_buttons_clipped(
-                &mut app.hitboxes,
-                &message.id,
-                area.x.saturating_add(button_start as u16),
-                y,
-                area,
-            );
+        } else if row == last {
+            for x in left..=right {
+                let symbol = if x == left {
+                    "└"
+                } else if x == right {
+                    "┘"
+                } else {
+                    "─"
+                };
+                let position = width
+                    .saturating_add(height.saturating_sub(1))
+                    .saturating_add((right - x) as usize);
+                frame.buffer_mut()[(x, y)]
+                    .set_symbol(symbol)
+                    .set_style(animated_card_border_style(position, tick));
+            }
+        } else {
+            let right_position = width.saturating_add(row.saturating_sub(first + 1));
+            let left_position = width
+                .saturating_add(height.saturating_sub(1))
+                .saturating_add(width.saturating_sub(1))
+                .saturating_add(last.saturating_sub(row + 1));
+            frame.buffer_mut()[(left, y)]
+                .set_symbol("│")
+                .set_style(animated_card_border_style(left_position, tick));
+            frame.buffer_mut()[(right, y)]
+                .set_symbol("│")
+                .set_style(animated_card_border_style(right_position, tick));
         }
     }
+}
 
-    let visible = visible_line_window(&lines, scroll, view_height);
-    frame.render_widget(Paragraph::new(visible), area);
+fn animated_card_border_style(position: usize, tick: u64) -> Style {
+    Style::default()
+        .fg(animated_color(position, tick))
+        .bg(ctp::MANTLE)
 }
 
 fn stable_card_scroll(scroll: usize, first: usize, button: usize, view_height: usize) -> usize {
@@ -1141,21 +1591,14 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     let (rendered_links, document_scroll) = {
         let document = app.document.as_mut().expect("document checked above");
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    document.title.clone(),
-                    Style::default()
-                        .fg(ctp::LAVENDER)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  Esc back", Style::default().fg(ctp::OVERLAY_0)),
-            ])),
+            Paragraph::new(Span::styled(
+                document.title.clone(),
+                Style::default()
+                    .fg(ctp::LAVENDER)
+                    .add_modifier(Modifier::BOLD),
+            )),
             header,
         );
-        let rendered =
-            crate::markdown::render_at_width(&document.source, document_area.width as usize);
-        let rendered_links = rendered.links;
-        let lines = rendered.lines;
         if let Some(target_line) = document.target_line.take() {
             document.scroll = crate::markdown::rendered_row_for_source_line(
                 &document.source,
@@ -1164,11 +1607,19 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             )
             .min(u16::MAX as usize) as u16;
         }
+        document.ensure_rendered(document_area.width as usize);
+        let rendered = &document
+            .render_cache
+            .as_ref()
+            .expect("document render cache was initialized")
+            .rendered;
+        let rendered_links = &rendered.links;
+        let lines = &rendered.lines;
         let max_scroll = lines.len().saturating_sub(document_area.height as usize);
         document.scroll = (document.scroll as usize).min(max_scroll) as u16;
         let document_scroll = document.scroll as usize;
         let visible = visible_line_window(
-            &lines,
+            lines,
             document.scroll as usize,
             document_area.height as usize,
         );
@@ -1178,7 +1629,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     if interactive {
         register_link_hitboxes(
             &mut app.link_hitboxes,
-            &rendered_links,
+            rendered_links,
             document_area,
             document_scroll,
         );
@@ -1486,12 +1937,38 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (_, CenterView::DocumentSearch, _) => "FIND",
         _ => "DAILY",
     };
-    let mode = format!(" {surface} · {} ", app.permission_mode.label());
-    let mode_style = Style::default().bg(ctp::BLUE).fg(ctp::CRUST);
-    frame.render_widget(Paragraph::new(Span::styled(mode.clone(), mode_style)), area);
+    let surface_segment = format!(" {surface} ");
+    let permission_segment = format!(" {} ", app.permission_mode.label());
+    let surface_style = Style::default().bg(ctp::BLUE).fg(ctp::CRUST);
+    let mode_line = if app.permission_mode == PermissionMode::Bypass {
+        let mut spans = vec![Span::styled(surface_segment.clone(), surface_style)];
+        let bypass_style = Style::default().bg(ctp::CRUST);
+        spans.push(Span::styled(" ", bypass_style));
+        spans.extend("BYPASS".chars().enumerate().map(|(index, character)| {
+            Span::styled(
+                character.to_string(),
+                bypass_style
+                    .fg(animated_color(index * 8, app.animation_tick))
+                    .add_modifier(Modifier::BOLD),
+            )
+        }));
+        spans.push(Span::styled(" ", bypass_style));
+        Line::from(spans)
+    } else {
+        Line::from(vec![
+            Span::styled(surface_segment.clone(), surface_style),
+            Span::styled(
+                permission_segment.clone(),
+                Style::default().bg(ctp::SAPPHIRE).fg(ctp::CRUST),
+            ),
+        ])
+    };
+    frame.render_widget(Paragraph::new(mode_line), area);
 
     let hint = footer_hint(app, area.width);
-    let mode_width = mode.width() as u16;
+    let mode_width = surface_segment
+        .width()
+        .saturating_add(permission_segment.width()) as u16;
     let available_status = area
         .width
         .saturating_sub(mode_width)
@@ -1528,31 +2005,46 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
             (Focus::Files, _) => "Esc back · Enter open",
             (Focus::Todo, _) => "Esc back · Enter toggle",
             (Focus::Agent, _) if app.ai_running => "c cancel · C clear · Esc back",
-            (Focus::Agent, _) => "Enter add · C clear · Esc back",
-            (Focus::Center, _) => "? help",
+            (Focus::Agent, _) => "C clear · Esc back",
+            (Focus::Center, CenterView::Document)
+                if app.document.as_ref().is_some_and(|document| {
+                    matches!(document.kind, crate::app::DocumentKind::File(_))
+                }) =>
+            {
+                "e edit · a archive · r rename · d delete"
+            }
+            (Focus::Center, _) => "Ctrl+P commands",
         };
     }
     match (app.focus, app.center_view) {
-        (Focus::Compose, CenterView::Chat) => "Enter send · Ctrl+Enter Agent · Ctrl+J newline",
+        (Focus::Compose, CenterView::Chat) => {
+            "Enter send · Ctrl+Enter Agent · Ctrl+J newline · Ctrl+P commands"
+        }
         (Focus::Compose, CenterView::Document) => {
-            "Enter append · Ctrl+Enter Agent · Ctrl+J newline"
+            "Enter append · Ctrl+Enter Agent · Ctrl+J newline · Ctrl+P commands"
         }
         (Focus::Files, _) => "↑↓ select · Enter open · a/u archive/restore · e edit · / filter",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
         (Focus::Agent, _) if app.ai_running => "c cancel · C clear session · ↑↓ scroll · ← center",
-        (Focus::Agent, _) => "Enter add to Daily · C clear session · ↑↓ scroll · ← center",
-        (_, CenterView::Chat) if width >= 95 => "i compose · f files · T todo · / search · ? help",
+        (Focus::Agent, _) => "C clear session · ↑↓ scroll · ← center",
+        (_, CenterView::Chat) if width >= 95 => {
+            "i compose · f files · T todo · / search · Ctrl+P commands · ? help"
+        }
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {
                 matches!(document.kind, crate::app::DocumentKind::File(_))
             }) =>
         {
-            "↑↓ scroll · e editor · / find · Esc back"
+            if width >= 85 {
+                "↑↓ scroll · e edit · a archive · r rename · d delete · / find · Esc back"
+            } else {
+                "e edit · a archive · r rename · d delete · / find"
+            }
         }
         (_, CenterView::Document) => "↑↓ scroll · e edit message · / find · Esc back",
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
         (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
-        _ => "f files · T todo · ? help",
+        _ => "f files · T todo · Ctrl+P commands · ? help",
     }
 }
 
@@ -1626,6 +2118,7 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     let width = match dialog.mode {
         DialogMode::Approval => 110,
         DialogMode::Informational => 92,
+        DialogMode::CommandPalette => 80,
         _ => 80,
     }
     .min(root.width.saturating_sub(4).max(root.width.min(1)));
@@ -1662,6 +2155,11 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
             .saturating_add(2),
         DialogMode::Approval => root.height.saturating_sub(4).min(36),
         DialogMode::Informational => root.height.saturating_sub(2).min(30),
+        DialogMode::CommandPalette => option_count
+            .min(8)
+            .saturating_mul(3)
+            .saturating_add(6)
+            .max(7),
     };
     let height = desired_height
         .max(3)
@@ -1674,7 +2172,10 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     let border = match dialog.mode {
         DialogMode::Approval => ctp::YELLOW,
         DialogMode::FreeText => ctp::MAUVE,
-        DialogMode::SelectOrInput | DialogMode::SingleSelect | DialogMode::MultiSelect => ctp::SKY,
+        DialogMode::SelectOrInput
+        | DialogMode::SingleSelect
+        | DialogMode::MultiSelect
+        | DialogMode::CommandPalette => ctp::SKY,
         _ => ctp::SUBTEXT_0,
     };
     let modal_background = if matches!(
@@ -1685,12 +2186,17 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     } else {
         ctp::CRUST
     };
+    let border_style = if dialog.mode == DialogMode::CommandPalette {
+        focus_border(true)
+    } else {
+        Style::default().fg(border)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
         .title(format!(" {} ", dialog.title))
         .style(Style::default().bg(modal_background))
-        .border_style(Style::default().fg(border));
+        .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -1789,11 +2295,129 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
                 inner,
             );
         }
+        DialogMode::CommandPalette => draw_command_palette(frame, app, &dialog, inner),
         DialogMode::SingleSelect | DialogMode::MultiSelect | DialogMode::SelectOrInput => {
             draw_select_dialog(frame, app, &dialog, inner);
         }
     }
     area
+}
+
+fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, inner: Rect) {
+    if inner.height == 0 {
+        return;
+    }
+    let input = Rect::new(inner.x, inner.y, inner.width, 1);
+    draw_single_line_input(frame, input, "/ ", &dialog.input, dialog.cursor, true);
+    if inner.height > 1 {
+        frame.render_widget(
+            Paragraph::new("─".repeat(inner.width as usize))
+                .style(Style::default().fg(ctp::SURFACE_1)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+
+    let footer_y = inner.y + inner.height.saturating_sub(1);
+    let gap_y = footer_y.saturating_sub(1);
+    let options = Rect::new(
+        inner.x,
+        inner.y.saturating_add(2),
+        inner.width,
+        gap_y.saturating_sub(inner.y.saturating_add(2)),
+    );
+    let visible_items = (options.height as usize).div_ceil(3).max(1);
+    if dialog.options.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching commands")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(ctp::OVERLAY_0)),
+            options,
+        );
+    } else if options.height > 0 {
+        let list_start = dialog
+            .selected
+            .saturating_sub(visible_items.saturating_sub(1));
+        let options_end = options.y.saturating_add(options.height);
+        let mut y = options.y;
+        for (index, option) in dialog
+            .options
+            .iter()
+            .enumerate()
+            .skip(list_start)
+            .take(visible_items)
+        {
+            if y >= options_end {
+                break;
+            }
+            let item_height = 3.min(options_end.saturating_sub(y));
+            let item_area = Rect::new(options.x, y, options.width, item_height);
+            let selected = index == dialog.selected;
+            let selection_style = if selected {
+                Style::default().bg(ctp::SURFACE_1)
+            } else {
+                Style::default()
+            };
+            if selected {
+                let selection_y = y.saturating_sub(1).max(options.y);
+                let selection_end = y.saturating_add(3).min(options_end);
+                let selection_area = Rect::new(
+                    options.x,
+                    selection_y,
+                    options.width,
+                    selection_end.saturating_sub(selection_y),
+                );
+                frame.render_widget(Block::default().style(selection_style), selection_area);
+                for rail_y in selection_y..selection_end {
+                    frame.render_widget(
+                        Paragraph::new(Span::styled("▌", Style::default().fg(ctp::MAUVE))),
+                        Rect::new(options.x, rail_y, 1, 1),
+                    );
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        option.label.clone(),
+                        Style::default()
+                            .fg(ctp::SUBTEXT_1)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                Rect::new(
+                    options.x.saturating_add(1),
+                    y,
+                    options.width.saturating_sub(1),
+                    1,
+                ),
+            );
+            if item_height > 1 {
+                let description = option.hint.as_deref().unwrap_or("");
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(description, Style::default().fg(ctp::OVERLAY_0)),
+                    ])),
+                    Rect::new(
+                        options.x.saturating_add(1),
+                        y + 1,
+                        options.width.saturating_sub(1),
+                        1,
+                    ),
+                );
+            }
+            app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
+                index,
+                area: item_area,
+            });
+            y = y.saturating_add(item_height);
+        }
+    }
+    draw_dialog_footer(
+        frame,
+        Rect::new(inner.x, footer_y, inner.width, 1),
+        "↑↓ select · Enter run · Esc close",
+    );
 }
 
 fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str) {
@@ -1965,6 +2589,9 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
     let footer_text = match dialog.mode {
         DialogMode::MultiSelect => "↑↓ move · Space toggle · Enter submit · Esc cancel",
         DialogMode::SelectOrInput => "↑↓ choose · Enter submit · type custom · Esc cancel",
+        DialogMode::SingleSelect if dialog.purpose == DialogPurpose::AskUser => {
+            "↑↓ choose · Enter submit · Esc stop"
+        }
         _ => "↑↓ choose · Enter open · Esc cancel",
     };
     draw_dialog_footer(frame, footer, footer_text);
@@ -2058,6 +2685,10 @@ fn draw_approval(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
 
 #[allow(dead_code)]
 fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
+    let round_limit = app
+        .ask_user_request
+        .as_ref()
+        .is_some_and(|request| request.kind == AskUserKind::RoundLimit);
     let width = ASK_USER_WIDTH.min(root.width.saturating_sub(4));
     let text_width = width.saturating_sub(4).max(1) as usize;
     let question_rows = app
@@ -2069,13 +2700,12 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
                 .clamp(1, 8) as u16
         })
         .unwrap_or(1);
-    let option_rows = app
-        .ask_user_request
-        .as_ref()
-        .map_or(0, |request| request.options.len() as u16 + 1);
+    let option_rows = app.ask_user_request.as_ref().map_or(0, |request| {
+        request.options.len() as u16 + u16::from(!round_limit)
+    });
     let desired_height = question_rows
         .saturating_add(option_rows)
-        .saturating_add(4) // Free-text input.
+        .saturating_add(if round_limit { 0 } else { 4 }) // Free-text input.
         .saturating_add(1) // Keyboard hint.
         .saturating_add(2); // Borders.
     let height = desired_height
@@ -2089,7 +2719,11 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
-        .title(" Agent question ")
+        .title(if round_limit {
+            " Agent round limit "
+        } else {
+            " Agent question "
+        })
         .style(Style::default().bg(ctp::CRUST))
         .border_style(Style::default().fg(ctp::SKY));
     let inner = block.inner(area);
@@ -2102,7 +2736,11 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     }
 
     let footer_height = u16::from(inner.height > 0);
-    let input_height = inner.height.saturating_sub(footer_height).min(4);
+    let input_height = if round_limit {
+        0
+    } else {
+        inner.height.saturating_sub(footer_height).min(4)
+    };
     let available = inner
         .height
         .saturating_sub(footer_height)
@@ -2111,7 +2749,8 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
     let option_rows = if request.options.is_empty() {
         0
     } else {
-        (request.options.len() as u16 + 1).min(available.saturating_sub(question_height))
+        (request.options.len() as u16 + u16::from(!round_limit))
+            .min(available.saturating_sub(question_height))
     };
     let question = Rect::new(inner.x, inner.y, inner.width, question_height);
     let options = Rect::new(
@@ -2144,6 +2783,7 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
         .iter()
         .map(|option| option.as_str())
         .chain(std::iter::once("Other answer"))
+        .take(request.options.len() + usize::from(!round_limit))
         .take(options.height as usize)
         .enumerate()
     {
@@ -2159,7 +2799,7 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
         );
     }
 
-    if input.width > 0 && input.height > 0 {
+    if !round_limit && input.width > 0 && input.height > 0 {
         let custom_selected = app.ask_user_option >= request.options.len();
         let input_block = Block::default()
             .borders(Borders::ALL)
@@ -2177,9 +2817,13 @@ fn draw_ask_user(frame: &mut Frame, app: &App, root: Rect) -> Rect {
         );
     }
     frame.render_widget(
-        Paragraph::new("↑↓ choose · Enter submit · type for custom answer · Esc cancel")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(ctp::OVERLAY_0)),
+        Paragraph::new(if round_limit {
+            "↑↓ choose · Enter submit · Esc stop"
+        } else {
+            "↑↓ choose · Enter submit · type for custom answer · Esc cancel"
+        })
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(ctp::OVERLAY_0)),
         footer,
     );
     area
@@ -2350,6 +2994,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("f / T", "focus Files / Todo"),
         key("← → / ↑ ↓", "move focus between panes"),
         key("Tab", "toggle approve / bypass mode"),
+        key("Ctrl+P", "open command palette"),
         key("Esc", "return / cancel"),
         key("?", "open this help"),
         Line::default(),
@@ -2387,7 +3032,6 @@ fn help_lines() -> Vec<Line<'static>> {
         heading("Agent output"),
         key("c", "cancel running Agent while panel is focused"),
         key("C", "clear Agent conversation and start a new session"),
-        key("Enter", "add final output to Daily"),
     ]
 }
 
@@ -2469,13 +3113,14 @@ fn wrap_spans_to_width(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static
 mod tests {
     use std::fs;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use tempfile::tempdir;
 
     use super::*;
     use crate::agent::ApprovalRequest;
-    use crate::app::{Document, DocumentKind, DocumentReturn};
+    use crate::app::{AgentPanelEntry, Document, DocumentKind, DocumentReturn};
     use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate};
     use crate::storage::Storage;
 
@@ -2507,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_title_shows_request_rounds_and_compact_directional_token_usage() {
+    fn agent_header_shows_rounds_session_usage_tps_and_cache() {
         assert_eq!(human_token_count(999), "999");
         assert_eq!(human_token_count(1_000), "1k");
         assert_eq!(human_token_count(12_400), "12.4k");
@@ -2522,8 +3167,68 @@ mod tests {
             cache_creation_input_tokens: 1_000,
             cache_read_input_tokens: 2_000,
         };
+        app.agent_timed_output_tokens = 1_234;
+        app.agent_response_duration = std::time::Duration::from_secs(2);
         let terminal = render(&mut app, 170, 24);
-        assert!(buffer_string(&terminal).contains("Agent · ↻3/25 · ↑3.5k ↓1.2k"));
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Agent · ↻3/25"));
+        assert!(screen.contains("↑3.5k ↓1.2k · 617.0 t/s · Cache 2k 57%"));
+    }
+
+    #[test]
+    fn command_palette_is_fixed_width_and_renders_query_and_commands() {
+        let (mut app, _directory) = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("agent");
+
+        let terminal = render(&mut app, 120, 24);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Command Palette · Ctrl+P"));
+        assert!(screen.contains("/ agent"));
+        assert!(screen.contains("Agent: Interrupt task"));
+        assert!(screen.contains("Stop the active Agent task"));
+        assert!(screen.contains("Agent: Clear session"));
+        let palette = app.layout.overlay.unwrap();
+        assert_eq!(palette.width, 80);
+        assert_eq!(
+            terminal.backend().buffer()[(palette.x, palette.y)].fg,
+            ctp::GREEN
+        );
+        assert!(app.dialog_hitboxes.len() >= 4);
+        let selected = &app.dialog_hitboxes[0].area;
+        assert_eq!(selected.height, 3);
+        assert_eq!(
+            terminal.backend().buffer()[(selected.x, selected.y)].symbol(),
+            "▌"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(selected.x, selected.y + 1)].symbol(),
+            "▌"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(selected.x, selected.y + 2)].symbol(),
+            "▌",
+            "selection rail should fill the shared blank row"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(selected.x, selected.y + 2)].bg,
+            ctp::SURFACE_1,
+            "selection should include the shared blank row"
+        );
+        assert!(terminal.backend().buffer()[(selected.x + 2, selected.y)]
+            .modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(
+            terminal.backend().buffer()[(selected.x + 2, selected.y + 1)].fg,
+            ctp::OVERLAY_0
+        );
+        let last = &app.dialog_hitboxes.last().unwrap().area;
+        let gap_y = last.y + last.height;
+        assert_eq!(
+            gap_y,
+            palette.y + palette.height - 3,
+            "one blank row should separate commands from the footer"
+        );
     }
 
     fn contains(outer: Rect, inner: Rect) -> bool {
@@ -2602,14 +3307,36 @@ mod tests {
     fn running_agent_animates_its_border_and_current_activity_only() {
         let (mut app, _directory) = make_app();
         app.ai_running = true;
-        app.agent_prompt = "Analyze this".to_string();
-        app.agent_output = vec![
-            "Completed read_file".to_string(),
-            "Using web_fetch".to_string(),
+        app.agent_panel = vec![
+            AgentPanelEntry::Prompt {
+                text: "Analyze this".to_string(),
+                muted: false,
+            },
+            AgentPanelEntry::Tool {
+                text: "Completed Read File.".to_string(),
+                active: false,
+            },
+            AgentPanelEntry::Tool {
+                text: "Fetching Web...".to_string(),
+                active: true,
+            },
+            AgentPanelEntry::Assistant {
+                text: "I will compare **multiple sources**.".to_string(),
+                streaming: false,
+                final_output: false,
+            },
+            AgentPanelEntry::Prompt {
+                text: "Consumed follow-up".to_string(),
+                muted: false,
+            },
+            AgentPanelEntry::Prompt {
+                text: "Queued follow-up".to_string(),
+                muted: true,
+            },
         ];
         app.status = "AI is working".to_string();
         app.animation_tick = 0;
-        let first = render(&mut app, 170, 24);
+        let first = render(&mut app, 170, 40);
         let agent = app.layout.agent.unwrap();
         let first_corner = first.backend().buffer()[(agent.x, agent.y)].fg;
         let top_colors = (agent.x..agent.x + agent.width)
@@ -2621,21 +3348,54 @@ mod tests {
         assert!(top_colors.windows(2).any(|colors| colors[0] != colors[1]));
         let first_footer = buffer_string(&first).lines().last().unwrap().to_string();
         let first_footer_colors = (0..170)
-            .map(|x| first.backend().buffer()[(x, 23)].fg)
+            .map(|x| first.backend().buffer()[(x, 39)].fg)
             .collect::<Vec<_>>();
         let first_activity_colors = (agent.y + 1..agent.y + agent.height - 1)
             .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
             .map(|(x, y)| first.backend().buffer()[(x, y)].fg)
             .collect::<Vec<_>>();
-        assert!(buffer_string(&first).contains("• Completed read_file"));
-        assert!(buffer_string(&first).contains("• Using web_fetch"));
+        let first_screen = buffer_string(&first);
+        let completed = first_screen.find("• Completed Read File.").unwrap();
+        let active = first_screen.find("• Fetching Web...").unwrap();
+        let intermediate = first_screen
+            .find("I will compare multiple sources.")
+            .unwrap();
+        let consumed = first_screen.find("Consumed follow-up").unwrap();
+        let queued = first_screen.find("Queued follow-up").unwrap();
+        assert!(completed < active && active < intermediate && intermediate < consumed);
+        assert!(consumed < queued);
+        let screen_lines = first_screen.lines().collect::<Vec<_>>();
+        let consumed_y = screen_lines
+            .iter()
+            .position(|line| line.contains("Consumed follow-up"))
+            .unwrap() as u16;
+        let queued_y = screen_lines
+            .iter()
+            .position(|line| line.contains("Queued follow-up"))
+            .unwrap() as u16;
+        let consumed_byte = screen_lines[consumed_y as usize]
+            .find("Consumed follow-up")
+            .unwrap();
+        let queued_byte = screen_lines[queued_y as usize]
+            .find("Queued follow-up")
+            .unwrap();
+        let consumed_x = screen_lines[consumed_y as usize][..consumed_byte].width() as u16;
+        let queued_x = screen_lines[queued_y as usize][..queued_byte].width() as u16;
+        assert_ne!(
+            first.backend().buffer()[(consumed_x, consumed_y)].fg,
+            ctp::OVERLAY_0
+        );
+        assert_eq!(
+            first.backend().buffer()[(queued_x, queued_y)].fg,
+            ctp::OVERLAY_0
+        );
 
         app.animation_tick = 1;
-        let second = render(&mut app, 170, 24);
+        let second = render(&mut app, 170, 40);
         let second_corner = second.backend().buffer()[(agent.x, agent.y)].fg;
         let second_footer = buffer_string(&second).lines().last().unwrap().to_string();
         let second_footer_colors = (0..170)
-            .map(|x| second.backend().buffer()[(x, 23)].fg)
+            .map(|x| second.backend().buffer()[(x, 39)].fg)
             .collect::<Vec<_>>();
         let second_activity_colors = (agent.y + 1..agent.y + agent.height - 1)
             .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
@@ -2645,6 +3405,27 @@ mod tests {
         assert_eq!(first_footer, second_footer);
         assert_eq!(first_footer_colors, second_footer_colors);
         assert_ne!(first_activity_colors, second_activity_colors);
+
+        app.ai_running = false;
+        app.agent_panel.push(AgentPanelEntry::Assistant {
+            text: "Final response".to_string(),
+            streaming: false,
+            final_output: true,
+        });
+        let final_frame = render(&mut app, 170, 40);
+        let final_screen = buffer_string(&final_frame);
+        assert!(final_screen.contains("Prompt"));
+        assert!(final_screen.contains("Response"));
+        assert!(final_screen.contains("Final response"));
+        for retained in [
+            "Completed Read File.",
+            "Fetching Web...",
+            "multiple sources",
+            "Consumed follow-up",
+            "Queued follow-up",
+        ] {
+            assert!(final_screen.contains(retained));
+        }
     }
 
     #[test]
@@ -2660,13 +3441,56 @@ mod tests {
                 .skip(1)
                 .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
                 .count(),
-            1
+            6
         );
         assert!(lines[0]
             .spans
             .iter()
             .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
             .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn bypass_mode_animates_in_the_footer_and_daily_advertises_commands() {
+        let (mut app, _directory) = make_app();
+        let approve = render(&mut app, 170, 24);
+        let approve_screen = buffer_string(&approve);
+        let approve_footer = approve_screen.lines().last().unwrap();
+        assert!(!approve_footer.contains("COMPOSE · APPROVE"));
+        assert!(approve_footer.contains("COMPOSE  APPROVE"));
+        let surface_x = approve_footer.find("COMPOSE").unwrap() as u16;
+        let approve_byte = approve_footer.find("APPROVE").unwrap();
+        let approve_x = approve_footer[..approve_byte].width() as u16;
+        assert_eq!(approve.backend().buffer()[(surface_x, 23)].bg, ctp::BLUE);
+        assert_eq!(
+            approve.backend().buffer()[(approve_x, 23)].bg,
+            ctp::SAPPHIRE
+        );
+
+        app.permission_mode = PermissionMode::Bypass;
+        app.animation_tick = 0;
+        let first = render(&mut app, 170, 24);
+        let footer_y = 23;
+        let first_screen = buffer_string(&first);
+        let first_footer = first_screen.lines().last().unwrap();
+        let bypass_byte = first_footer.find("BYPASS").unwrap();
+        let bypass_x = first_footer[..bypass_byte].width() as u16;
+        let first_colors = (bypass_x..bypass_x + "BYPASS".width() as u16)
+            .map(|x| first.backend().buffer()[(x, footer_y)].fg)
+            .collect::<Vec<_>>();
+        assert!(first_footer.contains("Ctrl+P commands"));
+        assert!(first_colors
+            .iter()
+            .all(|color| matches!(color, Color::Rgb(..))));
+        assert!((bypass_x..bypass_x + "BYPASS".width() as u16)
+            .all(|x| first.backend().buffer()[(x, footer_y)].bg == ctp::CRUST));
+
+        app.animation_tick = 1;
+        let second = render(&mut app, 170, 24);
+        let second_colors = (bypass_x..bypass_x + "BYPASS".width() as u16)
+            .map(|x| second.backend().buffer()[(x, footer_y)].fg)
+            .collect::<Vec<_>>();
+        assert_ne!(first_colors, second_colors);
     }
 
     #[test]
@@ -2887,6 +3711,7 @@ mod tests {
             scroll: 0,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
         let terminal = render(&mut app, 80, 18);
         assert!(buffer_string(&terminal).contains("Heading"));
@@ -2981,6 +3806,7 @@ mod tests {
             scroll: 0,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
         app.center_view = CenterView::Document;
         render(&mut app, 170, 24);
@@ -2989,9 +3815,11 @@ mod tests {
             .iter()
             .any(|hitbox| { hitbox.target == LinkTarget::WikiLink("Project".to_string()) }));
 
-        app.agent_prompt.clear();
-        app.agent_output = vec!["[result](https://agent.example)".to_string()];
-        app.agent_output_final = true;
+        app.agent_panel = vec![AgentPanelEntry::Assistant {
+            text: "[result](https://agent.example)".to_string(),
+            streaming: false,
+            final_output: true,
+        }];
         render(&mut app, 170, 24);
         assert!(app.link_hitboxes.iter().any(|hitbox| {
             hitbox.target == LinkTarget::External("https://agent.example".to_string())
@@ -3051,6 +3879,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         app.overlay = Some(Overlay::AskUser);
         app.ask_user_request = Some(crate::agent::AskUserRequest {
+            kind: AskUserKind::Tool,
             question: "Which output format should be used?".to_string(),
             options: vec!["Markdown".to_string(), "MBDown".to_string()],
         });
@@ -3070,11 +3899,39 @@ mod tests {
     }
 
     #[test]
+    fn round_limit_dialog_only_offers_continue_or_stop() {
+        let (mut app, _directory) = make_app();
+        app.overlay = Some(Overlay::AskUser);
+        app.ask_user_request = Some(crate::agent::AskUserRequest {
+            kind: AskUserKind::RoundLimit,
+            question: "Continue for up to 25 more rounds?".to_string(),
+            options: vec!["Continue".to_string(), "Stop".to_string()],
+        });
+
+        let terminal = render(&mut app, 100, 24);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Agent round limit"));
+        assert!(screen.contains("Continue"));
+        assert!(screen.contains("Stop"));
+        assert!(!screen.contains("Other answer"));
+        assert!(!screen.contains("Your answer"));
+        assert!(screen.contains("Esc stop"));
+    }
+
+    #[test]
     fn agent_panel_shows_the_user_prompt_above_the_response() {
         let (mut app, _directory) = make_app();
-        app.agent_prompt = "Explain the selected note".to_string();
-        app.agent_output = vec!["Here is the explanation".to_string()];
-        app.agent_output_final = true;
+        app.agent_panel = vec![
+            AgentPanelEntry::Prompt {
+                text: "Explain the selected note".to_string(),
+                muted: false,
+            },
+            AgentPanelEntry::Assistant {
+                text: "Here is the explanation".to_string(),
+                streaming: false,
+                final_output: true,
+            },
+        ];
         app.focus = Focus::Agent;
 
         let terminal = render(&mut app, 170, 24);
@@ -3098,6 +3955,7 @@ mod tests {
             scroll: 0,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
         app.notifications.notify("Recorded in Daily");
         let terminal = render(&mut app, 120, 24);
@@ -3164,6 +4022,58 @@ mod tests {
         assert!(screen.contains("panel"));
         assert_eq!(app.todo_hitboxes.len(), 1);
         assert!(app.todo_hitboxes[0].area.height > 1);
+    }
+
+    #[test]
+    fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Todo;
+        app.todo_items = vec![
+            TodoItem {
+                checked: false,
+                text: "first task".to_string(),
+            },
+            TodoItem {
+                checked: true,
+                text: "second task".to_string(),
+            },
+        ];
+        app.todo_index = 1;
+
+        let terminal = render(&mut app, 170, 24);
+        let screen = buffer_string(&terminal);
+        let lines = screen.lines().collect::<Vec<_>>();
+        let first_row = lines
+            .iter()
+            .position(|line| line.contains("first task"))
+            .unwrap();
+        let second_row = lines
+            .iter()
+            .position(|line| line.contains("second task"))
+            .unwrap();
+        assert_eq!(second_row, first_row + 2);
+        assert_eq!(app.todo_hitboxes.len(), 2);
+        assert_eq!(app.todo_hitboxes[0].area.height, 2);
+        let todo = app.layout.todo.unwrap();
+        let first = app.todo_hitboxes[0].area;
+        let last = app.todo_hitboxes[1].area;
+        assert_eq!(first.y, todo.y + 2, "the first item needs a top margin");
+        assert_eq!(
+            terminal.backend().buffer()[(first.x, first.y + first.height - 1)].bg,
+            ctp::SURFACE_1,
+            "the selected background should include the shared blank row"
+        );
+        let last_margin = &terminal.backend().buffer()[(last.x, last.y + last.height - 1)];
+        assert_eq!(last_margin.symbol(), " ");
+        assert_eq!(last_margin.bg, ctp::SURFACE_1);
+        assert!(!last_margin.modifier.contains(Modifier::CROSSED_OUT));
+        assert!(!terminal.backend().buffer()[(last.x, last.y - 1)]
+            .modifier
+            .contains(Modifier::CROSSED_OUT));
+        assert!((last.x..last.x + last.width).any(|x| {
+            let cell = &terminal.backend().buffer()[(x, last.y)];
+            cell.modifier.contains(Modifier::CROSSED_OUT) && cell.symbol() != " "
+        }));
     }
 
     #[test]
@@ -3257,9 +4167,9 @@ mod tests {
             buffer.content().iter().any(|cell| {
                 cell.symbol() == "H"
                     && cell.modifier.contains(Modifier::BOLD)
-                    && cell.bg == ctp::SURFACE_1
+                    && cell.bg == ctp::MANTLE
             }),
-            "heading should retain Markdown emphasis on the selected card background"
+            "selection should not alter the Markdown body background"
         );
         let ai = app
             .hitboxes
@@ -3272,6 +4182,38 @@ mod tests {
             ai.area.x + ai.area.width,
             message_area.x + message_area.width - PAGE_PADDING_X as u16,
             "AI button should share the body content axis"
+        );
+    }
+
+    #[test]
+    fn selected_daily_card_uses_an_animated_gradient_border() {
+        let (mut app, _directory) = make_app();
+        app.storage.append_chat_message("A daily note").unwrap();
+        app.reload();
+        app.animation_tick = 0;
+
+        let first = render(&mut app, 170, 30);
+        let center = app.layout.center.unwrap();
+        let daily = inset_horizontal(center_content_axis(center), 2);
+        let top = daily.y + 2;
+        let first_buffer = first.backend().buffer();
+        assert_eq!(first_buffer[(daily.x, top)].symbol(), "┌");
+        assert_eq!(first_buffer[(daily.x, top)].fg, animated_color(0, 0));
+        assert_eq!(first_buffer[(daily.x + 1, top)].fg, animated_color(1, 0));
+        assert_ne!(
+            first_buffer[(daily.x, top)].fg,
+            first_buffer[(daily.x + 1, top)].fg
+        );
+
+        app.animation_tick = 1;
+        let second = render(&mut app, 170, 30);
+        assert_eq!(
+            second.backend().buffer()[(daily.x, top)].fg,
+            animated_color(0, 1)
+        );
+        assert_ne!(
+            second.backend().buffer()[(daily.x, top)].fg,
+            first_buffer[(daily.x, top)].fg
         );
     }
 
@@ -3372,10 +4314,14 @@ mod tests {
         let center = app.layout.center.expect("center area");
         let sample_x = center.x + center.width / 2;
         assert!(date_row >= 2);
-        assert_eq!(buffer[(sample_x, date_row as u16 - 1)].bg, ctp::SURFACE_1);
-        assert_eq!(buffer[(sample_x, date_row as u16 - 2)].bg, ctp::SURFACE_1);
-        assert_eq!(buffer[(sample_x, button_row as u16 + 1)].bg, ctp::SURFACE_1);
-        assert_eq!(buffer[(sample_x, button_row as u16 + 2)].bg, ctp::SURFACE_1);
+        assert_eq!(buffer[(sample_x, date_row as u16 - 1)].bg, ctp::MANTLE);
+        assert_eq!(buffer[(sample_x, date_row as u16 - 2)].bg, ctp::MANTLE);
+        assert_eq!(buffer[(sample_x, button_row as u16 + 1)].bg, ctp::MANTLE);
+        assert_eq!(buffer[(sample_x, button_row as u16 + 2)].bg, ctp::MANTLE);
+        let card_left = inset_horizontal(center_content_axis(center), 2).x;
+        assert_eq!(buffer[(card_left, date_row as u16 - 2)].symbol(), "┌");
+        assert_eq!(buffer[(card_left, date_row as u16)].symbol(), "│");
+        assert_eq!(buffer[(card_left, button_row as u16 + 2)].symbol(), "└");
     }
 
     #[test]
@@ -3390,9 +4336,15 @@ mod tests {
             scroll: 0,
             target_line: Some(5),
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
         let terminal = render(&mut app, 80, 30);
         let buffer = terminal.backend().buffer();
+        let header: String = (0..80)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(header.contains("Archive"));
+        assert!(!header.contains("Esc back"));
         assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert!(buffer_string(&terminal).contains("Compose"));
         assert!(buffer_string(&terminal).contains("  Archive"));
@@ -3410,6 +4362,53 @@ mod tests {
     }
 
     #[test]
+    fn document_scroll_overwrites_box_borders_from_the_previous_frame() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        app.center_view = CenterView::Document;
+        let boxed = (0..40)
+            .map(|line| format!("boxed {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let plain = (0..40)
+            .map(|line| format!("plain {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.document = Some(Document {
+            kind: DocumentKind::File(app.storage.data_dir.join("scroll.md")),
+            title: "Scroll".to_string(),
+            source: format!(
+                "{plain}\n\n[box width=full border=single border-color=#df7f3f bg=16]\n{boxed}\n[/box]"
+            ),
+            scroll: u16::MAX,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+            render_cache: None,
+        });
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "│"));
+
+        app.document.as_mut().unwrap().scroll = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let page = app.layout.center.unwrap();
+        let border = Color::Rgb(223, 127, 63);
+        assert!(buffer_string(&terminal).contains("plain 0"));
+        assert!((page.y..page.y + page.height).all(|y| {
+            (page.x..page.x + page.width)
+                .all(|x| buffer[(x, y)].symbol() != "│" || buffer[(x, y)].fg != border)
+        }));
+    }
+
+    #[test]
     fn document_code_block_background_has_no_wrapped_gaps() {
         let (mut app, _directory) = make_app();
         app.focus = Focus::Center;
@@ -3421,6 +4420,7 @@ mod tests {
             scroll: 0,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
 
         let terminal = render(&mut app, 80, 30);
@@ -3434,5 +4434,92 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 7);
         assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[test]
+    fn daily_vlist_only_renders_visible_cards_and_invalidates_changed_content() {
+        let (mut app, _directory) = make_app();
+        app.messages = (1..=40)
+            .map(|day| crate::model::Message {
+                id: format!("2026-06-{day:02}"),
+                created_at: Local::now(),
+                body: format!("# Card {day}\n\nA daily card that may be off screen."),
+            })
+            .collect();
+
+        sync_daily_vlist(&mut app, 80);
+        assert!(app
+            .daily_vlist
+            .items
+            .iter()
+            .all(|item| item.cache.is_none()));
+        let scroll = measure_visible_daily_cards(&mut app, 0, 8, false);
+        assert_eq!(scroll, 0);
+        let rendered = app
+            .daily_vlist
+            .items
+            .iter()
+            .filter(|item| item.cache.is_some())
+            .count();
+        assert!(rendered > 0 && rendered < app.messages.len());
+        assert!(app.daily_vlist.items[20].cache.is_none());
+        let original = app.daily_vlist.items[0].cache.clone();
+
+        measure_visible_daily_cards(&mut app, 0, 8, false);
+        assert_eq!(app.daily_vlist.items[0].cache, original);
+
+        app.messages[0].body.push_str("\n\nChanged");
+        sync_daily_vlist(&mut app, 80);
+        assert!(app.daily_vlist.items[0].cache.is_none());
+        assert!(!app.daily_vlist.geometry.is_measured(0));
+
+        sync_daily_vlist(&mut app, 72);
+        assert!(app
+            .daily_vlist
+            .items
+            .iter()
+            .all(|item| item.cache.is_none()));
+        assert_eq!(app.daily_vlist.width, 72);
+    }
+
+    #[test]
+    fn agent_vlist_only_renders_visible_entries_and_keeps_animation_out_of_cache() {
+        let (mut app, _directory) = make_app();
+        app.agent_panel.push(AgentPanelEntry::Tool {
+            text: "Fetching Web...".to_string(),
+            active: true,
+        });
+        app.agent_panel
+            .extend((1..40).map(|index| AgentPanelEntry::Prompt {
+                text: format!("Prompt {index}"),
+                muted: false,
+            }));
+
+        sync_agent_vlist(&mut app, 40);
+        assert!(app.agent_vlist.caches.iter().all(Option::is_none));
+        let scroll = measure_visible_agent_entries(&mut app, 0, 6, false);
+        assert_eq!(scroll, 0);
+        let rendered = app
+            .agent_vlist
+            .caches
+            .iter()
+            .filter(|cache| cache.is_some())
+            .count();
+        assert!(rendered > 0 && rendered < app.agent_panel.len());
+        assert!(app.agent_vlist.caches[20].is_none());
+        let original = app.agent_vlist.caches[0].clone();
+        let (visible, _) = visible_agent_lines(&mut app, 0, 6);
+        assert_eq!(visible.len(), 6);
+
+        app.animation_tick = 10;
+        sync_agent_vlist(&mut app, 40);
+        assert_eq!(app.agent_vlist.caches[0], original);
+
+        if let AgentPanelEntry::Tool { text, .. } = &mut app.agent_panel[0] {
+            text.push_str(" now");
+        }
+        sync_agent_vlist(&mut app, 40);
+        assert!(app.agent_vlist.caches[0].is_none());
+        assert!(!app.agent_vlist.geometry.is_measured(0));
     }
 }

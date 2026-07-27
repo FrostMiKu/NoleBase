@@ -85,7 +85,8 @@ impl Storage {
             "tavily_api_key = \"\"\n",
             "model = \"claude-sonnet-4-5\"\n",
             "base_url = \"https://api.anthropic.com\"\n",
-            "max_tokens = 4096\n",
+            "max_tokens = 8192\n",
+            "context_window_tokens = 200000\n",
             "max_rounds = 25\n",
         );
         let mut options = OpenOptions::new();
@@ -1242,6 +1243,8 @@ mod tests {
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
         assert!(config.contains("api_key = \"\""));
         assert!(config.contains("tavily_api_key = \"\""));
+        assert!(config.contains("max_tokens = 8192"));
+        assert!(config.contains("context_window_tokens = 200000"));
         assert!(config.contains("max_rounds = 25"));
     }
 

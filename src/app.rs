@@ -3,16 +3,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::agent::{
-    Agent, AgentConversation, AgentEvent, ApprovalDecision, ApprovalRequest, AskUserRequest,
-    AskUserResponse, PermissionMode, TokenUsage,
+    Agent, AgentConversation, AgentEvent, AgentRuntime, ApprovalDecision, ApprovalRequest,
+    AskUserKind, AskUserRequest, AskUserResponse, PermissionMode, TokenUsage,
 };
 use crate::model::{
     Action, ButtonHitbox, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow,
@@ -165,6 +166,123 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCommand {
+    InterruptAgent,
+    ClearAgentSession,
+    NewNote,
+    EditCurrentNote,
+    RenameCurrentNote,
+    DeleteCurrentNote,
+    ArchiveCurrentNote,
+    RestoreCurrentNote,
+    EditAiConfig,
+    EditAgentInstructions,
+    EditAgentMemory,
+}
+
+struct AppCommandDefinition {
+    id: AppCommand,
+    label: &'static str,
+    description: &'static str,
+    keywords: &'static str,
+}
+
+const APP_COMMANDS: &[AppCommandDefinition] = &[
+    AppCommandDefinition {
+        id: AppCommand::InterruptAgent,
+        label: "Agent: Interrupt task",
+        description: "Stop the active Agent task",
+        keywords: "agent interrupt cancel stop task",
+    },
+    AppCommandDefinition {
+        id: AppCommand::ClearAgentSession,
+        label: "Agent: Clear session",
+        description: "Discard the in-memory conversation context",
+        keywords: "agent clear reset new session context conversation",
+    },
+    AppCommandDefinition {
+        id: AppCommand::NewNote,
+        label: "Note: New",
+        description: "Create and open a new blank note",
+        keywords: "note new create file blank",
+    },
+    AppCommandDefinition {
+        id: AppCommand::EditCurrentNote,
+        label: "Note: Edit",
+        description: "Open the current note in your editor",
+        keywords: "note edit editor current article",
+    },
+    AppCommandDefinition {
+        id: AppCommand::RenameCurrentNote,
+        label: "Note: Rename",
+        description: "Rename the current note without changing its format",
+        keywords: "note rename name current article",
+    },
+    AppCommandDefinition {
+        id: AppCommand::DeleteCurrentNote,
+        label: "Note: Delete",
+        description: "Delete the current note after confirmation",
+        keywords: "note delete remove current article",
+    },
+    AppCommandDefinition {
+        id: AppCommand::ArchiveCurrentNote,
+        label: "Note: Archive",
+        description: "Move the current note into Archives",
+        keywords: "note archive achieve current article",
+    },
+    AppCommandDefinition {
+        id: AppCommand::RestoreCurrentNote,
+        label: "Note: Restore",
+        description: "Move the current archived note back into Notes",
+        keywords: "note restore unarchive current article",
+    },
+    AppCommandDefinition {
+        id: AppCommand::EditAiConfig,
+        label: "Config: Edit AI settings",
+        description: "Open config/ai.toml in your editor",
+        keywords: "config configuration ai anthropic tavily model settings editor",
+    },
+    AppCommandDefinition {
+        id: AppCommand::EditAgentInstructions,
+        label: "Config: Edit Agent instructions",
+        description: "Open config/AGENTS.md in your editor",
+        keywords: "config configuration agent instructions agents md editor",
+    },
+    AppCommandDefinition {
+        id: AppCommand::EditAgentMemory,
+        label: "Config: Edit Agent memory",
+        description: "Open MEMORY.md in your editor",
+        keywords: "config configuration agent memory md editor",
+    },
+];
+
+fn command_definition(id: AppCommand) -> Option<&'static AppCommandDefinition> {
+    APP_COMMANDS.iter().find(|command| command.id == id)
+}
+
+fn command_match_score(command: &AppCommandDefinition, query: &str) -> Option<u8> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let candidate = format!(
+        "{} {} {}",
+        command.label, command.description, command.keywords
+    )
+    .to_lowercase();
+    if candidate.contains(&query) {
+        return Some(0);
+    }
+    if query
+        .split_whitespace()
+        .all(|term| candidate.contains(term))
+    {
+        return Some(1);
+    }
+    fuzzy_match(&candidate, &query).then_some(2)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorMove {
     Left,
     Right,
@@ -242,6 +360,7 @@ pub enum DialogMode {
     FreeText,
     Approval,
     Informational,
+    CommandPalette,
 }
 
 /// Business purpose of a dialog. The mode controls interaction while the
@@ -257,6 +376,7 @@ pub enum DialogPurpose {
     Help,
     NewFile,
     RenameFile,
+    CommandPalette,
     Custom,
 }
 
@@ -372,6 +492,37 @@ pub struct Document {
     /// One-based source line to reveal on the next render.
     pub target_line: Option<usize>,
     pub return_to: DocumentReturn,
+    pub(crate) render_cache: Option<DocumentRenderCache>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentRenderCache {
+    width: usize,
+    pub rendered: crate::markdown::RenderedMarkup,
+}
+
+impl Document {
+    pub(crate) fn replace_source(&mut self, source: String) {
+        if self.source != source {
+            self.source = source;
+            self.render_cache = None;
+        }
+    }
+
+    pub(crate) fn ensure_rendered(&mut self, width: usize) -> bool {
+        if self
+            .render_cache
+            .as_ref()
+            .is_some_and(|cache| cache.width == width)
+        {
+            return false;
+        }
+        self.render_cache = Some(DocumentRenderCache {
+            width,
+            rendered: crate::markdown::render_at_width(&self.source, width),
+        });
+        true
+    }
 }
 
 /// Screen geometry recorded by the renderer after each layout pass.
@@ -388,6 +539,84 @@ pub struct LayoutSnapshot {
     pub overlay: Option<Rect>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentPanelEntry {
+    Prompt {
+        text: String,
+        muted: bool,
+    },
+    Assistant {
+        text: String,
+        streaming: bool,
+        final_output: bool,
+    },
+    Tool {
+        text: String,
+        active: bool,
+    },
+    Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DailyCardRenderCache {
+    pub width: usize,
+    pub id: String,
+    pub date: String,
+    pub body: String,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub links: Vec<crate::markdown::RenderedLink>,
+    pub button_line: usize,
+    pub button_start: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentEntryRenderCache {
+    pub width: usize,
+    pub entry: AgentPanelEntry,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub links: Vec<crate::markdown::RenderedLink>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DailyVirtualItem {
+    pub id: String,
+    pub cache: Option<DailyCardRenderCache>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DailyVirtualList {
+    pub width: usize,
+    pub geometry: crate::vlist::VList,
+    pub items: Vec<DailyVirtualItem>,
+}
+
+impl Default for DailyVirtualList {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            geometry: crate::vlist::VList::new(12),
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentVirtualList {
+    pub width: usize,
+    pub geometry: crate::vlist::VList,
+    pub caches: Vec<Option<AgentEntryRenderCache>>,
+}
+
+impl Default for AgentVirtualList {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            geometry: crate::vlist::VList::new(4),
+            caches: Vec::new(),
+        }
+    }
+}
+
 pub struct App {
     pub storage: Storage,
 
@@ -398,6 +627,7 @@ pub struct App {
     pub document: Option<Document>,
 
     pub messages: Vec<Message>,
+    pub(crate) daily_vlist: DailyVirtualList,
     pub selected: usize,
     pub scroll: u16,
     /// Set only when navigation should bring the selected card back on screen.
@@ -454,18 +684,21 @@ pub struct App {
     /// Result of a caller-provided [`Overlay::Dialog`]. Business dialogs
     /// deliver their result directly to their existing subsystem channels.
     pub dialog_result: Option<DialogResult>,
+    command_matches: Vec<AppCommand>,
 
     ai_events: Option<Receiver<AgentEvent>>,
     ai_approval_sender: Option<mpsc::Sender<ApprovalDecision>>,
     ai_user_sender: Option<mpsc::Sender<AskUserResponse>>,
+    agent_input_buffer: Arc<Mutex<Vec<String>>>,
     pub ai_running: bool,
     pub permission_mode: PermissionMode,
     permission_bypass: Arc<AtomicBool>,
-    pub agent_prompt: String,
-    pub agent_output: Vec<String>,
-    pub agent_output_final: bool,
+    pub agent_panel: Vec<AgentPanelEntry>,
+    pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
     pub agent_usage: TokenUsage,
+    pub agent_timed_output_tokens: u64,
+    pub agent_response_duration: Duration,
     pub agent_round: u32,
     pub agent_round_limit: u32,
     agent_conversation: AgentConversation,
@@ -505,6 +738,7 @@ impl App {
             overlay: None,
             document: None,
             messages,
+            daily_vlist: DailyVirtualList::default(),
             selected,
             scroll: u16::MAX,
             reveal_selected_message: true,
@@ -542,17 +776,20 @@ impl App {
             dialog_hitboxes: Vec::new(),
             dialog: None,
             dialog_result: None,
+            command_matches: Vec::new(),
             ai_events: None,
             ai_approval_sender: None,
             ai_user_sender: None,
+            agent_input_buffer: Arc::new(Mutex::new(Vec::new())),
             ai_running: false,
             permission_mode: PermissionMode::Approve,
             permission_bypass: Arc::new(AtomicBool::new(false)),
-            agent_prompt: String::new(),
-            agent_output: Vec::new(),
-            agent_output_final: false,
+            agent_panel: Vec::new(),
+            agent_vlist: AgentVirtualList::default(),
             agent_scroll: 0,
             agent_usage: TokenUsage::default(),
+            agent_timed_output_tokens: 0,
+            agent_response_duration: Duration::ZERO,
             agent_round: 0,
             agent_round_limit: 0,
             agent_conversation: AgentConversation::default(),
@@ -589,7 +826,10 @@ impl App {
     }
 
     pub fn advance_animation(&mut self) {
-        if self.ai_running {
+        if self.center_view == CenterView::Chat
+            || self.ai_running
+            || self.permission_mode == PermissionMode::Bypass
+        {
             self.animation_tick = self.animation_tick.wrapping_add(1);
         }
     }
@@ -645,7 +885,7 @@ impl App {
             match self.storage.read_document_file(&path) {
                 Ok(updated) => {
                     if let Some(document) = self.document.as_mut() {
-                        document.source = updated;
+                        document.replace_source(updated);
                     }
                 }
                 Err(_) if self.ai_running && !path.exists() => {
@@ -681,13 +921,82 @@ impl App {
         }
         for event in events {
             match event {
-                AgentEvent::Progress(message) => {
-                    self.agent_output.push(message.clone());
-                    self.agent_output_final = false;
+                AgentEvent::AssistantDelta(delta) => {
+                    match self.agent_panel.last_mut() {
+                        Some(AgentPanelEntry::Assistant {
+                            text, streaming, ..
+                        }) if *streaming => text.push_str(&delta),
+                        _ => self.agent_panel.push(AgentPanelEntry::Assistant {
+                            text: delta,
+                            streaming: true,
+                            final_output: false,
+                        }),
+                    }
+                    self.agent_scroll = u16::MAX;
+                }
+                AgentEvent::AssistantMessageFinished { final_output } => {
+                    for entry in &mut self.agent_panel {
+                        if let AgentPanelEntry::Assistant {
+                            streaming,
+                            final_output: entry_final,
+                            ..
+                        } = entry
+                        {
+                            if *streaming {
+                                *streaming = false;
+                                *entry_final = final_output;
+                            }
+                        }
+                    }
+                }
+                AgentEvent::BufferedInputConsumed(count) => {
+                    for followup in self
+                        .agent_panel
+                        .iter_mut()
+                        .filter_map(|entry| match entry {
+                            AgentPanelEntry::Prompt { muted, .. } if *muted => Some(muted),
+                            _ => None,
+                        })
+                        .take(count)
+                    {
+                        *followup = false;
+                    }
+                }
+                AgentEvent::ToolStarted(message) => {
+                    self.agent_panel.push(AgentPanelEntry::Tool {
+                        text: message.clone(),
+                        active: true,
+                    });
+                    self.agent_scroll = u16::MAX;
+                    self.set_status(message);
+                }
+                AgentEvent::ToolFinished(message) => {
+                    if let Some(AgentPanelEntry::Tool { text, active }) =
+                        self.agent_panel.iter_mut().rev().find(|entry| {
+                            matches!(entry, AgentPanelEntry::Tool { active: true, .. })
+                        })
+                    {
+                        *text = message.clone();
+                        *active = false;
+                    } else {
+                        self.agent_panel.push(AgentPanelEntry::Tool {
+                            text: message.clone(),
+                            active: false,
+                        });
+                    }
                     self.agent_scroll = u16::MAX;
                     self.set_status(message);
                 }
                 AgentEvent::Usage(usage) => self.agent_usage.add(usage),
+                AgentEvent::ResponseTiming {
+                    output_tokens,
+                    elapsed,
+                } => {
+                    self.agent_timed_output_tokens =
+                        self.agent_timed_output_tokens.saturating_add(output_tokens);
+                    self.agent_response_duration =
+                        self.agent_response_duration.saturating_add(elapsed);
+                }
                 AgentEvent::Round { current, limit } => {
                     self.agent_round = current;
                     self.agent_round_limit = limit;
@@ -702,6 +1011,16 @@ impl App {
                 AgentEvent::FileMoved { from, to } => {
                     self.handle_agent_file_moved(&from, &to);
                 }
+                AgentEvent::OpenFile(path) => {
+                    self.open_file_document(&path, DocumentReturn::Chat);
+                    if self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.kind == DocumentKind::File(path.clone()))
+                    {
+                        self.set_status(format!("Agent opened {}", path.display()));
+                    }
+                }
                 AgentEvent::Approval(request) => {
                     if self.permission_mode == PermissionMode::Bypass {
                         let _ = self.send_approval(ApprovalDecision::Approve);
@@ -713,7 +1032,11 @@ impl App {
                     }
                 }
                 AgentEvent::AskUser(request) => {
-                    self.set_status("Agent is waiting for your answer");
+                    self.set_status(if request.kind == AskUserKind::RoundLimit {
+                        "Agent reached its request-round limit"
+                    } else {
+                        "Agent is waiting for your answer"
+                    });
                     self.ask_user_option = 0;
                     self.ask_user_input.clear();
                     self.ask_user_cursor = 0;
@@ -721,36 +1044,53 @@ impl App {
                     self.set_overlay(Overlay::AskUser);
                 }
                 AgentEvent::Finished(result) => {
+                    let completed_successfully = result.is_ok();
                     self.ai_running = false;
                     self.ai_cancel = None;
                     match result {
                         Ok(output) => {
-                            self.agent_output.clear();
-                            self.agent_output_final = true;
-                            self.agent_scroll = 0;
-                            if !output.trim().is_empty() {
-                                self.agent_output.push(output);
-                            }
-                            self.set_status("Agent finished");
+                            self.agent_scroll = u16::MAX;
+                            self.set_status(if output.is_empty() {
+                                "Agent paused at the request-round limit"
+                            } else {
+                                "Agent finished"
+                            });
                         }
                         Err(error) => {
-                            self.agent_output.clear();
-                            self.agent_output_final = false;
-                            self.agent_scroll = 0;
+                            for entry in &mut self.agent_panel {
+                                if let AgentPanelEntry::Assistant { streaming, .. } = entry {
+                                    *streaming = false;
+                                }
+                            }
+                            self.agent_panel
+                                .push(AgentPanelEntry::Error(format!("Agent failed: {error}")));
+                            self.agent_scroll = u16::MAX;
                             self.set_status(format!("AI error: {error}"));
                         }
                     }
                     self.clear_ask_user();
                     self.reload_workspace();
+                    if completed_successfully {
+                        let pending = self
+                            .agent_input_buffer
+                            .lock()
+                            .map(|mut buffer| std::mem::take(&mut *buffer))
+                            .unwrap_or_default();
+                        if !pending.is_empty() {
+                            self.mark_buffered_prompts_consumed(pending.len());
+                            self.start_agent_worker(pending.join("\n\n"));
+                        }
+                    }
                 }
             }
         }
         if disconnected && self.ai_running {
             self.ai_running = false;
             self.ai_cancel = None;
-            self.agent_output.clear();
-            self.agent_output_final = false;
-            self.agent_scroll = 0;
+            self.agent_panel.push(AgentPanelEntry::Error(
+                "Agent worker stopped unexpectedly".to_string(),
+            ));
+            self.agent_scroll = u16::MAX;
             self.clear_ask_user();
             self.set_status("AI error: worker stopped unexpectedly");
         }
@@ -829,6 +1169,9 @@ impl App {
 
     pub fn open_files(&mut self) {
         self.reload_files();
+        if let Some(path) = self.current_note_path() {
+            self.sync_file_tree_to_note(&path);
+        }
         self.focus = Focus::Files;
         if !matches!(
             self.files_context,
@@ -863,6 +1206,155 @@ impl App {
     pub fn open_help(&mut self) {
         self.help_scroll = 0;
         self.set_overlay(Overlay::Help);
+    }
+
+    fn open_command_palette(&mut self) {
+        let dialog = DialogState::new(
+            "Command Palette · Ctrl+P",
+            String::new(),
+            DialogMode::CommandPalette,
+            DialogPurpose::CommandPalette,
+            Vec::new(),
+        );
+        self.open_dialog(dialog);
+        self.refresh_command_palette();
+    }
+
+    fn refresh_command_palette(&mut self) {
+        let query = self
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.input.trim().to_string())
+            .unwrap_or_default();
+        let mut matches = APP_COMMANDS
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| self.command_available(command.id))
+            .filter_map(|(index, command)| {
+                command_match_score(command, &query).map(|score| (score, index, command.id))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(score, index, _)| (*score, *index));
+        self.command_matches = matches.into_iter().map(|(_, _, id)| id).collect();
+        let options = self
+            .command_matches
+            .iter()
+            .filter_map(|id| command_definition(*id))
+            .map(|command| DialogOption::with_hint(command.label, command.description))
+            .collect::<Vec<_>>();
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.options = options;
+            dialog.checked = vec![false; dialog.options.len()];
+            dialog.selected = dialog.selected.min(dialog.options.len().saturating_sub(1));
+        }
+    }
+
+    fn execute_selected_palette_command(&mut self) -> Option<Command> {
+        let selected = self.dialog_selected();
+        let Some(command) = self.command_matches.get(selected).copied() else {
+            self.set_status("No matching command");
+            return None;
+        };
+        self.close_dialog();
+        self.command_matches.clear();
+        self.execute_app_command(command)
+    }
+
+    fn execute_app_command(&mut self, command: AppCommand) -> Option<Command> {
+        match command {
+            AppCommand::InterruptAgent => self.cancel_agent(),
+            AppCommand::ClearAgentSession => self.clear_agent_session(),
+            AppCommand::NewNote => self.begin_new_note(),
+            AppCommand::EditCurrentNote => {
+                return self.current_note_path().map(Command::Edit);
+            }
+            AppCommand::RenameCurrentNote => self.rename_current_note(),
+            AppCommand::DeleteCurrentNote => self.delete_current_note(),
+            AppCommand::ArchiveCurrentNote => self.manage_current_note(false),
+            AppCommand::RestoreCurrentNote => self.manage_current_note(true),
+            AppCommand::EditAiConfig => {
+                return Some(Command::Edit(self.storage.ai_config_path.clone()))
+            }
+            AppCommand::EditAgentInstructions => {
+                return Some(Command::Edit(self.storage.agents_path.clone()));
+            }
+            AppCommand::EditAgentMemory => {
+                return Some(Command::Edit(self.storage.memory_path.clone()));
+            }
+        }
+        None
+    }
+
+    fn command_available(&self, command: AppCommand) -> bool {
+        match command {
+            AppCommand::InterruptAgent | AppCommand::ClearAgentSession | AppCommand::NewNote => {
+                true
+            }
+            AppCommand::EditCurrentNote
+            | AppCommand::RenameCurrentNote
+            | AppCommand::DeleteCurrentNote => self.current_note_path().is_some(),
+            AppCommand::ArchiveCurrentNote => self.current_note_archived() == Some(false),
+            AppCommand::RestoreCurrentNote => self.current_note_archived() == Some(true),
+            AppCommand::EditAiConfig
+            | AppCommand::EditAgentInstructions
+            | AppCommand::EditAgentMemory => true,
+        }
+    }
+
+    fn current_note_path(&self) -> Option<PathBuf> {
+        self.document
+            .as_ref()
+            .filter(|_| self.center_view == CenterView::Document)
+            .and_then(|document| match &document.kind {
+                DocumentKind::File(path) => Some(path.clone()),
+                DocumentKind::Message(_) => None,
+            })
+    }
+
+    fn current_note_archived(&self) -> Option<bool> {
+        let path = self.current_note_path()?;
+        self.note_files
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.archived)
+    }
+
+    fn rename_current_note(&mut self) {
+        let Some(path) = self.current_note_path() else {
+            self.set_status("No note is open");
+            return;
+        };
+        self.rename_input = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        self.rename_cursor = self.rename_input.chars().count();
+        self.pending_file = Some(path);
+        self.files_context = FilesContext::Rename;
+        self.open_file_name_dialog(DialogPurpose::RenameFile);
+    }
+
+    fn delete_current_note(&mut self) {
+        let Some(path) = self.current_note_path() else {
+            self.set_status("No note is open");
+            return;
+        };
+        self.pending_file = Some(path);
+        self.set_overlay(Overlay::ConfirmDeleteFile);
+    }
+
+    fn manage_current_note(&mut self, restore: bool) {
+        let Some(path) = self.current_note_path() else {
+            self.set_status("No note is open");
+            return;
+        };
+        self.selected_file = Some(path);
+        if restore {
+            self.restore_selected_note();
+        } else {
+            self.archive_selected_note();
+        }
     }
 
     /// Open a caller-defined command dialog. The caller can inspect the
@@ -1008,12 +1500,22 @@ impl App {
             }
             Overlay::AskUser => {
                 let request = self.ask_user_request.as_ref();
+                let round_limit =
+                    request.is_some_and(|request| request.kind == AskUserKind::RoundLimit);
                 let mut dialog = DialogState::new(
-                    "Agent question",
+                    if round_limit {
+                        "Agent round limit"
+                    } else {
+                        "Agent question"
+                    },
                     request
                         .map(|request| request.question.clone())
                         .unwrap_or_default(),
-                    DialogMode::SelectOrInput,
+                    if round_limit {
+                        DialogMode::SingleSelect
+                    } else {
+                        DialogMode::SelectOrInput
+                    },
                     DialogPurpose::AskUser,
                     request
                         .map(|request| {
@@ -1174,6 +1676,19 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
+        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.purpose == DialogPurpose::CommandPalette)
+            {
+                self.close_dialog();
+                self.command_matches.clear();
+            } else if self.overlay.is_none() {
+                self.open_command_palette();
+            }
+            return None;
+        }
         if key.code == KeyCode::Tab {
             self.toggle_permission_mode();
             return None;
@@ -1226,6 +1741,7 @@ impl App {
                         | DialogPurpose::AskUser
                         | DialogPurpose::NewFile
                         | DialogPurpose::RenameFile
+                        | DialogPurpose::CommandPalette
                 )
             ) {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1233,9 +1749,17 @@ impl App {
                     self.select_custom_dialog_option();
                 }
                 if let Some(dialog) = self.dialog.as_mut() {
+                    let text = if purpose == Some(DialogPurpose::CommandPalette) {
+                        text.replace('\n', "")
+                    } else {
+                        text
+                    };
                     paste_into(&mut dialog.input, &mut dialog.cursor, &text);
                 }
                 self.sync_legacy_from_dialog();
+                if purpose == Some(DialogPurpose::CommandPalette) {
+                    self.refresh_command_palette();
+                }
             }
             return;
         }
@@ -1434,6 +1958,7 @@ impl App {
                     scroll: 0,
                     target_line: None,
                     return_to: DocumentReturn::Chat,
+                    render_cache: None,
                 });
                 self.center_view = CenterView::Document;
                 self.focus = Focus::Center;
@@ -1549,6 +2074,9 @@ impl App {
     fn handle_file_browse(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => {
+                if let Some(path) = self.current_note_path() {
+                    self.sync_file_tree_to_note(&path);
+                }
                 self.focus = Focus::Center;
                 None
             }
@@ -1561,18 +2089,23 @@ impl App {
                 None
             }
             KeyCode::Right => {
-                if let Some(group) = self.selected_file_group() {
+                if self.center_view == CenterView::Chat {
+                    self.focus = Focus::Center;
+                } else if let Some(group) = self.selected_file_group() {
                     let expanded = match group {
                         FileGroup::Notes => &mut self.notes_expanded,
                         FileGroup::Archives => &mut self.archives_expanded,
                     };
                     if *expanded {
+                        if let Some(path) = self.current_note_path() {
+                            self.sync_file_tree_to_note(&path);
+                        }
                         self.focus = Focus::Center;
                     } else {
                         *expanded = true;
                     }
                 } else {
-                    self.focus = Focus::Center;
+                    self.open_selected_file(DocumentReturn::Chat);
                 }
                 None
             }
@@ -1704,6 +2237,15 @@ impl App {
         }
     }
 
+    fn begin_new_note(&mut self) {
+        self.pending_id = None;
+        self.new_file_input.clear();
+        self.new_file_cursor = 0;
+        self.files_context = FilesContext::NewTarget;
+        self.focus = Focus::Files;
+        self.open_file_name_dialog(DialogPurpose::NewFile);
+    }
+
     fn handle_new_target(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc => {
@@ -1712,12 +2254,18 @@ impl App {
             }
             KeyCode::Enter => {
                 let name = self.new_file_input.clone();
-                let Some(id) = self.pending_id.clone() else {
-                    self.cancel_file_context();
-                    return None;
-                };
                 match self.storage.create_named_file(&name) {
-                    Ok(path) => self.perform_move_to_id(&path, &id),
+                    Ok(path) => {
+                        if let Some(id) = self.pending_id.clone() {
+                            self.perform_move_to_id(&path, &id);
+                        } else {
+                            self.files_context = FilesContext::Browse;
+                            self.reload_files();
+                            self.selected_file = Some(path.clone());
+                            self.open_file_document(&path, DocumentReturn::Chat);
+                            self.set_status(format!("Created note {}", path.display()));
+                        }
+                    }
                     Err(error) => self.set_status(format!("Error: {error}")),
                 }
                 None
@@ -1872,7 +2420,7 @@ impl App {
                     || visible
                         .last()
                         .is_some_and(|index| *index == self.todo_index);
-                if at_end && (!self.agent_prompt.is_empty() || !self.agent_output.is_empty()) {
+                if at_end && !self.agent_panel.is_empty() {
                     self.focus = Focus::Agent;
                 } else {
                     self.move_todo_selection(1);
@@ -1897,10 +2445,7 @@ impl App {
 
     fn handle_agent(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Char('C') => {
-                self.clear_agent_session();
-                None
-            }
+            KeyCode::Char('C') => self.execute_app_command(AppCommand::ClearAgentSession),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                 self.focus = Focus::Center;
                 None
@@ -1925,50 +2470,10 @@ impl App {
                 self.agent_scroll = self.agent_scroll.saturating_add(8);
                 None
             }
-            KeyCode::Enter => {
-                self.add_agent_output_to_chat();
-                None
-            }
             KeyCode::Char('c') if self.ai_running => {
-                self.cancel_agent();
-                None
+                self.execute_app_command(AppCommand::InterruptAgent)
             }
             _ => None,
-        }
-    }
-
-    fn add_agent_output_to_chat(&mut self) {
-        if self.ai_running || !self.agent_output_final {
-            self.set_status("Agent has no final response to add");
-            return;
-        }
-        let body = self.agent_output.join("\n\n");
-        if body.trim().is_empty() {
-            self.set_status("Agent has no output to add");
-            return;
-        }
-        match self.storage.append_chat_message(&body) {
-            Ok(message) => {
-                self.agent_prompt.clear();
-                self.agent_output.clear();
-                self.agent_output_final = false;
-                self.agent_scroll = 0;
-                self.reload();
-                self.reload_todos();
-                if let Some(index) = self
-                    .messages
-                    .iter()
-                    .position(|candidate| candidate.id == message.id)
-                {
-                    self.selected = index;
-                }
-                if self.center_view == CenterView::Chat {
-                    self.scroll = u16::MAX;
-                }
-                self.focus = Focus::Center;
-                self.set_status("Agent output added to today's daily note");
-            }
-            Err(error) => self.set_status(format!("Error: {error}")),
         }
     }
 
@@ -2048,6 +2553,33 @@ impl App {
                 Some(DocumentKind::Message(id)) => self.message_edit_command(id),
                 None => None,
             },
+            KeyCode::Char('a')
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| matches!(document.kind, DocumentKind::File(_))) =>
+            {
+                self.manage_current_note(false);
+                None
+            }
+            KeyCode::Char('d')
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| matches!(document.kind, DocumentKind::File(_))) =>
+            {
+                self.delete_current_note();
+                None
+            }
+            KeyCode::Char('r')
+                if self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| matches!(document.kind, DocumentKind::File(_))) =>
+            {
+                self.rename_current_note();
+                None
+            }
             KeyCode::Char('/') => {
                 self.open_document_search();
                 None
@@ -2131,6 +2663,7 @@ impl App {
                 return None;
             }
             DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
+            DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::AgentPrompt | DialogPurpose::NewFile | DialogPurpose::RenameFile => {
                 return self.handle_text_dialog(key)
             }
@@ -2187,7 +2720,38 @@ impl App {
             },
             DialogMode::SelectOrInput => return self.handle_custom_select_or_input(key),
             DialogMode::FreeText => return self.handle_text_dialog(key),
+            DialogMode::CommandPalette => return self.handle_command_palette(key),
             DialogMode::Approval | DialogMode::Informational => {}
+        }
+        None
+    }
+
+    fn handle_command_palette(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_dialog();
+                self.command_matches.clear();
+            }
+            KeyCode::Up => self.move_dialog_selection(-1),
+            KeyCode::Down => self.move_dialog_selection(1),
+            KeyCode::Enter => return self.execute_selected_palette_command(),
+            KeyCode::Backspace => {
+                self.delete_dialog_backward();
+                self.refresh_command_palette();
+            }
+            KeyCode::Delete => {
+                self.delete_dialog_forward();
+                self.refresh_command_palette();
+            }
+            KeyCode::Left => self.move_dialog_cursor(CursorMove::Left),
+            KeyCode::Right => self.move_dialog_cursor(CursorMove::Right),
+            KeyCode::Home => self.move_dialog_cursor(CursorMove::LineStart),
+            KeyCode::End => self.move_dialog_cursor(CursorMove::LineEnd),
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_dialog_char(character);
+                self.refresh_command_palette();
+            }
+            _ => {}
         }
         None
     }
@@ -2325,6 +2889,31 @@ impl App {
     }
 
     fn handle_select_or_input_dialog(&mut self, key: KeyEvent) -> Option<Command> {
+        if self
+            .ask_user_request
+            .as_ref()
+            .is_some_and(|request| request.kind == AskUserKind::RoundLimit)
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    let _ = self.send_user_response(AskUserResponse::Answer("Stop".to_string()));
+                }
+                KeyCode::Up => self.move_dialog_selection(-1),
+                KeyCode::Down => self.move_dialog_selection(1),
+                KeyCode::Enter => {
+                    if let Some(answer) = self
+                        .dialog
+                        .as_ref()
+                        .and_then(DialogState::selected_option)
+                        .map(|option| option.label.clone())
+                    {
+                        let _ = self.send_user_response(AskUserResponse::Answer(answer));
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         let option_count = self
             .dialog
             .as_ref()
@@ -2785,10 +3374,40 @@ impl App {
     #[allow(dead_code)]
     fn handle_ask_user_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         let modifiers = key.modifiers;
+        let round_limit = self
+            .ask_user_request
+            .as_ref()
+            .is_some_and(|request| request.kind == AskUserKind::RoundLimit);
         let option_count = self
             .ask_user_request
             .as_ref()
             .map_or(0, |request| request.options.len());
+        if round_limit {
+            match key.code {
+                KeyCode::Esc => {
+                    let _ = self.send_user_response(AskUserResponse::Answer("Stop".to_string()));
+                }
+                KeyCode::Up => {
+                    self.ask_user_option = self.ask_user_option.saturating_sub(1);
+                }
+                KeyCode::Down if option_count > 0 => {
+                    self.ask_user_option =
+                        (self.ask_user_option + 1).min(option_count.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(answer) = self
+                        .ask_user_request
+                        .as_ref()
+                        .and_then(|request| request.options.get(self.ask_user_option))
+                        .cloned()
+                    {
+                        let _ = self.send_user_response(AskUserResponse::Answer(answer));
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => {
                 let _ = self.send_user_response(AskUserResponse::Cancelled);
@@ -2894,6 +3513,10 @@ impl App {
     }
 
     fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {
+        let round_limit = self
+            .ask_user_request
+            .as_ref()
+            .is_some_and(|request| request.kind == AskUserKind::RoundLimit);
         let sender = self
             .ai_user_sender
             .as_ref()
@@ -2901,9 +3524,16 @@ impl App {
         sender
             .send(response.clone())
             .context("sending response to Agent")?;
-        self.set_status(match response {
-            AskUserResponse::Answer(_) => "Answer sent to Agent",
-            AskUserResponse::Cancelled => "Agent question cancelled",
+        self.set_status(if round_limit {
+            match &response {
+                AskUserResponse::Answer(answer) if answer == "Continue" => "Agent continuing",
+                _ => "Agent stopping at the request-round limit",
+            }
+        } else {
+            match response {
+                AskUserResponse::Answer(_) => "Answer sent to Agent",
+                AskUserResponse::Cancelled => "Agent question cancelled",
+            }
         });
         self.clear_ask_user();
         Ok(())
@@ -3039,6 +3669,13 @@ impl App {
                     dialog.selected = index;
                 }
                 self.sync_legacy_from_dialog();
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.purpose == DialogPurpose::CommandPalette)
+                {
+                    return self.execute_selected_palette_command();
+                }
                 if self
                     .dialog
                     .as_ref()
@@ -3446,6 +4083,7 @@ impl App {
     fn open_file_document(&mut self, path: &Path, return_to: DocumentReturn) {
         match self.storage.read_document_file(path) {
             Ok(source) => {
+                self.sync_file_tree_to_note(path);
                 let title = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -3457,12 +4095,27 @@ impl App {
                     scroll: 0,
                     target_line: None,
                     return_to,
+                    render_cache: None,
                 });
                 self.center_view = CenterView::Document;
                 self.focus = Focus::Center;
             }
             Err(error) => self.set_status(format!("Error: {error}")),
         }
+    }
+
+    fn sync_file_tree_to_note(&mut self, path: &Path) {
+        let Some(index) = self.note_files.iter().position(|file| file.path == path) else {
+            return;
+        };
+        if self.note_files[index].archived {
+            self.archives_expanded = true;
+        } else {
+            self.notes_expanded = true;
+        }
+        self.file_index = index;
+        self.selected_file = Some(path.to_path_buf());
+        self.ensure_visible_file_selection();
     }
 
     fn open_message_document(&mut self, id: &str, return_to: DocumentReturn) {
@@ -3476,6 +4129,7 @@ impl App {
             scroll: 0,
             target_line: None,
             return_to,
+            render_cache: None,
         });
         self.center_view = CenterView::Document;
         self.focus = Focus::Center;
@@ -3558,10 +4212,6 @@ impl App {
     }
 
     fn open_agent_prompt(&mut self, id: &str) {
-        if self.ai_running {
-            self.set_status("AI is already working");
-            return;
-        }
         if self.message_clone(id).is_none() {
             self.set_status("Message not found");
             return;
@@ -3602,7 +4252,7 @@ impl App {
                 if let Some(document) = self.document.as_mut().filter(|document| {
                     matches!(&document.kind, DocumentKind::Message(message_id) if message_id == id)
                 }) {
-                    document.source = updated.body;
+                    document.replace_source(updated.body);
                 }
                 self.set_status("Message updated in editor");
             }
@@ -3630,7 +4280,11 @@ impl App {
         let prompt = format!("Source Nole daily date: {id}\n\n{content}");
         self.overlay = None;
         self.dialog = None;
-        self.start_agent(prompt, content);
+        if self.ai_running {
+            self.buffer_agent_prompt(prompt, content);
+        } else {
+            self.start_agent(prompt, content);
+        }
     }
 
     fn submit_compose_to_agent(&mut self) {
@@ -3639,10 +4293,38 @@ impl App {
             return;
         };
         let display_prompt = self.input.trim().to_string();
-        if self.start_agent(prompt, display_prompt) {
+        let accepted = if self.ai_running {
+            self.buffer_agent_prompt(prompt, display_prompt)
+        } else {
+            self.start_agent(prompt, display_prompt)
+        };
+        if accepted {
             self.input.clear();
             self.input_cursor = 0;
         }
+    }
+
+    fn buffer_agent_prompt(&mut self, prompt: String, display_prompt: String) -> bool {
+        let queued = {
+            match self.agent_input_buffer.lock() {
+                Ok(mut buffer) => {
+                    buffer.push(prompt);
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        if !queued {
+            self.set_status("Agent input buffer is unavailable");
+            return false;
+        }
+        self.agent_panel.push(AgentPanelEntry::Prompt {
+            text: display_prompt,
+            muted: true,
+        });
+        self.agent_scroll = u16::MAX;
+        self.set_status("Prompt buffered for Agent");
+        true
     }
 
     fn compose_agent_prompt(&self) -> Option<String> {
@@ -3674,24 +4356,36 @@ impl App {
             self.set_status("AI is already working");
             return false;
         }
+        self.agent_panel.push(AgentPanelEntry::Prompt {
+            text: display_prompt,
+            muted: false,
+        });
+        self.agent_scroll = u16::MAX;
+        self.start_agent_worker(prompt)
+    }
+
+    fn start_agent_worker(&mut self, prompt: String) -> bool {
+        if self.ai_running {
+            self.set_status("AI is already working");
+            return false;
+        }
         let config_path = self.storage.ai_config_path.clone();
         let root = self.storage.root.clone();
         let (event_sender, event_receiver) = mpsc::channel();
         let (approval_sender, approval_receiver) = mpsc::channel();
         let (user_sender, user_receiver) = mpsc::channel();
+        if let Ok(mut buffer) = self.agent_input_buffer.lock() {
+            buffer.clear();
+        }
         self.ai_events = Some(event_receiver);
         self.ai_approval_sender = Some(approval_sender);
         self.ai_user_sender = Some(user_sender);
         self.ai_running = true;
-        self.agent_prompt = display_prompt;
-        self.agent_output.clear();
-        self.agent_output_final = false;
-        self.agent_scroll = 0;
-        self.agent_usage = TokenUsage::default();
         self.agent_round = 0;
         self.agent_round_limit = 0;
         self.set_status("AI is working...");
         let bypass = self.permission_bypass.clone();
+        let input_buffer = self.agent_input_buffer.clone();
         let mut conversation = self.agent_conversation.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.ai_cancel = Some(cancelled.clone());
@@ -3699,11 +4393,14 @@ impl App {
             let result = Agent::from_config(
                 &config_path,
                 &root,
-                event_sender.clone(),
-                approval_receiver,
-                user_receiver,
-                bypass,
-                cancelled,
+                AgentRuntime::new(
+                    event_sender.clone(),
+                    approval_receiver,
+                    user_receiver,
+                    input_buffer,
+                    bypass,
+                    cancelled,
+                ),
             )
             .and_then(|agent| agent.run(&prompt, &mut conversation))
             .map_err(|error| error.to_string());
@@ -3713,6 +4410,20 @@ impl App {
             let _ = event_sender.send(AgentEvent::Finished(result));
         });
         true
+    }
+
+    fn mark_buffered_prompts_consumed(&mut self, count: usize) {
+        for muted in self
+            .agent_panel
+            .iter_mut()
+            .filter_map(|entry| match entry {
+                AgentPanelEntry::Prompt { muted, .. } if *muted => Some(muted),
+                _ => None,
+            })
+            .take(count)
+        {
+            *muted = false;
+        }
     }
 
     fn cancel_agent(&mut self) {
@@ -3727,13 +4438,28 @@ impl App {
         self.ai_events = None;
         self.ai_approval_sender = None;
         self.ai_user_sender = None;
+        if let Ok(mut buffer) = self.agent_input_buffer.lock() {
+            buffer.clear();
+        }
         self.approval_request = None;
         self.clear_ask_user();
         if self.overlay == Some(Overlay::Approval) {
             self.overlay = None;
         }
-        self.agent_output.push("Cancelled".to_string());
-        self.agent_output_final = false;
+        for entry in &mut self.agent_panel {
+            if let AgentPanelEntry::Assistant { streaming, .. } = entry {
+                *streaming = false;
+            }
+        }
+        for entry in self.agent_panel.iter_mut().rev() {
+            if let AgentPanelEntry::Tool { active, .. } = entry {
+                if *active {
+                    *active = false;
+                }
+            }
+        }
+        self.agent_panel
+            .push(AgentPanelEntry::Error("Cancelled".to_string()));
         self.agent_scroll = u16::MAX;
         self.set_status("Agent task cancelled");
     }
@@ -3744,12 +4470,15 @@ impl App {
             self.cancel_agent();
         }
         let had_history = self.agent_conversation.clear();
-        let had_panel_content = !self.agent_prompt.is_empty() || !self.agent_output.is_empty();
-        self.agent_prompt.clear();
-        self.agent_output.clear();
-        self.agent_output_final = false;
+        let had_panel_content = !self.agent_panel.is_empty();
+        self.agent_panel.clear();
+        if let Ok(mut buffer) = self.agent_input_buffer.lock() {
+            buffer.clear();
+        }
         self.agent_scroll = 0;
         self.agent_usage = TokenUsage::default();
+        self.agent_timed_output_tokens = 0;
+        self.agent_response_duration = Duration::ZERO;
         self.agent_round = 0;
         self.agent_round_limit = 0;
         if was_running || had_history || had_panel_content {
@@ -3824,7 +4553,7 @@ impl App {
         self.storage.append_document(path, body)?;
         let source = self.storage.read_document_file(path)?;
         if let Some(document) = self.document.as_mut() {
-            document.source = source;
+            document.replace_source(source);
         }
         self.input.clear();
         self.input_cursor = 0;
@@ -3842,7 +4571,7 @@ impl App {
     fn append_to_open_daily(&mut self, date: &str, body: &str) -> anyhow::Result<()> {
         let message = self.storage.append_daily(date, body)?;
         if let Some(document) = self.document.as_mut() {
-            document.source = message.body;
+            document.replace_source(message.body);
         }
         self.input.clear();
         self.input_cursor = 0;
@@ -4020,17 +4749,280 @@ mod tests {
     }
 
     #[test]
-    fn animation_phase_advances_only_while_agent_runs() {
+    fn animation_phase_advances_for_daily_agent_or_bypass() {
         let (mut app, _directory) = make_app();
         app.advance_animation();
-        assert_eq!(app.animation_tick, 0);
+        assert_eq!(app.animation_tick, 1);
+        app.center_view = CenterView::Document;
+        app.advance_animation();
+        assert_eq!(app.animation_tick, 1);
         app.ai_running = true;
         app.advance_animation();
         app.advance_animation();
-        assert_eq!(app.animation_tick, 2);
+        assert_eq!(app.animation_tick, 3);
         app.ai_running = false;
         app.advance_animation();
-        assert_eq!(app.animation_tick, 2);
+        assert_eq!(app.animation_tick, 3);
+        app.permission_mode = PermissionMode::Bypass;
+        app.advance_animation();
+        assert_eq!(app.animation_tick, 4);
+    }
+
+    #[test]
+    fn command_palette_filters_and_clears_the_agent_session() {
+        let (mut app, _directory) = make_app();
+        app.agent_conversation = AgentConversation::seeded_for_test();
+        app.agent_panel.push(AgentPanelEntry::Prompt {
+            text: "Previous prompt".to_string(),
+            muted: false,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.overlay, Some(Overlay::Dialog));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::CommandPalette)
+        );
+        assert_eq!(app.command_matches.len(), 6);
+
+        app.handle_paste("clear");
+        assert_eq!(
+            app.command_matches.first(),
+            Some(&AppCommand::ClearAgentSession)
+        );
+        assert_eq!(
+            app.dialog
+                .as_ref()
+                .and_then(DialogState::selected_option)
+                .map(|option| option.label.as_str()),
+            Some("Agent: Clear session")
+        );
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.overlay, None);
+        assert!(!app.agent_conversation.clear());
+        assert!(app.agent_panel.is_empty());
+        assert_eq!(app.status, "Agent session cleared");
+    }
+
+    #[test]
+    fn command_palette_interrupts_the_running_agent() {
+        let (mut app, _directory) = make_app();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.ai_cancel = Some(cancelled.clone());
+        app.ai_running = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("interrupt");
+        assert_eq!(
+            app.command_matches.first(),
+            Some(&AppCommand::InterruptAgent)
+        );
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!app.ai_running);
+        assert_eq!(app.status, "Agent task cancelled");
+    }
+
+    #[test]
+    fn command_palette_creates_and_opens_a_blank_note() {
+        let (mut app, _directory) = make_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("note new");
+        assert_eq!(app.command_matches.first(), Some(&AppCommand::NewNote));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.files_context, FilesContext::NewTarget);
+        assert_eq!(app.overlay, Some(Overlay::Dialog));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::NewFile)
+        );
+
+        app.handle_paste("Scratch");
+        app.handle_key(key(KeyCode::Enter));
+
+        let path = app.storage.data_dir.join("Scratch.md");
+        assert!(path.exists());
+        assert_eq!(app.files_context, FilesContext::Browse);
+        assert_eq!(app.focus, Focus::Center);
+        assert!(matches!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(DocumentKind::File(opened)) if opened == &path
+        ));
+    }
+
+    #[test]
+    fn command_palette_adds_contextual_note_and_agent_output_commands() {
+        let (mut app, _directory) = make_app();
+        let current = app.storage.data_dir.join("Current.md");
+        let other = app.storage.data_dir.join("Other.md");
+        fs::write(&current, "# Current\n").unwrap();
+        fs::write(&other, "# Other\n").unwrap();
+        app.reload_files();
+        app.open_file_document(&current, DocumentReturn::Chat);
+        app.selected_file = Some(other);
+        app.agent_panel.push(AgentPanelEntry::Assistant {
+            text: "Final response".to_string(),
+            streaming: false,
+            final_output: true,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(app.command_matches.contains(&AppCommand::EditCurrentNote));
+        assert!(app.command_matches.contains(&AppCommand::RenameCurrentNote));
+        assert!(app.command_matches.contains(&AppCommand::DeleteCurrentNote));
+        assert!(app
+            .command_matches
+            .contains(&AppCommand::ArchiveCurrentNote));
+        assert!(!app
+            .command_matches
+            .contains(&AppCommand::RestoreCurrentNote));
+
+        app.handle_paste("rename");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.pending_file.as_ref(), Some(&current));
+        assert_eq!(app.files_context, FilesContext::Rename);
+        assert_eq!(app.overlay, Some(Overlay::Dialog));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::RenameFile)
+        );
+    }
+
+    #[test]
+    fn archived_note_gets_restore_instead_of_archive_command() {
+        let (mut app, _directory) = make_app();
+        let note = app.storage.data_dir.join("Archived.md");
+        fs::write(&note, "archive me\n").unwrap();
+        let archived = app.storage.archive_note(&note).unwrap();
+        app.reload_files();
+        app.open_file_document(&archived, DocumentReturn::Chat);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        assert!(app
+            .command_matches
+            .contains(&AppCommand::RestoreCurrentNote));
+        assert!(!app
+            .command_matches
+            .contains(&AppCommand::ArchiveCurrentNote));
+    }
+
+    #[test]
+    fn opening_a_note_keeps_the_file_tree_selection_in_sync() {
+        let (mut app, _directory) = make_app();
+        let first = app.storage.data_dir.join("First.md");
+        let second = app.storage.data_dir.join("Second.md");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        app.reload_files();
+        app.selected_file = Some(first);
+        app.notes_expanded = false;
+
+        app.open_file_document(&second, DocumentReturn::Search);
+
+        assert_eq!(app.selected_file.as_ref(), Some(&second));
+        assert!(app.notes_expanded);
+        assert!(matches!(
+            app.visible_file_rows().get(app.file_row),
+            Some(FileListRow::File(index)) if app.note_files[*index].path == second
+        ));
+    }
+
+    #[test]
+    fn right_from_the_file_tree_opens_its_selected_note_before_focusing_content() {
+        let (mut app, _directory) = make_app();
+        let first = app.storage.data_dir.join("First.md");
+        let second = app.storage.data_dir.join("Second.md");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        app.reload_files();
+        app.open_file_document(&first, DocumentReturn::Chat);
+        app.open_files();
+        let second_row = app
+            .visible_file_rows()
+            .iter()
+            .position(|row| {
+                matches!(row, FileListRow::File(index) if app.note_files[*index].path == second)
+            })
+            .unwrap();
+        app.select_file_row(second_row);
+        assert_eq!(app.selected_file.as_ref(), Some(&second));
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(first))
+        );
+
+        app.handle_key(key(KeyCode::Right));
+
+        assert_eq!(app.focus, Focus::Center);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(second.clone()))
+        );
+        assert_eq!(app.selected_file.as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn right_from_the_file_tree_returns_to_daily_without_opening_a_note() {
+        let (mut app, _directory) = make_app();
+        let note = app.storage.data_dir.join("Selected.md");
+        fs::write(&note, "selected note\n").unwrap();
+        app.reload_files();
+        app.center_view = CenterView::Chat;
+        app.document = None;
+        app.open_files();
+        let note_row = app
+            .visible_file_rows()
+            .iter()
+            .position(|row| {
+                matches!(row, FileListRow::File(index) if app.note_files[*index].path == note)
+            })
+            .unwrap();
+        app.select_file_row(note_row);
+
+        app.handle_key(key(KeyCode::Right));
+
+        assert_eq!(app.focus, Focus::Center);
+        assert_eq!(app.center_view, CenterView::Chat);
+        assert!(app.document.is_none());
+        assert_eq!(app.selected_file.as_ref(), Some(&note));
+    }
+
+    #[test]
+    fn config_commands_open_each_file_through_the_editor_pipeline() {
+        let (mut app, _directory) = make_app();
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        for (query, expected) in [
+            ("ai settings", app.storage.ai_config_path.clone()),
+            ("agent instructions", app.storage.agents_path.clone()),
+            ("agent memory", app.storage.memory_path.clone()),
+        ] {
+            app.handle_key(ctrl_p);
+            app.handle_paste(query);
+            let command = app.handle_key(key(KeyCode::Enter));
+            assert_eq!(command, Some(Command::Edit(expected)));
+            assert_eq!(app.overlay, None);
+        }
+    }
+
+    #[test]
+    fn ctrl_p_toggles_the_command_palette_without_replacing_other_dialogs() {
+        let (mut app, _directory) = make_app();
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_p);
+        assert_eq!(app.overlay, Some(Overlay::Dialog));
+        app.handle_key(ctrl_p);
+        assert_eq!(app.overlay, None);
+
+        app.open_help();
+        app.handle_key(ctrl_p);
+        assert_eq!(app.overlay, Some(Overlay::Help));
     }
 
     #[test]
@@ -4085,6 +5077,7 @@ mod tests {
         app.ai_user_sender = Some(answer_sender);
         event_sender
             .send(AgentEvent::AskUser(AskUserRequest {
+                kind: AskUserKind::Tool,
                 question: "Choose a format".to_string(),
                 options: vec!["Markdown".to_string(), "MBDown".to_string()],
             }))
@@ -4102,6 +5095,7 @@ mod tests {
 
         event_sender
             .send(AgentEvent::AskUser(AskUserRequest {
+                kind: AskUserKind::Tool,
                 question: "Anything else?".to_string(),
                 options: vec!["No".to_string()],
             }))
@@ -4117,13 +5111,64 @@ mod tests {
     }
 
     #[test]
-    fn agent_panel_keeps_only_the_final_reply() {
+    fn round_limit_dialog_submits_continue_and_escape_submits_stop() {
+        let (mut app, _directory) = make_app();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (answer_sender, answer_receiver) = mpsc::channel();
+        app.ai_events = Some(event_receiver);
+        app.ai_user_sender = Some(answer_sender);
+        let request = AskUserRequest {
+            kind: AskUserKind::RoundLimit,
+            question: "Continue for another segment?".to_string(),
+            options: vec!["Continue".to_string(), "Stop".to_string()],
+        };
+
+        event_sender
+            .send(AgentEvent::AskUser(request.clone()))
+            .unwrap();
+        app.poll_agent();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            answer_receiver.try_recv().unwrap(),
+            AskUserResponse::Answer("Continue".to_string())
+        );
+        assert_eq!(app.status, "Agent continuing");
+
+        event_sender.send(AgentEvent::AskUser(request)).unwrap();
+        app.poll_agent();
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            answer_receiver.try_recv().unwrap(),
+            AskUserResponse::Answer("Stop".to_string())
+        );
+        assert_eq!(app.status, "Agent stopping at the request-round limit");
+    }
+
+    #[test]
+    fn agent_panel_appends_streaming_activity_and_final_reply() {
         let (mut app, _directory) = make_app();
         let (sender, receiver) = mpsc::channel();
         app.ai_events = Some(receiver);
         app.ai_running = true;
+        app.agent_panel = vec![
+            AgentPanelEntry::Prompt {
+                text: "First follow-up".to_string(),
+                muted: true,
+            },
+            AgentPanelEntry::Prompt {
+                text: "Second follow-up".to_string(),
+                muted: true,
+            },
+        ];
+        sender.send(AgentEvent::BufferedInputConsumed(1)).unwrap();
         sender
-            .send(AgentEvent::Progress("Using read_file".to_string()))
+            .send(AgentEvent::AssistantDelta("I need to inspect ".to_string()))
+            .unwrap();
+        sender
+            .send(AgentEvent::AssistantDelta("the source first.".to_string()))
+            .unwrap();
+        sender
+            .send(AgentEvent::ToolStarted("Calling Read File...".to_string()))
             .unwrap();
         sender
             .send(AgentEvent::Round {
@@ -4131,20 +5176,97 @@ mod tests {
                 limit: 25,
             })
             .unwrap();
+        sender
+            .send(AgentEvent::Usage(TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                cache_creation_input_tokens: 300,
+                cache_read_input_tokens: 700,
+            }))
+            .unwrap();
+        sender
+            .send(AgentEvent::ResponseTiming {
+                output_tokens: 200,
+                elapsed: Duration::from_secs(2),
+            })
+            .unwrap();
         app.poll_agent();
-        assert_eq!(app.status, "Using read_file");
-        assert_eq!(app.agent_output, ["Using read_file"]);
+        assert_eq!(app.status, "Calling Read File...");
+        assert!(matches!(
+            &app.agent_panel[2],
+            AgentPanelEntry::Assistant { text, streaming: true, .. }
+                if text == "I need to inspect the source first."
+        ));
+        assert!(matches!(
+            &app.agent_panel[3],
+            AgentPanelEntry::Tool { text, active: true } if text == "Calling Read File..."
+        ));
         assert_eq!(app.agent_round, 2);
         assert_eq!(app.agent_round_limit, 25);
-        assert!(!app.agent_output_final);
+        assert_eq!(app.agent_usage.total_input(), 2_000);
+        assert_eq!(app.agent_timed_output_tokens, 200);
+        assert_eq!(app.agent_response_duration, Duration::from_secs(2));
+        assert!(matches!(
+            &app.agent_panel[0],
+            AgentPanelEntry::Prompt { muted: false, .. }
+        ));
+        assert!(matches!(
+            &app.agent_panel[1],
+            AgentPanelEntry::Prompt { muted: true, .. }
+        ));
 
+        sender
+            .send(AgentEvent::ToolFinished("Completed Read File.".to_string()))
+            .unwrap();
+        app.poll_agent();
+        assert!(matches!(
+            &app.agent_panel[3],
+            AgentPanelEntry::Tool { text, active: false } if text == "Completed Read File."
+        ));
+
+        sender
+            .send(AgentEvent::AssistantMessageFinished {
+                final_output: false,
+            })
+            .unwrap();
+        sender
+            .send(AgentEvent::AssistantDelta("final reply".to_string()))
+            .unwrap();
+        sender
+            .send(AgentEvent::AssistantMessageFinished { final_output: true })
+            .unwrap();
         sender
             .send(AgentEvent::Finished(Ok("final reply".to_string())))
             .unwrap();
         app.poll_agent();
-        assert_eq!(app.agent_output, ["final reply"]);
-        assert!(app.agent_output_final);
+        assert_eq!(app.agent_panel.len(), 5);
+        assert!(matches!(
+            app.agent_panel.last(),
+            Some(AgentPanelEntry::Assistant { text, streaming: false, final_output: true })
+                if text == "final reply"
+        ));
         assert_eq!(app.status, "Agent finished");
+    }
+
+    #[test]
+    fn agent_open_file_event_displays_the_note_in_the_tui() {
+        let (mut app, _directory) = make_app();
+        let note = app.storage.data_dir.join("Agent View.md");
+        fs::write(&note, "# Opened by Agent\n").unwrap();
+        let note = fs::canonicalize(note).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+
+        sender.send(AgentEvent::OpenFile(note.clone())).unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(app.focus, Focus::Center);
+        assert!(matches!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(DocumentKind::File(path)) if path == &note
+        ));
+        assert_eq!(app.status, format!("Agent opened {}", note.display()));
     }
 
     #[test]
@@ -4153,7 +5275,10 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         app.ai_cancel = Some(cancelled.clone());
         app.ai_running = true;
-        app.agent_output = vec!["Using web_fetch".to_string()];
+        app.agent_panel.push(AgentPanelEntry::Tool {
+            text: "Fetching Web...".to_string(),
+            active: true,
+        });
         app.focus = Focus::Center;
 
         app.handle_key(key(KeyCode::Char('c')));
@@ -4164,11 +5289,13 @@ mod tests {
         app.handle_key(key(KeyCode::Char('c')));
         assert!(!app.ai_running);
         assert!(cancelled.load(Ordering::Relaxed));
-        assert_eq!(
-            app.agent_output.last().map(String::as_str),
-            Some("Cancelled")
+        assert!(
+            matches!(app.agent_panel.last(), Some(AgentPanelEntry::Error(text)) if text == "Cancelled")
         );
-        assert!(!app.agent_output_final);
+        assert!(matches!(
+            &app.agent_panel[0],
+            AgentPanelEntry::Tool { active: false, .. }
+        ));
         assert!(app.ai_events.is_none());
         assert!(app.ai_approval_sender.is_none());
         assert!(app.ai_user_sender.is_none());
@@ -4181,8 +5308,21 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         app.ai_cancel = Some(cancelled.clone());
         app.ai_running = true;
-        app.agent_prompt = "Current prompt".to_string();
-        app.agent_output = vec!["Searching Web...".to_string()];
+        app.agent_panel = vec![
+            AgentPanelEntry::Prompt {
+                text: "Current prompt".to_string(),
+                muted: false,
+            },
+            AgentPanelEntry::Tool {
+                text: "Searching Web...".to_string(),
+                active: true,
+            },
+            AgentPanelEntry::Assistant {
+                text: "Looking for sources.".to_string(),
+                streaming: true,
+                final_output: false,
+            },
+        ];
         app.agent_conversation = AgentConversation::seeded_for_test();
         app.focus = Focus::Agent;
 
@@ -4191,8 +5331,7 @@ mod tests {
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(!app.ai_running);
         assert!(!app.agent_conversation.clear());
-        assert!(app.agent_prompt.is_empty());
-        assert!(app.agent_output.is_empty());
+        assert!(app.agent_panel.is_empty());
         assert_eq!(app.status, "Agent session cleared");
     }
 
@@ -4298,6 +5437,7 @@ mod tests {
             scroll: 0,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
         assert_eq!(
             app.compose_agent_prompt().as_deref(),
@@ -4309,29 +5449,68 @@ mod tests {
     fn ctrl_enter_sends_compose_to_agent_without_creating_a_chat_card() {
         let (mut app, _directory) = make_app();
         let message_count = app.messages.len();
+        app.agent_usage.input_tokens = 1_234;
+        app.agent_timed_output_tokens = 400;
+        app.agent_response_duration = Duration::from_secs(2);
         app.input = "Direct Agent prompt".to_string();
         app.input_cursor = app.input.chars().count();
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
         assert!(app.ai_running);
-        assert_eq!(app.agent_prompt, "Direct Agent prompt");
+        assert!(matches!(
+            app.agent_panel.last(),
+            Some(AgentPanelEntry::Prompt { text, muted: false }) if text == "Direct Agent prompt"
+        ));
         assert!(app.input.is_empty());
         assert_eq!(app.input_cursor, 0);
         assert_eq!(app.messages.len(), message_count);
+        assert_eq!(app.agent_usage.input_tokens, 1_234);
+        assert_eq!(app.agent_timed_output_tokens, 400);
+        assert_eq!(app.agent_response_duration, Duration::from_secs(2));
     }
 
     #[test]
-    fn ctrl_enter_preserves_compose_while_agent_is_busy() {
+    fn ctrl_enter_buffers_and_clears_compose_while_agent_is_busy() {
         let (mut app, _directory) = make_app();
         app.ai_running = true;
-        app.input = "Keep this prompt".to_string();
+        app.agent_panel.push(AgentPanelEntry::Prompt {
+            text: "Initial prompt".to_string(),
+            muted: false,
+        });
+        app.input = "Additional prompt".to_string();
         app.input_cursor = app.input.chars().count();
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
-        assert_eq!(app.input, "Keep this prompt");
-        assert_eq!(app.status, "AI is already working");
+        app.input = "One more detail".to_string();
+        app.input_cursor = app.input.chars().count();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert!(app.input.is_empty());
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(
+            app.agent_panel,
+            [
+                AgentPanelEntry::Prompt {
+                    text: "Initial prompt".to_string(),
+                    muted: false,
+                },
+                AgentPanelEntry::Prompt {
+                    text: "Additional prompt".to_string(),
+                    muted: true,
+                },
+                AgentPanelEntry::Prompt {
+                    text: "One more detail".to_string(),
+                    muted: true,
+                }
+            ]
+        );
+        assert_eq!(
+            *app.agent_input_buffer.lock().unwrap(),
+            ["Additional prompt", "One more detail"]
+        );
+        assert_eq!(app.status, "Prompt buffered for Agent");
     }
 
     #[test]
@@ -4364,7 +5543,11 @@ mod tests {
         assert_eq!(app.focus, Focus::Center);
 
         app.todo_items.clear();
-        app.agent_output = vec!["final reply".to_string()];
+        app.agent_panel.push(AgentPanelEntry::Assistant {
+            text: "final reply".to_string(),
+            streaming: false,
+            final_output: true,
+        });
         app.focus = Focus::Todo;
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.focus, Focus::Agent);
@@ -4425,7 +5608,11 @@ mod tests {
             text: "only task".to_string(),
         }];
         app.todo_index = 0;
-        app.agent_output = vec!["final reply".to_string()];
+        app.agent_panel.push(AgentPanelEntry::Assistant {
+            text: "final reply".to_string(),
+            streaming: false,
+            final_output: true,
+        });
         app.focus = Focus::Todo;
 
         app.handle_key(key(KeyCode::Down));
@@ -4439,25 +5626,27 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_agent_output_adds_exactly_one_chat_card() {
+    fn enter_on_agent_panel_does_not_move_output_to_daily() {
         let (mut app, _directory) = make_app();
         let original_count = app.messages.len();
-        app.agent_prompt = "User prompt".to_string();
-        app.agent_output = vec!["Agent final reply".to_string()];
-        app.agent_output_final = true;
+        app.agent_panel = vec![
+            AgentPanelEntry::Prompt {
+                text: "User prompt".to_string(),
+                muted: false,
+            },
+            AgentPanelEntry::Assistant {
+                text: "Agent final reply".to_string(),
+                streaming: false,
+                final_output: true,
+            },
+        ];
         app.focus = Focus::Agent;
 
         app.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(app.messages.len(), original_count + 1);
-        assert_eq!(app.messages.last().unwrap().body, "Agent final reply");
-        assert!(app.agent_prompt.is_empty());
-        assert!(app.agent_output.is_empty());
-        assert_eq!(app.focus, Focus::Center);
-
-        app.add_agent_output_to_chat();
-        assert_eq!(app.messages.len(), original_count + 1);
-        assert_eq!(app.status, "Agent has no final response to add");
+        assert_eq!(app.messages.len(), original_count);
+        assert_eq!(app.agent_panel.len(), 2);
+        assert_eq!(app.focus, Focus::Agent);
     }
 
     #[test]
@@ -4542,6 +5731,64 @@ mod tests {
             Some(Command::Edit(path))
         );
         assert_eq!(app.center_view, CenterView::Document);
+    }
+
+    #[test]
+    fn document_render_cache_survives_scroll_and_invalidates_on_content_or_width() {
+        let mut document = Document {
+            kind: DocumentKind::File(PathBuf::from("cached.md")),
+            title: "Cached".to_string(),
+            source: "```rust\nfn main() {}\n```".repeat(100),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Chat,
+            render_cache: None,
+        };
+
+        assert!(document.ensure_rendered(80));
+        assert!(!document.ensure_rendered(80));
+        document.scroll = 20;
+        assert!(!document.ensure_rendered(80));
+
+        assert!(document.ensure_rendered(100));
+        assert!(!document.ensure_rendered(100));
+        document.replace_source("updated".to_string());
+        assert!(document.render_cache.is_none());
+        assert!(document.ensure_rendered(100));
+    }
+
+    #[test]
+    fn file_document_supports_rename_delete_and_archive_shortcuts() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Project.md");
+        fs::write(&path, "# Project\n").unwrap();
+        app.reload_files();
+        app.open_file_document(&path, DocumentReturn::Chat);
+
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(app.overlay, Some(Overlay::Dialog));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::RenameFile)
+        );
+        assert_eq!(app.pending_file.as_ref(), Some(&path));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.overlay, Some(Overlay::ConfirmDeleteFile));
+        assert_eq!(app.pending_file.as_ref(), Some(&path));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(key(KeyCode::Char('a')));
+        let archived = app.storage.archives_dir.join("Project.md");
+        assert!(!path.exists());
+        assert!(archived.exists());
+        assert_eq!(app.center_view, CenterView::Document);
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(archived))
+        );
+        assert_eq!(app.status, "Note archived");
     }
 
     #[test]

@@ -190,35 +190,61 @@ api_key = ""
 tavily_api_key = ""
 model = "claude-sonnet-4-5"
 base_url = "https://api.anthropic.com"
-max_tokens = 4096
+max_tokens = 8192
+context_window_tokens = 200000
 max_rounds = 25
 ```
 
 Set the Anthropic API key directly in `api_key`. The card's `AI` button runs the
 Anthropic Messages API in the background. It first opens a prompt dialog; an
-empty prompt sends the source card content. Tool calls and Agent state appear in
-the bottom status bar. The lower two-thirds of the right sidebar shows the
-user's prompt followed by the Agent's final reply; Todo uses the upper third.
-`max_rounds` limits Messages API request rounds for each submitted prompt, not
-the lifetime of the in-memory conversation; one response may call several tools.
-Agent output enters the current daily card only when
-the Agent explicitly calls `append_daily`, or when the Agent panel is focused
-and you press Enter. The latter appends to the current Daily card, clears the
-Agent panel, and returns focus to the center view.
+empty prompt sends the source card content. The lower two-thirds of the right
+sidebar shows a chronological Agent timeline: user prompts, tool activity,
+intermediate text, and final responses; Todo uses the upper third.
+`max_rounds` is the request-round budget for one Agent segment, not a tool-call
+limit; one response may call several tools. At the limit, Nole rings the terminal
+bell and asks whether to continue with another segment or stop. Stopping keeps
+the completed conversation and tool history, so a later prompt can continue it.
+`context_window_tokens` is the model's total context size. Nole reserves
+`max_tokens` for the next response and, before the remaining input budget is
+exhausted, uses Anthropic's token-counting endpoint and replaces a safe prefix
+of older completed turns with a dense summary. The system prompt, current turn,
+recent history, and complete `tool_use`/`tool_result` pairs are retained.
+Compatible endpoints without token counting fall back to a conservative local
+estimate.
+If a compatible endpoint stops at `max_tokens`, Nole preserves any partial text
+as intermediate output and automatically requests continuation. A response
+with no text is retried a limited number of times; persistent failures report
+the stop reason and returned content-block types.
+Agent output enters a daily card only when the Agent explicitly calls
+`append_daily`.
 
 Set `tavily_api_key` to enable the Agent's Tavily `web_search` tool. When the
 key is empty or absent, Nole omits the tool and its instructions entirely, so
 the Agent does not know that web search is available.
 
 While the Agent is running, its panel border carries a moving color gradient
-and the panel lists tool activity. A color highlight advances character by
-character across the current activity item; the bottom status text stays
-static. The panel title shows request rounds against the configured limit plus
-input/output token counts, for example `↻3/25 · ↑12.4k ↓842`. Multiple tool
-calls returned in one model response still count as one round. When the Agent
-finishes, its final response replaces the activity log.
+and the current tool uses the same animated full-text color gradient. Messages
+API text is streamed into the current Agent entry and rendered as MBDown. The
+panel header shows request rounds plus session-cumulative input/output tokens,
+observed output throughput in `t/s`, and cache-read tokens with their share of
+total input tokens. These statistics reset only when the Agent session is
+cleared. Multiple tool calls returned in one model response still count as one
+round.
+Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
+application command pipeline; the initial commands interrupt the active Agent
+task, clear its in-memory session, create or manage notes, or open `ai.toml`,
+`AGENTS.md`, and `MEMORY.md` with `$EDITOR`.
+The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
 Agent conversations persist across completed prompts. Continue in the compose
 box with `Ctrl+Enter`; the Agent receives the completed conversation history.
+You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
+such prompts in one buffer and delivers them before the next pending tool call.
+An in-flight tool is allowed to finish, while later unstarted calls from the
+old plan are deferred so the Agent can reconsider them with the new input. A
+follow-up appears at the end of the timeline in muted text while queued, then
+uses normal MBDown colors once the Agent consumes it. Final responses and later
+prompts append to the same virtual-scrolling timeline. Only clearing the Agent
+session removes panel history.
 Focus the Agent panel and press `c` to cancel the current task, or `C` to clear
 the conversation and start a new session. Cancellation is
 cooperative: no later tools will start, although an in-flight HTTP request or
@@ -237,6 +263,13 @@ Every user prompt sent to the Agent includes the current local date and time.
 `read_file` defaults to 200 lines and accepts at most 2,000 lines per call. Its
 structured response includes the total line count and whether more content
 remains.
+
+`list_directory` lists any directory by absolute path or a path relative to
+the Nole root. `depth=1` returns direct children and values up to 16 include
+nested descendants without following symlinks. Each entry includes its type,
+depth, extension, byte size, line count for files up to 1 MB, and creation and
+modification timestamps. Results support metadata sorting and pagination; one
+call scans at most 10,000 entries.
 
 `list_notes` returns managed notes with their line count, creation and
 modification timestamps, and byte size. Results can be sorted ascending or
@@ -270,7 +303,11 @@ regular files inside Nole and uses the common approval dialog. Generic file
 tools cannot operate directly inside `daily/` or on `config/ai.toml`.
 
 The `notify` tool lets the Agent display a short notification card in the TUI's
-top-right corner. Notifications are non-blocking and expire automatically.
+top-right corner and emits the terminal bell. Notifications are non-blocking
+and expire automatically.
+The `open_file` tool switches the TUI to an existing managed `.md` or `.mb`
+note in `data/` or `archives/`, so the Agent can present relevant material to
+the user directly.
 The `ask_user` tool pauses the Agent and opens a TUI dialog for clarification.
 The Agent may provide up to ten choices; use Up/Down and Enter to select one,
 or type a different free-text response. Esc cancels the question. Questions

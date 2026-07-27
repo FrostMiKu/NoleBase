@@ -10,8 +10,8 @@ name = "nole"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30.2"
+crossterm = "0.29"
 mbdown = { path = "../mbdown/crates/mbdown" }
 mbtui = { path = "../mbdown/crates/mbtui" }
 anyhow = "1"
@@ -19,7 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 notify = "8"
 open = "5"
-unicode-width = "0.2"
+unicode-width = "0.2.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -14,6 +14,7 @@ struct Notification {
 pub struct NotificationService {
     items: VecDeque<Notification>,
     ttl: Duration,
+    pending_bells: usize,
 }
 
 impl Default for NotificationService {
@@ -21,6 +22,7 @@ impl Default for NotificationService {
         Self {
             items: VecDeque::new(),
             ttl: DEFAULT_TTL,
+            pending_bells: 0,
         }
     }
 }
@@ -38,6 +40,11 @@ impl NotificationService {
             message,
             expires_at: Instant::now() + self.ttl,
         });
+        self.pending_bells = self.pending_bells.saturating_add(1);
+    }
+
+    pub fn take_bells(&mut self) -> usize {
+        std::mem::take(&mut self.pending_bells)
     }
 
     pub fn visible(&mut self) -> Option<String> {
@@ -65,8 +72,25 @@ mod tests {
         let mut service = NotificationService {
             items: VecDeque::new(),
             ttl: Duration::ZERO,
+            pending_bells: 0,
         };
         service.notify("expired");
         assert_eq!(service.visible(), None);
+    }
+
+    #[test]
+    fn each_nonempty_notification_schedules_one_terminal_bell() {
+        let mut service = NotificationService::default();
+        assert_eq!(service.take_bells(), 0);
+
+        service.notify("first");
+        service.notify("second");
+        assert_eq!(service.take_bells(), 2);
+        assert_eq!(service.take_bells(), 0);
+
+        service.notify("  ");
+        assert_eq!(service.take_bells(), 0);
+        service.notify("third");
+        assert_eq!(service.take_bells(), 1);
     }
 }

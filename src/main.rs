@@ -2,13 +2,13 @@
 
 mod agent;
 mod app;
-mod backend;
 mod markdown;
 mod model;
 mod notification;
 mod storage;
 mod theme;
 mod ui;
+mod vlist;
 
 use std::fs;
 use std::io::{self, Stdout, Write};
@@ -27,12 +27,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::{App, Command};
-use backend::PositionedBackend;
 
-type Tui = Terminal<PositionedBackend<Stdout>>;
+type Tui = Terminal<CrosstermBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -200,6 +200,14 @@ fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Res
     loop {
         process_workspace_events(workspace_events, app);
         app.poll_agent();
+        let pending_bells = app.notifications.take_bells();
+        if pending_bells > 0 {
+            let mut output = io::stdout();
+            for _ in 0..pending_bells {
+                output.write_all(b"\x07")?;
+            }
+            output.flush()?;
+        }
         app.advance_animation();
         terminal.draw(|f| ui::draw(f, app))?;
         if !event::poll(EVENT_POLL_INTERVAL)? {
@@ -286,7 +294,7 @@ fn main() -> Result<()> {
 
     enter_tui()?;
     let _guard = TerminalGuard;
-    let backend = PositionedBackend::new(io::stdout());
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
@@ -329,6 +337,7 @@ mod tests {
             scroll: 3,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
 
         app.storage.append_chat_message("external message").unwrap();
@@ -385,6 +394,7 @@ mod tests {
             scroll: 10,
             target_line: None,
             return_to: DocumentReturn::Chat,
+            render_cache: None,
         });
 
         let mut down = Some((10, 10, 200));

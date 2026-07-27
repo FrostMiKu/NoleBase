@@ -9,18 +9,21 @@ use mbtui::{CornerStyle, Renderer, Theme};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use unicode_width::UnicodeWidthChar;
+#[cfg(test)]
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::LinkTarget;
 use crate::theme::catppuccin as ctp;
 
 const LINK_UNDERLINE_COLOR: Color = ctp::BLUE;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedMarkup {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<RenderedLink>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedLink {
     pub target: LinkTarget,
     pub row: usize,
@@ -399,6 +402,30 @@ mod tests {
         let wikilink = span_with(&lines, "[[项目计划]]");
         assert_eq!(wikilink.style.fg, Some(ctp::SKY));
         assert!(wikilink.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn weather_table_with_emoji_keeps_every_row_aligned() {
+        let source = concat!(
+            "## 🌤️ 明天（7月28日）北京天气预报\n\n",
+            "| 项目 | 内容 |\n",
+            "|------|------|\n",
+            "| **日期** | 2026年7月28日（周二） |\n",
+            "| **天气** | ☀️ **天晴 (Fine)** |\n",
+            "| **气温** | **24°C ~ 34°C** |\n",
+            "| **来源** | 香港天文台 7月27日12:15发布 |",
+        );
+        let output = text(&to_lines_at_width(source, 60));
+        let table = output
+            .lines()
+            .filter(|line| matches!(line.chars().next(), Some('╭' | '│' | '├' | '╰')))
+            .collect::<Vec<_>>();
+
+        assert!(!table.is_empty());
+        assert!(
+            table.iter().all(|line| UnicodeWidthStr::width(*line) == 60),
+            "{output}"
+        );
     }
 
     #[test]
