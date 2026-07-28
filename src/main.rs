@@ -31,6 +31,7 @@ use crossterm::terminal::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use app::{App, Command};
@@ -305,7 +306,11 @@ fn run(
                 Event::Paste(text) => {
                     app.handle_paste(&text);
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(width, height) => {
+                    // Kitty can report the old grid size briefly after an alternate-screen
+                    // transition. The resize event carries the authoritative dimensions.
+                    terminal.resize(Rect::new(0, 0, width, height))?;
+                }
                 Event::FocusGained => app.reload_workspace(),
                 Event::FocusLost => {}
             }
@@ -368,12 +373,10 @@ fn main() -> Result<()> {
 mod tests {
     use std::fs;
 
-    use notify::event::ModifyKind;
-    use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
-
     use super::*;
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
+    use notify::event::ModifyKind;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn present_frame_changes_cursor_visibility_only_with_input_focus() {
