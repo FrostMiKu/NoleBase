@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Local, NaiveDate};
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -31,6 +32,67 @@ const PANEL_PADDING: u16 = 1;
 const DAILY_PADDING_X: usize = 1;
 const PAGE_PADDING_X: usize = DAILY_PADDING_X + 12;
 const DIALOG_WIDTH: u16 = 80;
+
+/// Clear a widget's rectangle without leaving a wide-character continuation
+/// cell from the content underneath it. Ratatui's diff buffer can otherwise
+/// miss the cell next to a one-column border when a CJK glyph straddles that
+/// boundary.
+fn clear_widget(frame: &mut Frame, area: Rect) {
+    sanitize_widget_edges(frame, area);
+    frame.render_widget(Clear, area);
+}
+
+fn sanitize_widget_edges(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let buffer = frame.buffer_mut();
+    let bounds = buffer.area;
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+
+    // Only the perimeter and its immediately adjacent cells can contain a
+    // continuation of a glyph crossing the widget boundary.
+    for y in area.y..bottom {
+        for x in [
+            area.x.saturating_sub(1),
+            area.x,
+            right.saturating_sub(1),
+            right,
+        ] {
+            sanitize_cell(buffer, bounds, x, y);
+        }
+    }
+    for x in area.x..right {
+        for y in [
+            area.y.saturating_sub(1),
+            area.y,
+            bottom.saturating_sub(1),
+            bottom,
+        ] {
+            sanitize_cell(buffer, bounds, x, y);
+        }
+    }
+}
+
+fn sanitize_cell(buffer: &mut Buffer, bounds: Rect, x: u16, y: u16) {
+    let in_bounds = x >= bounds.x
+        && y >= bounds.y
+        && x < bounds.x.saturating_add(bounds.width)
+        && y < bounds.y.saturating_add(bounds.height);
+    if !in_bounds {
+        return;
+    }
+    let cell = &mut buffer[(x, y)];
+    if cell.symbol().width() > 1 {
+        cell.set_symbol(" ");
+    }
+    // Continuation cells are represented as ordinary empty cells by Ratatui,
+    // so the adjacent perimeter must be forced dirty even when its symbol
+    // alone does not reveal that it belonged to a wide glyph.
+    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+}
 
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
 /// position without changing the terminal's hardware cursor.
@@ -1205,7 +1267,7 @@ fn draw_daily(
     draw_daily_notes(frame, app, daily_view, unoccluded_height, interactive);
 
     if compose.width > 0 && compose.height > 0 {
-        frame.render_widget(Clear, compose);
+        clear_widget(frame, compose);
         draw_compose(frame, app, compose, interactive, cursor_position);
     }
 }
@@ -1985,7 +2047,7 @@ fn draw_document(
         );
     }
     if compose.width > 0 && compose.height > 0 {
-        frame.render_widget(Clear, compose);
+        clear_widget(frame, compose);
         draw_compose(frame, app, compose, interactive, cursor_position);
     }
 }
@@ -2006,7 +2068,7 @@ fn draw_notification(frame: &mut Frame, root: Rect, message: &str, theme: Theme)
         width,
         height,
     );
-    frame.render_widget(Clear, area);
+    clear_widget(frame, area);
     frame.render_widget(
         Paragraph::new(message.to_string())
             .wrap(Wrap { trim: false })
@@ -2051,7 +2113,7 @@ fn draw_search(
     );
     let input_style = Style::default().bg(app.theme.surface_panel);
     if input_height >= 3 {
-        frame.render_widget(Clear, input_box);
+        clear_widget(frame, input_box);
         let block = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::horizontal(1))
@@ -2516,7 +2578,7 @@ fn draw_dialog(
     if area.width == 0 || area.height == 0 {
         return area;
     }
-    frame.render_widget(Clear, area);
+    clear_widget(frame, area);
     let border = match dialog.mode {
         DialogMode::Approval => app.theme.ui_warning,
         DialogMode::FreeText => app.theme.ui_dialog_input,
@@ -3139,6 +3201,31 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn clearing_a_floating_widget_sanitizes_wide_characters_at_its_edges() {
+        let backend = TestBackend::new(12, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("界"), Rect::new(4, 2, 2, 1));
+                frame.render_widget(Paragraph::new("界"), Rect::new(8, 2, 2, 1));
+
+                clear_widget(frame, Rect::new(5, 1, 4, 3));
+
+                let left_outside = &frame.buffer_mut()[(4, 2)];
+                assert_eq!(left_outside.symbol(), " ");
+                assert_eq!(left_outside.diff_option, CellDiffOption::AlwaysUpdate);
+                assert_eq!(frame.buffer_mut()[(5, 2)].symbol(), " ");
+
+                assert_eq!(frame.buffer_mut()[(8, 2)].symbol(), " ");
+                let right_outside = &frame.buffer_mut()[(9, 2)];
+                assert_eq!(right_outside.symbol(), " ");
+                assert_eq!(right_outside.diff_option, CellDiffOption::AlwaysUpdate);
+            })
+            .unwrap();
+    }
     use crate::theme::catppuccin as ctp;
 
     fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
