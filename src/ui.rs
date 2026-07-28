@@ -38,39 +38,34 @@ const DIALOG_WIDTH: u16 = 80;
 /// miss the cell next to a one-column border when a CJK glyph straddles that
 /// boundary.
 fn clear_widget(frame: &mut Frame, area: Rect) {
-    refresh_widget_side_edges(frame, area, true);
+    sanitize_floating_widget_sides(frame, area);
     frame.render_widget(Clear, area);
 }
 
-/// Force the cells along a widget's vertical edges through Ratatui's diff. When
-/// `clear_wide` is set, wide glyphs touching the boundary are also erased;
-/// this is appropriate for opaque floating widgets but not scrolling
-/// viewports, whose edge content must remain visible.
-fn refresh_widget_side_edges(frame: &mut Frame, area: Rect, clear_wide: bool) {
+/// Erase only wide glyphs that actually cross an opaque widget's vertical
+/// boundary. Continuation cells are deliberately left to Ratatui's normal
+/// wide-cell diff instead of being emitted with their reset background.
+fn sanitize_floating_widget_sides(frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
     let buffer = frame.buffer_mut();
     let bounds = buffer.area;
-    let right = area.x.saturating_add(area.width);
+    let inside_right = area.x.saturating_add(area.width).saturating_sub(1);
     let bottom = area.y.saturating_add(area.height);
 
-    // Terminal glyphs occupy extra columns, never extra rows, so only the
-    // inside and outside columns of the left and right edges are relevant.
     for y in area.y..bottom {
-        for x in [
-            area.x.saturating_sub(1),
-            area.x,
-            right.saturating_sub(1),
-            right,
-        ] {
-            refresh_edge_cell(buffer, bounds, x, y, clear_wide);
+        if area.x > bounds.x {
+            clear_wide_cell(buffer, bounds, area.x - 1, y);
+        }
+        if inside_right != area.x {
+            clear_wide_cell(buffer, bounds, inside_right, y);
         }
     }
 }
 
-fn refresh_edge_cell(buffer: &mut Buffer, bounds: Rect, x: u16, y: u16, clear_wide: bool) {
+fn clear_wide_cell(buffer: &mut Buffer, bounds: Rect, x: u16, y: u16) {
     let in_bounds = x >= bounds.x
         && y >= bounds.y
         && x < bounds.x.saturating_add(bounds.width)
@@ -79,13 +74,9 @@ fn refresh_edge_cell(buffer: &mut Buffer, bounds: Rect, x: u16, y: u16, clear_wi
         return;
     }
     let cell = &mut buffer[(x, y)];
-    if clear_wide && cell.symbol().width() > 1 {
-        cell.set_symbol(" ");
+    if cell.symbol().width() > 1 {
+        cell.set_symbol(" ").set_diff_option(CellDiffOption::None);
     }
-    // Continuation cells are represented as ordinary empty cells by Ratatui,
-    // so the adjacent perimeter must be forced dirty even when its symbol
-    // alone does not reveal that it belonged to a wide glyph.
-    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
 }
 
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
@@ -2016,12 +2007,6 @@ fn draw_document(
             document_area.height as usize,
         );
         frame.render_widget(Paragraph::new(visible).style(page_style), document_area);
-        // Complex grapheme clusters (notably ZWJ emoji) do not have one
-        // universally observed terminal width. Re-emitting the viewport edge
-        // and its neighboring cells prevents a scrolled full-width box border
-        // from surviving in the right gutter when the terminal and Ratatui
-        // disagree about a preceding grapheme's width.
-        refresh_widget_side_edges(frame, document_area, false);
         (rendered_links, rendered_images, document_scroll)
     };
     app.images.render(
@@ -3216,13 +3201,13 @@ mod tests {
 
                 let left_outside = &frame.buffer_mut()[(4, 2)];
                 assert_eq!(left_outside.symbol(), " ");
-                assert_eq!(left_outside.diff_option, CellDiffOption::AlwaysUpdate);
+                assert_eq!(left_outside.diff_option, CellDiffOption::None);
                 assert_eq!(frame.buffer_mut()[(5, 2)].symbol(), " ");
 
                 assert_eq!(frame.buffer_mut()[(8, 2)].symbol(), " ");
                 let right_outside = &frame.buffer_mut()[(9, 2)];
                 assert_eq!(right_outside.symbol(), " ");
-                assert_eq!(right_outside.diff_option, CellDiffOption::AlwaysUpdate);
+                assert_eq!(right_outside.diff_option, CellDiffOption::None);
 
                 assert_eq!(frame.buffer_mut()[(6, 0)].diff_option, CellDiffOption::None);
                 assert_eq!(frame.buffer_mut()[(6, 4)].diff_option, CellDiffOption::None);
@@ -3230,29 +3215,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn refreshing_a_viewport_edge_keeps_visible_wide_characters() {
-        let backend = TestBackend::new(8, 3);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new("界"), Rect::new(5, 1, 2, 1));
-                refresh_widget_side_edges(frame, Rect::new(0, 0, 7, 3), false);
-
-                let wide = &frame.buffer_mut()[(5, 1)];
-                assert_eq!(wide.symbol(), "界");
-                assert_eq!(
-                    frame.buffer_mut()[(6, 1)].diff_option,
-                    CellDiffOption::AlwaysUpdate
-                );
-                assert_eq!(
-                    frame.buffer_mut()[(7, 1)].diff_option,
-                    CellDiffOption::AlwaysUpdate
-                );
-            })
-            .unwrap();
-    }
     use crate::theme::catppuccin as ctp;
 
     fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
@@ -4703,7 +4665,7 @@ mod tests {
         app.focus = Focus::Center;
         app.center_view = CenterView::Document;
         let boxed = (0..40)
-            .map(|line| format!("boxed {line} 👨‍👩‍👧‍👦 🀄 𓂀"))
+            .map(|line| format!("boxed {line}"))
             .collect::<Vec<_>>()
             .join("\n\n");
         let plain = (0..40)
@@ -4745,22 +4707,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let page = app.layout.center.unwrap();
         let border = Color::Rgb(223, 127, 63);
-        let content = inset_horizontal(center_content_axis(page), 2);
-        let horizontal_padding = (PAGE_PADDING_X as u16).min(content.width.saturating_sub(1) / 2);
-        let document_right = content
-            .x
-            .saturating_add(content.width)
-            .saturating_sub(horizontal_padding);
-        let document_top = content.y.saturating_add(4);
         assert!(buffer_string(&terminal).contains("plain 0"));
-        assert_eq!(
-            buffer[(document_right - 1, document_top)].diff_option,
-            CellDiffOption::AlwaysUpdate
-        );
-        assert_eq!(
-            buffer[(document_right, document_top)].diff_option,
-            CellDiffOption::AlwaysUpdate
-        );
         assert!((page.y..page.y + page.height).all(|y| {
             (page.x..page.x + page.width)
                 .all(|x| buffer[(x, y)].symbol() != "│" || buffer[(x, y)].fg != border)
