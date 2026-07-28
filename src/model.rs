@@ -94,6 +94,13 @@ pub struct LinkHitbox {
     pub area: Rect,
 }
 
+/// One visible, clickable segment of a rendered Hashtag.
+#[derive(Debug, Clone)]
+pub struct TagHitbox {
+    pub name: String,
+    pub area: Rect,
+}
+
 /// A managed markdown file shown in the persistent file list.
 #[derive(Debug, Clone)]
 pub struct NoteFile {
@@ -145,9 +152,7 @@ pub struct TodoHitbox {
 /// One content-search match.
 #[derive(Debug, Clone)]
 pub enum SearchHit {
-    /// A daily note whose body matched.
-    Daily { date: NaiveDate, text: String },
-    /// A matching line in a `.md` file.
+    /// A matching line in a managed Markdown file.
     FileLine {
         path: std::path::PathBuf,
         line_no: usize,

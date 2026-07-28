@@ -19,11 +19,12 @@ use crate::agent::{
 };
 use crate::model::{
     Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
-    FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TodoHitbox, TodoItem,
-    WikiLinkCandidate, WikiLinkHitbox,
+    FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
+    TodoItem, WikiLinkCandidate, WikiLinkHitbox,
 };
 use crate::notification::NotificationService;
 use crate::storage::{LoadedTheme, Storage};
+use crate::workspace_index::WorkspaceIndex;
 
 fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
     col >= area.x
@@ -62,15 +63,6 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
         offset += found + 1;
     }
     true
-}
-
-fn best_line(body: &str, query_lower: &str) -> String {
-    body.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && line.to_lowercase().contains(query_lower))
-        .or_else(|| body.lines().map(str::trim).find(|line| !line.is_empty()))
-        .unwrap_or("")
-        .to_string()
 }
 
 fn char_to_byte(text: &str, char_index: usize) -> usize {
@@ -171,6 +163,8 @@ enum AppCommand {
     InterruptAgent,
     ClearAgentSession,
     NewNote,
+    NewNoteFromTemplate,
+    EditTemplate,
     EditCurrentNote,
     RenameCurrentNote,
     DeleteCurrentNote,
@@ -178,6 +172,7 @@ enum AppCommand {
     RestoreCurrentNote,
     EditAiConfig,
     SwitchTheme,
+    BrowseTags,
     EditAgentInstructions,
     EditAgentMemory,
 }
@@ -205,8 +200,20 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
     AppCommandDefinition {
         id: AppCommand::NewNote,
         label: "Note: New",
-        description: "Create and open a new blank note",
-        keywords: "note new create file blank",
+        description: "Create and open a new note",
+        keywords: "note new create file blank title",
+    },
+    AppCommandDefinition {
+        id: AppCommand::NewNoteFromTemplate,
+        label: "Note: New from template",
+        description: "Create and open a note from template.mb",
+        keywords: "note new create file template",
+    },
+    AppCommandDefinition {
+        id: AppCommand::EditTemplate,
+        label: "Template: Edit",
+        description: "Open template.mb in your editor",
+        keywords: "template edit note new mb editor",
     },
     AppCommandDefinition {
         id: AppCommand::EditCurrentNote,
@@ -245,12 +252,6 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         keywords: "config configuration ai anthropic tavily model settings editor",
     },
     AppCommandDefinition {
-        id: AppCommand::SwitchTheme,
-        label: "Theme: Switch",
-        description: "Choose the active theme",
-        keywords: "theme switch colors palette appearance random default",
-    },
-    AppCommandDefinition {
         id: AppCommand::EditAgentInstructions,
         label: "Config: Edit Agent instructions",
         description: "Open config/AGENTS.md in your editor",
@@ -261,6 +262,18 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Config: Edit Agent memory",
         description: "Open MEMORY.md in your editor",
         keywords: "config configuration agent memory md editor",
+    },
+    AppCommandDefinition {
+        id: AppCommand::SwitchTheme,
+        label: "Theme: Switch",
+        description: "Choose the active theme",
+        keywords: "theme switch colors palette appearance random default",
+    },
+    AppCommandDefinition {
+        id: AppCommand::BrowseTags,
+        label: "Tags: Browse",
+        description: "Browse tags by document and mention count",
+        keywords: "tags hashtags browse search documents mentions",
     },
 ];
 
@@ -384,6 +397,7 @@ pub enum DialogPurpose {
     RenameFile,
     CommandPalette,
     ThemePicker,
+    TagPicker,
     Custom,
 }
 
@@ -632,6 +646,7 @@ pub(crate) struct DailyCardRenderCache {
     pub body: String,
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::markdown::RenderedLink>,
+    pub tags: Vec<crate::markdown::RenderedTag>,
     pub images: Vec<mbtui::ImagePlacement>,
     pub button_line: usize,
     pub button_start: usize,
@@ -729,6 +744,7 @@ pub struct App {
 
     /// Daily note being moved, filed, or deleted by a contextual interaction.
     pub pending_daily_date: Option<NaiveDate>,
+    new_note_from_template: bool,
     /// File awaiting rename or delete confirmation.
     pub pending_file: Option<PathBuf>,
 
@@ -738,6 +754,7 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
+    workspace_index: Option<WorkspaceIndex>,
 
     pub help_scroll: u16,
     pub status: String,
@@ -747,6 +764,7 @@ pub struct App {
     /// Rebuilt every frame by the renderer.
     pub hitboxes: Vec<ButtonHitbox>,
     pub link_hitboxes: Vec<LinkHitbox>,
+    pub tag_hitboxes: Vec<TagHitbox>,
     pub file_hitboxes: Vec<FileHitbox>,
     pub file_group_hitboxes: Vec<FileGroupHitbox>,
     pub todo_hitboxes: Vec<TodoHitbox>,
@@ -839,18 +857,21 @@ impl App {
             new_file_input: String::new(),
             new_file_cursor: 0,
             pending_daily_date: None,
+            new_note_from_template: false,
             pending_file: None,
             todo_items,
             todo_index: 0,
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
+            workspace_index: None,
             help_scroll: 0,
             status: String::new(),
             animation_tick: 0,
             layout: LayoutSnapshot::default(),
             hitboxes: Vec::new(),
             link_hitboxes: Vec::new(),
+            tag_hitboxes: Vec::new(),
             file_hitboxes: Vec::new(),
             file_group_hitboxes: Vec::new(),
             todo_hitboxes: Vec::new(),
@@ -1376,6 +1397,34 @@ impl App {
         self.open_dialog(dialog);
     }
 
+    fn open_tag_picker(&mut self) {
+        let Some(index) = &self.workspace_index else {
+            self.set_status("Tag index is still building");
+            return;
+        };
+        let options = index
+            .tags()
+            .into_iter()
+            .map(|tag| {
+                DialogOption::with_hint(
+                    format!("#{}", tag.name),
+                    format!("{} documents · {} mentions", tag.documents, tag.mentions),
+                )
+            })
+            .collect::<Vec<_>>();
+        if options.is_empty() {
+            self.set_status("No tags found");
+            return;
+        }
+        self.open_dialog(DialogState::new(
+            "Tags · Enter search",
+            String::new(),
+            DialogMode::SingleSelect,
+            DialogPurpose::TagPicker,
+            options,
+        ));
+    }
+
     fn refresh_command_palette(&mut self) {
         let query = self
             .dialog
@@ -1421,6 +1470,10 @@ impl App {
             AppCommand::InterruptAgent => self.cancel_agent(),
             AppCommand::ClearAgentSession => self.clear_agent_session(),
             AppCommand::NewNote => self.begin_new_note(),
+            AppCommand::NewNoteFromTemplate => self.begin_new_note_from_template(),
+            AppCommand::EditTemplate => {
+                return Some(Command::Edit(self.storage.template_path.clone()));
+            }
             AppCommand::EditCurrentNote => {
                 return self.current_note_path().map(Command::Edit);
             }
@@ -1432,6 +1485,7 @@ impl App {
                 return Some(Command::Edit(self.storage.ai_config_path.clone()))
             }
             AppCommand::SwitchTheme => self.open_theme_picker(),
+            AppCommand::BrowseTags => self.open_tag_picker(),
             AppCommand::EditAgentInstructions => {
                 return Some(Command::Edit(self.storage.agents_path.clone()));
             }
@@ -1444,9 +1498,11 @@ impl App {
 
     fn command_available(&self, command: AppCommand) -> bool {
         match command {
-            AppCommand::InterruptAgent | AppCommand::ClearAgentSession | AppCommand::NewNote => {
-                true
-            }
+            AppCommand::InterruptAgent
+            | AppCommand::ClearAgentSession
+            | AppCommand::NewNote
+            | AppCommand::NewNoteFromTemplate
+            | AppCommand::EditTemplate => true,
             AppCommand::EditCurrentNote
             | AppCommand::RenameCurrentNote
             | AppCommand::DeleteCurrentNote => self.current_note_path().is_some(),
@@ -1454,6 +1510,7 @@ impl App {
             AppCommand::RestoreCurrentNote => self.current_note_archived() == Some(true),
             AppCommand::EditAiConfig
             | AppCommand::SwitchTheme
+            | AppCommand::BrowseTags
             | AppCommand::EditAgentInstructions
             | AppCommand::EditAgentMemory => true,
         }
@@ -1469,7 +1526,7 @@ impl App {
             })
     }
 
-    fn current_note_archived(&self) -> Option<bool> {
+    pub(crate) fn current_note_archived(&self) -> Option<bool> {
         let path = self.current_note_path()?;
         self.note_files
             .iter()
@@ -2293,7 +2350,16 @@ impl App {
     }
 
     fn begin_new_note(&mut self) {
+        self.begin_new_note_with_template(false);
+    }
+
+    fn begin_new_note_from_template(&mut self) {
+        self.begin_new_note_with_template(true);
+    }
+
+    fn begin_new_note_with_template(&mut self, from_template: bool) {
         self.pending_daily_date = None;
+        self.new_note_from_template = from_template;
         self.new_file_input.clear();
         self.new_file_cursor = 0;
         self.files_context = FilesContext::NewTarget;
@@ -2309,8 +2375,14 @@ impl App {
             }
             KeyCode::Enter => {
                 let name = self.new_file_input.clone();
-                match self.storage.create_named_file(&name) {
+                let created = if self.new_note_from_template {
+                    self.storage.create_named_file_from_template(&name)
+                } else {
+                    self.storage.create_named_file(&name)
+                };
+                match created {
                     Ok(path) => {
+                        self.new_note_from_template = false;
                         if let Some(date) = self.pending_daily_date {
                             self.perform_move_to_date(&path, date);
                         } else {
@@ -2609,13 +2681,12 @@ impl App {
                 Some(DocumentKind::Daily(date)) => self.daily_edit_command(*date),
                 None => None,
             },
-            KeyCode::Char('a')
-                if self
-                    .document
-                    .as_ref()
-                    .is_some_and(|document| matches!(document.kind, DocumentKind::File(_))) =>
-            {
+            KeyCode::Char('a') if self.current_note_archived() == Some(false) => {
                 self.manage_current_note(false);
+                None
+            }
+            KeyCode::Char('u') if self.current_note_archived() == Some(true) => {
+                self.manage_current_note(true);
                 None
             }
             KeyCode::Char('d')
@@ -2720,6 +2791,7 @@ impl App {
             DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
+            DialogPurpose::TagPicker => return self.handle_tag_picker(key),
             DialogPurpose::AgentPrompt | DialogPurpose::NewFile | DialogPurpose::RenameFile => {
                 return self.handle_text_dialog(key)
             }
@@ -2807,6 +2879,29 @@ impl App {
                     }
                     Err(error) => self.set_status(format!("Theme switch error: {error}")),
                 }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_tag_picker(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_dialog(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
+            KeyCode::Enter => {
+                let tag = self
+                    .dialog
+                    .as_ref()
+                    .and_then(DialogState::selected_option)
+                    .map(|option| option.label.clone())?;
+                self.close_dialog();
+                self.search_query = tag;
+                self.search_index = 0;
+                self.center_view = CenterView::Search;
+                self.focus = Focus::Center;
+                self.recompute_search();
             }
             _ => {}
         }
@@ -3502,6 +3597,16 @@ impl App {
             return self.activate_link(target);
         }
 
+        if let Some(name) = self
+            .tag_hitboxes
+            .iter()
+            .find(|hitbox| point_in_rect(column, row, hitbox.area))
+            .map(|hitbox| hitbox.name.clone())
+        {
+            self.open_tag_search(&name);
+            return None;
+        }
+
         if matches!(
             self.center_view,
             CenterView::Search | CenterView::DocumentSearch
@@ -3746,20 +3851,35 @@ impl App {
                 );
             }
         } else if !query.is_empty() {
-            for note in &self.daily_notes {
-                if note.body.to_lowercase().contains(&query) {
-                    results.push(SearchHit::Daily {
-                        date: note.date,
-                        text: best_line(&note.body, &query),
-                    });
-                }
+            if let Some(index) = &self.workspace_index {
+                results = index.search(&query);
+            } else {
+                self.set_status("Workspace index is still building");
             }
-            results.extend(self.storage.search_file_lines(&query));
         }
         self.search_results = results;
         self.search_index = self
             .search_index
             .min(self.search_results.len().saturating_sub(1));
+    }
+
+    fn open_tag_search(&mut self, name: &str) {
+        self.close_dialog();
+        self.search_query = format!("#{name}");
+        self.search_index = 0;
+        self.center_view = CenterView::Search;
+        self.focus = Focus::Center;
+        self.recompute_search();
+    }
+
+    pub fn apply_workspace_index(&mut self, index: WorkspaceIndex) {
+        self.workspace_index = Some(index);
+        if self.status == "Workspace index is still building" {
+            self.status.clear();
+        }
+        if self.center_view == CenterView::Search && !self.search_query.trim().is_empty() {
+            self.recompute_search();
+        }
     }
 
     fn jump_to_search_result(&mut self, index: usize) {
@@ -3778,9 +3898,12 @@ impl App {
             return;
         }
         match hit {
-            SearchHit::Daily { date, .. } => self.open_daily_document(date, DocumentReturn::Search),
             SearchHit::FileLine { path, line_no, .. } => {
-                self.open_file_document(&path, DocumentReturn::Search);
+                if let Some(date) = self.storage.daily_date_for_path(&path) {
+                    self.open_daily_document(date, DocumentReturn::Search);
+                } else {
+                    self.open_file_document(&path, DocumentReturn::Search);
+                }
                 if let Some(document) = self.document.as_mut() {
                     document.target_line = Some(line_no);
                 }
@@ -3962,10 +4085,10 @@ impl App {
     fn close_document(&mut self) {
         let Some(document) = self.document.as_ref() else {
             self.center_view = CenterView::Daily;
+            self.focus = Focus::Center;
             return;
         };
         let return_to = document.return_to;
-        let kind = document.kind.clone();
         self.stash_current_document();
         match return_to {
             DocumentReturn::Search => {
@@ -3974,11 +4097,7 @@ impl App {
             }
             DocumentReturn::Daily => {
                 self.center_view = CenterView::Daily;
-                self.focus = if matches!(kind, DocumentKind::File(_)) {
-                    Focus::Files
-                } else {
-                    Focus::Center
-                };
+                self.focus = Focus::Center;
             }
         }
     }
@@ -4287,6 +4406,7 @@ impl App {
 
     fn cancel_file_context(&mut self) {
         self.pending_daily_date = None;
+        self.new_note_from_template = false;
         self.pending_file = None;
         self.files_context = FilesContext::Browse;
         self.focus = Focus::Center;
@@ -4481,6 +4601,10 @@ mod tests {
         app.focus = Focus::Center;
     }
 
+    fn refresh_test_index(app: &mut App) {
+        app.apply_workspace_index(WorkspaceIndex::build(&app.storage));
+    }
+
     #[test]
     fn starts_with_daily_center_focused() {
         let (app, _directory) = make_app();
@@ -4581,7 +4705,7 @@ mod tests {
             app.dialog.as_ref().map(|dialog| dialog.purpose),
             Some(DialogPurpose::CommandPalette)
         );
-        assert_eq!(app.command_matches.len(), 7);
+        assert_eq!(app.command_matches.len(), 10);
 
         app.handle_paste("clear");
         assert_eq!(
@@ -4624,8 +4748,9 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_creates_and_opens_a_blank_note() {
+    fn command_palette_creates_and_opens_a_regular_note() {
         let (mut app, _directory) = make_app();
+        fs::write(&app.storage.template_path, "# From template\n").unwrap();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         app.handle_paste("note new");
@@ -4644,12 +4769,42 @@ mod tests {
 
         let path = app.storage.data_dir.join("Scratch.md");
         assert!(path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Scratch\n\n");
         assert_eq!(app.files_context, FilesContext::Browse);
         assert_eq!(app.focus, Focus::Center);
         assert!(matches!(
             app.document.as_ref().map(|document| &document.kind),
             Some(DocumentKind::File(opened)) if opened == &path
         ));
+        assert_eq!(
+            app.document
+                .as_ref()
+                .map(|document| document.source.as_str()),
+            Some("# Scratch\n\n")
+        );
+    }
+
+    #[test]
+    fn command_palette_creates_a_note_from_the_template_only_when_requested() {
+        let (mut app, _directory) = make_app();
+        fs::write(&app.storage.template_path, "# From template\n").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("new from template");
+        assert_eq!(
+            app.command_matches.first(),
+            Some(&AppCommand::NewNoteFromTemplate)
+        );
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_paste("Templated");
+        app.handle_key(key(KeyCode::Enter));
+
+        let path = app.storage.data_dir.join("Templated.md");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# From template\n");
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(path))
+        );
     }
 
     #[test]
@@ -4708,6 +4863,18 @@ mod tests {
         assert!(!app
             .command_matches
             .contains(&AppCommand::ArchiveCurrentNote));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('u')));
+
+        let restored = app.storage.data_dir.join("Archived.md");
+        assert!(!archived.exists());
+        assert!(restored.exists());
+        assert_eq!(app.status, "Note restored");
+        assert_eq!(
+            app.document.as_ref().map(|document| &document.kind),
+            Some(&DocumentKind::File(restored))
+        );
     }
 
     #[test]
@@ -4792,7 +4959,7 @@ mod tests {
     }
 
     #[test]
-    fn config_commands_open_each_file_through_the_editor_pipeline() {
+    fn editable_support_files_open_through_the_editor_pipeline() {
         let (mut app, _directory) = make_app();
         let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
@@ -4800,6 +4967,7 @@ mod tests {
             ("ai settings", app.storage.ai_config_path.clone()),
             ("agent instructions", app.storage.agents_path.clone()),
             ("agent memory", app.storage.memory_path.clone()),
+            ("template edit", app.storage.template_path.clone()),
         ] {
             app.handle_key(ctrl_p);
             app.handle_paste(query);
@@ -4833,6 +5001,41 @@ mod tests {
         assert_eq!(app.active_theme, "custom");
         assert_eq!(app.storage.load_theme_selection().unwrap(), "custom");
         assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn command_palette_browses_tags_with_counts_and_opens_exact_search() {
+        let (mut app, _directory) = make_app();
+        add_daily_note(&mut app, "daily #rust and #rust\nnot #rustlang");
+        fs::write(app.storage.data_dir.join("Project.md"), "note #rust\n").unwrap();
+        refresh_test_index(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("tags browse");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::TagPicker)
+        );
+        let rust = app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .options
+            .iter()
+            .find(|option| option.label == "#rust")
+            .unwrap();
+        assert_eq!(rust.hint.as_deref(), Some("2 documents · 3 mentions"));
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.center_view, CenterView::Search);
+        assert_eq!(app.search_query, "#rust");
+        assert_eq!(app.search_results.len(), 2);
+        assert!(app.search_results.iter().all(|hit| match hit {
+            SearchHit::FileLine { text, .. } | SearchHit::DocumentLine { text, .. } => {
+                !text.contains("#rustlang")
+            }
+        }));
     }
 
     #[test]
@@ -5570,7 +5773,7 @@ mod tests {
     }
 
     #[test]
-    fn file_enter_opens_center_document_and_escape_returns_to_files() {
+    fn file_enter_opens_center_document_and_escape_returns_to_daily() {
         let (mut app, _directory) = make_app();
         let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n").unwrap();
@@ -5590,7 +5793,7 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.center_view, CenterView::Daily);
-        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.focus, Focus::Center);
     }
 
     #[test]
@@ -5991,6 +6194,7 @@ mod tests {
     fn search_result_daily_edit_returns_physical_file_command() {
         let (mut app, _directory) = make_app();
         add_daily_note(&mut app, "needle");
+        refresh_test_index(&mut app);
         app.handle_key(key(KeyCode::Char('/')));
         assert_eq!(app.center_view, CenterView::Search);
         app.handle_paste("needle");
@@ -6018,6 +6222,7 @@ mod tests {
         let path = app.storage.data_dir.join("Project.md");
         fs::write(&path, "# Project\n\nintro\n\nunique needle\n").unwrap();
         app.reload_files();
+        refresh_test_index(&mut app);
         app.open_search();
         app.handle_paste("unique needle");
         assert_eq!(app.search_results.len(), 1);
@@ -6036,12 +6241,20 @@ mod tests {
         let archived = app.storage.archives_dir.join("Archived.md");
         fs::write(&active, "shared needle in active note\n").unwrap();
         fs::write(&archived, "shared needle in archived note\n").unwrap();
+        refresh_test_index(&mut app);
 
         app.open_search();
         app.handle_paste("shared needle");
 
         assert_eq!(app.search_results.len(), 3);
-        assert!(matches!(app.search_results[0], SearchHit::Daily { .. }));
+        let daily = app
+            .storage
+            .daily_file_path(&app.daily_notes[0].date.to_string())
+            .unwrap();
+        assert!(matches!(
+            &app.search_results[0],
+            SearchHit::FileLine { path, .. } if path == &daily
+        ));
         assert!(matches!(
             &app.search_results[1],
             SearchHit::FileLine { path, .. } if path == &active
@@ -6049,6 +6262,17 @@ mod tests {
         assert!(matches!(
             &app.search_results[2],
             SearchHit::FileLine { path, .. } if path == &archived
+        ));
+
+        let daily_date = app.daily_notes[0].date;
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.document.as_ref(),
+            Some(Document {
+                kind: DocumentKind::Daily(date),
+                target_line: Some(1),
+                ..
+            }) if *date == daily_date
         ));
     }
 

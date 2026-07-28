@@ -1874,11 +1874,11 @@ impl Tool for SearchContent {
     }
 
     fn description(&self) -> &'static str {
-        "Case-insensitive full-text search across DailyNotes and managed note files. Returns daily dates or note paths with matching snippets and supports result pagination."
+        "Case-insensitive full-text search across managed Markdown files. Returns paths and matching lines with result pagination."
     }
 
     fn input_schema(&self) -> Value {
-        search_schema("Text to find in DailyNotes and regular note contents")
+        search_schema("Text to find in managed Markdown file contents")
     }
 
     fn execute(&self, input: &Value) -> Result<String> {
@@ -1888,17 +1888,7 @@ impl Tool for SearchContent {
         }
         let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
         let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
-        let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
-        for note in self.storage.load_daily_notes()? {
-            if note.body.to_lowercase().contains(&query_lower) {
-                matches.push(json!({
-                    "type": "daily",
-                    "date": note.date.to_string(),
-                    "snippet": matching_line(&note.body, &query_lower),
-                }));
-            }
-        }
         for hit in self.storage.search_file_lines(query) {
             if let crate::model::SearchHit::FileLine {
                 path,
@@ -3326,16 +3316,6 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     true
 }
 
-fn matching_line(body: &str, query_lower: &str) -> String {
-    let line = body
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && line.to_lowercase().contains(query_lower))
-        .or_else(|| body.lines().map(str::trim).find(|line| !line.is_empty()))
-        .unwrap_or("");
-    truncate_chars(line, MAX_SEARCH_SNIPPET_CHARS)
-}
-
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
@@ -3574,8 +3554,11 @@ mod tests {
         assert_eq!(result["returned"], 1);
         assert_eq!(result["total_matches"], 3);
         assert_eq!(result["has_more"], true);
-        assert_eq!(result["matches"][0]["type"], "daily");
-        assert!(result["matches"][0]["date"].is_string());
+        assert_eq!(result["matches"][0]["type"], "file");
+        assert!(result["matches"][0]["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("daily/") && path.ends_with(".md")));
+        assert_eq!(result["matches"][0]["line"], 1);
 
         let remaining: Value = serde_json::from_str(
             &content

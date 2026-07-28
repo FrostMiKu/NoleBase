@@ -3,6 +3,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+#[cfg(test)]
+use std::path::PathBuf;
+
 use chrono::{DateTime, Local, NaiveDate};
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Alignment, Position, Rect};
@@ -19,7 +22,7 @@ use crate::app::{
 };
 use crate::model::{
     Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
-    SearchHit, SearchHitbox, TodoHitbox,
+    SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
 };
 use crate::theme::Theme;
 
@@ -160,6 +163,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
 fn clear_hitboxes(app: &mut App) {
     app.hitboxes.clear();
     app.link_hitboxes.clear();
+    app.tag_hitboxes.clear();
     app.wiki_link_hitboxes.clear();
     app.dialog_hitboxes.clear();
     app.file_hitboxes.clear();
@@ -871,14 +875,9 @@ fn draw_files(
                 let content_height = 2.min(layout_height);
                 if content_height > 1 {
                     let modified: DateTime<Local> = file.modified.into();
-                    let prefix = if file.archived {
-                        "  Archived · "
-                    } else {
-                        "  "
-                    };
                     frame.render_widget(
                         Paragraph::new(Line::from(Span::styled(
-                            format!("{prefix}{}", modified.format("%y/%m/%d %H:%M")),
+                            format!("  {}", modified.format("%y/%m/%d %H:%M")),
                             Style::default().fg(if selected {
                                 app.theme.text_secondary
                             } else {
@@ -1363,6 +1362,7 @@ fn draw_daily_notes(
     let end = scroll.saturating_add(render_height);
     let mut visible = Vec::with_capacity(render_height);
     let mut rendered_links = Vec::new();
+    let mut rendered_tags = Vec::new();
     let mut rendered_images = Vec::new();
     let visible_range = app
         .daily_vlist
@@ -1397,6 +1397,14 @@ fn draw_daily_notes(
                 link
             })
         }));
+        rendered_tags.extend(cached.tags.iter().filter_map(|tag| {
+            let global_row = first + tag.row;
+            (global_row >= scroll && global_row < end).then(|| {
+                let mut tag = tag.clone();
+                tag.row = global_row;
+                tag
+            })
+        }));
         rendered_images.extend(cached.images.iter().filter_map(|image| {
             let mut image = image.clone();
             image.row += first;
@@ -1410,6 +1418,12 @@ fn draw_daily_notes(
         register_link_hitboxes(
             &mut app.link_hitboxes,
             &rendered_links,
+            interactive_area,
+            scroll,
+        );
+        register_tag_hitboxes(
+            &mut app.tag_hitboxes,
+            &rendered_tags,
             interactive_area,
             scroll,
         );
@@ -1624,6 +1638,15 @@ fn render_daily_note(
             link
         })
         .collect();
+    let tags = markdown
+        .tags
+        .into_iter()
+        .map(|mut tag| {
+            tag.row += body_line_start;
+            tag.column += body_start;
+            tag
+        })
+        .collect();
     let images = markdown
         .images
         .into_iter()
@@ -1657,6 +1680,7 @@ fn render_daily_note(
         body: note.body.clone(),
         lines,
         links,
+        tags,
         images,
         button_line,
         button_start,
@@ -1803,6 +1827,36 @@ fn register_link_hitboxes(
             area: Rect::new(
                 viewport.x.saturating_add(column as u16),
                 viewport.y.saturating_add((link.row - scroll) as u16),
+                width as u16,
+                1,
+            ),
+        });
+    }
+}
+
+fn register_tag_hitboxes(
+    hitboxes: &mut Vec<TagHitbox>,
+    tags: &[crate::markdown::RenderedTag],
+    viewport: Rect,
+    scroll: usize,
+) {
+    let bottom = scroll.saturating_add(viewport.height as usize);
+    for tag in tags
+        .iter()
+        .filter(|tag| tag.row >= scroll && tag.row < bottom)
+    {
+        let column = tag.column.min(viewport.width as usize);
+        let width = tag
+            .width
+            .min((viewport.width as usize).saturating_sub(column));
+        if width == 0 {
+            continue;
+        }
+        hitboxes.push(TagHitbox {
+            name: tag.name.clone(),
+            area: Rect::new(
+                viewport.x.saturating_add(column as u16),
+                viewport.y.saturating_add((tag.row - scroll) as u16),
                 width as u16,
                 1,
             ),
@@ -2005,7 +2059,7 @@ fn draw_document(
             .unwrap_or_else(|| app.storage.root.clone()),
         crate::app::DocumentKind::Daily(_) => app.storage.daily_dir.clone(),
     };
-    let (rendered_links, rendered_images, document_scroll) = {
+    let (rendered_links, rendered_tags, rendered_images, document_scroll) = {
         let document = app.document.as_mut().expect("document checked above");
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -2032,6 +2086,7 @@ fn draw_document(
             .expect("document render cache was initialized")
             .rendered;
         let rendered_links = rendered.links.clone();
+        let rendered_tags = rendered.tags.clone();
         let rendered_images = rendered.images.clone();
         let lines = &rendered.lines;
         let max_scroll = lines
@@ -2045,7 +2100,12 @@ fn draw_document(
             document_area.height as usize,
         );
         frame.render_widget(Paragraph::new(visible).style(page_style), document_area);
-        (rendered_links, rendered_images, document_scroll)
+        (
+            rendered_links,
+            rendered_tags,
+            rendered_images,
+            document_scroll,
+        )
     };
     app.images.render(
         frame,
@@ -2065,6 +2125,12 @@ fn draw_document(
         register_link_hitboxes(
             &mut app.link_hitboxes,
             &rendered_links,
+            interactive_document_area,
+            document_scroll,
+        );
+        register_tag_hitboxes(
+            &mut app.tag_hitboxes,
+            &rendered_tags,
             interactive_document_area,
             document_scroll,
         );
@@ -2212,14 +2278,11 @@ fn draw_search(
         .enumerate()
     {
         let spans = match hit {
-            SearchHit::Daily { text, .. } => vec![
-                Span::styled("• ", Style::default().fg(app.theme.ui_search_marker)),
-                Span::raw(text.clone()),
-            ],
             SearchHit::FileLine {
                 path,
                 line_no,
                 text,
+                ..
             } => {
                 let name = path
                     .file_stem()
@@ -2472,7 +2535,11 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
                     matches!(document.kind, crate::app::DocumentKind::File(_))
                 }) =>
             {
-                "e edit · a archive · r rename · d delete"
+                if app.current_note_archived() == Some(true) {
+                    "e edit · u restore · r rename · d delete"
+                } else {
+                    "e edit · a archive · r rename · d delete"
+                }
             }
             (Focus::Center, _) => "Ctrl+P commands",
         };
@@ -2496,7 +2563,13 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
                 matches!(document.kind, crate::app::DocumentKind::File(_))
             }) =>
         {
-            if width >= 85 {
+            if app.current_note_archived() == Some(true) {
+                if width >= 85 {
+                    "↑↓ scroll · e edit · u restore · r rename · d delete · / find · Esc back"
+                } else {
+                    "e edit · u restore · r rename · d delete · / find"
+                }
+            } else if width >= 85 {
                 "↑↓ scroll · e edit · a archive · r rename · d delete · / find · Esc back"
             } else {
                 "e edit · a archive · r rename · d delete · / find"
@@ -2599,7 +2672,17 @@ fn draw_dialog(
     let height = desired_height
         .max(3)
         .min(root.height.saturating_sub(2).max(root.height.min(1)));
-    let area = centered_rect(root, width, height);
+    // Keep the command palette's query field anchored while its result list
+    // shrinks. Centering each filtered height would make the input jump.
+    let area = if dialog.mode == DialogMode::CommandPalette {
+        let maximum_height = 8_u16.saturating_mul(3).saturating_add(6);
+        let anchor_height =
+            maximum_height.min(root.height.saturating_sub(2).max(root.height.min(1)));
+        let anchor = centered_rect(root, width, anchor_height);
+        Rect::new(anchor.x, anchor.y, width, height)
+    } else {
+        centered_rect(root, width, height)
+    };
     if area.width == 0 || area.height == 0 {
         return area;
     }
@@ -3220,7 +3303,9 @@ fn wrap_spans_to_width(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static
 mod tests {
     use std::fs;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use tempfile::tempdir;
@@ -3462,6 +3547,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_palette_keeps_its_query_field_position_when_filtering() {
+        let (mut app, _directory) = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+        let _terminal = render(&mut app, 120, 40);
+        let initial = app.layout.overlay.unwrap();
+
+        app.handle_paste("theme");
+        let _terminal = render(&mut app, 120, 40);
+        let filtered = app.layout.overlay.unwrap();
+
+        assert!(filtered.height < initial.height);
+        assert_eq!(filtered.y, initial.y);
+    }
+
     fn contains(outer: Rect, inner: Rect) -> bool {
         inner.x >= outer.x
             && inner.y >= outer.y
@@ -3532,6 +3633,30 @@ mod tests {
         assert!(footer.starts_with(" DAILY "));
         assert!(footer.contains("saved-at-left"));
         assert!(footer.trim_end().ends_with("? help"));
+    }
+
+    #[test]
+    fn archived_document_footer_offers_restore_instead_of_archive() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.archives_dir.join("Archived.md");
+        fs::write(&path, "archived").unwrap();
+        app.reload_files();
+        app.center_view = CenterView::Document;
+        app.focus = Focus::Center;
+        app.document = Some(Document {
+            kind: DocumentKind::File(path),
+            title: "Archived".to_string(),
+            source: "archived".to_string(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Daily,
+            render_cache: None,
+        });
+
+        assert!(footer_hint(&app, 120).contains("u restore"));
+        assert!(!footer_hint(&app, 120).contains("a archive"));
+        assert!(footer_hint(&app, 54).contains("u restore"));
+        assert!(!footer_hint(&app, 54).contains("a archive"));
     }
 
     #[test]
@@ -3844,6 +3969,19 @@ mod tests {
     }
 
     #[test]
+    fn archived_file_metadata_does_not_repeat_its_group() {
+        let (mut app, _directory) = make_app();
+        fs::write(app.storage.archives_dir.join("Old.md"), "old").unwrap();
+        app.reload_files();
+        app.archives_expanded = true;
+
+        let terminal = render(&mut app, 170, 18);
+        let screen = buffer_string(&terminal);
+        assert!(screen.contains("Old"));
+        assert!(!screen.contains("Archived ·"));
+    }
+
+    #[test]
     fn file_selection_includes_both_shared_spacing_lines() {
         let (mut app, _directory) = make_app();
         fs::write(app.storage.data_dir.join("First.md"), "first").unwrap();
@@ -3977,13 +4115,15 @@ mod tests {
 
         app.center_view = CenterView::Search;
         app.search_query = "needle".to_string();
-        app.search_results = vec![SearchHit::Daily {
-            date: NaiveDate::from_ymd_opt(2026, 7, 27).unwrap(),
+        app.search_results = vec![SearchHit::FileLine {
+            path: PathBuf::from("2026-07-27.md"),
+            line_no: 1,
             text: "needle result".to_string(),
         }];
         let terminal = render(&mut app, 80, 18);
         let screen = buffer_string(&terminal);
         assert!(screen.contains("Searcher · 1"));
+        assert!(screen.contains("2026-07-27:1"));
         assert!(screen.contains("needle result"));
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
         assert_ne!(
@@ -4041,6 +4181,7 @@ mod tests {
         assert!(app.layout.overlay.is_some());
         assert!(app.hitboxes.is_empty());
         assert!(app.link_hitboxes.is_empty());
+        assert!(app.tag_hitboxes.is_empty());
         assert!(app.file_hitboxes.is_empty());
         assert!(app.todo_hitboxes.is_empty());
         assert!(app.search_hitboxes.is_empty());
@@ -4083,6 +4224,44 @@ mod tests {
         assert!(app.link_hitboxes.iter().any(|hitbox| {
             hitbox.target == LinkTarget::External("https://agent.example".to_string())
         }));
+    }
+
+    #[test]
+    fn hashtags_are_clickable_in_daily_and_document_views() {
+        let (mut app, _directory) = make_app();
+        app.storage.append_to_today("Daily #rust").unwrap();
+        app.reload();
+        render(&mut app, 170, 24);
+        let daily = app
+            .tag_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.name == "rust")
+            .expect("Daily Hashtag hitbox")
+            .area;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: daily.x,
+            row: daily.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.center_view, CenterView::Search);
+        assert_eq!(app.search_query, "#rust");
+
+        app.document = Some(Document {
+            kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),
+            title: "Preview".to_string(),
+            source: "Document #design".to_string(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Daily,
+            render_cache: None,
+        });
+        app.center_view = CenterView::Document;
+        render(&mut app, 170, 24);
+        assert!(app
+            .tag_hitboxes
+            .iter()
+            .any(|hitbox| hitbox.name == "design"));
     }
 
     #[test]

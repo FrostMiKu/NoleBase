@@ -83,6 +83,15 @@ with the system default application. Clicking `[[wikilink]]` searches both
 open a chooser showing archive and format metadata; a missing note is created
 as a new `.md` file under `data/`.
 
+Hashtags are an exact navigation layer over workspace search. Clicking a
+`#tag` in Daily or a document opens all lines carrying that exact tag, so
+`#rust` does not include `#rustlang`. `Tags: Browse` in the command palette
+lists tags by document count and mention count. Nole builds this index for
+`daily/`, `data/`, and `archives/` on a background thread, then updates it
+incrementally from file-watcher events. Typing in global search queries the
+in-memory snapshot and never rescans files on the UI thread. Search results
+remain grouped as Daily, Notes, then Archives.
+
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
 opens that file in `$EDITOR` (then `$VISUAL`, then `vi`). Search and message
 editing also use Center instead of covering the workspace with a popup. External
@@ -179,6 +188,7 @@ themes/         # Agent-editable application and MBDown themes
   default.toml   # generated current default colors
   <name>.toml    # additional custom themes
 MEMORY.md       # Agent-maintained persistent memory
+template.mb     # initial content for "Note: New from template"
 daily/         # chat cards; absent dates have no file
   YYYY-MM-DD.md
 archives/      # flat storage for archived daily cards and articles
@@ -270,8 +280,8 @@ cleared. Multiple tool calls returned in one model response still count as one
 round.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
-task, clear its in-memory session, create or manage notes, or open `ai.toml`,
-`AGENTS.md`, and `MEMORY.md` with `$EDITOR`.
+task, clear its in-memory session, create or manage notes, or open `template.mb`,
+`ai.toml`, `AGENTS.md`, and `MEMORY.md` with `$EDITOR`.
 The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
 Agent conversations persist across completed prompts. Continue in the compose
 box with `Ctrl+Enter`; the Agent receives the completed conversation history.
@@ -356,6 +366,8 @@ The system prompt requires the Agent to use `ask_user` when it needs an answer
 before it can complete the current task. Later `Ctrl+Enter` prompts remain part
 of the same in-memory conversation until `C` is pressed or Nole exits.
 
+Nole creates an empty `template.mb`. `Note: New from template` starts the new
+note with its exact contents; regular note creation still generates the note title.
 Nole also creates empty `config/AGENTS.md` and `MEMORY.md` files. Their complete
 contents are appended to the system prompt in that order for every Agent task.
 `config/AGENTS.md` is user-owned: Agent file tools cannot mutate anything in

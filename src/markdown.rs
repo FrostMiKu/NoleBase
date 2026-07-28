@@ -17,12 +17,21 @@ use crate::theme::Theme;
 pub struct RenderedMarkup {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<RenderedLink>,
+    pub tags: Vec<RenderedTag>,
     pub images: Vec<mbtui::ImagePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedLink {
     pub target: LinkTarget,
+    pub row: usize,
+    pub column: usize,
+    pub width: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedTag {
+    pub name: String,
     pub row: usize,
     pub column: usize,
     pub width: usize,
@@ -42,15 +51,33 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
             let lines = rendered.text.lines;
             let specs = link_specs(document.nodes());
             let links = locate_links(&lines, &specs, theme.markdown_link);
+            let tags = rendered
+                .semantics
+                .into_iter()
+                .filter_map(|semantic| match semantic.kind {
+                    mbtui::SemanticKind::Hashtag { name } => Some((name, semantic.regions)),
+                    _ => None,
+                })
+                .flat_map(|(name, regions)| {
+                    regions.into_iter().map(move |region| RenderedTag {
+                        name: name.clone(),
+                        row: region.row,
+                        column: region.column,
+                        width: region.width,
+                    })
+                })
+                .collect();
             RenderedMarkup {
                 lines,
                 links,
+                tags,
                 images: rendered.images,
             }
         }
         Err(error) => RenderedMarkup {
             lines: Text::raw(format!("MBDown parse error: {error}")).lines,
             links: Vec::new(),
+            tags: Vec::new(),
             images: Vec::new(),
         },
     }

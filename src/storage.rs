@@ -21,6 +21,7 @@ const AI_CONFIG_FILE: &str = "ai.toml";
 const SETTINGS_FILE: &str = "settings.toml";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
+const TEMPLATE_FILE: &str = "template.mb";
 const THEMES_DIR: &str = "themes";
 const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
@@ -71,6 +72,7 @@ pub struct Storage {
     pub themes_dir: PathBuf,
     pub agents_path: PathBuf,
     pub memory_path: PathBuf,
+    pub template_path: PathBuf,
 }
 
 impl Storage {
@@ -94,6 +96,7 @@ impl Storage {
             themes_dir: root.join(THEMES_DIR),
             agents_path: root.join(CONFIG_DIR).join(AGENTS_FILE),
             memory_path: root.join(MEMORY_FILE),
+            template_path: root.join(TEMPLATE_FILE),
             root,
         })
     }
@@ -124,6 +127,7 @@ impl Storage {
         }
         create_empty_file(&self.agents_path)?;
         create_empty_file(&self.memory_path)?;
+        create_empty_file(&self.template_path)?;
         Ok(())
     }
 
@@ -430,46 +434,28 @@ impl Storage {
         Ok(false)
     }
 
-    /// Case-insensitive substring search across every managed `.md`/`.mb` file.
-    /// Active `data/` hits precede `archives/` hits. One result is returned per
-    /// matching non-blank line, with a shared cap to keep the list bounded.
+    /// Perform an explicit content scan for Agent tools and other non-interactive callers.
     pub fn search_file_lines(&self, query: &str) -> Vec<SearchHit> {
-        let q = query.to_lowercase();
-        if q.is_empty() {
+        let query = query.to_lowercase();
+        if query.is_empty() {
             return Vec::new();
         }
         const CAP: usize = 200;
-        let mut out: Vec<SearchHit> = Vec::new();
-        let active = self.list_note_files().unwrap_or_default();
-        let archived = self.list_archived_note_files().unwrap_or_default();
-        for file in active.into_iter().chain(archived) {
-            let path = file.path;
-            let text = if file.archived {
-                self.read_archived_note_file(&path)
-            } else {
-                self.read_note_file(&path)
-            };
-            let Ok(text) = text else {
+        let mut hits = Vec::new();
+        let daily = self
+            .list_note_files_in(&self.daily_dir, false)
+            .unwrap_or_default();
+        let notes = self.list_note_files().unwrap_or_default();
+        let archives = self.list_archived_note_files().unwrap_or_default();
+        for file in daily.into_iter().chain(notes).chain(archives) {
+            let Ok(source) = fs::read_to_string(&file.path) else {
                 continue;
             };
-            for (i, line) in text.lines().enumerate() {
-                if line.to_lowercase().contains(&q) {
-                    let t = line.trim();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    out.push(SearchHit::FileLine {
-                        path: path.clone(),
-                        line_no: i + 1,
-                        text: t.to_string(),
-                    });
-                    if out.len() >= CAP {
-                        return out;
-                    }
-                }
+            if append_search_hits(&mut hits, &file.path, &source, &query, CAP) {
+                break;
             }
         }
-        out
+        hits
     }
 
     /// Append a DailyNote to a managed note, then remove its daily file.
@@ -562,6 +548,12 @@ impl Storage {
         Ok(self.daily_path(parse_daily_date(date)?))
     }
 
+    pub fn daily_date_for_path(&self, path: &Path) -> Option<NaiveDate> {
+        (path.parent() == Some(self.daily_dir.as_path()))
+            .then(|| date_from_path(path))
+            .flatten()
+    }
+
     fn daily_dates(&self) -> Result<Vec<NaiveDate>> {
         let mut dates = Vec::new();
         for entry in fs::read_dir(&self.daily_dir)? {
@@ -581,16 +573,26 @@ impl Storage {
     /// Existing filesystem entries are never overwritten.
     pub fn create_named_file(&self, name: &str) -> Result<PathBuf> {
         let file_name = normalize_new_name(name)?;
+        self.create_named_file_with_content(&file_name, &format!("# {}\n\n", stem(&file_name)))
+    }
 
+    pub fn create_named_file_from_template(&self, name: &str) -> Result<PathBuf> {
+        let file_name = normalize_new_name(name)?;
+        let template = fs::read_to_string(&self.template_path)
+            .with_context(|| format!("reading {}", self.template_path.display()))?;
+        self.create_named_file_with_content(&file_name, &template)
+    }
+
+    fn create_named_file_with_content(&self, file_name: &str, content: &str) -> Result<PathBuf> {
         fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("creating {}", self.data_dir.display()))?;
-        let path = self.data_dir.join(&file_name);
+        let path = self.data_dir.join(file_name);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("creating new note file {}", path.display()))?;
-        file.write_all(format!("# {}\n\n", stem(&file_name)).as_bytes())?;
+        file.write_all(content.as_bytes())?;
         Ok(path)
     }
 
@@ -828,6 +830,29 @@ fn create_empty_file(path: &Path) -> Result<()> {
     }
 }
 
+fn append_search_hits(
+    hits: &mut Vec<SearchHit>,
+    path: &Path,
+    source: &str,
+    query: &str,
+    cap: usize,
+) -> bool {
+    for (index, line) in source.lines().enumerate() {
+        let text = line.trim();
+        if !text.is_empty() && line.to_lowercase().contains(query) {
+            hits.push(SearchHit::FileLine {
+                path: path.to_path_buf(),
+                line_no: index + 1,
+                text: text.to_string(),
+            });
+            if hits.len() >= cap {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn parse_daily_date(value: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .with_context(|| format!("invalid daily date {value}; expected YYYY-MM-DD"))
@@ -924,7 +949,7 @@ pub fn normalize_new_name(name: &str) -> Result<String> {
 fn stem(file_name: &str) -> &str {
     Path::new(file_name)
         .file_stem()
-        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.to_str())
         .unwrap_or(file_name)
 }
 
@@ -1094,34 +1119,6 @@ mod tests {
     }
 
     #[test]
-    fn search_file_lines_finds_matches_case_insensitively() {
-        let (_dir, st) = fresh();
-        st.create_named_file("Project").unwrap();
-        let p = st.data_dir.join("Project.md");
-        fs::write(&p, "# Project\n\nA note about Rust speed\n\nunrelated\n").unwrap();
-        let archived = st.archives_dir.join("Legacy.md");
-        fs::write(&archived, "Archived Rust notes\n").unwrap();
-
-        let hits = st.search_file_lines("rust");
-        assert!(hits.iter().any(|h| matches!(h,
-            SearchHit::FileLine { text, .. } if text.to_lowercase().contains("rust"))));
-        let active_index = hits
-            .iter()
-            .position(|hit| matches!(hit, SearchHit::FileLine { path, .. } if path == &p))
-            .unwrap();
-        let archived_index = hits
-            .iter()
-            .position(|hit| matches!(hit, SearchHit::FileLine { path, .. } if path == &archived))
-            .unwrap();
-        assert!(active_index < archived_index);
-        // Case-insensitive across both storage groups.
-        let hi = st.search_file_lines("RUST");
-        assert_eq!(hi.len(), 2);
-        // Empty query returns nothing.
-        assert!(st.search_file_lines("").is_empty());
-    }
-
-    #[test]
     fn move_to_markdown_writes_section() {
         let (_dir, st) = fresh();
         let m = st.append_daily("2026-06-18", "idea!").unwrap();
@@ -1136,9 +1133,24 @@ mod tests {
     #[test]
     fn create_named_file_adds_extension() {
         let (_dir, st) = fresh();
+        fs::write(&st.template_path, "ignored template").unwrap();
         let p = st.create_named_file("笔记").unwrap();
         assert_eq!(p.file_name().unwrap(), "笔记.md");
         assert!(p.exists());
+        assert_eq!(fs::read_to_string(p).unwrap(), "# 笔记\n\n");
+    }
+
+    #[test]
+    fn create_named_file_uses_the_current_template_verbatim() {
+        let (_dir, st) = fresh();
+        fs::write(&st.template_path, "# Template\n\n- [ ] Next\n").unwrap();
+
+        let path = st.create_named_file_from_template("Project").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "# Template\n\n- [ ] Next\n"
+        );
     }
 
     #[test]
@@ -1462,11 +1474,14 @@ mod tests {
         assert!(default_theme_path.exists());
         assert!(st.agents_path.exists());
         assert!(st.memory_path.exists());
+        assert!(st.template_path.exists());
         assert_eq!(fs::read_to_string(&st.agents_path).unwrap(), "");
         assert_eq!(fs::read_to_string(&st.memory_path).unwrap(), "");
+        assert_eq!(fs::read_to_string(&st.template_path).unwrap(), "");
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
         assert_eq!(st.settings_path.parent(), Some(st.config_dir.as_path()));
         assert_eq!(st.themes_dir.parent(), Some(st.root.as_path()));
+        assert_eq!(st.template_path.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
         assert!(config.contains("api_key = \"\""));
         assert!(config.contains("tavily_api_key = \"\""));

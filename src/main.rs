@@ -10,6 +10,7 @@ mod storage;
 mod theme;
 mod ui;
 mod vlist;
+mod workspace_index;
 
 use std::io::{self, Stdout, Write};
 use std::process::Command as ProcCommand;
@@ -33,6 +34,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 
 use app::{App, Command};
+use workspace_index::WorkspaceIndexer;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
@@ -143,8 +145,9 @@ fn watch_workspace(path: &std::path::Path) -> Result<(RecommendedWatcher, WatchE
     Ok((watcher, receiver))
 }
 
-fn process_workspace_events(events: &WatchEvents, app: &mut App) {
+fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::path::PathBuf> {
     let mut changed = false;
+    let mut indexed_paths = Vec::new();
     let mut watcher_error = None;
     for event in events.try_iter() {
         match event {
@@ -168,6 +171,20 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
                             })
                 }) =>
             {
+                indexed_paths.extend(
+                    event
+                        .paths
+                        .iter()
+                        .filter(|path| {
+                            path.extension()
+                                .and_then(|extension| extension.to_str())
+                                .is_some_and(|extension| {
+                                    extension.eq_ignore_ascii_case("md")
+                                        || extension.eq_ignore_ascii_case("mb")
+                                })
+                        })
+                        .cloned(),
+                );
                 changed = true;
             }
             Ok(_) => {}
@@ -180,6 +197,7 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
     if let Some(error) = watcher_error {
         app.status = format!("File watcher error: {error}");
     }
+    indexed_paths
 }
 
 fn present_frame<B: Backend>(
@@ -219,10 +237,19 @@ fn draw_frame(terminal: &mut Tui, app: &mut App, cursor_visible: &mut bool) -> R
     Ok(())
 }
 
-fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Result<()> {
+fn run(
+    terminal: &mut Tui,
+    app: &mut App,
+    workspace_events: &WatchEvents,
+    workspace_indexer: &WorkspaceIndexer,
+) -> Result<()> {
     let mut cursor_visible = true;
     loop {
-        process_workspace_events(workspace_events, app);
+        let indexed_paths = process_workspace_events(workspace_events, app);
+        workspace_indexer.paths_changed(indexed_paths);
+        if let Some(index) = workspace_indexer.try_latest_update() {
+            app.apply_workspace_index(index);
+        }
         app.poll_agent();
         let pending_bells = app.notifications.take_bells();
         if pending_bells > 0 {
@@ -313,8 +340,9 @@ fn resolve_storage() -> Result<storage::Storage> {
 fn main() -> Result<()> {
     let storage = resolve_storage()?;
     storage.ensure_files()?;
+    let (_watcher, workspace_events) = watch_workspace(&storage.root)?;
+    let workspace_indexer = WorkspaceIndexer::spawn(storage.clone());
     let mut app = App::new(storage)?;
-    let (_watcher, workspace_events) = watch_workspace(&app.storage.root)?;
 
     enter_tui()?;
     let _guard = TerminalGuard;
@@ -326,7 +354,13 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    run(&mut terminal, &mut app, &workspace_events).context("event loop failed")?;
+    run(
+        &mut terminal,
+        &mut app,
+        &workspace_events,
+        &workspace_indexer,
+    )
+    .context("event loop failed")?;
     Ok(())
 }
 
