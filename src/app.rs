@@ -4587,17 +4587,13 @@ impl App {
         let source = self.storage.read_document_file(path)?;
         if let Some(document) = self.document.as_mut() {
             document.replace_source(source);
+            document.scroll = u16::MAX;
+            document.target_line = None;
         }
         self.input.clear();
         self.input_cursor = 0;
         self.reload_files();
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        self.notifications.notify(format!("Appended to {name}"));
-        self.set_status("Appended without leaving the document");
+        self.status.clear();
         Ok(())
     }
 
@@ -5569,12 +5565,15 @@ mod tests {
     }
 
     #[test]
-    fn recording_from_a_document_appends_to_it_and_keeps_it_open() {
+    fn recording_from_a_document_appends_silently_and_pins_scroll_to_end() {
         let (mut app, _directory) = make_app();
         let path = app.storage.data_dir.join("Article.md");
         fs::write(&path, "# Article\n\nInspiration\n").unwrap();
         app.open_file_document(&path, DocumentReturn::Daily);
-        app.document.as_mut().unwrap().scroll = 1;
+        let document = app.document.as_mut().unwrap();
+        document.scroll = 1;
+        document.target_line = Some(1);
+        app.status = "Old status".to_string();
         app.handle_key(key(KeyCode::Char('i')));
         assert_eq!(app.focus, Focus::Compose);
         app.handle_paste("new idea");
@@ -5585,7 +5584,8 @@ mod tests {
             app.document.as_ref().map(|document| &document.kind),
             Some(&DocumentKind::File(path.clone()))
         );
-        assert_eq!(app.document.as_ref().unwrap().scroll, 1);
+        assert_eq!(app.document.as_ref().unwrap().scroll, u16::MAX);
+        assert_eq!(app.document.as_ref().unwrap().target_line, None);
         assert!(app.daily_notes.is_empty());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -5595,10 +5595,8 @@ mod tests {
             app.document.as_ref().unwrap().source,
             "# Article\n\nInspiration\n\nnew idea\n"
         );
-        assert_eq!(
-            app.notifications.visible().as_deref(),
-            Some("Appended to Article.md")
-        );
+        assert!(app.notifications.visible().is_none());
+        assert!(app.status.is_empty());
     }
 
     #[test]

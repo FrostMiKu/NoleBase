@@ -19,7 +19,8 @@ popups:
   state.
 - **Compose** floats at the bottom of Daily on the same centered content axis.
 - **Compose** remains available while reading a document, so content can be
-  appended to that article without leaving it or losing its scroll position.
+  appended to that article without leaving it; the viewport follows the newly
+  appended content to the end.
 
 Files is a flat recent-files list, not a fake directory tree. Direct `.md` and
 `.mb` files under the storage `data/` directory are sorted by last modification
@@ -156,7 +157,7 @@ Errors leave the active input/context in place so they can be corrected.
   daily file; `Esc`/`q` returns to Center.
 - **Document:** arrows or `j`/`k` scroll; `PageUp`/`PageDown` move by pages;
   `i` or Enter focuses Compose; `Esc`/`q` closes. Sending from Compose appends
-  to the current article while keeping it open and shows a top-right notification.
+  to the current article, keeps it open, and scrolls directly to the new content.
   `Ctrl+Enter` instead sends the buffer directly to Agent and includes the path
   of the note currently being viewed as context.
   On a file, `e` invokes `$EDITOR`; on a message, `e` opens the in-app message
