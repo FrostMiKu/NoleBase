@@ -270,7 +270,7 @@ as intermediate output and automatically requests continuation. A response
 with no text is retried a limited number of times; persistent failures report
 the stop reason and returned content-block types.
 Agent output enters a daily card only when the Agent explicitly calls
-`append_daily`.
+`add_daily_entry`.
 
 Set `tavily_api_key` to enable the Agent's Tavily `web_search` tool. When the
 key is empty or absent, Nole omits the tool and its instructions entirely, so
@@ -316,13 +316,16 @@ inputs submit only their currently visible rows to Ratatui; off-screen rows are
 retained as scroll state rather than rendered.
 
 The Agent can read arbitrary text files with zero-based `offset`/`limit` line
-pagination, write only inside the Nole directory, and fetch HTTP(S) text. When
+pagination. Each returned line includes its absolute zero-based line number
+and text without the line ending. It can write only inside the Nole directory,
+and fetch HTTP(S) text. When
 configured, `web_search` queries Tavily with optional topic, depth, time range,
 answer, and result-count controls, then returns compact ranked results.
 Every user prompt sent to the Agent includes the current local date and time.
 `read_file` defaults to 200 lines and accepts at most 2,000 lines per call. Its
 structured response includes the total line count and whether more content
-remains.
+remains. Paths under the Nole root are returned in root-relative form so they
+can be passed directly to other file tools.
 
 `list_directory` lists any directory by absolute path or a path relative to
 the Nole root. `depth=1` returns direct children and values up to 16 include
@@ -331,27 +334,30 @@ depth, extension, byte size, line count for files up to 1 MB, and creation and
 modification timestamps. Results support metadata sorting and pagination; one
 call scans at most 10,000 entries.
 
-`list_notes` returns managed notes with their line count, creation and
+`list_notes` returns active `data/` notes with their line count, creation and
 modification timestamps, and byte size. Results can be sorted ascending or
 descending by name or any of those metadata fields and paginated with
 `offset`/`limit`.
 
-`search_content` performs case-insensitive full-text search across daily cards,
-active notes, and archived notes, in that order, returning daily dates or file
-paths and line numbers. `search_files` uses the same case-insensitive fuzzy
+`search_content` performs case-insensitive full-text search across daily files,
+active notes, and archived notes, in that order, returning file paths and
+zero-based source line numbers. `search_files` uses the same case-insensitive fuzzy
 filename matching as the Files sidebar. Both search tools support result
 `offset`/`limit` pagination.
 
-`write_file` creates new files and refuses existing paths. `update_file` changes
-existing files, while `read_daily`, `update_daily`, and `append_daily` provide
-date-based access to daily cards without exposing `daily/` to generic file
-tools. `read_daily` accepts an inclusive `start_date`/`end_date` range and
-returns every existing card in it; use equal bounds for one day. `update_file`
-accepts one or more zero-based `[start_line, end_line)` replacements and
-preserves the rest of the file internally, so large files do not need to be
-read or submitted in full. Changed/deleted ranges must have been covered by
-`read_file` in the same Agent run; insertions require adjacent anchor lines.
-Daily updates require a prior range read containing the exact date.
+`create_file` creates new files and refuses existing paths. `edit_file` accepts
+one or more zero-based `[start_line, end_line)` replacements and preserves the
+rest of the file internally, so large files do not need to be read or submitted
+in full. Every range refers to the original `read_file` snapshot. Each edit
+provides a `lines` array of complete lines without line-ending characters; the
+tool adds separators and never requires the Agent to repeat adjacent anchor
+text. Changed/deleted ranges must have been covered by `read_file` in the same
+Agent run; insertions require adjacent anchor lines. Existing
+`daily/YYYY-MM-DD.md` files use the same `read_file`, `edit_file`, and
+`delete_file` operations as other Markdown files. `add_daily_entry` remains the
+high-level create-or-append operation for recording content on a date and does
+not require approval. The Agent can list `daily/` to discover available dates
+before reading the relevant files.
 
 `copy_file` and `move_file` accept a regular source file anywhere on the
 filesystem, but the destination must be a new path inside the Nole directory;
@@ -360,13 +366,15 @@ one existing Nole directory, preserves basenames, preflights all collisions,
 and attempts rollback if a later move fails. `rename_file` gives same-directory
 renames an explicit non-overwriting operation. `delete_file` only accepts
 regular files inside Nole and uses the common approval dialog. Generic file
-tools cannot operate directly inside `daily/` or on `config/ai.toml`.
+creation, transfer, and rename tools cannot operate directly inside `daily/`,
+preserving its `YYYY-MM-DD.md` naming invariant. Agent file tools cannot mutate
+anything inside `config/`, and `config/ai.toml` cannot be read.
 
 The `notify` tool lets the Agent display a short notification card in the TUI's
 top-right corner and emits the terminal bell. Notifications are non-blocking
 and expire automatically.
 The `open_file` tool switches the TUI to an existing managed `.md` or `.mb`
-note in `data/` or `archives/`, so the Agent can present relevant material to
+note in `daily/`, `data/`, or `archives/`, so the Agent can present relevant material to
 the user directly.
 The `ask_user` tool pauses the Agent and opens a TUI dialog for clarification.
 The Agent may provide up to ten choices; use Up/Down and Enter to select one,

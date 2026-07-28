@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, Local};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -174,7 +174,6 @@ struct ApprovalGate {
 #[derive(Default)]
 struct ReadTracker {
     files: Mutex<HashMap<PathBuf, FileReadState>>,
-    daily_notes: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -240,31 +239,6 @@ impl ReadTracker {
             .remove(path);
         Ok(())
     }
-
-    fn mark_daily(&self, date: String, body: String) -> Result<()> {
-        self.daily_notes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("daily read tracker lock poisoned"))?
-            .insert(date, body);
-        Ok(())
-    }
-
-    fn daily_snapshot(&self, date: &str) -> Result<Option<String>> {
-        Ok(self
-            .daily_notes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("daily read tracker lock poisoned"))?
-            .get(date)
-            .cloned())
-    }
-
-    fn consume_daily(&self, date: &str) -> Result<()> {
-        self.daily_notes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("daily read tracker lock poisoned"))?
-            .remove(date);
-        Ok(())
-    }
 }
 
 impl FileReadState {
@@ -280,7 +254,7 @@ impl FileReadState {
         if start_line < end_line {
             if !self.covers(start_line, end_line) {
                 bail!(
-                    "update_file must read changed zero-based lines {start_line}..{end_line} first"
+                    "edit_file must read changed zero-based lines {start_line}..{end_line} first"
                 );
             }
         } else if self.total_lines > 0 {
@@ -288,7 +262,7 @@ impl FileReadState {
             let anchor_end = (start_line + 1).min(self.total_lines);
             if !self.covers(anchor_start, anchor_end) {
                 bail!(
-                    "update_file must read insertion anchor lines {anchor_start}..{anchor_end} first"
+                    "edit_file must read insertion anchor lines {anchor_start}..{anchor_end} first"
                 );
             }
         }
@@ -453,17 +427,15 @@ impl Agent {
         agent.register(ListTags::new(workspace_index.clone()));
         agent.register(SearchTag::new(nole_root, workspace_index.clone())?);
         agent.register(RenameTag::new(nole_root, workspace_index, gate.clone())?);
-        agent.register(WriteFile::new(nole_root)?);
+        agent.register(CreateFile::new(nole_root)?);
         agent.register(CopyFile::new(nole_root)?);
         let file_events = agent.events.clone();
         agent.register(MoveFile::new(nole_root, file_events.clone())?);
         agent.register(MoveFiles::new(nole_root, file_events.clone())?);
         agent.register(RenameFile::new(nole_root, file_events)?);
         agent.register(DeleteFile::new(nole_root, gate.clone())?);
-        agent.register(UpdateFile::new(nole_root, gate.clone(), reads.clone())?);
-        agent.register(ReadDaily::new(nole_root, reads.clone())?);
-        agent.register(UpdateDaily::new(nole_root, gate, reads)?);
-        agent.register(AppendDaily::new(nole_root)?);
+        agent.register(EditFile::new(nole_root, gate, reads)?);
+        agent.register(AddDailyEntry::new(nole_root)?);
         agent.register(OpenFile::new(nole_root, agent.events.clone())?);
         agent.register(Notify {
             events: agent.events.clone(),
@@ -1237,16 +1209,7 @@ fn tool_activity_target(call: &Value) -> Option<String> {
         "web_search" | "search_content" | "search_files" | "list_tags" => text("query"),
         "search_tag" => text("tag"),
         "rename_tag" => Some(format!("{} -> {}", text("from")?, text("to")?)),
-        "read_daily" => {
-            let start = text("start_date")?;
-            let end = text("end_date")?;
-            Some(if start == end {
-                start
-            } else {
-                format!("{start}..{end}")
-            })
-        }
-        "update_daily" | "append_daily" => text("date"),
+        "add_daily_entry" => text("date"),
         "copy_file" | "move_file" => {
             Some(format!("{} -> {}", text("source")?, text("destination")?))
         }
@@ -1302,8 +1265,6 @@ fn system_prompt(
     };
     format!(
         r#"You are the AI assistant in Nole, a terminal note app.
-The conversation is multi-turn and its history is retained for the current Agent session. Return only the useful final answer; it appears in the Agent panel.
-The user may add input while you work. Nole buffers it and delivers it before pending tool calls; incorporate all newly delivered input before continuing.
 
 ## MBDown
 Nole renders CommonMark plus #tag, [[wikilink]], and ![[file]] embeds. A Hashtag must start a source line or follow whitespace; its name allows Unicode letters/numbers and _, -, /. Wikilinks resolve .md/.mb notes in data/ and archives/.
@@ -1315,26 +1276,28 @@ Restricted BBCode is also available:
 Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never emit terminal escape sequences.
 
 ## Workspace
-Root: {root}
+Root: {root} (the user's `.nole` workspace)
 - data/: ordinary .md/.mb articles and notes; create them here by default.
-- daily/: YYYY-MM-DD.md DailyNotes; use only DailyNote tools.
-- archives/: archived DailyNotes and regular notes.
+- daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read_file, edit_file, and delete_file tools as other text files.
+- archives/: archived daily and regular Markdown files.
 - themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
 - template.mb: editable content used only by Create note from template; ordinary New note does not use it.
-- config/: read-only user configuration. You may inspect it except config/ai.toml; never modify, move, copy, rename, or delete anything here.
+- config/: application-managed configuration. You may inspect it read-only except config/ai.toml; never modify, move, copy, rename, or delete anything here.
+- config/settings.toml: read-only application settings, including the active theme selection.
+- config/agent-session.json: application-managed persisted Agent session; never edit or delete it.
+- config/ai.toml: private credentials and AI settings; never read it or expose its contents.
 - config/AGENTS.md: user instructions injected below.
 - MEMORY.md: persistent Agent memory injected below; you may update it.
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
-- read_file is paginated; read only needed lines. Use list_directory for filesystem structure, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
-- write_file creates only new files. update_file uses exact zero-based line ranges and requires diff approval unless bypassed. Every changed/deleted range must first be read in this run; insertions require adjacent lines. Unrelated lines need not be read.
-- Generic mutation tools cannot operate in daily/ or config/. Use read_daily before update_daily. append_daily creates/appends without approval; update_daily requires diff approval unless bypassed.
+- read_file is paginated and returns each line with its absolute zero-based line number and text without the line ending; read only needed lines. Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery. Search results also use zero-based source line numbers.
+- create_file creates only new files. edit_file uses exact zero-based line ranges from the original read_file snapshot and requires diff approval unless bypassed. Edits provide complete lines without line-ending characters; the tool adds separators. Every changed/deleted range must first be read in this run; insertions require adjacent lines. Unrelated lines need not be read.
+- Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md without approval. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
 - Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches and rename_file for file renames. Use rename_tag for exact workspace-wide tag renames. Deletes and tag renames require approval unless bypassed.
 - Use web_fetch when you already have a URL.
 {web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
-- Use open_file when the user should see an existing data/ or archives/ note in the TUI.
-- Final text is not saved automatically; call append_daily when it belongs in Daily.
+- Use open_file when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
 
 ## Project instructions (config/AGENTS.md)
 {agents_instructions}
@@ -1385,7 +1348,6 @@ fn safe_relative(root: &Path, input: &str) -> Result<PathBuf> {
 struct ReadFile {
     root: PathBuf,
     private_config: PathBuf,
-    daily_dir: PathBuf,
     reads: Arc<ReadTracker>,
 }
 
@@ -1396,7 +1358,6 @@ impl ReadFile {
             .unwrap_or_else(|_| root.join("config/ai.toml"));
         Ok(Self {
             private_config,
-            daily_dir: root.join("daily"),
             reads,
             root,
         })
@@ -1408,7 +1369,7 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a line range from any UTF-8 text file by absolute path, or by a path relative to the Nole root (maximum 1 MB). offset is zero-based. Reads default to 200 lines and return pagination metadata."
+        "Read a paginated range from any UTF-8 text file by absolute path, or by a path relative to the Nole root (maximum 1 MB). offset is a zero-based line number. The response includes every returned line's absolute zero-based line number and text without its line ending."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1432,8 +1393,8 @@ impl Tool for ReadFile {
         };
         let path =
             fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
-        if path == self.private_config || path.starts_with(&self.daily_dir) {
-            bail!("use DailyNote tools for daily notes; AI configuration is private");
+        if path == self.private_config {
+            bail!("AI configuration is private");
         }
         let metadata =
             fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -1444,20 +1405,24 @@ impl Tool for ReadFile {
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let offset = optional_usize(input, "offset", 0, usize::MAX)?;
         let limit = optional_usize(input, "limit", DEFAULT_READ_LINES, MAX_READ_LINES)?;
-        let lines: Vec<&str> = content.split_inclusive('\n').collect();
+        let lines: Vec<&str> = source_lines(&content);
         let total_lines = lines.len();
         let start = offset.min(total_lines);
         let end = start.saturating_add(limit).min(total_lines);
-        let selected = lines[start..end].concat();
+        let returned_lines = lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| json!({ "line": start + index, "text": text }))
+            .collect::<Vec<_>>();
         self.reads
             .mark_file(path.clone(), content, start, end, total_lines)?;
         serde_json::to_string_pretty(&json!({
-            "path": path.to_string_lossy(),
+            "path": display_path(&self.root, &path),
             "offset": start,
             "returned_lines": end - start,
             "total_lines": total_lines,
             "has_more": end < total_lines,
-            "content": selected,
+            "lines": returned_lines,
         }))
         .context("encoding file read")
     }
@@ -1713,7 +1678,7 @@ impl Tool for ListNotes {
     }
 
     fn description(&self) -> &'static str {
-        "List managed .md and .mb notes with line count, creation time, modification time, and byte size. Supports metadata sorting and pagination."
+        "List active data/ .md and .mb notes with line count, creation time, modification time, and byte size. Supports metadata sorting and pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -1841,7 +1806,7 @@ impl Tool for SearchContent {
     }
 
     fn description(&self) -> &'static str {
-        "Case-insensitive full-text search across managed Markdown files. Returns paths and matching lines with result pagination."
+        "Case-insensitive full-text search across managed Markdown files. Returns paths and matching zero-based source lines with result pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -1864,9 +1829,8 @@ impl Tool for SearchContent {
             } = hit
             {
                 matches.push(json!({
-                    "type": "file",
                     "path": display_path(&self.root, &path),
-                    "line": line_no,
+                    "line": line_no.saturating_sub(1),
                     "snippet": truncate_chars(&text, MAX_SEARCH_SNIPPET_CHARS),
                 }));
             }
@@ -1895,7 +1859,7 @@ impl Tool for SearchFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Fuzzy, case-insensitive filename search across managed .md and .mb notes, using the same matching as the Files sidebar. Supports result pagination."
+        "Fuzzy, case-insensitive filename search across active and archived .md/.mb notes, using the same matching as the Files sidebar. Supports result pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -1913,6 +1877,7 @@ impl Tool for SearchFiles {
             .storage
             .list_note_files()?
             .into_iter()
+            .chain(self.storage.list_archived_note_files()?)
             .filter(|file| {
                 file.path
                     .file_stem()
@@ -2063,7 +2028,7 @@ impl Tool for SearchTag {
     }
 
     fn description(&self) -> &'static str {
-        "Search one exact Hashtag across indexed Markdown files. Returns paths, one-based line numbers, and source snippets with pagination."
+        "Search one exact Hashtag across indexed Markdown files. Returns paths, zero-based source line numbers, and source snippets with pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -2110,7 +2075,7 @@ impl Tool for SearchTag {
                     text,
                 } => Some(json!({
                     "path": display_path(&self.root, path),
-                    "line": line_no,
+                    "line": line_no.saturating_sub(1),
                     "snippet": truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS),
                 })),
                 crate::model::SearchHit::DocumentLine { .. } => None,
@@ -2240,20 +2205,18 @@ fn tag_scope_label(scope: Option<TagScope>) -> &'static str {
     }
 }
 
-struct UpdateFile {
+struct EditFile {
     root: PathBuf,
     config_dir: PathBuf,
-    daily_dir: PathBuf,
     gate: ApprovalGate,
     reads: Arc<ReadTracker>,
 }
 
-impl UpdateFile {
+impl EditFile {
     fn new(root: &Path, gate: ApprovalGate, reads: Arc<ReadTracker>) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
             config_dir: root.join("config"),
-            daily_dir: root.join("daily"),
             root,
             gate,
             reads,
@@ -2261,13 +2224,13 @@ impl UpdateFile {
     }
 }
 
-impl Tool for UpdateFile {
+impl Tool for EditFile {
     fn name(&self) -> &'static str {
-        "update_file"
+        "edit_file"
     }
 
     fn description(&self) -> &'static str {
-        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root, outside config/ and daily/, while preserving all other content. Each edit replaces [start_line, end_line) with exact content. Changed/deleted lines, or adjacent anchors for insertions, must have been read in this run. Requires user diff approval unless bypassed."
+        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root, outside config/, while preserving all other content. Every [start_line, end_line) range refers to the original read_file snapshot; equal bounds insert before that source line. lines contains complete lines without line-ending characters; use an empty array to delete. Changed/deleted lines, or adjacent anchors for insertions, must have been read in this run. Requires user diff approval unless bypassed."
     }
 
     fn input_schema(&self) -> Value {
@@ -2282,18 +2245,19 @@ impl Tool for UpdateFile {
                         "properties": {
                             "start_line": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Zero-based inclusive source line"
+                                "description": "Zero-based inclusive line in the original read_file snapshot; equal to end_line inserts before this line"
                             },
                             "end_line": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Zero-based exclusive source line"
+                                "description": "Zero-based exclusive line in the original read_file snapshot"
                             },
-                            "content": {
-                                "type": "string",
-                                "description": "Exact replacement text; include newlines where required"
+                            "lines": {
+                                "type": "array",
+                                "description": "Complete inserted/replacement lines without line-ending characters or unchanged adjacent anchor text. Use an empty array to delete; the tool adds line separators",
+                                "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
                             }
                         },
-                        "required": ["start_line", "end_line", "content"],
+                        "required": ["start_line", "end_line", "lines"],
                         "additionalProperties": false
                     }
                 }
@@ -2307,12 +2271,12 @@ impl Tool for UpdateFile {
         let edits = parse_line_edits(input)?;
         let unresolved = safe_relative(&self.root, relative)?;
         if fs::symlink_metadata(&unresolved)?.file_type().is_symlink() {
-            bail!("refusing to update through a symlink");
+            bail!("refusing to edit through a symlink");
         }
         let path = fs::canonicalize(&unresolved)
             .with_context(|| format!("resolving existing file {}", unresolved.display()))?;
-        if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
-            bail!("generic file tools cannot operate on this special file");
+        if path.starts_with(&self.config_dir) {
+            bail!("edit_file cannot operate inside config/");
         }
         let metadata = fs::metadata(&path)?;
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
@@ -2323,10 +2287,10 @@ impl Tool for UpdateFile {
         let state = self
             .reads
             .file_state(&path)?
-            .context("update_file requires read_file on the same path first")?;
+            .context("edit_file requires read_file on the same path first")?;
         if state.snapshot != old {
             self.reads.consume_file(&path)?;
-            bail!("file changed since read_file; read it again before updating");
+            bail!("file changed since read_file; read it again before editing");
         }
         let offsets = line_byte_offsets(&old);
         let total_lines = offsets.len().saturating_sub(1);
@@ -2342,24 +2306,24 @@ impl Tool for UpdateFile {
         }
         let content = apply_line_edits(&old, &offsets, &edits);
         if content.len() as u64 > MAX_FILE_BYTES {
-            bail!("updated content exceeds 1 MB");
+            bail!("edited content exceeds 1 MB");
         }
         if old == content {
             return Ok(format!("no changes needed for {relative}"));
         }
         self.gate.request(ApprovalRequest {
-            title: format!("Update {relative}"),
+            title: format!("Edit {relative}"),
             diff: limited_diff(&old, &content, relative, relative),
         })?;
         let current =
             fs::read_to_string(&path).with_context(|| format!("rechecking {}", path.display()))?;
         if current != old {
             self.reads.consume_file(&path)?;
-            bail!("file changed while awaiting approval; read it again before updating");
+            bail!("file changed while awaiting approval; read it again before editing");
         }
-        fs::write(&path, &content).with_context(|| format!("updating {}", path.display()))?;
+        fs::write(&path, &content).with_context(|| format!("editing {}", path.display()))?;
         self.reads.consume_file(&path)?;
-        Ok(format!("updated {relative}"))
+        Ok(format!("edited {relative}"))
     }
 }
 
@@ -2367,7 +2331,7 @@ impl Tool for UpdateFile {
 struct LineEdit {
     start_line: usize,
     end_line: usize,
-    content: String,
+    lines: Vec<String>,
 }
 
 fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
@@ -2392,7 +2356,19 @@ fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
             Ok(LineEdit {
                 start_line: usize::try_from(start_line).context("start_line is too large")?,
                 end_line: usize::try_from(end_line).context("end_line is too large")?,
-                content: required_string(value, "content")?.to_string(),
+                lines: value
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .context("edit lines must be an array")?
+                    .iter()
+                    .map(|line| {
+                        let line = line.as_str().context("each edit line must be a string")?;
+                        if line.contains('\r') || line.contains('\n') {
+                            bail!("edit lines must not contain line-ending characters");
+                        }
+                        Ok(line.to_string())
+                    })
+                    .collect::<Result<Vec<_>>>()?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2405,6 +2381,17 @@ fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
         }
     }
     Ok(edits)
+}
+
+fn source_lines(content: &str) -> Vec<&str> {
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            line.strip_suffix('\n')
+                .and_then(|line| line.strip_suffix('\r'))
+                .unwrap_or(line)
+        })
+        .collect()
 }
 
 fn line_byte_offsets(content: &str) -> Vec<usize> {
@@ -2422,172 +2409,34 @@ fn line_byte_offsets(content: &str) -> Vec<usize> {
 
 fn apply_line_edits(old: &str, offsets: &[usize], edits: &[LineEdit]) -> String {
     let mut content = old.to_string();
+    let line_ending = if old.contains("\r\n") { "\r\n" } else { "\n" };
     for edit in edits.iter().rev() {
+        let mut replacement = if edit.lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}{}", edit.lines.join(line_ending), line_ending)
+        };
+        if edit.start_line == edit.end_line
+            && edit.start_line == offsets.len().saturating_sub(1)
+            && !old.is_empty()
+            && !old.ends_with('\n')
+            && !replacement.is_empty()
+        {
+            replacement.insert_str(0, line_ending);
+        }
         content.replace_range(
             offsets[edit.start_line]..offsets[edit.end_line],
-            &edit.content,
+            &replacement,
         );
     }
     content
 }
 
-struct ReadDaily {
-    storage: Storage,
-    reads: Arc<ReadTracker>,
-}
-
-impl ReadDaily {
-    fn new(root: &Path, reads: Arc<ReadTracker>) -> Result<Self> {
-        Ok(Self {
-            storage: Storage::new(root)?,
-            reads,
-        })
-    }
-}
-
-impl Tool for ReadDaily {
-    fn name(&self) -> &'static str {
-        "read_daily"
-    }
-
-    fn description(&self) -> &'static str {
-        "Read existing DailyNotes in an inclusive YYYY-MM-DD date range. Use the same start_date and end_date for one day. Every returned DailyNote is eligible for update_daily in this Agent run."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "start_date": {
-                    "type": "string", "description": "Inclusive YYYY-MM-DD start date"
-                },
-                "end_date": {
-                    "type": "string", "description": "Inclusive YYYY-MM-DD end date"
-                }
-            },
-            "required": ["start_date", "end_date"], "additionalProperties": false
-        })
-    }
-
-    fn execute(&self, input: &Value) -> Result<String> {
-        let start_text = required_string(input, "start_date")?;
-        let end_text = required_string(input, "end_date")?;
-        let start = NaiveDate::parse_from_str(start_text, "%Y-%m-%d")
-            .with_context(|| format!("invalid start_date: {start_text}"))?;
-        let end = NaiveDate::parse_from_str(end_text, "%Y-%m-%d")
-            .with_context(|| format!("invalid end_date: {end_text}"))?;
-        if start > end {
-            bail!("start_date must not be after end_date");
-        }
-        let notes = self
-            .storage
-            .load_daily_notes()?
-            .into_iter()
-            .filter(|note| note.date >= start && note.date <= end)
-            .collect::<Vec<_>>();
-        let daily_notes = notes
-            .iter()
-            .map(|note| json!({ "date": note.date.to_string(), "body": note.body }))
-            .collect::<Vec<_>>();
-        let encoded = serde_json::to_string_pretty(&json!({
-            "start_date": start_text,
-            "end_date": end_text,
-            "count": daily_notes.len(),
-            "daily_notes": daily_notes,
-        }))
-        .context("encoding daily range")?;
-        if encoded.len() as u64 > MAX_FETCH_BYTES {
-            bail!("daily range response exceeds 1 MB; request a narrower date range");
-        }
-        for note in notes {
-            self.reads.mark_daily(note.date.to_string(), note.body)?;
-        }
-        Ok(encoded)
-    }
-}
-
-struct UpdateDaily {
-    storage: Storage,
-    gate: ApprovalGate,
-    reads: Arc<ReadTracker>,
-}
-
-impl UpdateDaily {
-    fn new(root: &Path, gate: ApprovalGate, reads: Arc<ReadTracker>) -> Result<Self> {
-        Ok(Self {
-            storage: Storage::new(root)?,
-            gate,
-            reads,
-        })
-    }
-}
-
-impl Tool for UpdateDaily {
-    fn name(&self) -> &'static str {
-        "update_daily"
-    }
-
-    fn description(&self) -> &'static str {
-        "Replace an existing DailyNote body by YYYY-MM-DD date after read_daily and, unless bypassed, user diff approval."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "date": { "type": "string" },
-                "body": { "type": "string" }
-            },
-            "required": ["date", "body"], "additionalProperties": false
-        })
-    }
-
-    fn execute(&self, input: &Value) -> Result<String> {
-        let date = required_string(input, "date")?;
-        let body = required_string(input, "body")?;
-        if body.len() as u64 > MAX_FILE_BYTES {
-            bail!("DailyNote body exceeds 1 MB");
-        }
-        let mut note = self.storage.read_daily_by_date(date)?;
-        let old = note.body.clone();
-        let snapshot = self
-            .reads
-            .daily_snapshot(date)?
-            .context("update_daily requires read_daily for the same date first")?;
-        if snapshot != old {
-            self.reads.consume_daily(date)?;
-            bail!("DailyNote changed since read_daily; read it again before updating");
-        }
-        if old == body {
-            return Ok(format!("no changes needed for daily {date}"));
-        }
-        let label = format!("daily/{date}.md");
-        self.gate.request(ApprovalRequest {
-            title: format!("Update daily {date}"),
-            diff: limited_diff(&old, body, &label, &label),
-        })?;
-        let current = self
-            .storage
-            .read_daily_by_date(date)
-            .with_context(|| format!("DailyNote disappeared while awaiting approval: {date}"))?;
-        if current.body != old {
-            self.reads.consume_daily(date)?;
-            bail!("DailyNote changed while awaiting approval; read it again before updating");
-        }
-        note.body = body.to_string();
-        if !self.storage.replace_daily(&note)? {
-            bail!("DailyNote not found: {date}");
-        }
-        self.reads.consume_daily(date)?;
-        Ok(format!("updated daily {date}"))
-    }
-}
-
-struct AppendDaily {
+struct AddDailyEntry {
     storage: Storage,
 }
 
-impl AppendDaily {
+impl AddDailyEntry {
     fn new(root: &Path) -> Result<Self> {
         Ok(Self {
             storage: Storage::new(root)?,
@@ -2595,31 +2444,31 @@ impl AppendDaily {
     }
 }
 
-impl Tool for AppendDaily {
+impl Tool for AddDailyEntry {
     fn name(&self) -> &'static str {
-        "append_daily"
+        "add_daily_entry"
     }
 
     fn description(&self) -> &'static str {
-        "Append content to a YYYY-MM-DD DailyNote, creating it if absent. This operation does not require approval."
+        "Add content to daily/YYYY-MM-DD.md, creating the file if absent and otherwise appending it after a blank line. This operation does not require approval."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object", "properties": {
-                "date": { "type": "string" }, "body": { "type": "string" }
+                "date": { "type": "string" }, "content": { "type": "string" }
             },
-            "required": ["date", "body"], "additionalProperties": false
+            "required": ["date", "content"], "additionalProperties": false
         })
     }
 
     fn execute(&self, input: &Value) -> Result<String> {
         let date = required_string(input, "date")?;
-        let body = required_string(input, "body")?;
-        if body.len() as u64 > MAX_FILE_BYTES {
-            bail!("DailyNote body exceeds 1 MB");
+        let content = required_string(input, "content")?;
+        if content.len() as u64 > MAX_FILE_BYTES {
+            bail!("daily entry content exceeds 1 MB");
         }
-        let note = self.storage.append_daily(date, body)?;
+        let note = self.storage.append_daily(date, content)?;
         serde_json::to_string(&json!({ "date": note.date.to_string() }))
             .context("encoding daily result")
     }
@@ -2647,7 +2496,7 @@ impl Tool for OpenFile {
     }
 
     fn description(&self) -> &'static str {
-        "Open an existing managed .md or .mb note from data/ or archives/ in the user's TUI. The path may be absolute or relative to the Nole root."
+        "Open an existing managed .md or .mb note from daily/, data/, or archives/ in the user's TUI. The path may be absolute or relative to the Nole root."
     }
 
     fn input_schema(&self) -> Value {
@@ -3218,7 +3067,7 @@ impl Tool for DeleteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Delete a regular file under the Nole root after user approval, unless permission checks are bypassed. Files in config/ and daily/ are forbidden."
+        "Delete a regular file under the Nole root outside config/ after user approval, unless permission checks are bypassed."
     }
 
     fn input_schema(&self) -> Value {
@@ -3239,7 +3088,9 @@ impl Tool for DeleteFile {
             bail!("delete_file only accepts regular files, not symlinks or directories");
         }
         let path = fs::canonicalize(&unresolved)?;
-        ensure_not_special(&self.root, &path)?;
+        if path.starts_with(self.root.join("config")) {
+            bail!("delete_file cannot operate inside config/");
+        }
         let modified = metadata.modified().ok();
         let preview = if metadata.len() <= MAX_FILE_BYTES {
             fs::read_to_string(&path)
@@ -3269,13 +3120,13 @@ impl Tool for DeleteFile {
     }
 }
 
-struct WriteFile {
+struct CreateFile {
     root: PathBuf,
     config_dir: PathBuf,
     daily_dir: PathBuf,
 }
 
-impl WriteFile {
+impl CreateFile {
     fn new(root: &Path) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
@@ -3286,9 +3137,9 @@ impl WriteFile {
     }
 }
 
-impl Tool for WriteFile {
+impl Tool for CreateFile {
     fn name(&self) -> &'static str {
-        "write_file"
+        "create_file"
     }
     fn description(&self) -> &'static str {
         "Create a new UTF-8 text file under the Nole root, outside config/ and daily/. Fails if the path already exists."
@@ -3745,14 +3596,16 @@ mod tests {
     fn file_tools_stay_inside_root() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
-        let write = WriteFile::new(directory.path()).unwrap();
-        write
+        let create = CreateFile::new(directory.path()).unwrap();
+        create
             .execute(&json!({"path": "data/test.md", "content": "hello"}))
             .unwrap();
         let read = ReadFile::new(directory.path(), Arc::new(ReadTracker::default())).unwrap();
         let result: Value =
             serde_json::from_str(&read.execute(&json!({"path": "data/test.md"})).unwrap()).unwrap();
-        assert_eq!(result["content"], "hello");
+        assert_eq!(result["path"], "data/test.md");
+        assert_eq!(result["lines"][0]["line"], 0);
+        assert_eq!(result["lines"][0]["text"], "hello");
         assert_eq!(result["total_lines"], 1);
         assert_eq!(result["has_more"], false);
         let outside_directory = tempfile::tempdir().unwrap();
@@ -3760,11 +3613,15 @@ mod tests {
         fs::write(&outside, "outside").unwrap();
         let result: Value =
             serde_json::from_str(&read.execute(&json!({"path": outside})).unwrap()).unwrap();
-        assert_eq!(result["content"], "outside");
+        assert!(result["path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).is_absolute()));
+        assert_eq!(result["lines"][0]["line"], 0);
+        assert_eq!(result["lines"][0]["text"], "outside");
     }
 
     #[test]
-    fn paginated_file_reads_require_only_the_ranges_touched_by_update() {
+    fn paginated_file_reads_require_only_the_ranges_touched_by_edit() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
@@ -3775,7 +3632,7 @@ mod tests {
         fs::write(directory.path().join("data/large.md"), &content).unwrap();
         let reads = Arc::new(ReadTracker::default());
         let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
-        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
 
         let first: Value = serde_json::from_str(
             &read
@@ -3786,21 +3643,20 @@ mod tests {
         assert_eq!(first["returned_lines"], 200);
         assert_eq!(first["total_lines"], 450);
         assert_eq!(first["has_more"], true);
-        assert!(update
+        assert!(edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"start_line": 450, "end_line": 450, "content": "done\n"}]
+                "edits": [{"start_line": 450, "end_line": 450, "lines": ["done"]}]
             }))
             .is_err());
 
         read.execute(&json!({"path": "data/large.md", "offset": 400, "limit": 50}))
             .unwrap();
-        update
-            .execute(&json!({
-                "path": "data/large.md",
-                "edits": [{"start_line": 450, "end_line": 450, "content": "done\n"}]
-            }))
-            .unwrap();
+        edit.execute(&json!({
+            "path": "data/large.md",
+            "edits": [{"start_line": 450, "end_line": 450, "lines": ["done"]}]
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -3831,11 +3687,10 @@ mod tests {
         assert_eq!(result["returned"], 1);
         assert_eq!(result["total_matches"], 3);
         assert_eq!(result["has_more"], true);
-        assert_eq!(result["matches"][0]["type"], "file");
         assert!(result["matches"][0]["path"]
             .as_str()
             .is_some_and(|path| path.starts_with("daily/") && path.ends_with(".md")));
-        assert_eq!(result["matches"][0]["line"], 1);
+        assert_eq!(result["matches"][0]["line"], 0);
 
         let remaining: Value = serde_json::from_str(
             &content
@@ -3855,24 +3710,33 @@ mod tests {
         .unwrap();
         assert_eq!(result["total_matches"], 1);
         assert_eq!(result["matches"][0]["path"], "data/RustProject.md");
+        let archived: Value = serde_json::from_str(
+            &files
+                .execute(&json!({"query": "history", "limit": 10}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived["total_matches"], 1);
+        assert_eq!(archived["matches"][0]["path"], "archives/RustHistory.md");
     }
 
     #[test]
-    fn private_config_is_not_available_to_tools() {
+    fn private_config_is_not_available_but_daily_files_are_readable() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("config/ai.toml"), "api_key='secret'").unwrap();
-        fs::write(
-            directory.path().join("daily/2026-07-27.md"),
-            "private daily",
-        )
-        .unwrap();
+        fs::write(directory.path().join("daily/2026-07-27.md"), "daily entry").unwrap();
         let read = ReadFile::new(directory.path(), Arc::new(ReadTracker::default())).unwrap();
         assert!(read.execute(&json!({"path": "config/ai.toml"})).is_err());
-        assert!(read
-            .execute(&json!({"path": "daily/2026-07-27.md"}))
-            .is_err());
+        let daily: Value = serde_json::from_str(
+            &read
+                .execute(&json!({"path": "daily/2026-07-27.md"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(daily["lines"][0]["line"], 0);
+        assert_eq!(daily["lines"][0]["text"], "daily entry");
     }
 
     #[test]
@@ -3891,43 +3755,46 @@ mod tests {
 
         let reads = Arc::new(ReadTracker::default());
         let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
-        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
-        let write = WriteFile::new(directory.path()).unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let create = CreateFile::new(directory.path()).unwrap();
 
         read.execute(&json!({"path": "config/AGENTS.md"})).unwrap();
-        assert!(update
+        assert!(edit
             .execute(&json!({
                 "path": "config/AGENTS.md",
-                "edits": [{"start_line": 0, "end_line": 1, "content": "changed\n"}]
+                "edits": [{"start_line": 0, "end_line": 1, "lines": ["changed"]}]
             }))
             .is_err());
-        assert!(write
+        assert!(create
             .execute(&json!({"path": "config/new.md", "content": "forbidden"}))
             .is_err());
+        assert!(DeleteFile::new(directory.path(), bypass_gate())
+            .unwrap()
+            .execute(&json!({"path": "config/AGENTS.md"}))
+            .is_err());
+        assert!(directory.path().join("config/AGENTS.md").exists());
         assert!(
             ensure_not_special(directory.path(), &directory.path().join("config/AGENTS.md"))
                 .is_err()
         );
         read.execute(&json!({"path": "themes/custom.toml"}))
             .unwrap();
-        update
-            .execute(&json!({
-                "path": "themes/custom.toml",
-                "edits": [{"start_line": 1, "end_line": 2, "content": "action = \"#010203\"\n"}]
-            }))
-            .unwrap();
+        edit.execute(&json!({
+            "path": "themes/custom.toml",
+                "edits": [{"start_line": 1, "end_line": 2, "lines": ["action = \"#010203\""]}]
+        }))
+        .unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("themes/custom.toml")).unwrap(),
             "[ui]\naction = \"#010203\"\n"
         );
 
         read.execute(&json!({"path": "MEMORY.md"})).unwrap();
-        update
-            .execute(&json!({
-                "path": "MEMORY.md",
-                "edits": [{"start_line": 0, "end_line": 1, "content": "new memory\n"}]
-            }))
-            .unwrap();
+        edit.execute(&json!({
+            "path": "MEMORY.md",
+                "edits": [{"start_line": 0, "end_line": 1, "lines": ["new memory"]}]
+        }))
+        .unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("MEMORY.md")).unwrap(),
             "new memory\n"
@@ -4226,7 +4093,7 @@ mod tests {
             tool_finish_activity(&read, None),
             "Completed Read File.\ndata/project notes.md"
         );
-        assert_eq!(tool_display_name("update_daily"), "Update Daily");
+        assert_eq!(tool_display_name("add_daily_entry"), "Add Daily Entry");
 
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
@@ -4652,12 +4519,12 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_describes_multi_turn_conversation_and_ask_user() {
+    fn system_prompt_describes_ask_user_without_runtime_protocol_details() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        assert!(prompt.contains("conversation is multi-turn"));
-        assert!(prompt.contains("history is retained for the current Agent session"));
         assert!(prompt.contains("Use ask_user"));
-        assert!(prompt.contains("buffers it and delivers it before pending tool calls"));
+        assert!(!prompt.contains("conversation is multi-turn"));
+        assert!(!prompt.contains("buffers it and delivers it before pending tool calls"));
+        assert!(!prompt.contains("Final text is not saved automatically"));
     }
 
     #[test]
@@ -4672,19 +4539,23 @@ mod tests {
         assert!(prompt.contains("relative to the containing note"));
         assert!(prompt.contains("Nole root when emitted in the Agent panel"));
         assert!(prompt.contains("absolute paths may point outside Nole"));
-        assert!(prompt.contains("archived DailyNotes and regular notes"));
+        assert!(prompt.contains("archived daily and regular Markdown files"));
         assert!(prompt.contains("create them here by default"));
         assert!(prompt.contains("themes/: editable TOML theme definitions"));
         assert!(
             prompt.contains("template.mb: editable content used only by Create note from template")
         );
         assert!(prompt.contains("ordinary New note does not use it"));
-        assert!(prompt.contains("config/: read-only user configuration"));
-        assert!(prompt.contains("inspect it except config/ai.toml"));
-        assert!(prompt.contains("Use list_directory for filesystem structure"));
-        assert!(prompt.contains("Generic mutation tools cannot operate in daily/ or config/"));
+        assert!(prompt.contains("config/: application-managed configuration"));
+        assert!(prompt.contains("config/settings.toml: read-only application settings"));
         assert!(prompt
-            .contains("update_file uses exact zero-based line ranges and requires diff approval"));
+            .contains("config/agent-session.json: application-managed persisted Agent session"));
+        assert!(prompt.contains("config/ai.toml: private credentials and AI settings"));
+        assert!(prompt.contains("never read it or expose its contents"));
+        assert!(prompt.contains("Use list_directory on daily/ to discover dates"));
+        assert!(prompt.contains("daily/: ordinary Markdown files named YYYY-MM-DD.md"));
+        assert!(prompt.contains("Existing daily Markdown files may be read, edited, or deleted"));
+        assert!(prompt.contains("edit_file uses exact zero-based line ranges from the original"));
         assert!(prompt.contains("Use web_fetch when you already have a URL"));
         assert!(prompt.contains("Use open_file"));
         assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
@@ -4739,6 +4610,12 @@ mod tests {
         let without_key = make_agent("");
         assert!(!without_key.tools.contains_key("web_search"));
         assert!(!without_key.system.contains("web_search"));
+        assert!(without_key.tools.contains_key("create_file"));
+        assert!(without_key.tools.contains_key("edit_file"));
+        assert!(without_key.tools.contains_key("add_daily_entry"));
+        for removed in ["update_file", "read_daily", "update_daily", "append_daily"] {
+            assert!(!without_key.tools.contains_key(removed));
+        }
 
         let with_key = make_agent("tvly-test");
         assert!(with_key.tools.contains_key("web_search"));
@@ -4769,42 +4646,42 @@ mod tests {
     }
 
     #[test]
-    fn file_update_requires_read_and_write_file_never_overwrites() {
+    fn file_edit_requires_read_and_create_file_never_overwrites() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("data/note.md"), "old\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let update = UpdateFile::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
         let input = json!({
             "path": "data/note.md",
-            "edits": [{"start_line": 0, "end_line": 1, "content": "new\n"}]
+            "edits": [{"start_line": 0, "end_line": 1, "lines": ["new"]}]
         });
-        assert!(update.execute(&input).is_err());
+        assert!(edit.execute(&input).is_err());
 
         let read = ReadFile::new(directory.path(), reads).unwrap();
         read.execute(&json!({"path": "data/note.md"})).unwrap();
-        update.execute(&input).unwrap();
+        edit.execute(&input).unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("data/note.md")).unwrap(),
             "new\n"
         );
-        assert!(update
+        assert!(edit
             .execute(&json!({
                 "path": "data/note.md",
-                "edits": [{"start_line": 0, "end_line": 1, "content": "again\n"}]
+                "edits": [{"start_line": 0, "end_line": 1, "lines": ["again"]}]
             }))
             .is_err());
 
-        let write = WriteFile::new(directory.path()).unwrap();
-        assert!(write
+        let create = CreateFile::new(directory.path()).unwrap();
+        assert!(create
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
             .is_err());
     }
 
     #[test]
-    fn file_update_requires_only_changed_lines_and_insertion_anchors() {
+    fn file_edit_requires_only_changed_lines_and_insertion_anchors() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
@@ -4817,26 +4694,25 @@ mod tests {
 
         let reads = Arc::new(ReadTracker::default());
         let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
-        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
             .unwrap();
-        update
-            .execute(&json!({
-                "path": "data/large.md",
-                "edits": [{"start_line": 10, "end_line": 11, "content": "changed 10\n"}]
-            }))
-            .unwrap();
+        edit.execute(&json!({
+            "path": "data/large.md",
+            "edits": [{"start_line": 10, "end_line": 11, "lines": ["changed 10"]}]
+        }))
+        .unwrap();
 
         fs::write(&path, &original).unwrap();
         let reads = Arc::new(ReadTracker::default());
         let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
-        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
             .unwrap();
-        let error = update
+        let error = edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"start_line": 2, "end_line": 3, "content": "changed 2\n"}]
+                "edits": [{"start_line": 2, "end_line": 3, "lines": ["changed 2"]}]
             }))
             .unwrap_err()
             .to_string();
@@ -4845,13 +4721,13 @@ mod tests {
         fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
         let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
-        let update = UpdateFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 1, "limit": 1}))
             .unwrap();
-        let error = update
+        let error = edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"start_line": 1, "end_line": 1, "content": "inserted\n"}]
+                "edits": [{"start_line": 1, "end_line": 1, "lines": ["inserted"]}]
             }))
             .unwrap_err()
             .to_string();
@@ -4859,77 +4735,136 @@ mod tests {
     }
 
     #[test]
-    fn daily_update_requires_read_but_append_does_not_require_approval() {
+    fn file_edit_rejects_lines_with_embedded_newlines() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let note = storage.append_daily("2026-07-27", "old").unwrap();
-        let date = note.date.to_string();
+        let path = storage.data_dir.join("table.md");
+        let original = "| model | score |\n| --- | --- |\n| MM26 | 0.65 |\n";
+        fs::write(&path, original).unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let update = UpdateDaily::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
-        let input = json!({"date": date, "body": "new"});
-        assert!(update.execute(&input).is_err());
+        ReadFile::new(directory.path(), reads.clone())
+            .unwrap()
+            .execute(&json!({"path": "data/table.md"}))
+            .unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
 
-        let read = ReadDaily::new(directory.path(), reads).unwrap();
-        read.execute(&json!({
-            "start_date": date,
-            "end_date": date
+        let error = edit
+            .execute(&json!({
+                "path": "data/table.md",
+                "edits": [{
+                    "start_line": 2,
+                    "end_line": 2,
+                    "lines": ["| SAC | 0.639 |\n| MM26"]
+                }]
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("edit lines must not contain line-ending characters"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        edit.execute(&json!({
+                "path": "data/table.md",
+                "edits": [{
+                    "start_line": 2,
+                    "end_line": 2,
+                    "lines": ["| SAC | 0.639 |"]
+                }]
         }))
         .unwrap();
-        update.execute(&input).unwrap();
-        assert_eq!(storage.load_daily_notes().unwrap()[0].body, "new");
-        assert!(update
-            .execute(&json!({"date": date, "body": "again"}))
-            .is_err());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "| model | score |\n| --- | --- |\n| SAC | 0.639 |\n| MM26 | 0.65 |\n"
+        );
 
-        let append = AppendDaily::new(directory.path()).unwrap();
-        append
-            .execute(&json!({"date": "2026-07-27", "body": "added"}))
+        let eof_path = storage.data_dir.join("eof.md");
+        fs::write(&eof_path, "old").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        ReadFile::new(directory.path(), reads.clone())
+            .unwrap()
+            .execute(&json!({"path": "data/eof.md"}))
             .unwrap();
-        assert_eq!(storage.load_daily_notes().unwrap()[0].body, "new\n\nadded");
+        EditFile::new(directory.path(), bypass_gate(), reads)
+            .unwrap()
+            .execute(&json!({
+                "path": "data/eof.md",
+                "edits": [{"start_line": 1, "end_line": 1, "lines": ["new"]}]
+            }))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&eof_path).unwrap(), "old\nnew\n");
+
+        let crlf_path = storage.data_dir.join("crlf.md");
+        fs::write(&crlf_path, "old\r\nvalue\r\n").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        ReadFile::new(directory.path(), reads.clone())
+            .unwrap()
+            .execute(&json!({"path": "data/crlf.md"}))
+            .unwrap();
+        EditFile::new(directory.path(), bypass_gate(), reads)
+            .unwrap()
+            .execute(&json!({
+                "path": "data/crlf.md",
+                "edits": [{"start_line": 1, "end_line": 2, "lines": ["changed"]}]
+            }))
+            .unwrap();
+        assert_eq!(fs::read_to_string(crlf_path).unwrap(), "old\r\nchanged\r\n");
     }
 
     #[test]
-    fn read_daily_returns_an_inclusive_range_and_marks_each_card_read() {
+    fn daily_markdown_uses_generic_read_edit_and_delete_tools() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        storage.append_daily("2026-07-25", "before").unwrap();
-        storage.append_daily("2026-07-26", "first").unwrap();
-        storage.append_daily("2026-07-28", "last").unwrap();
-        storage.append_daily("2026-07-29", "after").unwrap();
+        storage.append_daily("2026-07-27", "old").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadDaily::new(directory.path(), reads.clone()).unwrap();
-
-        let result = read
+        ReadFile::new(directory.path(), reads.clone())
+            .unwrap()
+            .execute(&json!({"path": "daily/2026-07-27.md"}))
+            .unwrap();
+        EditFile::new(directory.path(), bypass_gate(), reads)
+            .unwrap()
             .execute(&json!({
-                "start_date": "2026-07-26",
-                "end_date": "2026-07-28"
+                "path": "daily/2026-07-27.md",
+                "edits": [{"start_line": 0, "end_line": 1, "lines": ["edited"]}]
             }))
             .unwrap();
-        let result: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["count"], 2);
-        assert_eq!(result["daily_notes"][0]["date"], "2026-07-26");
-        assert_eq!(result["daily_notes"][1]["date"], "2026-07-28");
-        assert_eq!(
-            reads.daily_snapshot("2026-07-26").unwrap().as_deref(),
-            Some("first")
-        );
-        assert_eq!(
-            reads.daily_snapshot("2026-07-28").unwrap().as_deref(),
-            Some("last")
-        );
-        assert!(reads.daily_snapshot("2026-07-25").unwrap().is_none());
-        assert!(read
+        assert_eq!(storage.load_daily_notes().unwrap()[0].body, "edited");
+
+        DeleteFile::new(directory.path(), bypass_gate())
+            .unwrap()
+            .execute(&json!({"path": "daily/2026-07-27.md"}))
+            .unwrap();
+        assert!(!storage.daily_dir.join("2026-07-27.md").exists());
+        assert!(CreateFile::new(directory.path())
+            .unwrap()
             .execute(&json!({
-                "start_date": "2026-07-29",
-                "end_date": "2026-07-28"
+                "path": "daily/2026-07-27.md",
+                "content": "must use add_daily_entry"
             }))
             .is_err());
     }
 
     #[test]
-    fn update_waits_for_diff_approval() {
+    fn add_daily_entry_creates_and_appends_without_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let add = AddDailyEntry::new(directory.path()).unwrap();
+
+        add.execute(&json!({"date": "2026-07-27", "content": "first"}))
+            .unwrap();
+        add.execute(&json!({"date": "2026-07-27", "content": "second"}))
+            .unwrap();
+
+        assert_eq!(
+            storage.load_daily_notes().unwrap()[0].body,
+            "first\n\nsecond"
+        );
+    }
+
+    #[test]
+    fn edit_waits_for_diff_approval() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
@@ -4947,11 +4882,11 @@ mod tests {
             events: event_sender,
             decisions: Arc::new(Mutex::new(decision_receiver)),
         };
-        let update = UpdateFile::new(directory.path(), gate, reads).unwrap();
+        let edit = EditFile::new(directory.path(), gate, reads).unwrap();
         let worker = std::thread::spawn(move || {
-            update.execute(&json!({
+            edit.execute(&json!({
                 "path": "data/note.md",
-                "edits": [{"start_line": 0, "end_line": 1, "content": "new\n"}]
+                "edits": [{"start_line": 0, "end_line": 1, "lines": ["new"]}]
             }))
         });
 
@@ -4997,6 +4932,14 @@ mod tests {
             panic!("expected open-file event");
         };
         assert_eq!(opened, fs::canonicalize(note).unwrap());
+        let daily = storage.daily_dir.join("2026-07-27.md");
+        fs::write(&daily, "daily\n").unwrap();
+        tool.execute(&json!({"path": "daily/2026-07-27.md"}))
+            .unwrap();
+        let AgentEvent::OpenFile(opened) = receiver.recv().unwrap() else {
+            panic!("expected daily open-file event");
+        };
+        assert_eq!(opened, fs::canonicalize(daily).unwrap());
         assert!(tool
             .execute(&json!({"path": "data/raw.txt"}))
             .unwrap_err()
@@ -5057,7 +5000,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(searched["total"], 1);
-        assert_eq!(searched["entries"][0]["line"], 1);
+        assert_eq!(searched["entries"][0]["line"], 0);
         assert!(searched["entries"][0]["snippet"]
             .as_str()
             .unwrap()

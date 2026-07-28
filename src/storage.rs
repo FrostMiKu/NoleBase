@@ -593,20 +593,6 @@ impl Storage {
         }
     }
 
-    /// Replace a daily file's complete card body.
-    pub fn replace_daily(&self, note: &DailyNote) -> Result<bool> {
-        let path = self.daily_path(note.date);
-        if !path.is_file() {
-            return Ok(false);
-        }
-        let mut body = note.body.clone();
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        fs::write(path, body)?;
-        Ok(true)
-    }
-
     fn daily_path(&self, date: NaiveDate) -> PathBuf {
         self.daily_dir.join(date_file_name(date))
     }
@@ -805,9 +791,7 @@ impl Storage {
         validate_direct_note(&self.archives_dir, target, "archives")
     }
 
-    /// Read an open article after it has been moved anywhere within the Nole
-    /// workspace. DailyNotes and configuration remain owned by their
-    /// dedicated APIs.
+    /// Read an open Markdown article anywhere within the Nole workspace.
     pub fn read_document_file(&self, path: &Path) -> Result<String> {
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("checking document {}", path.display()))?;
@@ -819,10 +803,8 @@ impl Storage {
         let canonical = fs::canonicalize(path)
             .with_context(|| format!("resolving document {}", path.display()))?;
         let config = fs::canonicalize(&self.config_dir).unwrap_or_else(|_| self.config_dir.clone());
-        let daily = fs::canonicalize(&self.daily_dir).unwrap_or_else(|_| self.daily_dir.clone());
         if !canonical.starts_with(&canonical_root)
             || canonical.starts_with(config)
-            || canonical.starts_with(daily)
             || !is_note_path(&canonical)
         {
             bail!(
@@ -1336,35 +1318,6 @@ mod tests {
         assert!(st.remove_first_occurrence(&p, "NEEDLE here").unwrap());
         assert!(!fs::read_to_string(&p).unwrap().contains("NEEDLE"));
         assert!(!st.remove_first_occurrence(&p, "nope").unwrap());
-    }
-
-    #[test]
-    fn replace_daily_updates_only_the_target_date() {
-        let (_dir, st) = fresh();
-        let note = st.append_to_today("original").unwrap();
-        st.append_daily("2026-06-17", "keep me").unwrap();
-
-        let mut updated = note.clone();
-        updated.body = "edited body".to_string();
-        assert!(st.replace_daily(&updated).unwrap());
-
-        let notes = st.load_daily_notes().unwrap();
-        assert_eq!(notes.len(), 2);
-        let got = notes
-            .iter()
-            .find(|candidate| candidate.date == note.date)
-            .unwrap();
-        assert_eq!(got.body, "edited body");
-        assert!(
-            notes.iter().any(|x| x.body == "keep me"),
-            "others untouched"
-        );
-
-        let unknown = DailyNote {
-            date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            body: "x".to_string(),
-        };
-        assert!(!st.replace_daily(&unknown).unwrap());
     }
 
     #[test]
