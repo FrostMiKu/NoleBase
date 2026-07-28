@@ -1,6 +1,7 @@
 //! Entry point: terminal lifecycle, event loop, and `$EDITOR` integration.
 
 mod agent;
+mod agent_session;
 mod app;
 mod markdown;
 mod media;

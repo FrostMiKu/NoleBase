@@ -14,9 +14,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::agent::{
-    Agent, AgentConversation, AgentEvent, AgentRuntime, ApprovalDecision, ApprovalRequest,
-    AskUserKind, AskUserRequest, AskUserResponse, PermissionMode, TokenUsage,
+    Agent, AgentEvent, AgentRuntime, ApprovalDecision, ApprovalRequest, AskUserKind,
+    AskUserRequest, AskUserResponse, PermissionMode,
 };
+use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::model::{
     Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
     FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
@@ -196,7 +197,7 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
     AppCommandDefinition {
         id: AppCommand::ClearAgentSession,
         label: "Agent: Clear session",
-        description: "Discard the in-memory conversation context",
+        description: "Delete the saved conversation and panel history",
         keywords: "agent clear reset new session context conversation",
     },
     AppCommandDefinition {
@@ -631,24 +632,6 @@ pub struct LayoutSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AgentPanelEntry {
-    Prompt {
-        text: String,
-        muted: bool,
-    },
-    Assistant {
-        text: String,
-        streaming: bool,
-        final_output: bool,
-    },
-    Tool {
-        text: String,
-        active: bool,
-    },
-    Error(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DailyCardRenderCache {
     pub width: usize,
     pub date: NaiveDate,
@@ -828,6 +811,17 @@ pub struct App {
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
         let loaded_theme = storage.load_theme(None)?;
+        let (
+            agent_conversation,
+            agent_panel,
+            agent_usage,
+            agent_timed_output_tokens,
+            agent_response_duration,
+        ) = storage
+            .load_agent_session()?
+            .unwrap_or_default()
+            .into_parts();
+        let agent_scroll = if agent_panel.is_empty() { 0 } else { u16::MAX };
         let daily_notes = storage.load_daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
         let mut note_files = storage.list_note_files()?;
@@ -900,15 +894,15 @@ impl App {
             ai_running: false,
             permission_mode: PermissionMode::Approve,
             permission_bypass: Arc::new(AtomicBool::new(false)),
-            agent_panel: Vec::new(),
+            agent_panel,
             agent_vlist: AgentVirtualList::default(),
-            agent_scroll: 0,
-            agent_usage: TokenUsage::default(),
-            agent_timed_output_tokens: 0,
-            agent_response_duration: Duration::ZERO,
+            agent_scroll,
+            agent_usage,
+            agent_timed_output_tokens,
+            agent_response_duration,
             agent_round: 0,
             agent_round_limit: 0,
-            agent_conversation: AgentConversation::default(),
+            agent_conversation,
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,
             ai_source_date: None,
@@ -1155,6 +1149,9 @@ impl App {
                 }
                 AgentEvent::ConversationUpdated(conversation) => {
                     self.agent_conversation = conversation;
+                    if let Err(error) = self.persist_agent_session() {
+                        self.set_error(format!("Agent session save error: {error}"));
+                    }
                 }
                 AgentEvent::Notification(message) => {
                     self.notifications.notify(message);
@@ -4510,6 +4507,13 @@ impl App {
         if was_running {
             self.cancel_agent();
         }
+        let had_saved_session = match self.storage.clear_agent_session() {
+            Ok(had_saved_session) => had_saved_session,
+            Err(error) => {
+                self.set_error(format!("Agent session clear error: {error}"));
+                return;
+            }
+        };
         let had_history = self.agent_conversation.clear();
         let had_panel_content = !self.agent_panel.is_empty();
         self.agent_panel.clear();
@@ -4522,11 +4526,22 @@ impl App {
         self.agent_response_duration = Duration::ZERO;
         self.agent_round = 0;
         self.agent_round_limit = 0;
-        if was_running || had_history || had_panel_content {
+        if was_running || had_saved_session || had_history || had_panel_content {
             self.set_status("Agent session cleared");
         } else {
             self.set_status("Agent session is already empty");
         }
+    }
+
+    fn persist_agent_session(&self) -> anyhow::Result<()> {
+        let session = AgentSession::from_parts(
+            &self.agent_conversation,
+            &self.agent_panel,
+            self.agent_usage,
+            self.agent_timed_output_tokens,
+            self.agent_response_duration,
+        );
+        self.storage.write_agent_session(&session)
     }
 
     fn cancel_file_context(&mut self) {
@@ -4829,6 +4844,8 @@ mod tests {
             text: "Previous prompt".to_string(),
             muted: false,
         });
+        app.persist_agent_session().unwrap();
+        assert!(app.storage.agent_session_path.exists());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(app.overlay, Some(Overlay::Dialog));
@@ -4855,7 +4872,85 @@ mod tests {
         assert_eq!(app.overlay, None);
         assert!(!app.agent_conversation.clear());
         assert!(app.agent_panel.is_empty());
+        assert!(!app.storage.agent_session_path.exists());
         assert_eq!(app.status, "Agent session cleared");
+    }
+
+    #[test]
+    fn app_restores_the_single_agent_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let conversation = AgentConversation::seeded_for_test();
+        let panel = vec![AgentPanelEntry::Assistant {
+            text: "Persisted answer".to_string(),
+            streaming: false,
+            final_output: true,
+        }];
+        storage
+            .write_agent_session(&AgentSession::from_parts(
+                &conversation,
+                &panel,
+                TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    cache_creation_input_tokens: 2,
+                    cache_read_input_tokens: 3,
+                },
+                4,
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+
+        let mut app = App::new(storage).unwrap();
+
+        assert!(app.agent_conversation.clear());
+        assert_eq!(app.agent_panel, panel);
+        assert_eq!(app.agent_scroll, u16::MAX);
+        assert_eq!(app.agent_usage.input_tokens, 10);
+        assert_eq!(app.agent_timed_output_tokens, 4);
+        assert_eq!(app.agent_response_duration, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn conversation_update_overwrites_the_saved_agent_session() {
+        let (mut app, _directory) = make_app();
+        app.agent_panel.push(AgentPanelEntry::Assistant {
+            text: "Completed answer".to_string(),
+            streaming: false,
+            final_output: true,
+        });
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+
+        sender
+            .send(AgentEvent::ConversationUpdated(
+                AgentConversation::seeded_for_test(),
+            ))
+            .unwrap();
+        app.poll_agent();
+
+        let (mut conversation, panel, _, _, _) = app
+            .storage
+            .load_agent_session()
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        assert!(conversation.clear());
+        assert_eq!(panel, app.agent_panel);
+    }
+
+    #[test]
+    fn failed_session_delete_keeps_the_in_memory_session() {
+        let (mut app, _directory) = make_app();
+        app.agent_conversation = AgentConversation::seeded_for_test();
+        fs::create_dir(&app.storage.agent_session_path).unwrap();
+
+        app.clear_agent_session();
+
+        assert!(app.agent_conversation.clear());
+        assert!(app.status.starts_with("Agent session clear error:"));
+        assert!(app.notifications.visible().is_some());
     }
 
     #[test]
@@ -5582,7 +5677,7 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_c_cancels_work_and_clears_the_in_memory_agent_session() {
+    fn uppercase_c_cancels_work_and_clears_the_agent_session() {
         let (mut app, _directory) = make_app();
         let cancelled = Arc::new(AtomicBool::new(false));
         app.ai_cancel = Some(cancelled.clone());

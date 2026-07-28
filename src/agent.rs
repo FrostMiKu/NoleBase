@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, NaiveDate};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use similar::TextDiff;
 
+use crate::agent_session::{AgentConversation, TokenUsage};
 use crate::storage::Storage;
 use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};
 
@@ -141,59 +142,6 @@ impl AgentRuntime {
     pub fn with_workspace_index(mut self, workspace_index: WorkspaceIndexHandle) -> Self {
         self.workspace_index = workspace_index;
         self
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AgentConversation {
-    messages: Vec<Value>,
-}
-
-impl AgentConversation {
-    pub fn clear(&mut self) -> bool {
-        let had_history = !self.messages.is_empty();
-        self.messages.clear();
-        had_history
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seeded_for_test() -> Self {
-        Self {
-            messages: vec![json!({ "role": "user", "content": "previous prompt" })],
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u64,
-    #[serde(default)]
-    pub cache_read_input_tokens: u64,
-}
-
-impl TokenUsage {
-    pub fn total_input(self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cache_creation_input_tokens)
-            .saturating_add(self.cache_read_input_tokens)
-    }
-
-    pub fn add(&mut self, usage: Self) {
-        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
-        self.cache_creation_input_tokens = self
-            .cache_creation_input_tokens
-            .saturating_add(usage.cache_creation_input_tokens);
-        self.cache_read_input_tokens = self
-            .cache_read_input_tokens
-            .saturating_add(usage.cache_read_input_tokens);
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.total_input() == 0 && self.output_tokens == 0
     }
 }
 
@@ -3748,7 +3696,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_conversation_is_memory_only_and_clearable() {
+    fn agent_conversation_is_clearable() {
         let mut conversation = AgentConversation::default();
         conversation
             .messages

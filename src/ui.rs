@@ -383,7 +383,7 @@ fn measure_visible_agent_entries(
 }
 
 fn render_agent_entry(
-    entry: &crate::app::AgentPanelEntry,
+    entry: &crate::agent_session::AgentPanelEntry,
     width: usize,
     tick: u64,
     animate: bool,
@@ -397,7 +397,7 @@ fn render_agent_entry(
     let mut links = Vec::new();
     let mut images = Vec::new();
     match entry {
-        crate::app::AgentPanelEntry::Prompt { text, muted } => {
+        crate::agent_session::AgentPanelEntry::Prompt { text, muted } => {
             let background = theme.surface_message_user;
             lines.push(agent_message_line(Line::default(), width, background));
             lines.push(agent_message_line(
@@ -439,7 +439,7 @@ fn render_agent_entry(
             );
             lines.push(agent_message_line(Line::default(), width, background));
         }
-        crate::app::AgentPanelEntry::Assistant { text, .. } => {
+        crate::agent_session::AgentPanelEntry::Assistant { text, .. } => {
             let background = theme.surface_message_agent;
             lines.push(agent_message_line(Line::default(), width, background));
             lines.push(agent_message_line(
@@ -470,14 +470,14 @@ fn render_agent_entry(
             );
             lines.push(agent_message_line(Line::default(), width, background));
         }
-        crate::app::AgentPanelEntry::Tool { text, active } => {
+        crate::agent_session::AgentPanelEntry::Tool { text, active } => {
             lines.extend(if *active && animate {
                 animated_activity_lines(text, width, tick, theme)
             } else {
                 activity_lines(text, width, theme)
             });
         }
-        crate::app::AgentPanelEntry::Error(text) => lines.push(Line::from(Span::styled(
+        crate::agent_session::AgentPanelEntry::Error(text) => lines.push(Line::from(Span::styled(
             text.clone(),
             Style::default().fg(theme.ui_error),
         ))),
@@ -530,7 +530,7 @@ fn visible_agent_lines(
             .expect("visible Agent entries are measured before rendering");
         let active = matches!(
             cached.entry,
-            crate::app::AgentPanelEntry::Tool { active: true, .. }
+            crate::agent_session::AgentPanelEntry::Tool { active: true, .. }
         );
         let from = scroll.saturating_sub(item_top);
         let to = height.min(end.saturating_sub(item_top));
@@ -3506,7 +3506,7 @@ mod tests {
     }
 
     fn render_agent_entry(
-        entry: &crate::app::AgentPanelEntry,
+        entry: &crate::agent_session::AgentPanelEntry,
         width: usize,
         tick: u64,
         animate: bool,
@@ -3531,7 +3531,8 @@ mod tests {
     }
     use crate::agent::ApprovalRequest;
     use crate::agent::AskUserKind;
-    use crate::app::{AgentPanelEntry, Document, DocumentKind, DocumentReturn};
+    use crate::agent_session::AgentPanelEntry;
+    use crate::app::{Document, DocumentKind, DocumentReturn};
     use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate};
     use crate::storage::Storage;
 
@@ -3612,7 +3613,7 @@ mod tests {
         let (mut app, _directory) = make_app();
         app.agent_round = 3;
         app.agent_round_limit = 25;
-        app.agent_usage = crate::agent::TokenUsage {
+        app.agent_usage = crate::agent_session::TokenUsage {
             input_tokens: 500,
             output_tokens: 1_234,
             cache_creation_input_tokens: 1_000,

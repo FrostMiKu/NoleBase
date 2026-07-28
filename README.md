@@ -186,6 +186,7 @@ under `~/.nole`:
 config/         # private application configuration
   ai.toml       # Anthropic and optional Tavily configuration
   settings.toml # selected theme
+  agent-session.json # current Agent conversation; absent when empty
   AGENTS.md      # user-authored Agent instructions
 themes/         # Agent-editable application and MBDown themes
   default.toml   # generated current default colors
@@ -285,11 +286,14 @@ cleared. Multiple tool calls returned in one model response still count as one
 round.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
-task, clear its in-memory session, create or manage notes, or open `template.mb`,
+task, clear its saved session, create or manage notes, or open `template.mb`,
 `ai.toml`, `AGENTS.md`, and `MEMORY.md` with `$EDITOR`.
 The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
-Agent conversations persist across completed prompts. Continue in the compose
-box with `Ctrl+Enter`; the Agent receives the completed conversation history.
+Agent conversations and their visible panel history persist in the single
+`config/agent-session.json` file across prompts and application restarts. Each
+completed conversation update atomically replaces that file; Nole does not
+maintain multiple sessions. Continue in the compose box with `Ctrl+Enter`; the
+Agent receives the completed conversation history.
 The Agent can inspect the same shared tag index with `list_tags` and
 `search_tag`. Its `rename_tag` tool shows a multi-file diff and follows the
 normal approval/bypass policy before changing exact Hashtag source spans.
@@ -372,7 +376,7 @@ not skip them.
 
 The system prompt requires the Agent to use `ask_user` when it needs an answer
 before it can complete the current task. Later `Ctrl+Enter` prompts remain part
-of the same in-memory conversation until `C` is pressed or Nole exits.
+of the same conversation until `C` is pressed or `Agent: Clear session` is run.
 
 Nole creates an empty `template.mb`. `Note: New from template` starts the new
 note with its exact contents; regular note creation still generates the note title.

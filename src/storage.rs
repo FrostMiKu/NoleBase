@@ -13,12 +13,14 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
+use crate::agent_session::AgentSession;
 use crate::model::{DailyNote, NoteFile, SearchHit, TodoItem};
 use crate::theme::Theme;
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
 const SETTINGS_FILE: &str = "settings.toml";
+const AGENT_SESSION_FILE: &str = "agent-session.json";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
 const TEMPLATE_FILE: &str = "template.mb";
@@ -69,6 +71,7 @@ pub struct Storage {
     pub archives_dir: PathBuf,
     pub ai_config_path: PathBuf,
     pub settings_path: PathBuf,
+    pub agent_session_path: PathBuf,
     pub themes_dir: PathBuf,
     pub agents_path: PathBuf,
     pub memory_path: PathBuf,
@@ -93,6 +96,7 @@ impl Storage {
             archives_dir: root.join(ARCHIVES_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
             settings_path: root.join(CONFIG_DIR).join(SETTINGS_FILE),
+            agent_session_path: root.join(CONFIG_DIR).join(AGENT_SESSION_FILE),
             themes_dir: root.join(THEMES_DIR),
             agents_path: root.join(CONFIG_DIR).join(AGENTS_FILE),
             memory_path: root.join(MEMORY_FILE),
@@ -200,6 +204,70 @@ impl Storage {
     pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
         fs::write(&self.settings_path, serialize_settings(selection)?)
             .with_context(|| format!("writing {}", self.settings_path.display()))
+    }
+
+    pub fn load_agent_session(&self) -> Result<Option<AgentSession>> {
+        let file = match fs::File::open(&self.agent_session_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening {}", self.agent_session_path.display()))
+            }
+        };
+        serde_json::from_reader(file)
+            .with_context(|| format!("parsing {}", self.agent_session_path.display()))
+            .map(Some)
+    }
+
+    pub fn write_agent_session(&self, session: &AgentSession) -> Result<()> {
+        if session.is_empty() {
+            self.clear_agent_session()?;
+            return Ok(());
+        }
+        fs::create_dir_all(&self.config_dir)
+            .with_context(|| format!("creating {}", self.config_dir.display()))?;
+        let temporary_path = self
+            .config_dir
+            .join(format!(".{AGENT_SESSION_FILE}.{}.tmp", std::process::id()));
+        let result = (|| -> Result<()> {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temporary_path)
+                .with_context(|| format!("creating {}", temporary_path.display()))?;
+            serde_json::to_writer_pretty(&mut file, session)
+                .context("serializing Agent session")?;
+            file.write_all(b"\n")?;
+            file.sync_all()
+                .with_context(|| format!("syncing {}", temporary_path.display()))?;
+            fs::rename(&temporary_path, &self.agent_session_path).with_context(|| {
+                format!(
+                    "replacing {} using {}",
+                    self.agent_session_path.display(),
+                    temporary_path.display()
+                )
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        result
+    }
+
+    pub fn clear_agent_session(&self) -> Result<bool> {
+        match fs::remove_file(&self.agent_session_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("removing {}", self.agent_session_path.display())),
+        }
     }
 
     pub fn select_theme(&self, selection: &str) -> Result<LoadedTheme> {
@@ -1519,6 +1587,7 @@ mod tests {
         assert!(!st.daily_dir.join("2026-07-27.md").exists());
         assert!(st.ai_config_path.exists());
         assert!(st.settings_path.exists());
+        assert!(!st.agent_session_path.exists());
         let default_theme_path = st.themes_dir.join("default.toml");
         assert!(default_theme_path.exists());
         assert!(st.agents_path.exists());
@@ -1529,6 +1598,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&st.template_path).unwrap(), "");
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
         assert_eq!(st.settings_path.parent(), Some(st.config_dir.as_path()));
+        assert_eq!(
+            st.agent_session_path.parent(),
+            Some(st.config_dir.as_path())
+        );
         assert_eq!(st.themes_dir.parent(), Some(st.root.as_path()));
         assert_eq!(st.template_path.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
@@ -1550,6 +1623,83 @@ mod tests {
             fs::read_to_string(default_theme_path).unwrap(),
             crate::theme::DEFAULT_THEME_TOML
         );
+    }
+
+    #[test]
+    fn agent_session_round_trip_overwrites_the_single_file_and_clears() {
+        use crate::agent_session::{AgentConversation, AgentPanelEntry};
+
+        let (_directory, storage) = fresh();
+        let first = AgentSession::from_parts(
+            &AgentConversation {
+                messages: vec![serde_json::json!({
+                    "role": "user",
+                    "content": "first"
+                })],
+            },
+            &[AgentPanelEntry::Prompt {
+                text: "first".to_string(),
+                muted: false,
+            }],
+            crate::agent_session::TokenUsage::default(),
+            0,
+            std::time::Duration::ZERO,
+        );
+        storage.write_agent_session(&first).unwrap();
+        assert_eq!(storage.load_agent_session().unwrap(), Some(first));
+
+        let second = AgentSession::from_parts(
+            &AgentConversation {
+                messages: vec![serde_json::json!({
+                    "role": "user",
+                    "content": "second"
+                })],
+            },
+            &[AgentPanelEntry::Assistant {
+                text: "second reply".to_string(),
+                streaming: false,
+                final_output: true,
+            }],
+            crate::agent_session::TokenUsage::default(),
+            0,
+            std::time::Duration::ZERO,
+        );
+        storage.write_agent_session(&second).unwrap();
+        assert_eq!(storage.load_agent_session().unwrap(), Some(second));
+        assert_eq!(
+            fs::read_to_string(&storage.agent_session_path)
+                .unwrap()
+                .matches("\"messages\"")
+                .count(),
+            1
+        );
+
+        assert!(storage.clear_agent_session().unwrap());
+        assert!(!storage.agent_session_path.exists());
+        assert!(!storage.clear_agent_session().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_session_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, storage) = fresh();
+        storage
+            .write_agent_session(&AgentSession::from_parts(
+                &crate::agent_session::AgentConversation::seeded_for_test(),
+                &[],
+                crate::agent_session::TokenUsage::default(),
+                0,
+                std::time::Duration::ZERO,
+            ))
+            .unwrap();
+
+        let mode = fs::metadata(&storage.agent_session_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
