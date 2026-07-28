@@ -729,7 +729,7 @@ mod tests {
         storage.ensure_files().unwrap();
         fs::write(
             storage.data_dir.join("Tags.md"),
-            "#rust twice #rust\n`#rust` and \\#rust\n#rustlang\n",
+            "#rust twice #rust\n`#rust` and \\#rust\n#rustlang\n[#2652 (#paren foo:#suffix\n",
         )
         .unwrap();
 
@@ -737,6 +737,9 @@ mod tests {
         let hits = index.search("#rust");
         assert_eq!(hits.len(), 1, "one result per matching source line");
         assert_eq!(index.search("#rustlang").len(), 1);
+        assert!(index.search("#2652").is_empty());
+        assert!(index.search("#paren").is_empty());
+        assert!(index.search("#suffix").is_empty());
         let rust = index
             .tags()
             .into_iter()
