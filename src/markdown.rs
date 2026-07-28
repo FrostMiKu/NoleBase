@@ -2,20 +2,16 @@
 //!
 //! MBDown owns the language and syntax tree. MBTUI owns Nole's Ratatui layout.
 
-use std::sync::OnceLock;
-
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
-use mbtui::{CornerStyle, Renderer, Theme};
-use ratatui::style::{Color, Modifier, Style};
+use mbtui::Renderer;
+use ratatui::style::Color;
 use ratatui::text::{Line, Text};
 use unicode_width::UnicodeWidthChar;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
 use crate::model::LinkTarget;
-use crate::theme::catppuccin as ctp;
-
-const LINK_UNDERLINE_COLOR: Color = ctp::BLUE;
+use crate::theme::Theme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedMarkup {
@@ -33,19 +29,19 @@ pub struct RenderedLink {
 }
 
 /// Render markup for an exact terminal display width.
-pub fn to_lines_at_width(source: &str, width: usize) -> Vec<Line<'static>> {
-    render_at_width(source, width).lines
+pub fn to_lines_at_width(source: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    render_at_width(source, width, theme).lines
 }
 
-pub fn render_at_width(source: &str, width: usize) -> RenderedMarkup {
+pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMarkup {
     match mbdown::parse(source) {
         Ok(document) => {
-            let rendered = Renderer::with_theme(width.max(1), note_theme().clone())
+            let rendered = Renderer::with_theme(width.max(1), theme.markdown_theme())
                 .with_image_height(12)
                 .render(&document);
             let lines = rendered.text.lines;
             let specs = link_specs(document.nodes());
-            let links = locate_links(&lines, &specs);
+            let links = locate_links(&lines, &specs, theme.markdown_link);
             RenderedMarkup {
                 lines,
                 links,
@@ -166,8 +162,12 @@ fn visible_event_text(events: &[mbdown::SpannedEvent<'_>]) -> String {
     text
 }
 
-fn locate_links(lines: &[Line<'_>], specs: &[LinkSpec]) -> Vec<RenderedLink> {
-    let cells = rendered_cells(lines)
+fn locate_links(
+    lines: &[Line<'_>],
+    specs: &[LinkSpec],
+    link_underline_color: Color,
+) -> Vec<RenderedLink> {
+    let cells = rendered_cells(lines, link_underline_color)
         .into_iter()
         .filter(|cell| cell.clickable)
         .collect::<Vec<_>>();
@@ -188,12 +188,12 @@ fn locate_links(lines: &[Line<'_>], specs: &[LinkSpec]) -> Vec<RenderedLink> {
     links
 }
 
-fn rendered_cells(lines: &[Line<'_>]) -> Vec<RenderedCell> {
+fn rendered_cells(lines: &[Line<'_>], link_underline_color: Color) -> Vec<RenderedCell> {
     let mut cells = Vec::new();
     for (row, line) in lines.iter().enumerate() {
         let mut column = 0;
         for span in &line.spans {
-            let clickable = span.style.underline_color == Some(LINK_UNDERLINE_COLOR);
+            let clickable = span.style.underline_color == Some(link_underline_color);
             for character in span.content.chars() {
                 let width = UnicodeWidthChar::width(character).unwrap_or(0);
                 if width > 0 {
@@ -250,26 +250,14 @@ fn link_segments(cells: &[RenderedCell], target: &LinkTarget) -> Vec<RenderedLin
     links
 }
 
-fn note_theme() -> &'static Theme {
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        let mut theme = Theme::default().with_corner_style(CornerStyle::Rounded);
-        theme.link = Style::default()
-            .fg(ctp::BLUE)
-            .underline_color(LINK_UNDERLINE_COLOR)
-            .add_modifier(Modifier::UNDERLINED);
-        theme.wikilink = Style::default()
-            .fg(ctp::SKY)
-            .underline_color(LINK_UNDERLINE_COLOR)
-            .add_modifier(Modifier::UNDERLINED);
-        theme.insert("markdown-box", Style::default().fg(ctp::OVERLAY_0));
-        theme
-    })
-}
-
 /// Map a one-based source line to its first terminal row after MBTUI layout.
-pub fn rendered_row_for_source_line(source: &str, line_no: usize, width: usize) -> usize {
-    let rendered = to_lines_at_width(source, width);
+pub fn rendered_row_for_source_line(
+    source: &str,
+    line_no: usize,
+    width: usize,
+    theme: Theme,
+) -> usize {
+    let rendered = to_lines_at_width(source, width, theme);
     if rendered.is_empty() {
         return 0;
     }
@@ -281,6 +269,7 @@ pub fn rendered_row_for_source_line(source: &str, line_no: usize, width: usize) 
     let target_key = normalized_rendered_text(&to_lines_at_width(
         source_lines.get(source_index).copied().unwrap_or(""),
         width,
+        theme,
     ));
     let expected = source_index
         .saturating_mul(rendered.len())
@@ -345,6 +334,19 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
+    use crate::theme::catppuccin as ctp;
+
+    fn to_lines_at_width(source: &str, width: usize) -> Vec<Line<'static>> {
+        super::to_lines_at_width(source, width, Theme::default())
+    }
+
+    fn render_at_width(source: &str, width: usize) -> RenderedMarkup {
+        super::render_at_width(source, width, Theme::default())
+    }
+
+    fn rendered_row_for_source_line(source: &str, line_no: usize, width: usize) -> usize {
+        super::rendered_row_for_source_line(source, line_no, width, Theme::default())
+    }
 
     const WIDTH: usize = 120;
 

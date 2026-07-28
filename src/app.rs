@@ -177,6 +177,7 @@ enum AppCommand {
     ArchiveCurrentNote,
     RestoreCurrentNote,
     EditAiConfig,
+    EditTheme,
     EditAgentInstructions,
     EditAgentMemory,
 }
@@ -242,6 +243,12 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Config: Edit AI settings",
         description: "Open config/ai.toml in your editor",
         keywords: "config configuration ai anthropic tavily model settings editor",
+    },
+    AppCommandDefinition {
+        id: AppCommand::EditTheme,
+        label: "Theme: Edit colors",
+        description: "Open theme.toml in your editor",
+        keywords: "theme colors palette appearance settings editor",
     },
     AppCommandDefinition {
         id: AppCommand::EditAgentInstructions,
@@ -568,7 +575,7 @@ impl Document {
         }
     }
 
-    pub(crate) fn ensure_rendered(&mut self, width: usize) -> bool {
+    pub(crate) fn ensure_rendered(&mut self, width: usize, theme: crate::theme::Theme) -> bool {
         if self
             .render_cache
             .as_ref()
@@ -578,7 +585,7 @@ impl Document {
         }
         self.render_cache = Some(DocumentRenderCache {
             width,
-            rendered: crate::markdown::render_at_width(&self.source, width),
+            rendered: crate::markdown::render_at_width(&self.source, width, theme),
         });
         true
     }
@@ -680,6 +687,7 @@ impl Default for AgentVirtualList {
 
 pub struct App {
     pub storage: Storage,
+    pub theme: crate::theme::Theme,
     pub(crate) images: crate::media::ImageService,
 
     pub focus: Focus,
@@ -786,6 +794,7 @@ pub struct App {
 
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
+        let theme = storage.load_theme()?;
         let daily_notes = storage.load_daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
         let mut note_files = storage.list_note_files()?;
@@ -796,6 +805,7 @@ impl App {
         let images = crate::media::ImageService::new(&storage.root);
         Ok(Self {
             storage,
+            theme,
             images,
             focus: Focus::Center,
             center_view: CenterView::Daily,
@@ -931,6 +941,19 @@ impl App {
 
     /// Reload everything that may have changed while `$EDITOR` was running.
     pub fn reload_workspace(&mut self) {
+        match self.storage.load_theme() {
+            Ok(theme) if theme != self.theme => {
+                self.theme = theme;
+                self.document_render_lru = DocumentRenderLru::default();
+                if let Some(document) = self.document.as_mut() {
+                    document.render_cache = None;
+                }
+                self.daily_vlist = DailyVirtualList::default();
+                self.agent_vlist = AgentVirtualList::default();
+            }
+            Ok(_) => {}
+            Err(error) => self.set_status(format!("Theme reload error: {error}")),
+        }
         self.reload();
         self.reload_files();
         self.reload_todos();
@@ -1356,6 +1379,9 @@ impl App {
             AppCommand::EditAiConfig => {
                 return Some(Command::Edit(self.storage.ai_config_path.clone()))
             }
+            AppCommand::EditTheme => {
+                return Some(Command::Edit(self.storage.theme_path.clone()));
+            }
             AppCommand::EditAgentInstructions => {
                 return Some(Command::Edit(self.storage.agents_path.clone()));
             }
@@ -1377,6 +1403,7 @@ impl App {
             AppCommand::ArchiveCurrentNote => self.current_note_archived() == Some(false),
             AppCommand::RestoreCurrentNote => self.current_note_archived() == Some(true),
             AppCommand::EditAiConfig
+            | AppCommand::EditTheme
             | AppCommand::EditAgentInstructions
             | AppCommand::EditAgentMemory => true,
         }
@@ -4472,7 +4499,7 @@ mod tests {
             app.dialog.as_ref().map(|dialog| dialog.purpose),
             Some(DialogPurpose::CommandPalette)
         );
-        assert_eq!(app.command_matches.len(), 6);
+        assert_eq!(app.command_matches.len(), 7);
 
         app.handle_paste("clear");
         assert_eq!(
@@ -4689,6 +4716,7 @@ mod tests {
 
         for (query, expected) in [
             ("ai settings", app.storage.ai_config_path.clone()),
+            ("theme colors", app.storage.theme_path.clone()),
             ("agent instructions", app.storage.agents_path.clone()),
             ("agent memory", app.storage.memory_path.clone()),
         ] {
@@ -5146,6 +5174,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_reload_applies_theme_changes_and_invalidates_render_caches() {
+        let (mut app, _directory) = make_app();
+        app.daily_vlist.width = 80;
+        app.agent_vlist.width = 40;
+        let custom =
+            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        fs::write(&app.storage.theme_path, custom).unwrap();
+
+        app.reload_workspace();
+
+        assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
+        assert_eq!(app.daily_vlist.width, 0);
+        assert_eq!(app.agent_vlist.width, 0);
+    }
+
+    #[test]
     fn compose_paste_normalizes_newlines_at_character_cursor() {
         let (mut app, _directory) = make_app();
         app.focus = Focus::Compose;
@@ -5485,16 +5529,16 @@ mod tests {
             render_cache: None,
         };
 
-        assert!(document.ensure_rendered(80));
-        assert!(!document.ensure_rendered(80));
+        assert!(document.ensure_rendered(80, crate::theme::Theme::default()));
+        assert!(!document.ensure_rendered(80, crate::theme::Theme::default()));
         document.scroll = 20;
-        assert!(!document.ensure_rendered(80));
+        assert!(!document.ensure_rendered(80, crate::theme::Theme::default()));
 
-        assert!(document.ensure_rendered(100));
-        assert!(!document.ensure_rendered(100));
+        assert!(document.ensure_rendered(100, crate::theme::Theme::default()));
+        assert!(!document.ensure_rendered(100, crate::theme::Theme::default()));
         document.replace_source("updated".to_string());
         assert!(document.render_cache.is_none());
-        assert!(document.ensure_rendered(100));
+        assert!(document.ensure_rendered(100, crate::theme::Theme::default()));
     }
 
     #[test]
@@ -5506,14 +5550,18 @@ mod tests {
         fs::write(&second, "# Second").unwrap();
 
         app.open_file_document(&first, DocumentReturn::Daily);
-        assert!(app.document.as_mut().unwrap().ensure_rendered(80));
+        assert!(app
+            .document
+            .as_mut()
+            .unwrap()
+            .ensure_rendered(80, crate::theme::Theme::default()));
         app.open_file_document(&second, DocumentReturn::Daily);
         assert_eq!(app.document_render_lru.entries.len(), 1);
 
         app.open_file_document(&first, DocumentReturn::Daily);
         let document = app.document.as_mut().unwrap();
         assert!(document.render_cache.is_some());
-        assert!(!document.ensure_rendered(80));
+        assert!(!document.ensure_rendered(80, crate::theme::Theme::default()));
     }
 
     #[test]
@@ -5525,7 +5573,10 @@ mod tests {
         fs::write(&second, "second source").unwrap();
 
         app.open_file_document(&first, DocumentReturn::Daily);
-        app.document.as_mut().unwrap().ensure_rendered(80);
+        app.document
+            .as_mut()
+            .unwrap()
+            .ensure_rendered(80, crate::theme::Theme::default());
         app.open_file_document(&second, DocumentReturn::Daily);
         fs::write(&first, "new source").unwrap();
 
@@ -5544,13 +5595,20 @@ mod tests {
         fs::write(&other, "other source").unwrap();
 
         app.open_file_document(&from, DocumentReturn::Daily);
-        app.document.as_mut().unwrap().ensure_rendered(80);
+        app.document
+            .as_mut()
+            .unwrap()
+            .ensure_rendered(80, crate::theme::Theme::default());
         app.open_file_document(&other, DocumentReturn::Daily);
         fs::rename(&from, &to).unwrap();
         assert!(!app.retarget_open_document(&from, &to));
 
         app.open_file_document(&to, DocumentReturn::Daily);
-        assert!(!app.document.as_mut().unwrap().ensure_rendered(80));
+        assert!(!app
+            .document
+            .as_mut()
+            .unwrap()
+            .ensure_rendered(80, crate::theme::Theme::default()));
     }
 
     #[test]
@@ -5566,7 +5624,10 @@ mod tests {
 
         for path in &paths {
             app.open_file_document(path, DocumentReturn::Daily);
-            app.document.as_mut().unwrap().ensure_rendered(80);
+            app.document
+                .as_mut()
+                .unwrap()
+                .ensure_rendered(80, crate::theme::Theme::default());
         }
 
         assert_eq!(

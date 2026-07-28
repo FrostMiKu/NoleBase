@@ -171,9 +171,10 @@ Data lives under `${NOLE_DIR}` when that environment variable is set, otherwise
 under `~/.nole`:
 
 ```text
-config/        # reserved for configuration
+config/         # AI configuration
   ai.toml       # Anthropic and optional Tavily configuration
   AGENTS.md      # user-authored Agent instructions
+theme.toml      # application and MBDown colors
 MEMORY.md       # Agent-maintained persistent memory
 daily/         # chat cards; absent dates have no file
   YYYY-MM-DD.md
@@ -193,6 +194,16 @@ Archives groups; symlinks and nested paths are rejected. Startup creates
 sent for that date. Later sends append with a blank line separator. Archiving an
 article moves it from `data/` to `archives/`; restoring it moves it back without
 overwriting an existing file.
+
+### Theme
+
+On first start Nole also creates `theme.toml` directly under the Nole root. It
+contains semantic `#RRGGBB` tokens grouped under `[surface]`, `[text]`, `[ui]`,
+`[markdown]`, and `[animation]`. Tokens describe their role rather than a
+palette color, so UI and Markdown roles can be changed independently. Editing
+it changes the application chrome, Markdown styles, image fallback labels, and
+animated accents. Use `Theme: Edit colors` from the command palette; changes
+made by the editor or Agent are loaded automatically.
 
 ### AI agent
 

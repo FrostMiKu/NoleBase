@@ -19,7 +19,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::Resize;
 
-use crate::theme::catppuccin as ctp;
+use crate::theme::Theme;
 
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -91,6 +91,7 @@ impl ImageService {
         viewport: Rect,
         scroll: usize,
         base_dir: &Path,
+        theme: Theme,
     ) {
         self.collect_results();
         if viewport.width == 0 || viewport.height == 0 {
@@ -117,7 +118,15 @@ impl ImageService {
             let (key, source) = match self.resolve(&placement.source, base_dir, width, height) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    draw_image_label(frame, viewport, top, placement, &error.to_string(), true);
+                    draw_image_label(
+                        frame,
+                        viewport,
+                        top,
+                        placement,
+                        &error.to_string(),
+                        true,
+                        theme,
+                    );
                     continue;
                 }
             };
@@ -138,10 +147,10 @@ impl ImageService {
                     frame.render_widget(SlicedImage::new(protocol, position), viewport);
                 }
                 Some(ImageState::Failed(error)) => {
-                    draw_image_label(frame, viewport, top, placement, error, true);
+                    draw_image_label(frame, viewport, top, placement, error, true, theme);
                 }
                 Some(ImageState::Loading) | None => {
-                    draw_image_label(frame, viewport, top, placement, "loading", false);
+                    draw_image_label(frame, viewport, top, placement, "loading", false, theme);
                 }
             }
         }
@@ -391,6 +400,7 @@ fn draw_image_label(
     placement: &mbtui::ImagePlacement,
     detail: &str,
     failed: bool,
+    theme: Theme,
 ) {
     let visible_y = top.max(0);
     if visible_y >= i64::from(viewport.height) {
@@ -417,7 +427,11 @@ fn draw_image_label(
         Paragraph::new(Line::from(Span::styled(
             text,
             Style::default()
-                .fg(if failed { ctp::PINK } else { ctp::OVERLAY_0 })
+                .fg(if failed {
+                    theme.ui_error
+                } else {
+                    theme.text_muted
+                })
                 .add_modifier(Modifier::ITALIC),
         ))),
         Rect::new(viewport.x + column, viewport.y + visible_y as u16, width, 1),

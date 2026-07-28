@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Local, NaiveDate};
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -20,7 +20,7 @@ use crate::model::{
     Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
     SearchHit, SearchHitbox, TodoHitbox,
 };
-use crate::theme::catppuccin as ctp;
+use crate::theme::Theme;
 
 const DATE_FMT: &str = "%Y-%m-%d";
 const WIDE_BREAKPOINT: u16 = 170;
@@ -32,12 +32,18 @@ const DAILY_PADDING_X: usize = 1;
 const PAGE_PADDING_X: usize = DAILY_PADDING_X + 12;
 const DIALOG_WIDTH: u16 = 80;
 
-/// Render one frame and rebuild all geometry consumed by mouse handling.
-pub fn draw(frame: &mut Frame, app: &mut App) {
+/// Render one frame, rebuild mouse geometry, and return the requested cursor
+/// position without changing the terminal's hardware cursor.
+pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
     app.layout = LayoutSnapshot::default();
     clear_hitboxes(app);
+    let mut cursor_position = None;
 
     let root = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().fg(app.theme.text_primary)),
+        root,
+    );
     let (body, footer) = body_and_footer(root);
     app.ensure_file_input_dialog();
     let file_input_modal = matches!(
@@ -47,22 +53,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let interactive = app.overlay.is_none() && !file_input_modal;
 
     if root.width >= WIDE_BREAKPOINT {
-        draw_wide_workspace(frame, app, body, interactive);
+        draw_wide_workspace(frame, app, body, interactive, &mut cursor_position);
     } else {
-        draw_narrow_workspace(frame, app, body, interactive);
+        draw_narrow_workspace(frame, app, body, interactive, &mut cursor_position);
     }
     draw_footer(frame, app, footer);
     if let Some(message) = app.notifications.visible() {
-        draw_notification(frame, root, &message);
+        draw_notification(frame, root, &message, app.theme);
     }
 
     if let Some(overlay) = app.overlay {
         // Background widgets may still be visible, but an overlay owns all input.
         // Keeping no base hitboxes makes that ownership explicit to mouse code.
         clear_hitboxes(app);
-        let area = draw_overlay(frame, app, root, overlay);
+        let area = draw_overlay(frame, app, root, overlay, &mut cursor_position);
         app.layout.overlay = non_empty(area);
     }
+    cursor_position
 }
 
 fn clear_hitboxes(app: &mut App) {
@@ -86,7 +93,13 @@ fn body_and_footer(area: Rect) -> (Rect, Rect) {
     )
 }
 
-fn draw_wide_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
+fn draw_wide_workspace(
+    frame: &mut Frame,
+    app: &mut App,
+    body: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     let files = Rect::new(body.x, body.y, FILES_WIDTH.min(body.width), body.height);
     let todo_width = RIGHT_SIDEBAR_WIDTH.min(body.width.saturating_sub(files.width));
     let todo = Rect::new(
@@ -105,8 +118,8 @@ fn draw_wide_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive
     );
     app.layout.files = non_empty(files);
     app.layout.center = non_empty(center_region);
-    draw_files(frame, app, files, interactive);
-    draw_center(frame, app, center_region, interactive);
+    draw_files(frame, app, files, interactive, cursor_position);
+    draw_center(frame, app, center_region, interactive, cursor_position);
     draw_right_sidebar(frame, app, todo, interactive);
 }
 
@@ -138,12 +151,12 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
         .title(title)
-        .style(Style::default().bg(ctp::MANTLE))
-        .border_style(focus_border(app.focus == Focus::Agent));
+        .style(Style::default().bg(app.theme.surface_panel))
+        .border_style(focus_border(app.focus == Focus::Agent, app.theme));
     let mut inner = block.inner(area);
     frame.render_widget(block, area);
     if app.ai_running {
-        draw_animated_border(frame, area, app.animation_tick);
+        draw_animated_border(frame, area, app.animation_tick, app.theme);
     }
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -182,8 +195,14 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     fill_agent_message_rows(frame, message_rows, &visible);
     frame.render_widget(Paragraph::new(visible), inner);
     let image_base = app.storage.root.clone();
-    app.images
-        .render(frame, &rendered_images, inner, scroll, &image_base);
+    app.images.render(
+        frame,
+        &rendered_images,
+        inner,
+        scroll,
+        &image_base,
+        app.theme,
+    );
     register_link_hitboxes(&mut app.link_hitboxes, &rendered_links, inner, scroll);
 }
 
@@ -211,8 +230,13 @@ fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
         return;
     }
     let entry = app.agent_panel[index].clone();
-    let (lines, links, images) =
-        render_agent_entry(&entry, app.agent_vlist.width, app.animation_tick, false);
+    let (lines, links, images) = render_agent_entry(
+        &entry,
+        app.agent_vlist.width,
+        app.animation_tick,
+        false,
+        app.theme,
+    );
     let height = lines.len();
     app.agent_vlist.caches[index] = Some(crate::app::AgentEntryRenderCache {
         width: app.agent_vlist.width,
@@ -267,6 +291,7 @@ fn render_agent_entry(
     width: usize,
     tick: u64,
     animate: bool,
+    theme: Theme,
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::markdown::RenderedLink>,
@@ -277,16 +302,16 @@ fn render_agent_entry(
     let mut images = Vec::new();
     match entry {
         crate::app::AgentPanelEntry::Prompt { text, muted } => {
-            let background = ctp::SURFACE_0;
+            let background = theme.surface_message_user;
             lines.push(agent_message_line(Line::default(), width, background));
             lines.push(agent_message_line(
                 Line::from(Span::styled(
                     "User",
                     Style::default()
                         .fg(if *muted {
-                            ctp::OVERLAY_0
+                            theme.text_muted
                         } else {
-                            ctp::SAPPHIRE
+                            theme.ui_agent_user
                         })
                         .add_modifier(Modifier::BOLD),
                 )),
@@ -294,11 +319,11 @@ fn render_agent_entry(
                 background,
             ));
             let row = lines.len();
-            let mut rendered = crate::markdown::render_at_width(text, width);
+            let mut rendered = crate::markdown::render_at_width(text, width, theme);
             if *muted {
                 for line in &mut rendered.lines {
                     for span in &mut line.spans {
-                        span.style = span.style.fg(ctp::OVERLAY_0);
+                        span.style = span.style.fg(theme.text_muted);
                     }
                 }
             }
@@ -319,18 +344,20 @@ fn render_agent_entry(
             lines.push(agent_message_line(Line::default(), width, background));
         }
         crate::app::AgentPanelEntry::Assistant { text, .. } => {
-            let background = ctp::BASE;
+            let background = theme.surface_message_agent;
             lines.push(agent_message_line(Line::default(), width, background));
             lines.push(agent_message_line(
                 Line::from(Span::styled(
                     "Agent",
-                    Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.ui_agent_assistant)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 width,
                 background,
             ));
             let row = lines.len();
-            let rendered = crate::markdown::render_at_width(text, width);
+            let rendered = crate::markdown::render_at_width(text, width, theme);
             links.extend(rendered.links.into_iter().map(|mut link| {
                 link.row += row;
                 link
@@ -349,14 +376,14 @@ fn render_agent_entry(
         }
         crate::app::AgentPanelEntry::Tool { text, active } => {
             lines.extend(if *active && animate {
-                animated_activity_lines(text, width, tick)
+                animated_activity_lines(text, width, tick, theme)
             } else {
-                activity_lines(text, width)
+                activity_lines(text, width, theme)
             });
         }
         crate::app::AgentPanelEntry::Error(text) => lines.push(Line::from(Span::styled(
             text.clone(),
-            Style::default().fg(ctp::PINK),
+            Style::default().fg(theme.ui_error),
         ))),
     }
     (lines, links, images)
@@ -414,8 +441,14 @@ fn visible_agent_lines(
         let content_from = from;
         let content_to = to.min(cached.lines.len());
         if active {
-            let animated =
-                render_agent_entry(&cached.entry, cached.width, app.animation_tick, true).0;
+            let animated = render_agent_entry(
+                &cached.entry,
+                cached.width,
+                app.animation_tick,
+                true,
+                app.theme,
+            )
+            .0;
             visible.extend(
                 animated[content_from.min(content_to)..content_to]
                     .iter()
@@ -476,7 +509,7 @@ fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
     };
     Some(Line::from(Span::styled(
         text,
-        Style::default().fg(ctp::OVERLAY_1),
+        Style::default().fg(app.theme.text_subtle),
     )))
 }
 
@@ -492,10 +525,16 @@ fn human_token_count(tokens: u64) -> String {
     format!("{}{suffix}", formatted.trim_end_matches(".0"))
 }
 
-fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interactive: bool) {
+fn draw_narrow_workspace(
+    frame: &mut Frame,
+    app: &mut App,
+    body: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     if app.focus == Focus::Files || app.files_context != FilesContext::Browse {
         app.layout.files = non_empty(body);
-        draw_files(frame, app, body, interactive);
+        draw_files(frame, app, body, interactive, cursor_position);
     } else if app.focus == Focus::Todo {
         app.layout.todo = non_empty(body);
         draw_todo(frame, app, body, interactive);
@@ -504,7 +543,7 @@ fn draw_narrow_workspace(frame: &mut Frame, app: &mut App, body: Rect, interacti
         draw_agent_output(frame, app, body);
     } else {
         app.layout.center = non_empty(body);
-        draw_center(frame, app, body, interactive);
+        draw_center(frame, app, body, interactive, cursor_position);
     }
 }
 
@@ -533,7 +572,13 @@ fn inset_horizontal(area: Rect, padding: u16) -> Rect {
     )
 }
 
-fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+fn draw_files(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -550,8 +595,8 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
         .title(title)
-        .style(Style::default().bg(ctp::MANTLE))
-        .border_style(focus_border(focused));
+        .style(Style::default().bg(app.theme.surface_panel))
+        .border_style(focus_border(focused, app.theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -573,18 +618,21 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             FilesContext::Search => ("/ ", app.file_query.as_str()),
             _ => ("", ""),
         };
-        draw_single_line_input(
+        if let Some(position) = draw_single_line_input(
             frame,
             input_area,
             prompt,
             value,
             value.chars().count(),
             focused && interactive,
-        );
+            app.theme,
+        ) {
+            *cursor_position = Some(position);
+        }
         if inner.height > 1 {
             frame.render_widget(
                 Paragraph::new("─".repeat(usize::from(inner.width)))
-                    .style(Style::default().fg(ctp::OVERLAY_0)),
+                    .style(Style::default().fg(app.theme.text_muted)),
                 Rect::new(inner.x, inner.y + 1, inner.width, 1),
             );
         }
@@ -647,9 +695,9 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         let row_style = if selected {
             Style::default()
                 .bg(if focused {
-                    ctp::SURFACE_1
+                    app.theme.surface_selection
                 } else {
-                    ctp::SURFACE_0
+                    app.theme.surface_selection_inactive
                 })
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -687,7 +735,7 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
                 frame.render_widget(Paragraph::new("").style(row_style), group_area);
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled(marker, Style::default().fg(ctp::TEAL)),
+                        Span::styled(marker, Style::default().fg(app.theme.ui_group_marker)),
                         Span::raw(format!(" {label}")),
                     ]))
                     .style(row_style),
@@ -696,8 +744,11 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
                 let count = count.to_string();
                 let count_width = (count.width() as u16).min(group_area.width);
                 frame.render_widget(
-                    Paragraph::new(Span::styled(count, Style::default().fg(ctp::OVERLAY_0)))
-                        .alignment(Alignment::Right),
+                    Paragraph::new(Span::styled(
+                        count,
+                        Style::default().fg(app.theme.text_muted),
+                    ))
+                    .alignment(Alignment::Right),
                     Rect::new(
                         group_area.x + group_area.width.saturating_sub(count_width),
                         group_area.y,
@@ -722,7 +773,9 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
                     .and_then(|name| name.to_str())
                     .unwrap_or("?");
                 let base_style = if file.archived && !selected {
-                    row_style.fg(ctp::OVERLAY_0).add_modifier(Modifier::DIM)
+                    row_style
+                        .fg(app.theme.text_muted)
+                        .add_modifier(Modifier::DIM)
                 } else {
                     row_style
                 };
@@ -742,9 +795,9 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
                         Paragraph::new(Line::from(Span::styled(
                             format!("{prefix}{}", modified.format("%y/%m/%d %H:%M")),
                             Style::default().fg(if selected {
-                                ctp::SUBTEXT_1
+                                app.theme.text_secondary
                             } else {
-                                ctp::OVERLAY_0
+                                app.theme.text_muted
                             }),
                         )))
                         .style(row_style),
@@ -760,7 +813,10 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
                 if let Some(selection_area) = selection_area {
                     for rail_y in selection_area.y..selection_area.y + selection_area.height {
                         frame.render_widget(
-                            Paragraph::new(Span::styled("▌", Style::default().fg(ctp::MAUVE))),
+                            Paragraph::new(Span::styled(
+                                "▌",
+                                Style::default().fg(app.theme.ui_selection_indicator),
+                            )),
                             Rect::new(selection_area.x, rail_y, 1, 1),
                         );
                     }
@@ -781,8 +837,8 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
         .title(format!(" Todo {done}/{} ", app.todo_items.len()))
-        .style(Style::default().bg(ctp::MANTLE))
-        .border_style(focus_border(focused));
+        .style(Style::default().bg(app.theme.surface_panel))
+        .border_style(focus_border(focused, app.theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -832,9 +888,11 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         };
         let checked = if item.checked { "[x]" } else { "[ ]" };
         let marker_style = if item.checked {
-            Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(app.theme.ui_task_done)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(ctp::TEAL)
+            Style::default().fg(app.theme.ui_task_open)
         };
         let mut text_style = if item.checked {
             Style::default().add_modifier(Modifier::CROSSED_OUT)
@@ -842,7 +900,7 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             Style::default()
         };
         if focused && index == selected {
-            text_style = text_style.bg(ctp::SURFACE_1);
+            text_style = text_style.bg(app.theme.surface_selection);
         }
         let wrapped = wrap_spans_to_width(
             &[Span::styled(item.text.replace('\n', " "), text_style)],
@@ -859,7 +917,7 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
                 .saturating_add(layout_height)
                 .min(inner.y.saturating_add(inner.height));
             frame.render_widget(
-                Block::default().style(Style::default().bg(ctp::SURFACE_1)),
+                Block::default().style(Style::default().bg(app.theme.surface_selection)),
                 Rect::new(
                     inner.x,
                     selection_y,
@@ -895,25 +953,22 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
     }
 }
 
-fn focus_border(focused: bool) -> Style {
-    Style::default().fg(if focused { ctp::GREEN } else { ctp::OVERLAY_0 })
+fn focus_border(focused: bool, theme: Theme) -> Style {
+    Style::default().fg(if focused {
+        theme.ui_focus_border
+    } else {
+        theme.ui_border
+    })
 }
 
-fn animated_color(position: usize, tick: u64) -> Color {
-    const STOPS: [(u8, u8, u8); 6] = [
-        (137, 220, 235),
-        (137, 180, 250),
-        (203, 166, 247),
-        (245, 194, 231),
-        (249, 226, 175),
-        (166, 227, 161),
-    ];
+fn animated_color(position: usize, tick: u64, theme: Theme) -> Color {
+    let stops = theme.animation_gradient.map(rgb_components);
     const STEPS: usize = 24;
-    let phase = (position + tick as usize * 3) % (STOPS.len() * STEPS);
+    let phase = (position + tick as usize * 3) % (stops.len() * STEPS);
     let stop = phase / STEPS;
     let amount = phase % STEPS;
-    let from = STOPS[stop];
-    let to = STOPS[(stop + 1) % STOPS.len()];
+    let from = stops[stop];
+    let to = stops[(stop + 1) % stops.len()];
     let blend = |a: u8, b: u8| {
         let a = usize::from(a);
         let b = usize::from(b);
@@ -926,9 +981,21 @@ fn animated_color(position: usize, tick: u64) -> Color {
     )
 }
 
-fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
+fn rgb_components(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(red, green, blue) => (red, green, blue),
+        _ => unreachable!("theme colors are parsed as RGB"),
+    }
+}
+
+fn animated_activity_lines(
+    text: &str,
+    width: usize,
+    tick: u64,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let (status, detail) = activity_parts(text);
-    let marker = activity_marker(width);
+    let marker = activity_marker(width, theme);
     let available = width.saturating_sub(marker.width());
     let characters = compact_activity_line(status, available)
         .chars()
@@ -943,7 +1010,7 @@ fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'sta
                 Span::styled(
                     character.to_string(),
                     Style::default()
-                        .fg(animated_color(index * 8, tick))
+                        .fg(animated_color(index * 8, tick, theme))
                         .add_modifier(Modifier::BOLD),
                 )
             })
@@ -951,25 +1018,25 @@ fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'sta
     );
     let mut lines = vec![Line::from(spans)];
     if let Some(detail) = detail {
-        lines.push(activity_detail_line(detail, width));
+        lines.push(activity_detail_line(detail, width, theme));
     }
     lines
 }
 
-fn activity_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+fn activity_lines(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
     let (status, detail) = activity_parts(text);
-    let marker = activity_marker(width);
+    let marker = activity_marker(width, theme);
     let available = width.saturating_sub(marker.width());
     let spans = vec![
         marker,
         Span::styled(
             compact_activity_line(status, available),
-            Style::default().fg(ctp::OVERLAY_0),
+            Style::default().fg(theme.text_muted),
         ),
     ];
     let mut lines = vec![Line::from(spans)];
     if let Some(detail) = detail {
-        lines.push(activity_detail_line(detail, width));
+        lines.push(activity_detail_line(detail, width, theme));
     }
     lines
 }
@@ -979,14 +1046,14 @@ fn activity_parts(text: &str) -> (&str, Option<&str>) {
     (status, (!detail.is_empty()).then_some(detail))
 }
 
-fn activity_detail_line(detail: &str, width: usize) -> Line<'static> {
-    let marker = activity_detail_marker(width);
+fn activity_detail_line(detail: &str, width: usize, theme: Theme) -> Line<'static> {
+    let marker = activity_detail_marker(width, theme);
     let available = width.saturating_sub(marker.width());
     Line::from(vec![
         marker,
         Span::styled(
             compact_activity_line(detail, available),
-            Style::default().fg(ctp::OVERLAY_0),
+            Style::default().fg(theme.text_muted),
         ),
     ])
 }
@@ -1017,7 +1084,7 @@ fn compact_activity_line(text: &str, width: usize) -> String {
     result
 }
 
-fn activity_marker(width: usize) -> Span<'static> {
+fn activity_marker(width: usize, theme: Theme) -> Span<'static> {
     let marker = match width {
         0 => "",
         1 => "•",
@@ -1026,11 +1093,13 @@ fn activity_marker(width: usize) -> Span<'static> {
     };
     Span::styled(
         marker,
-        Style::default().fg(ctp::TEAL).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.ui_activity_marker)
+            .add_modifier(Modifier::BOLD),
     )
 }
 
-fn activity_detail_marker(width: usize) -> Span<'static> {
+fn activity_detail_marker(width: usize, theme: Theme) -> Span<'static> {
     let marker = match width {
         0 => "",
         1 => "└",
@@ -1039,27 +1108,27 @@ fn activity_detail_marker(width: usize) -> Span<'static> {
         4 => " └─",
         _ => "   └─ ",
     };
-    Span::styled(marker, Style::default().fg(ctp::SURFACE_1))
+    Span::styled(marker, Style::default().fg(theme.ui_border_subtle))
 }
 
-fn draw_animated_border(frame: &mut Frame, area: Rect, tick: u64) {
+fn draw_animated_border(frame: &mut Frame, area: Rect, tick: u64, theme: Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let mut position = 0usize;
     for x in area.x..area.x.saturating_add(area.width) {
-        frame.buffer_mut()[(x, area.y)].set_fg(animated_color(position, tick));
+        frame.buffer_mut()[(x, area.y)].set_fg(animated_color(position, tick, theme));
         position += 1;
     }
     for y in area.y.saturating_add(1)..area.y.saturating_add(area.height) {
         let x = area.x.saturating_add(area.width.saturating_sub(1));
-        frame.buffer_mut()[(x, y)].set_fg(animated_color(position, tick));
+        frame.buffer_mut()[(x, y)].set_fg(animated_color(position, tick, theme));
         position += 1;
     }
     if area.height > 1 {
         let y = area.y.saturating_add(area.height - 1);
         for x in (area.x..area.x.saturating_add(area.width.saturating_sub(1))).rev() {
-            frame.buffer_mut()[(x, y)].set_fg(animated_color(position, tick));
+            frame.buffer_mut()[(x, y)].set_fg(animated_color(position, tick, theme));
             position += 1;
         }
     }
@@ -1067,24 +1136,37 @@ fn draw_animated_border(frame: &mut Frame, area: Rect, tick: u64) {
         for y in
             (area.y.saturating_add(1)..area.y.saturating_add(area.height.saturating_sub(1))).rev()
         {
-            frame.buffer_mut()[(area.x, y)].set_fg(animated_color(position, tick));
+            frame.buffer_mut()[(area.x, y)].set_fg(animated_color(position, tick, theme));
             position += 1;
         }
     }
 }
 
-fn draw_center(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+fn draw_center(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     let content = center_content_axis(area);
     match app.center_view {
-        CenterView::Daily => draw_daily(frame, app, area, content, interactive),
-        CenterView::Document => draw_document(frame, app, content, interactive),
+        CenterView::Daily => draw_daily(frame, app, area, content, interactive, cursor_position),
+        CenterView::Document => draw_document(frame, app, content, interactive, cursor_position),
         CenterView::Search | CenterView::DocumentSearch => {
-            draw_search(frame, app, content, interactive)
+            draw_search(frame, app, content, interactive, cursor_position)
         }
     }
 }
 
-fn draw_daily(frame: &mut Frame, app: &mut App, surface: Rect, content: Rect, interactive: bool) {
+fn draw_daily(
+    frame: &mut Frame,
+    app: &mut App,
+    surface: Rect,
+    content: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     if surface.width == 0 || surface.height == 0 {
         return;
     }
@@ -1096,7 +1178,7 @@ fn draw_daily(frame: &mut Frame, app: &mut App, surface: Rect, content: Rect, in
         Paragraph::new(Span::styled(
             "Daily",
             Style::default()
-                .fg(ctp::LAVENDER)
+                .fg(app.theme.ui_page_heading)
                 .add_modifier(Modifier::BOLD),
         )),
         Rect::new(content.x, content.y, content.width, 1),
@@ -1124,7 +1206,7 @@ fn draw_daily(frame: &mut Frame, app: &mut App, surface: Rect, content: Rect, in
 
     if compose.width > 0 && compose.height > 0 {
         frame.render_widget(Clear, compose);
-        draw_compose(frame, app, compose, interactive);
+        draw_compose(frame, app, compose, interactive, cursor_position);
     }
 }
 
@@ -1216,6 +1298,7 @@ fn draw_daily_notes(
                     width,
                     cached.button_start,
                     index == app.selected,
+                    app.theme,
                 ));
             } else {
                 visible.push(line.clone());
@@ -1268,8 +1351,14 @@ fn draw_daily_notes(
 
     frame.render_widget(Paragraph::new(visible), area);
     let image_base = app.storage.daily_dir.clone();
-    app.images
-        .render(frame, &rendered_images, area, scroll, &image_base);
+    app.images.render(
+        frame,
+        &rendered_images,
+        area,
+        scroll,
+        &image_base,
+        app.theme,
+    );
     if let Some(cached) = app
         .daily_vlist
         .items
@@ -1278,7 +1367,15 @@ fn draw_daily_notes(
     {
         let first = app.daily_vlist.geometry.item_top(app.selected);
         let last = first + cached.lines.len().saturating_sub(2);
-        draw_selected_card_border(frame, area, scroll, first, last, app.animation_tick);
+        draw_selected_card_border(
+            frame,
+            area,
+            scroll,
+            first,
+            last,
+            app.animation_tick,
+            app.theme,
+        );
     }
 }
 
@@ -1350,7 +1447,12 @@ fn ensure_daily_card_rendered(app: &mut App, index: usize) {
         return;
     }
     let date_label = app.daily_notes[index].date.format(DATE_FMT).to_string();
-    let cached = render_daily_note(&app.daily_notes[index], date_label, app.daily_vlist.width);
+    let cached = render_daily_note(
+        &app.daily_notes[index],
+        date_label,
+        app.daily_vlist.width,
+        app.theme,
+    );
     let height = cached.lines.len();
     app.daily_vlist.items[index].cache = Some(cached);
     app.daily_vlist.geometry.set_height(index, height);
@@ -1402,8 +1504,9 @@ fn render_daily_note(
     note: &crate::model::DailyNote,
     date_label: String,
     width: usize,
+    theme: Theme,
 ) -> crate::app::DailyCardRenderCache {
-    let card_style = Style::default().bg(ctp::MANTLE);
+    let card_style = Style::default().bg(theme.surface_panel);
     let horizontal_padding = DAILY_PADDING_X.min(width.saturating_sub(1) / 2);
     let body_start = horizontal_padding + UnicodeWidthStr::width(date_label.as_str()) + 2;
     let (body_start, body_width) = centered_daily_body_axis(width, body_start);
@@ -1416,7 +1519,7 @@ fn render_daily_note(
                 Span::styled(
                     date_label.clone(),
                     Style::default()
-                        .fg(ctp::OVERLAY_1)
+                        .fg(theme.text_subtle)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ),
             ],
@@ -1425,7 +1528,7 @@ fn render_daily_note(
         ),
         line_with_background(Vec::new(), width, card_style),
     ];
-    let markdown = crate::markdown::render_at_width(&note.body, body_width);
+    let markdown = crate::markdown::render_at_width(&note.body, body_width, theme);
     let body_line_start = lines.len();
     let links = markdown
         .links
@@ -1458,7 +1561,7 @@ fn render_daily_note(
         .saturating_sub(body_start)
         .saturating_sub(action_buttons_width());
     let button_line = lines.len();
-    lines.push(daily_button_line(width, button_start, false));
+    lines.push(daily_button_line(width, button_start, false, theme));
     lines.push(line_with_background(Vec::new(), width, card_style));
     lines.push(line_with_background(Vec::new(), width, card_style));
     lines.push(Line::default());
@@ -1475,10 +1578,15 @@ fn render_daily_note(
     }
 }
 
-fn daily_button_line(width: usize, button_start: usize, selected: bool) -> Line<'static> {
+fn daily_button_line(
+    width: usize,
+    button_start: usize,
+    selected: bool,
+    theme: Theme,
+) -> Line<'static> {
     let mut spans = vec![Span::raw(" ".repeat(button_start))];
-    spans.extend(render_button_line(selected).spans);
-    line_with_background(spans, width, Style::default().bg(ctp::MANTLE))
+    spans.extend(render_button_line(selected, theme).spans);
+    line_with_background(spans, width, Style::default().bg(theme.surface_panel))
 }
 
 fn draw_selected_card_border(
@@ -1488,6 +1596,7 @@ fn draw_selected_card_border(
     first: usize,
     last: usize,
     tick: u64,
+    theme: Theme,
 ) {
     if area.width < 2 || first > last {
         return;
@@ -1516,7 +1625,7 @@ fn draw_selected_card_border(
                 let position = (x - left) as usize;
                 frame.buffer_mut()[(x, y)]
                     .set_symbol(symbol)
-                    .set_style(animated_card_border_style(position, tick));
+                    .set_style(animated_card_border_style(position, tick, theme));
             }
         } else if row == last {
             for x in left..=right {
@@ -1532,7 +1641,7 @@ fn draw_selected_card_border(
                     .saturating_add((right - x) as usize);
                 frame.buffer_mut()[(x, y)]
                     .set_symbol(symbol)
-                    .set_style(animated_card_border_style(position, tick));
+                    .set_style(animated_card_border_style(position, tick, theme));
             }
         } else {
             let right_position = width.saturating_add(row.saturating_sub(first + 1));
@@ -1542,18 +1651,18 @@ fn draw_selected_card_border(
                 .saturating_add(last.saturating_sub(row + 1));
             frame.buffer_mut()[(left, y)]
                 .set_symbol("│")
-                .set_style(animated_card_border_style(left_position, tick));
+                .set_style(animated_card_border_style(left_position, tick, theme));
             frame.buffer_mut()[(right, y)]
                 .set_symbol("│")
-                .set_style(animated_card_border_style(right_position, tick));
+                .set_style(animated_card_border_style(right_position, tick, theme));
         }
     }
 }
 
-fn animated_card_border_style(position: usize, tick: u64) -> Style {
+fn animated_card_border_style(position: usize, tick: u64, theme: Theme) -> Style {
     Style::default()
-        .fg(animated_color(position, tick))
-        .bg(ctp::MANTLE)
+        .fg(animated_color(position, tick, theme))
+        .bg(theme.surface_panel)
 }
 
 fn stable_card_scroll(scroll: usize, first: usize, button: usize, view_height: usize) -> usize {
@@ -1616,7 +1725,7 @@ fn register_link_hitboxes(
     }
 }
 
-fn render_button_line(selected: bool) -> Line<'static> {
+fn render_button_line(selected: bool, theme: Theme) -> Line<'static> {
     let mut spans = Vec::new();
     for (index, action) in Action::all().iter().enumerate() {
         if index > 0 {
@@ -1624,16 +1733,16 @@ fn render_button_line(selected: bool) -> Line<'static> {
         }
         let style = if *action == Action::Ai {
             Style::default()
-                .fg(ctp::CRUST)
-                .bg(ctp::PINK)
+                .fg(theme.text_on_accent)
+                .bg(theme.ui_action_ai)
                 .add_modifier(Modifier::BOLD)
         } else if selected {
             Style::default()
-                .fg(ctp::CRUST)
-                .bg(ctp::TEAL)
+                .fg(theme.text_on_accent)
+                .bg(theme.ui_action)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(ctp::TEAL)
+            Style::default().fg(theme.ui_action)
         };
         spans.push(Span::styled(format!("[{}]", action.label()), style));
     }
@@ -1691,7 +1800,13 @@ fn register_buttons_clipped(
     }
 }
 
-fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
+fn draw_compose(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     let focused = app.focus == Focus::Compose;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1701,26 +1816,29 @@ fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
         } else {
             " Compose · i "
         })
-        .style(Style::default().bg(ctp::MANTLE))
-        .border_style(focus_border(focused));
+        .style(Style::default().bg(app.theme.surface_panel))
+        .border_style(focus_border(focused, app.theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if focused {
-        draw_animated_border(frame, area, app.animation_tick);
+        draw_animated_border(frame, area, app.animation_tick, app.theme);
     }
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
     let (text_area, toolbar) = split_last_row(inner);
-    draw_multiline_input(
+    if let Some(position) = draw_multiline_input(
         frame,
         text_area,
         &app.input,
         app.input_cursor,
         "Write something…",
         focused && interactive,
-    );
+        app.theme,
+    ) {
+        *cursor_position = Some(position);
+    }
 
     if toolbar.height > 0 {
         let lines = if app.input.is_empty() {
@@ -1739,11 +1857,17 @@ fn draw_compose(frame: &mut Frame, app: &App, area: Rect, interactive: bool) {
         } else {
             ""
         };
-        draw_left_right_line(frame, toolbar, &count, hint, ctp::OVERLAY_0);
+        draw_left_right_line(frame, toolbar, &count, hint, app.theme.text_muted);
     }
 }
 
-fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+fn draw_document(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1770,7 +1894,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             .saturating_add(content.height)
             .saturating_sub(content.y.saturating_add(2)),
     );
-    let page_style = Style::default().bg(ctp::MANTLE);
+    let page_style = Style::default().bg(app.theme.surface_panel);
     frame.render_widget(Block::default().style(page_style), page_area);
     let horizontal_padding = (PAGE_PADDING_X as u16).min(page_area.width.saturating_sub(1) / 2);
     let vertical_padding = 2.min(page_area.height / 2);
@@ -1802,7 +1926,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
             Paragraph::new(Span::styled(
                 document.title.clone(),
                 Style::default()
-                    .fg(ctp::LAVENDER)
+                    .fg(app.theme.ui_page_heading)
                     .add_modifier(Modifier::BOLD),
             )),
             header,
@@ -1812,10 +1936,11 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
                 &document.source,
                 target_line,
                 document_area.width as usize,
+                app.theme,
             )
             .min(u16::MAX as usize) as u16;
         }
-        document.ensure_rendered(document_area.width as usize);
+        document.ensure_rendered(document_area.width as usize, app.theme);
         let rendered = &document
             .render_cache
             .as_ref()
@@ -1843,6 +1968,7 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
         document_area,
         document_scroll,
         &image_base,
+        app.theme,
     );
     if interactive {
         let interactive_document_area = Rect::new(
@@ -1860,11 +1986,11 @@ fn draw_document(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool
     }
     if compose.width > 0 && compose.height > 0 {
         frame.render_widget(Clear, compose);
-        draw_compose(frame, app, compose, interactive);
+        draw_compose(frame, app, compose, interactive, cursor_position);
     }
 }
 
-fn draw_notification(frame: &mut Frame, root: Rect, message: &str) {
+fn draw_notification(frame: &mut Frame, root: Rect, message: &str, theme: Theme) {
     if root.width < 4 || root.height < 3 {
         return;
     }
@@ -1889,14 +2015,20 @@ fn draw_notification(frame: &mut Frame, root: Rect, message: &str) {
                     .borders(Borders::ALL)
                     .padding(Padding::horizontal(1))
                     .title(" Notification ")
-                    .style(Style::default().bg(ctp::MANTLE))
-                    .border_style(Style::default().fg(ctp::YELLOW)),
+                    .style(Style::default().bg(theme.surface_panel))
+                    .border_style(Style::default().fg(theme.ui_warning)),
             ),
         area,
     );
 }
 
-fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+fn draw_search(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1917,7 +2049,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
         input_width,
         input_height,
     );
-    let input_style = Style::default().bg(ctp::MANTLE);
+    let input_style = Style::default().bg(app.theme.surface_panel);
     if input_height >= 3 {
         frame.render_widget(Clear, input_box);
         let block = Block::default()
@@ -1925,26 +2057,32 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
             .padding(Padding::horizontal(1))
             .title(format!(" Searcher · {} ", app.search_results.len()))
             .style(input_style)
-            .border_style(focus_border(app.focus == Focus::Center));
+            .border_style(focus_border(app.focus == Focus::Center, app.theme));
         let input = block.inner(input_box);
         frame.render_widget(block, input_box);
-        draw_single_line_input(
+        if let Some(position) = draw_single_line_input(
             frame,
             input,
             "/ ",
             &app.search_query,
             app.search_query.chars().count(),
             app.focus == Focus::Center && interactive,
-        );
+            app.theme,
+        ) {
+            *cursor_position = Some(position);
+        }
     } else {
-        draw_single_line_input(
+        if let Some(position) = draw_single_line_input(
             frame,
             input_box,
             "/ ",
             &app.search_query,
             app.search_query.chars().count(),
             app.focus == Focus::Center && interactive,
-        );
+            app.theme,
+        ) {
+            *cursor_position = Some(position);
+        }
     }
 
     let results_y = input_box
@@ -1990,7 +2128,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
     {
         let spans = match hit {
             SearchHit::Daily { text, .. } => vec![
-                Span::styled("• ", Style::default().fg(ctp::TEAL)),
+                Span::styled("• ", Style::default().fg(app.theme.ui_search_marker)),
                 Span::raw(text.clone()),
             ],
             SearchHit::FileLine {
@@ -2005,7 +2143,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
                 vec![
                     Span::styled(
                         format!("{name}:{line_no} "),
-                        Style::default().fg(ctp::OVERLAY_0),
+                        Style::default().fg(app.theme.text_muted),
                     ),
                     Span::raw(text.clone()),
                 ]
@@ -2013,13 +2151,13 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) 
             SearchHit::DocumentLine { line_no, text } => vec![
                 Span::styled(
                     format!("line {line_no} "),
-                    Style::default().fg(ctp::OVERLAY_0),
+                    Style::default().fg(app.theme.text_muted),
                 ),
                 Span::raw(text.clone()),
             ],
         };
         let style = if index == selected {
-            Style::default().bg(ctp::SURFACE_1)
+            Style::default().bg(app.theme.surface_selection)
         } else {
             Style::default()
         };
@@ -2041,23 +2179,27 @@ fn draw_single_line_input(
     value: &str,
     cursor: usize,
     show_cursor: bool,
-) {
+    theme: Theme,
+) -> Option<Position> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(prompt.to_string(), Style::default().fg(ctp::GREEN)),
+            Span::styled(
+                prompt.to_string(),
+                Style::default().fg(theme.ui_input_prompt),
+            ),
             Span::raw(value.to_string()),
         ])),
         area,
     );
-    if show_cursor {
+    show_cursor.then(|| {
         let cursor_byte = char_to_byte(value, cursor.min(value.chars().count()));
         let column = UnicodeWidthStr::width(prompt) + UnicodeWidthStr::width(&value[..cursor_byte]);
         let x = area.x + (column as u16).min(area.width.saturating_sub(1));
-        frame.set_cursor_position((x, area.y));
-    }
+        Position::new(x, area.y)
+    })
 }
 
 fn draw_multiline_input(
@@ -2067,16 +2209,17 @@ fn draw_multiline_input(
     cursor: usize,
     placeholder: &str,
     show_cursor: bool,
-) {
+    theme: Theme,
+) -> Option<Position> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
     let width = area.width as usize;
     let lines: Vec<Line> = if value.is_empty() {
         wrap_spans_to_width(
             &[Span::styled(
                 placeholder.to_string(),
-                Style::default().fg(ctp::OVERLAY_0),
+                Style::default().fg(theme.text_muted),
             )],
             width,
         )
@@ -2112,12 +2255,12 @@ fn draw_multiline_input(
     };
     let visible = visible_line_window(&lines, scroll, viewport_height);
     frame.render_widget(Paragraph::new(visible), area);
-    if show_cursor {
+    show_cursor.then(|| {
         let x = area.x + (cursor_column % width.max(1)) as u16;
         let visible_row = wrapped_cursor_row.saturating_sub(scroll);
         let y = area.y + (visible_row as u16).min(area.height.saturating_sub(1));
-        frame.set_cursor_position((x.min(area.x + area.width - 1), y));
-    }
+        Position::new(x.min(area.x + area.width - 1), y)
+    })
 }
 
 fn visible_line_window<'a>(
@@ -2163,16 +2306,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let surface_segment = format!(" {surface} ");
     let permission_segment = format!(" {} ", app.permission_mode.label());
-    let surface_style = Style::default().bg(ctp::BLUE).fg(ctp::CRUST);
+    let surface_style = Style::default()
+        .bg(app.theme.surface_footer)
+        .fg(app.theme.text_on_accent);
     let mode_line = if app.permission_mode == PermissionMode::Bypass {
         let mut spans = vec![Span::styled(surface_segment.clone(), surface_style)];
-        let bypass_style = Style::default().bg(ctp::CRUST);
+        let bypass_style = Style::default().bg(app.theme.surface_overlay);
         spans.push(Span::styled(" ", bypass_style));
         spans.extend("BYPASS".chars().enumerate().map(|(index, character)| {
             Span::styled(
                 character.to_string(),
                 bypass_style
-                    .fg(animated_color(index * 8, app.animation_tick))
+                    .fg(animated_color(index * 8, app.animation_tick, app.theme))
                     .add_modifier(Modifier::BOLD),
             )
         }));
@@ -2183,7 +2328,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(surface_segment.clone(), surface_style),
             Span::styled(
                 permission_segment.clone(),
-                Style::default().bg(ctp::SAPPHIRE).fg(ctp::CRUST),
+                Style::default()
+                    .bg(app.theme.surface_footer_mode)
+                    .fg(app.theme.text_on_accent),
             ),
         ])
     };
@@ -2201,7 +2348,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if !app.status.is_empty() && available_status > 2 {
         let status = Line::from(Span::styled(
             format!(" {}", app.status),
-            Style::default().fg(ctp::YELLOW),
+            Style::default().fg(app.theme.ui_warning),
         ));
         frame.render_widget(
             Paragraph::new(status),
@@ -2211,8 +2358,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if !hint.is_empty() {
         let width = (hint.width() as u16).min(area.width);
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(ctp::OVERLAY_0)))
-                .alignment(Alignment::Right),
+            Paragraph::new(Span::styled(
+                hint,
+                Style::default().fg(app.theme.text_muted),
+            ))
+            .alignment(Alignment::Right),
             Rect::new(area.x + area.width - width, area.y, width, area.height),
         );
     }
@@ -2290,15 +2440,26 @@ fn draw_left_right_line(frame: &mut Frame, area: Rect, left: &str, right: &str, 
     }
 }
 
-fn draw_overlay(frame: &mut Frame, app: &mut App, root: Rect, overlay: Overlay) -> Rect {
+fn draw_overlay(
+    frame: &mut Frame,
+    app: &mut App,
+    root: Rect,
+    overlay: Overlay,
+    cursor_position: &mut Option<Position>,
+) -> Rect {
     let _ = overlay;
-    draw_dialog(frame, app, root)
+    draw_dialog(frame, app, root, cursor_position)
 }
 
 /// Render every modal interaction through one fixed-width, bounded-height
 /// command surface. The body changes by mode, but title, scrolling, option
 /// selection, input and footer geometry remain identical.
-fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
+fn draw_dialog(
+    frame: &mut Frame,
+    app: &mut App,
+    root: Rect,
+    cursor_position: &mut Option<Position>,
+) -> Rect {
     let Some(dialog) = app.dialog.clone() else {
         return Rect::new(root.x, root.y, 0, 0);
     };
@@ -2311,7 +2472,7 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     .min(root.width.saturating_sub(4).max(root.width.min(1)));
     let text_width = width.saturating_sub(4).max(1) as usize;
     let message_rows = if dialog.purpose == DialogPurpose::Help {
-        help_lines().len() as u16
+        help_lines(app.theme).len() as u16
     } else {
         wrap_spans_to_width(&[Span::raw(dialog.message.clone())], text_width)
             .len()
@@ -2357,24 +2518,24 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
     }
     frame.render_widget(Clear, area);
     let border = match dialog.mode {
-        DialogMode::Approval => ctp::YELLOW,
-        DialogMode::FreeText => ctp::MAUVE,
+        DialogMode::Approval => app.theme.ui_warning,
+        DialogMode::FreeText => app.theme.ui_dialog_input,
         DialogMode::SelectOrInput
         | DialogMode::SingleSelect
         | DialogMode::MultiSelect
-        | DialogMode::CommandPalette => ctp::SKY,
-        _ => ctp::SUBTEXT_0,
+        | DialogMode::CommandPalette => app.theme.ui_dialog_choice,
+        _ => app.theme.text_disabled,
     };
     let modal_background = if matches!(
         dialog.purpose,
         DialogPurpose::NewFile | DialogPurpose::RenameFile
     ) {
-        ctp::MANTLE
+        app.theme.surface_panel
     } else {
-        ctp::CRUST
+        app.theme.surface_overlay
     };
     let border_style = if dialog.mode == DialogMode::CommandPalette {
-        focus_border(true)
+        focus_border(true, app.theme)
     } else {
         Style::default().fg(border)
     };
@@ -2405,7 +2566,7 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
                     .wrap(Wrap { trim: false }),
                 body,
             );
-            draw_dialog_footer(frame, inner, "Enter/Y confirm · N/Esc cancel");
+            draw_dialog_footer(frame, inner, "Enter/Y confirm · N/Esc cancel", app.theme);
         }
         DialogMode::FreeText => {
             let (input, footer) = split_last_row(inner);
@@ -2414,28 +2575,35 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
                 DialogPurpose::NewFile | DialogPurpose::RenameFile
             ) {
                 let single = Rect::new(input.x, input.y, input.width, 1);
-                draw_single_line_input(
+                if let Some(position) = draw_single_line_input(
                     frame,
                     single,
                     &dialog.message,
                     &dialog.input,
                     dialog.cursor,
                     true,
-                );
-                draw_dialog_footer(frame, footer, "Enter save · Esc cancel");
+                    app.theme,
+                ) {
+                    *cursor_position = Some(position);
+                }
+                draw_dialog_footer(frame, footer, "Enter save · Esc cancel", app.theme);
             } else {
-                draw_multiline_input(
+                if let Some(position) = draw_multiline_input(
                     frame,
                     input,
                     &dialog.input,
                     dialog.cursor,
                     "Optional prompt; empty uses the card content",
                     true,
-                );
+                    app.theme,
+                ) {
+                    *cursor_position = Some(position);
+                }
                 draw_dialog_footer(
                     frame,
                     footer,
                     "Enter submit · Shift/Ctrl/Alt+Enter newline · Esc cancel",
+                    app.theme,
                 );
             }
         }
@@ -2444,6 +2612,7 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
             let lines = crate::markdown::to_lines_at_width(
                 &format!("```diff\n{}\n```", dialog.message),
                 content.width as usize,
+                app.theme,
             );
             let maximum = lines.len().saturating_sub(content.height as usize);
             let scroll = dialog.scroll.min(maximum as u16);
@@ -2463,10 +2632,11 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
                 frame,
                 footer,
                 "Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab bypass",
+                app.theme,
             );
         }
         DialogMode::Informational => {
-            let lines = help_lines();
+            let lines = help_lines(app.theme);
             let maximum = lines.len().saturating_sub(inner.height as usize);
             let scroll = dialog.scroll.min(maximum as u16);
             if let Some(state) = app.dialog.as_mut() {
@@ -2482,24 +2652,42 @@ fn draw_dialog(frame: &mut Frame, app: &mut App, root: Rect) -> Rect {
                 inner,
             );
         }
-        DialogMode::CommandPalette => draw_command_palette(frame, app, &dialog, inner),
+        DialogMode::CommandPalette => {
+            draw_command_palette(frame, app, &dialog, inner, cursor_position)
+        }
         DialogMode::SingleSelect | DialogMode::MultiSelect | DialogMode::SelectOrInput => {
-            draw_select_dialog(frame, app, &dialog, inner);
+            draw_select_dialog(frame, app, &dialog, inner, cursor_position);
         }
     }
     area
 }
 
-fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, inner: Rect) {
+fn draw_command_palette(
+    frame: &mut Frame,
+    app: &mut App,
+    dialog: &DialogState,
+    inner: Rect,
+    cursor_position: &mut Option<Position>,
+) {
     if inner.height == 0 {
         return;
     }
     let input = Rect::new(inner.x, inner.y, inner.width, 1);
-    draw_single_line_input(frame, input, "/ ", &dialog.input, dialog.cursor, true);
+    if let Some(position) = draw_single_line_input(
+        frame,
+        input,
+        "/ ",
+        &dialog.input,
+        dialog.cursor,
+        true,
+        app.theme,
+    ) {
+        *cursor_position = Some(position);
+    }
     if inner.height > 1 {
         frame.render_widget(
             Paragraph::new("─".repeat(inner.width as usize))
-                .style(Style::default().fg(ctp::SURFACE_1)),
+                .style(Style::default().fg(app.theme.ui_border_subtle)),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
     }
@@ -2517,7 +2705,7 @@ fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, 
         frame.render_widget(
             Paragraph::new("No matching commands")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(ctp::OVERLAY_0)),
+                .style(Style::default().fg(app.theme.text_muted)),
             options,
         );
     } else if options.height > 0 {
@@ -2540,7 +2728,7 @@ fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, 
             let item_area = Rect::new(options.x, y, options.width, item_height);
             let selected = index == dialog.selected;
             let selection_style = if selected {
-                Style::default().bg(ctp::SURFACE_1)
+                Style::default().bg(app.theme.surface_selection)
             } else {
                 Style::default()
             };
@@ -2556,7 +2744,10 @@ fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, 
                 frame.render_widget(Block::default().style(selection_style), selection_area);
                 for rail_y in selection_y..selection_end {
                     frame.render_widget(
-                        Paragraph::new(Span::styled("▌", Style::default().fg(ctp::MAUVE))),
+                        Paragraph::new(Span::styled(
+                            "▌",
+                            Style::default().fg(app.theme.ui_selection_indicator),
+                        )),
                         Rect::new(options.x, rail_y, 1, 1),
                     );
                 }
@@ -2567,7 +2758,7 @@ fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, 
                     Span::styled(
                         option.label.clone(),
                         Style::default()
-                            .fg(ctp::SUBTEXT_1)
+                            .fg(app.theme.text_secondary)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])),
@@ -2583,7 +2774,7 @@ fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, 
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::raw(" "),
-                        Span::styled(description, Style::default().fg(ctp::OVERLAY_0)),
+                        Span::styled(description, Style::default().fg(app.theme.text_muted)),
                     ])),
                     Rect::new(
                         options.x.saturating_add(1),
@@ -2604,10 +2795,11 @@ fn draw_command_palette(frame: &mut Frame, app: &mut App, dialog: &DialogState, 
         frame,
         Rect::new(inner.x, footer_y, inner.width, 1),
         "↑↓ select · Enter run · Esc close",
+        app.theme,
     );
 }
 
-fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str) {
+fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str, theme: Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -2620,12 +2812,18 @@ fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)
-            .style(Style::default().fg(ctp::OVERLAY_0)),
+            .style(Style::default().fg(theme.text_muted)),
         footer,
     );
 }
 
-fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, inner: Rect) {
+fn draw_select_dialog(
+    frame: &mut Frame,
+    app: &mut App,
+    dialog: &DialogState,
+    inner: Rect,
+    cursor_position: &mut Option<Position>,
+) {
     if inner.height == 0 {
         return;
     }
@@ -2697,9 +2895,11 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
         let row = index - list_start;
         let selected = dialog.selected == index;
         let style = if selected {
-            Style::default().fg(ctp::CRUST).bg(ctp::TEAL)
+            Style::default()
+                .fg(app.theme.text_on_accent)
+                .bg(app.theme.ui_action)
         } else {
-            Style::default().fg(ctp::SUBTEXT_0)
+            Style::default().fg(app.theme.text_disabled)
         };
         let marker = if dialog.mode == DialogMode::MultiSelect {
             if dialog.checked.get(index).copied().unwrap_or(false) {
@@ -2719,7 +2919,7 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
                 if selected {
                     style.add_modifier(Modifier::DIM)
                 } else {
-                    Style::default().fg(ctp::OVERLAY_0)
+                    Style::default().fg(app.theme.text_muted)
                 },
             ));
         }
@@ -2741,17 +2941,20 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
         let input_block = Block::default()
             .borders(Borders::ALL)
             .title(" Your answer ")
-            .border_style(focus_border(custom_selected));
+            .border_style(focus_border(custom_selected, app.theme));
         let input_inner = input_block.inner(input);
         frame.render_widget(input_block, input);
-        draw_multiline_input(
+        if let Some(position) = draw_multiline_input(
             frame,
             input_inner,
             &dialog.input,
             dialog.cursor,
             "Type a different response",
             custom_selected,
-        );
+            app.theme,
+        ) {
+            *cursor_position = Some(position);
+        }
         let other_index = dialog.options.len();
         if other_index >= list_start && other_index < list_start + visible_rows {
             let row = other_index - list_start;
@@ -2760,9 +2963,11 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
                 Paragraph::new(Line::from(Span::styled(
                     "> Other answer",
                     if custom_selected {
-                        Style::default().fg(ctp::CRUST).bg(ctp::TEAL)
+                        Style::default()
+                            .fg(app.theme.text_on_accent)
+                            .bg(app.theme.ui_action)
                     } else {
-                        Style::default().fg(ctp::SUBTEXT_0)
+                        Style::default().fg(app.theme.text_disabled)
                     },
                 ))),
                 row_area,
@@ -2781,15 +2986,15 @@ fn draw_select_dialog(frame: &mut Frame, app: &mut App, dialog: &DialogState, in
         }
         _ => "↑↓ choose · Enter open · Esc cancel",
     };
-    draw_dialog_footer(frame, footer, footer_text);
+    draw_dialog_footer(frame, footer, footer_text, app.theme);
 }
 
-fn help_lines() -> Vec<Line<'static>> {
+fn help_lines(theme: Theme) -> Vec<Line<'static>> {
     let heading = |text: &str| {
         Line::from(Span::styled(
             text.to_string(),
             Style::default()
-                .fg(ctp::SAPPHIRE)
+                .fg(theme.ui_section_heading)
                 .add_modifier(Modifier::BOLD),
         ))
     };
@@ -2797,7 +3002,9 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled(
                 format!(" {keys:<16}"),
-                Style::default().fg(ctp::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.ui_shortcut)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(description.to_string()),
         ])
@@ -2932,6 +3139,40 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::theme::catppuccin as ctp;
+
+    fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
+        super::animated_activity_lines(text, width, tick, Theme::default())
+    }
+
+    fn activity_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+        super::activity_lines(text, width, Theme::default())
+    }
+
+    fn render_agent_entry(
+        entry: &crate::app::AgentPanelEntry,
+        width: usize,
+        tick: u64,
+        animate: bool,
+    ) -> (
+        Vec<Line<'static>>,
+        Vec<crate::markdown::RenderedLink>,
+        Vec<mbtui::ImagePlacement>,
+    ) {
+        super::render_agent_entry(entry, width, tick, animate, Theme::default())
+    }
+
+    fn render_daily_note(
+        note: &crate::model::DailyNote,
+        date_label: String,
+        width: usize,
+    ) -> crate::app::DailyCardRenderCache {
+        super::render_daily_note(note, date_label, width, Theme::default())
+    }
+
+    fn animated_color(position: usize, tick: u64) -> Color {
+        super::animated_color(position, tick, Theme::default())
+    }
     use crate::agent::ApprovalRequest;
     use crate::agent::AskUserKind;
     use crate::app::{AgentPanelEntry, Document, DocumentKind, DocumentReturn};
@@ -2948,7 +3189,11 @@ mod tests {
     fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = draw(frame, app);
+            })
+            .unwrap();
         terminal
     }
 
@@ -2963,6 +3208,28 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    #[test]
+    fn rendering_uses_colors_loaded_from_the_app_theme() {
+        let (mut app, _directory) = make_app();
+        let custom = crate::theme::DEFAULT_THEME_TOML
+            .replace("panel = \"#181825\"", "panel = \"#010203\"")
+            .replace("footer = \"#89b4fa\"", "footer = \"#040506\"")
+            .replace("heading_1 = \"#b4befe\"", "heading_1 = \"#070809\"");
+        app.theme = Theme::from_toml(&custom).unwrap();
+
+        let terminal = render(&mut app, 170, 24);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(buffer[(0, 23)].bg, Color::Rgb(4, 5, 6));
+
+        let markdown = crate::markdown::render_at_width("# Heading", 40, app.theme);
+        assert!(markdown
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg == Some(Color::Rgb(7, 8, 9))));
     }
 
     #[test]
@@ -4343,7 +4610,11 @@ mod tests {
 
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = draw(frame, &mut app);
+            })
+            .unwrap();
         assert!(terminal
             .backend()
             .buffer()
@@ -4352,7 +4623,11 @@ mod tests {
             .any(|cell| cell.symbol() == "│"));
 
         app.document.as_mut().unwrap().scroll = 0;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = draw(frame, &mut app);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let page = app.layout.center.unwrap();
         let border = Color::Rgb(223, 127, 63);

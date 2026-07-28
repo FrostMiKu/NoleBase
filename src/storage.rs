@@ -16,6 +16,7 @@ use crate::model::{DailyNote, NoteFile, SearchHit, TodoItem};
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
+const THEME_FILE: &str = "theme.toml";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
 const DATA_DIR: &str = "data";
@@ -31,6 +32,7 @@ pub struct Storage {
     pub daily_dir: PathBuf,
     pub archives_dir: PathBuf,
     pub ai_config_path: PathBuf,
+    pub theme_path: PathBuf,
     pub agents_path: PathBuf,
     pub memory_path: PathBuf,
 }
@@ -52,6 +54,7 @@ impl Storage {
             daily_dir: root.join(DAILY_DIR),
             archives_dir: root.join(ARCHIVES_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
+            theme_path: root.join(THEME_FILE),
             agents_path: root.join(CONFIG_DIR).join(AGENTS_FILE),
             memory_path: root.join(MEMORY_FILE),
             root,
@@ -72,6 +75,9 @@ impl Storage {
             .with_context(|| format!("creating {}", self.archives_dir.display()))?;
         if !self.ai_config_path.exists() {
             self.write_default_ai_config()?;
+        }
+        if !self.theme_path.exists() {
+            self.write_default_theme()?;
         }
         create_empty_file(&self.agents_path)?;
         create_empty_file(&self.memory_path)?;
@@ -101,6 +107,23 @@ impl Storage {
             .with_context(|| format!("creating {}", self.ai_config_path.display()))?;
         file.write_all(DEFAULT.as_bytes())?;
         Ok(())
+    }
+
+    fn write_default_theme(&self) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.theme_path)
+            .with_context(|| format!("creating {}", self.theme_path.display()))?;
+        file.write_all(crate::theme::DEFAULT_THEME_TOML.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn load_theme(&self) -> Result<crate::theme::Theme> {
+        let source = fs::read_to_string(&self.theme_path)
+            .with_context(|| format!("reading {}", self.theme_path.display()))?;
+        crate::theme::Theme::from_toml(&source)
+            .with_context(|| format!("loading {}", self.theme_path.display()))
     }
 
     /// Load one card per daily file, oldest first.
@@ -1252,17 +1275,22 @@ mod tests {
         assert!(st.append_daily("2026-07-27", "   ").is_err());
         assert!(!st.daily_dir.join("2026-07-27.md").exists());
         assert!(st.ai_config_path.exists());
+        assert!(st.theme_path.exists());
         assert!(st.agents_path.exists());
         assert!(st.memory_path.exists());
         assert_eq!(fs::read_to_string(&st.agents_path).unwrap(), "");
         assert_eq!(fs::read_to_string(&st.memory_path).unwrap(), "");
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
+        assert_eq!(st.theme_path.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
         assert!(config.contains("api_key = \"\""));
         assert!(config.contains("tavily_api_key = \"\""));
         assert!(config.contains("max_tokens = 8192"));
         assert!(config.contains("context_window_tokens = 200000"));
         assert!(config.contains("max_rounds = 25"));
+        let theme = fs::read_to_string(&st.theme_path).unwrap();
+        assert_eq!(theme, crate::theme::DEFAULT_THEME_TOML);
+        assert_eq!(st.load_theme().unwrap(), crate::theme::Theme::default());
     }
 
     #[test]
@@ -1280,6 +1308,22 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&storage.memory_path).unwrap(),
             "remember this\n"
+        );
+    }
+
+    #[test]
+    fn ensure_files_preserves_and_loads_a_custom_root_theme() {
+        let (_directory, storage) = fresh();
+        let custom = crate::theme::DEFAULT_THEME_TOML
+            .replace("message_agent = \"#1e1e2e\"", "message_agent = \"#010203\"");
+        fs::write(&storage.theme_path, &custom).unwrap();
+
+        storage.ensure_files().unwrap();
+
+        assert_eq!(fs::read_to_string(&storage.theme_path).unwrap(), custom);
+        assert_eq!(
+            storage.load_theme().unwrap().surface_message_agent,
+            ratatui::style::Color::Rgb(1, 2, 3)
         );
     }
 

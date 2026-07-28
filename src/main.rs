@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
@@ -24,10 +25,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 
 use app::{App, Command};
@@ -60,6 +62,7 @@ fn leave_tui() -> Result<()> {
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
+        Show,
         LeaveAlternateScreen,
     )?;
     disable_raw_mode()?;
@@ -99,7 +102,12 @@ fn run_editor(path: &std::path::Path, terminal: &mut Tui) -> Result<()> {
     }
 }
 
-fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Result<bool> {
+fn handle_command(
+    cmd: Option<Command>,
+    app: &mut App,
+    terminal: &mut Tui,
+    cursor_visible: &mut bool,
+) -> Result<bool> {
     match cmd {
         Some(Command::Quit) => Ok(true),
         Some(Command::Edit(path)) => {
@@ -108,6 +116,7 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
             if let Err(e) = run_editor(&path, terminal) {
                 app.status = format!("Editor error: {e}");
             }
+            *cursor_visible = true;
             app.reload_workspace();
             Ok(false)
         }
@@ -144,12 +153,14 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) && event.paths.iter().any(|path| {
-                    path.extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| {
-                            extension.eq_ignore_ascii_case("md")
-                                || extension.eq_ignore_ascii_case("mb")
-                        })
+                    path == &app.storage.theme_path
+                        || path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| {
+                                extension.eq_ignore_ascii_case("md")
+                                    || extension.eq_ignore_ascii_case("mb")
+                            })
                 }) =>
             {
                 changed = true;
@@ -166,7 +177,45 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
     }
 }
 
+fn present_frame<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    cursor_visible: &mut bool,
+) -> Result<(), B::Error> {
+    terminal.autoresize()?;
+    let cursor_position = {
+        let mut frame = terminal.get_frame();
+        ui::draw(&mut frame, app)
+    };
+    terminal.flush()?;
+    terminal.swap_buffers();
+    if let Some(position) = cursor_position {
+        terminal.set_cursor_position(position)?;
+        if !*cursor_visible {
+            terminal.show_cursor()?;
+            *cursor_visible = true;
+        }
+    } else if *cursor_visible {
+        terminal.hide_cursor()?;
+        *cursor_visible = false;
+    }
+    terminal.backend_mut().flush()?;
+    Ok(())
+}
+
+/// Present the frame atomically so the terminal never exposes the cursor
+/// movements used to paint animated cells.
+fn draw_frame(terminal: &mut Tui, app: &mut App, cursor_visible: &mut bool) -> Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let frame_result = present_frame(terminal, app, cursor_visible);
+    let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    end_result?;
+    frame_result?;
+    Ok(())
+}
+
 fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Result<()> {
+    let mut cursor_visible = true;
     loop {
         process_workspace_events(workspace_events, app);
         app.poll_agent();
@@ -179,7 +228,7 @@ fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Res
             output.flush()?;
         }
         app.advance_animation();
-        terminal.draw(|f| ui::draw(f, app))?;
+        draw_frame(terminal, app, &mut cursor_visible)?;
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
@@ -204,7 +253,7 @@ fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Res
                     continue;
                 }
                 flush_wheel(&mut pending_wheel, app);
-                if handle_command(app.handle_mouse(mouse), app, terminal)? {
+                if handle_command(app.handle_mouse(mouse), app, terminal, &mut cursor_visible)? {
                     quit = true;
                     break;
                 }
@@ -213,7 +262,7 @@ fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Res
             flush_wheel(&mut pending_wheel, app);
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if handle_command(app.handle_key(key), app, terminal)? {
+                    if handle_command(app.handle_key(key), app, terminal, &mut cursor_visible)? {
                         quit = true;
                         break;
                     }
@@ -281,10 +330,40 @@ mod tests {
     use std::fs;
 
     use notify::event::ModifyKind;
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
     use super::*;
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
+
+    #[test]
+    fn present_frame_changes_cursor_visibility_only_with_input_focus() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut cursor_visible = true;
+
+        present_frame(&mut terminal, &mut app, &mut cursor_visible).unwrap();
+        assert!(!cursor_visible);
+        assert!(!terminal.backend().cursor_visible());
+
+        app.focus = app::Focus::Compose;
+        present_frame(&mut terminal, &mut app, &mut cursor_visible).unwrap();
+
+        let compose = app.layout.compose.expect("compose layout");
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(cursor_visible);
+        assert!(terminal.backend().cursor_visible());
+        assert!(cursor.x > compose.x && cursor.x < compose.right() - 1);
+        assert!(cursor.y > compose.y && cursor.y < compose.bottom() - 1);
+
+        app.advance_animation();
+        present_frame(&mut terminal, &mut app, &mut cursor_visible).unwrap();
+        assert!(cursor_visible);
+        assert!(terminal.backend().cursor_visible());
+    }
 
     #[test]
     fn markdown_change_events_reload_the_visible_workspace() {
@@ -340,6 +419,26 @@ mod tests {
         process_workspace_events(&receiver, &mut app);
 
         assert!(app.daily_notes.is_empty());
+    }
+
+    #[test]
+    fn root_theme_change_events_reload_the_theme() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+        let custom =
+            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        fs::write(&app.storage.theme_path, custom).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(app.storage.theme_path.clone())))
+            .unwrap();
+        process_workspace_events(&receiver, &mut app);
+
+        assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
     }
 
     #[test]
