@@ -3,16 +3,20 @@ use mbtui::{CornerStyle, Theme as MarkdownTheme};
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
-pub const DEFAULT_THEME_TOML: &str = r##"# Nole semantic color tokens. Values must use the #RRGGBB format.
+pub const DEFAULT_THEME_TOML: &str = r##"# Nole semantic color tokens. Values accept #RRGGBB or "terminal".
+# For background tokens, "terminal" means the terminal's own default background color.
 [surface]
+canvas = "terminal"
 panel = "#181825"
+compose = "#313244"
 overlay = "#11111b"
 selection = "#45475a"
 selection_inactive = "#313244"
 message_user = "#313244"
 message_agent = "#1e1e2e"
-footer = "#89b4fa"
-footer_mode = "#74c7ec"
+status_bar = "terminal"
+status_context = "#89b4fa"
+status_mode = "#74c7ec"
 
 [text]
 primary = "#cdd6f4"
@@ -88,14 +92,17 @@ pub mod catppuccin {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
+    pub surface_canvas: Color,
     pub surface_panel: Color,
+    pub surface_compose: Color,
     pub surface_overlay: Color,
     pub surface_selection: Color,
     pub surface_selection_inactive: Color,
     pub surface_message_user: Color,
     pub surface_message_agent: Color,
-    pub surface_footer: Color,
-    pub surface_footer_mode: Color,
+    pub surface_status_bar: Color,
+    pub surface_status_context: Color,
+    pub surface_status_mode: Color,
     pub text_primary: Color,
     pub text_secondary: Color,
     pub text_muted: Color,
@@ -154,14 +161,17 @@ struct ThemeFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SurfaceTokens {
+    canvas: String,
     panel: String,
+    compose: String,
     overlay: String,
     selection: String,
     selection_inactive: String,
     message_user: String,
     message_agent: String,
-    footer: String,
-    footer_mode: String,
+    status_bar: String,
+    status_context: String,
+    status_mode: String,
 }
 
 #[derive(Deserialize)]
@@ -231,7 +241,9 @@ impl Theme {
     pub fn from_toml(source: &str) -> Result<Self> {
         let file: ThemeFile = toml::from_str(source).context("parsing theme TOML")?;
         Ok(Self {
+            surface_canvas: parse_color("surface.canvas", &file.surface.canvas)?,
             surface_panel: parse_color("surface.panel", &file.surface.panel)?,
+            surface_compose: parse_color("surface.compose", &file.surface.compose)?,
             surface_overlay: parse_color("surface.overlay", &file.surface.overlay)?,
             surface_selection: parse_color("surface.selection", &file.surface.selection)?,
             surface_selection_inactive: parse_color(
@@ -243,8 +255,12 @@ impl Theme {
                 "surface.message_agent",
                 &file.surface.message_agent,
             )?,
-            surface_footer: parse_color("surface.footer", &file.surface.footer)?,
-            surface_footer_mode: parse_color("surface.footer_mode", &file.surface.footer_mode)?,
+            surface_status_bar: parse_color("surface.status_bar", &file.surface.status_bar)?,
+            surface_status_context: parse_color(
+                "surface.status_context",
+                &file.surface.status_context,
+            )?,
+            surface_status_mode: parse_color("surface.status_mode", &file.surface.status_mode)?,
             text_primary: parse_color("text.primary", &file.text.primary)?,
             text_secondary: parse_color("text.secondary", &file.text.secondary)?,
             text_muted: parse_color("text.muted", &file.text.muted)?,
@@ -355,12 +371,20 @@ impl Default for Theme {
 fn parse_gradient(values: &[String; 6]) -> Result<[Color; 6]> {
     let mut colors = [Color::Reset; 6];
     for (index, value) in values.iter().enumerate() {
-        colors[index] = parse_color(&format!("animation.gradient[{index}]"), value)?;
+        colors[index] = parse_rgb_color(&format!("animation.gradient[{index}]"), value)?;
     }
     Ok(colors)
 }
 
 fn parse_color(field: &str, value: &str) -> Result<Color> {
+    if value == "terminal" {
+        return Ok(Color::Reset);
+    }
+    parse_rgb_color(field, value)
+        .with_context(|| format!("{field} must use #RRGGBB or \"terminal\""))
+}
+
+fn parse_rgb_color(field: &str, value: &str) -> Result<Color> {
     let Some(hex) = value.strip_prefix('#').filter(|hex| hex.len() == 6) else {
         bail!("{field} must use #RRGGBB, got {value:?}");
     };
@@ -380,9 +404,12 @@ mod tests {
     #[test]
     fn default_file_reproduces_the_current_theme() {
         let theme = Theme::from_toml(DEFAULT_THEME_TOML).unwrap();
+        assert_eq!(theme.surface_canvas, Color::Reset);
+        assert_eq!(theme.surface_status_bar, Color::Reset);
+        assert_eq!(theme.surface_compose, Color::Rgb(49, 50, 68));
         assert_eq!(theme.ui_page_heading, Color::Rgb(180, 190, 254));
         assert_eq!(theme.markdown_code_block_background, Color::Rgb(49, 50, 68));
-        assert_eq!(theme.surface_footer, Color::Rgb(137, 180, 250));
+        assert_eq!(theme.surface_status_context, Color::Rgb(137, 180, 250));
         let markdown = theme.markdown_theme();
         assert_eq!(markdown.heading_1.fg, Some(theme.markdown_heading_1));
         assert_eq!(
@@ -421,5 +448,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("parsing theme TOML"));
+
+        let terminal_gradient =
+            DEFAULT_THEME_TOML.replace("gradient = [\"#89dceb\"", "gradient = [\"terminal\"");
+        assert!(Theme::from_toml(&terminal_gradient)
+            .unwrap_err()
+            .to_string()
+            .contains("animation.gradient[0]"));
     }
 }

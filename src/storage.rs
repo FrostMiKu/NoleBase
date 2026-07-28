@@ -11,17 +11,52 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
+use serde::{Deserialize, Serialize};
 
 use crate::model::{DailyNote, NoteFile, SearchHit, TodoItem};
+use crate::theme::Theme;
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
-const THEME_FILE: &str = "theme.toml";
+const SETTINGS_FILE: &str = "settings.toml";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
+const THEMES_DIR: &str = "themes";
 const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
 const ARCHIVES_DIR: &str = "archives";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsFile {
+    theme: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedTheme {
+    pub requested: String,
+    pub active: String,
+    pub source: Option<PathBuf>,
+    pub theme: Theme,
+}
+
+impl LoadedTheme {
+    fn built_in_default_for(requested: &str) -> Self {
+        Self {
+            requested: requested.to_string(),
+            active: "default".to_string(),
+            source: None,
+            theme: Theme::default(),
+        }
+    }
+}
+
+fn serialize_settings(theme: &str) -> Result<String> {
+    toml::to_string_pretty(&SettingsFile {
+        theme: theme.to_string(),
+    })
+    .context("serializing settings")
+}
 
 /// Filesystem locations backing the notes.
 #[derive(Debug, Clone)]
@@ -32,7 +67,8 @@ pub struct Storage {
     pub daily_dir: PathBuf,
     pub archives_dir: PathBuf,
     pub ai_config_path: PathBuf,
-    pub theme_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub themes_dir: PathBuf,
     pub agents_path: PathBuf,
     pub memory_path: PathBuf,
 }
@@ -54,7 +90,8 @@ impl Storage {
             daily_dir: root.join(DAILY_DIR),
             archives_dir: root.join(ARCHIVES_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
-            theme_path: root.join(THEME_FILE),
+            settings_path: root.join(CONFIG_DIR).join(SETTINGS_FILE),
+            themes_dir: root.join(THEMES_DIR),
             agents_path: root.join(CONFIG_DIR).join(AGENTS_FILE),
             memory_path: root.join(MEMORY_FILE),
             root,
@@ -73,11 +110,17 @@ impl Storage {
             .with_context(|| format!("creating {}", self.daily_dir.display()))?;
         fs::create_dir_all(&self.archives_dir)
             .with_context(|| format!("creating {}", self.archives_dir.display()))?;
+        fs::create_dir_all(&self.themes_dir)
+            .with_context(|| format!("creating {}", self.themes_dir.display()))?;
+        let default_theme_path = self.themes_dir.join("default.toml");
+        if !default_theme_path.exists() {
+            self.write_default_theme(&default_theme_path)?;
+        }
         if !self.ai_config_path.exists() {
             self.write_default_ai_config()?;
         }
-        if !self.theme_path.exists() {
-            self.write_default_theme()?;
+        if !self.settings_path.exists() {
+            self.write_default_settings()?;
         }
         create_empty_file(&self.agents_path)?;
         create_empty_file(&self.memory_path)?;
@@ -109,21 +152,159 @@ impl Storage {
         Ok(())
     }
 
-    fn write_default_theme(&self) -> Result<()> {
+    fn write_default_settings(&self) -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&self.theme_path)
-            .with_context(|| format!("creating {}", self.theme_path.display()))?;
+            .open(&self.settings_path)
+            .with_context(|| format!("creating {}", self.settings_path.display()))?;
+        file.write_all(serialize_settings("default")?.as_bytes())?;
+        Ok(())
+    }
+
+    fn write_default_theme(&self, path: &Path) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
         file.write_all(crate::theme::DEFAULT_THEME_TOML.as_bytes())?;
         Ok(())
     }
 
-    pub fn load_theme(&self) -> Result<crate::theme::Theme> {
-        let source = fs::read_to_string(&self.theme_path)
-            .with_context(|| format!("reading {}", self.theme_path.display()))?;
-        crate::theme::Theme::from_toml(&source)
-            .with_context(|| format!("loading {}", self.theme_path.display()))
+    pub fn load_theme(&self, previous_random_source: Option<&Path>) -> Result<LoadedTheme> {
+        let requested = self.load_theme_selection()?;
+        self.resolve_theme(&requested, previous_random_source)
+    }
+
+    pub fn load_theme_selection(&self) -> Result<String> {
+        let source = match fs::read_to_string(&self.settings_path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok("default".to_string())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading {}", self.settings_path.display()))
+            }
+        };
+        let settings: SettingsFile = toml::from_str(&source)
+            .with_context(|| format!("parsing {}", self.settings_path.display()))?;
+        Ok(settings.theme)
+    }
+
+    pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
+        fs::write(&self.settings_path, serialize_settings(selection)?)
+            .with_context(|| format!("writing {}", self.settings_path.display()))
+    }
+
+    pub fn select_theme(&self, selection: &str) -> Result<LoadedTheme> {
+        let loaded = self.resolve_theme(selection, None)?;
+        self.write_theme_selection(selection)?;
+        Ok(loaded)
+    }
+
+    pub fn list_theme_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .theme_files()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    fn resolve_theme(
+        &self,
+        requested: &str,
+        previous_random_source: Option<&Path>,
+    ) -> Result<LoadedTheme> {
+        if requested == "default" {
+            return self.load_default_theme(requested);
+        }
+
+        let files = self.theme_files()?;
+        if requested == "random" {
+            if let Some(previous) = previous_random_source {
+                if let Some((name, path)) = files.iter().find(|(_, path)| path == previous) {
+                    return self.load_theme_file(requested, name, path);
+                }
+            }
+
+            let mut valid = Vec::new();
+            for (name, path) in &files {
+                if let Ok(theme) = self.parse_theme_file(path) {
+                    valid.push((name, path, theme));
+                }
+            }
+            if valid.is_empty() {
+                return self.load_default_theme(requested);
+            }
+            let (name, path, theme) = valid.swap_remove(fastrand::usize(..valid.len()));
+            return Ok(LoadedTheme {
+                requested: requested.to_string(),
+                active: name.clone(),
+                source: Some(path.clone()),
+                theme,
+            });
+        }
+
+        match files.into_iter().find(|(name, _)| name == requested) {
+            Some((name, path)) => self.load_theme_file(requested, &name, &path),
+            None => self.load_default_theme(requested),
+        }
+    }
+
+    fn load_default_theme(&self, requested: &str) -> Result<LoadedTheme> {
+        let path = self.themes_dir.join("default.toml");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                self.load_theme_file(requested, "default", &path)
+            }
+            Ok(_) => Ok(LoadedTheme::built_in_default_for(requested)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(LoadedTheme::built_in_default_for(requested))
+            }
+            Err(error) => Err(error).with_context(|| format!("reading theme {}", path.display())),
+        }
+    }
+
+    fn load_theme_file(&self, requested: &str, name: &str, path: &Path) -> Result<LoadedTheme> {
+        Ok(LoadedTheme {
+            requested: requested.to_string(),
+            active: name.to_string(),
+            source: Some(path.to_path_buf()),
+            theme: self.parse_theme_file(path)?,
+        })
+    }
+
+    fn parse_theme_file(&self, path: &Path) -> Result<Theme> {
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("reading theme {}", path.display()))?;
+        Theme::from_toml(&source).with_context(|| format!("loading theme {}", path.display()))
+    }
+
+    fn theme_files(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut themes = Vec::new();
+        for entry in fs::read_dir(&self.themes_dir)
+            .with_context(|| format!("reading {}", self.themes_dir.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let is_toml = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"));
+            let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if is_toml && !name.is_empty() && name != "default" && name != "random" {
+                themes.push((name.to_string(), path));
+            }
+        }
+        themes.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(themes)
     }
 
     /// Load one card per daily file, oldest first.
@@ -1271,26 +1452,40 @@ mod tests {
         assert!(st.data_dir.is_dir());
         assert!(st.daily_dir.is_dir());
         assert!(st.archives_dir.is_dir());
+        assert!(st.themes_dir.is_dir());
         assert!(fs::read_dir(&st.daily_dir).unwrap().next().is_none());
         assert!(st.append_daily("2026-07-27", "   ").is_err());
         assert!(!st.daily_dir.join("2026-07-27.md").exists());
         assert!(st.ai_config_path.exists());
-        assert!(st.theme_path.exists());
+        assert!(st.settings_path.exists());
+        let default_theme_path = st.themes_dir.join("default.toml");
+        assert!(default_theme_path.exists());
         assert!(st.agents_path.exists());
         assert!(st.memory_path.exists());
         assert_eq!(fs::read_to_string(&st.agents_path).unwrap(), "");
         assert_eq!(fs::read_to_string(&st.memory_path).unwrap(), "");
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
-        assert_eq!(st.theme_path.parent(), Some(st.root.as_path()));
+        assert_eq!(st.settings_path.parent(), Some(st.config_dir.as_path()));
+        assert_eq!(st.themes_dir.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
         assert!(config.contains("api_key = \"\""));
         assert!(config.contains("tavily_api_key = \"\""));
         assert!(config.contains("max_tokens = 8192"));
         assert!(config.contains("context_window_tokens = 200000"));
         assert!(config.contains("max_rounds = 25"));
-        let theme = fs::read_to_string(&st.theme_path).unwrap();
-        assert_eq!(theme, crate::theme::DEFAULT_THEME_TOML);
-        assert_eq!(st.load_theme().unwrap(), crate::theme::Theme::default());
+        assert_eq!(
+            fs::read_to_string(&st.settings_path).unwrap(),
+            "theme = \"default\"\n"
+        );
+        let loaded = st.load_theme(None).unwrap();
+        assert_eq!(loaded.requested, "default");
+        assert_eq!(loaded.active, "default");
+        assert_eq!(loaded.source.as_deref(), Some(default_theme_path.as_path()));
+        assert_eq!(loaded.theme, crate::theme::Theme::default());
+        assert_eq!(
+            fs::read_to_string(default_theme_path).unwrap(),
+            crate::theme::DEFAULT_THEME_TOML
+        );
     }
 
     #[test]
@@ -1312,19 +1507,70 @@ mod tests {
     }
 
     #[test]
-    fn ensure_files_preserves_and_loads_a_custom_root_theme() {
+    fn custom_theme_selection_is_preserved_and_loaded() {
         let (_directory, storage) = fresh();
         let custom = crate::theme::DEFAULT_THEME_TOML
             .replace("message_agent = \"#1e1e2e\"", "message_agent = \"#010203\"");
-        fs::write(&storage.theme_path, &custom).unwrap();
+        let path = storage.themes_dir.join("custom.toml");
+        fs::write(&path, &custom).unwrap();
+        storage.write_theme_selection("custom").unwrap();
 
         storage.ensure_files().unwrap();
 
-        assert_eq!(fs::read_to_string(&storage.theme_path).unwrap(), custom);
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
+        assert_eq!(storage.load_theme_selection().unwrap(), "custom");
+        let loaded = storage.load_theme(None).unwrap();
+        assert_eq!(loaded.requested, "custom");
+        assert_eq!(loaded.active, "custom");
+        assert_eq!(loaded.source.as_deref(), Some(path.as_path()));
         assert_eq!(
-            storage.load_theme().unwrap().surface_message_agent,
+            loaded.theme.surface_message_agent,
             ratatui::style::Color::Rgb(1, 2, 3)
         );
+    }
+
+    #[test]
+    fn missing_and_random_theme_selections_fall_back_or_resolve() {
+        let (_directory, storage) = fresh();
+        let default_path = storage.themes_dir.join("default.toml");
+        let edited_default =
+            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#090807\"");
+        fs::write(&default_path, &edited_default).unwrap();
+        storage.ensure_files().unwrap();
+        assert_eq!(fs::read_to_string(&default_path).unwrap(), edited_default);
+        storage.write_theme_selection("missing").unwrap();
+        let missing = storage.load_theme(None).unwrap();
+        assert_eq!(missing.requested, "missing");
+        assert_eq!(missing.active, "default");
+        assert_eq!(missing.source.as_deref(), Some(default_path.as_path()));
+        assert_eq!(
+            missing.theme.surface_panel,
+            ratatui::style::Color::Rgb(9, 8, 7)
+        );
+
+        let custom =
+            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        let path = storage.themes_dir.join("only.toml");
+        fs::write(&path, custom).unwrap();
+        let random = storage.select_theme("random").unwrap();
+        assert_eq!(random.requested, "random");
+        assert_eq!(random.active, "only");
+        assert_eq!(random.source.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            random.theme.surface_panel,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
+
+        let reloaded = storage.load_theme(random.source.as_deref()).unwrap();
+        assert_eq!(reloaded.active, "only");
+        assert_eq!(reloaded.source, random.source);
+
+        fs::remove_file(default_path).unwrap();
+        storage.write_theme_selection("missing").unwrap();
+        let built_in = storage.load_theme(None).unwrap();
+        assert_eq!(built_in.active, "default");
+        assert_eq!(built_in.source, None);
+        assert_eq!(built_in.theme, crate::theme::Theme::default());
     }
 
     #[test]

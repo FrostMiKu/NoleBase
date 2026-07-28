@@ -121,7 +121,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
 
     let root = frame.area();
     frame.render_widget(
-        Block::default().style(Style::default().fg(app.theme.text_primary)),
+        Block::default().style(
+            Style::default()
+                .fg(app.theme.text_primary)
+                .bg(app.theme.surface_canvas),
+        ),
         root,
     );
     let (body, footer) = body_and_footer(root);
@@ -1897,7 +1901,7 @@ fn draw_compose(
         } else {
             " Compose · i "
         })
-        .style(Style::default().bg(app.theme.surface_panel))
+        .style(Style::default().bg(app.theme.surface_compose))
         .border_style(focus_border(focused, app.theme));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2388,7 +2392,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let surface_segment = format!(" {surface} ");
     let permission_segment = format!(" {} ", app.permission_mode.label());
     let surface_style = Style::default()
-        .bg(app.theme.surface_footer)
+        .bg(app.theme.surface_status_context)
         .fg(app.theme.text_on_accent);
     let mode_line = if app.permission_mode == PermissionMode::Bypass {
         let mut spans = vec![Span::styled(surface_segment.clone(), surface_style)];
@@ -2410,12 +2414,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 permission_segment.clone(),
                 Style::default()
-                    .bg(app.theme.surface_footer_mode)
+                    .bg(app.theme.surface_status_mode)
                     .fg(app.theme.text_on_accent),
             ),
         ])
     };
-    frame.render_widget(Paragraph::new(mode_line), area);
+    let status_bar_style = Style::default().bg(app.theme.surface_status_bar);
+    frame.render_widget(Paragraph::new(mode_line).style(status_bar_style), area);
 
     let hint = footer_hint(app, area.width);
     let mode_width = surface_segment
@@ -2432,7 +2437,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(app.theme.ui_warning),
         ));
         frame.render_widget(
-            Paragraph::new(status),
+            Paragraph::new(status).style(status_bar_style),
             Rect::new(area.x + mode_width, area.y, available_status, area.height),
         );
     }
@@ -2443,6 +2448,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 hint,
                 Style::default().fg(app.theme.text_muted),
             ))
+            .style(status_bar_style)
             .alignment(Alignment::Right),
             Rect::new(area.x + area.width - width, area.y, width, area.height),
         );
@@ -3344,15 +3350,29 @@ mod tests {
     fn rendering_uses_colors_loaded_from_the_app_theme() {
         let (mut app, _directory) = make_app();
         let custom = crate::theme::DEFAULT_THEME_TOML
+            .replace("canvas = \"terminal\"", "canvas = \"#0a0b0c\"")
             .replace("panel = \"#181825\"", "panel = \"#010203\"")
-            .replace("footer = \"#89b4fa\"", "footer = \"#040506\"")
+            .replace("compose = \"#313244\"", "compose = \"#0d0e0f\"")
+            .replace("status_bar = \"terminal\"", "status_bar = \"#101112\"")
+            .replace(
+                "status_context = \"#89b4fa\"",
+                "status_context = \"#040506\"",
+            )
             .replace("heading_1 = \"#b4befe\"", "heading_1 = \"#070809\"");
         app.theme = Theme::from_toml(&custom).unwrap();
 
-        let terminal = render(&mut app, 170, 24);
+        let terminal = render(&mut app, 220, 24);
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(1, 1)].bg, Color::Rgb(1, 2, 3));
+        let center = app.layout.center.unwrap();
+        assert_eq!(buffer[(center.x, 0)].bg, Color::Rgb(10, 11, 12));
+        let compose = app.layout.compose.unwrap();
+        assert_eq!(
+            buffer[(compose.x + 1, compose.y + 1)].bg,
+            Color::Rgb(13, 14, 15)
+        );
         assert_eq!(buffer[(0, 23)].bg, Color::Rgb(4, 5, 6));
+        assert_eq!(buffer[(219, 23)].bg, Color::Rgb(16, 17, 18));
 
         let markdown = crate::markdown::render_at_width("# Heading", 40, app.theme);
         assert!(markdown
@@ -4310,7 +4330,7 @@ mod tests {
         let content = inset_horizontal(center_content_axis(center), 2);
         assert!(compose.x > content.x);
         assert_eq!(buffer[(content.x, compose.y + 1)].bg, ctp::MANTLE);
-        assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::MANTLE);
+        assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::SURFACE_0);
         let last_paragraph_y = (0..buffer.area().height)
             .find(|y| {
                 (0..buffer.area().width)
@@ -4802,7 +4822,8 @@ mod tests {
             .code_block
             .bg
             .expect("the default code block theme has a background");
-        let rows = (0..buffer.area().height)
+        let compose = app.layout.compose.expect("document compose");
+        let rows = (0..compose.y)
             .filter(|y| (0..buffer.area().width).any(|x| buffer[(x, *y)].bg == background))
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 7);

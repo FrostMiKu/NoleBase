@@ -23,7 +23,7 @@ use crate::model::{
     WikiLinkCandidate, WikiLinkHitbox,
 };
 use crate::notification::NotificationService;
-use crate::storage::Storage;
+use crate::storage::{LoadedTheme, Storage};
 
 fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
     col >= area.x
@@ -177,7 +177,7 @@ enum AppCommand {
     ArchiveCurrentNote,
     RestoreCurrentNote,
     EditAiConfig,
-    EditTheme,
+    SwitchTheme,
     EditAgentInstructions,
     EditAgentMemory,
 }
@@ -245,10 +245,10 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         keywords: "config configuration ai anthropic tavily model settings editor",
     },
     AppCommandDefinition {
-        id: AppCommand::EditTheme,
-        label: "Theme: Edit colors",
-        description: "Open theme.toml in your editor",
-        keywords: "theme colors palette appearance settings editor",
+        id: AppCommand::SwitchTheme,
+        label: "Theme: Switch",
+        description: "Choose the active theme",
+        keywords: "theme switch colors palette appearance random default",
     },
     AppCommandDefinition {
         id: AppCommand::EditAgentInstructions,
@@ -383,6 +383,7 @@ pub enum DialogPurpose {
     NewFile,
     RenameFile,
     CommandPalette,
+    ThemePicker,
     Custom,
 }
 
@@ -688,6 +689,9 @@ impl Default for AgentVirtualList {
 pub struct App {
     pub storage: Storage,
     pub theme: crate::theme::Theme,
+    pub theme_selection: String,
+    pub active_theme: String,
+    pub theme_source: Option<PathBuf>,
     pub(crate) images: crate::media::ImageService,
 
     pub focus: Focus,
@@ -794,7 +798,7 @@ pub struct App {
 
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
-        let theme = storage.load_theme()?;
+        let loaded_theme = storage.load_theme(None)?;
         let daily_notes = storage.load_daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
         let mut note_files = storage.list_note_files()?;
@@ -805,7 +809,10 @@ impl App {
         let images = crate::media::ImageService::new(&storage.root);
         Ok(Self {
             storage,
-            theme,
+            theme: loaded_theme.theme,
+            theme_selection: loaded_theme.requested,
+            active_theme: loaded_theme.active,
+            theme_source: loaded_theme.source,
             images,
             focus: Focus::Center,
             center_view: CenterView::Daily,
@@ -939,19 +946,29 @@ impl App {
         self.todo_index = self.todo_index.min(self.todo_items.len().saturating_sub(1));
     }
 
+    fn apply_loaded_theme(&mut self, loaded: LoadedTheme) {
+        let colors_changed = loaded.theme != self.theme;
+        self.theme = loaded.theme;
+        self.theme_selection = loaded.requested;
+        self.active_theme = loaded.active;
+        self.theme_source = loaded.source;
+        if colors_changed {
+            self.document_render_lru = DocumentRenderLru::default();
+            if let Some(document) = self.document.as_mut() {
+                document.render_cache = None;
+            }
+            self.daily_vlist = DailyVirtualList::default();
+            self.agent_vlist = AgentVirtualList::default();
+        }
+    }
+
     /// Reload everything that may have changed while `$EDITOR` was running.
     pub fn reload_workspace(&mut self) {
-        match self.storage.load_theme() {
-            Ok(theme) if theme != self.theme => {
-                self.theme = theme;
-                self.document_render_lru = DocumentRenderLru::default();
-                if let Some(document) = self.document.as_mut() {
-                    document.render_cache = None;
-                }
-                self.daily_vlist = DailyVirtualList::default();
-                self.agent_vlist = AgentVirtualList::default();
-            }
-            Ok(_) => {}
+        let previous_random_source = (self.theme_selection == "random")
+            .then_some(self.theme_source.as_deref())
+            .flatten();
+        match self.storage.load_theme(previous_random_source) {
+            Ok(loaded) => self.apply_loaded_theme(loaded),
             Err(error) => self.set_status(format!("Theme reload error: {error}")),
         }
         self.reload();
@@ -1324,6 +1341,41 @@ impl App {
         self.refresh_command_palette();
     }
 
+    fn open_theme_picker(&mut self) {
+        let names = match self.storage.list_theme_names() {
+            Ok(names) => names,
+            Err(error) => {
+                self.set_status(format!("Theme list error: {error}"));
+                return;
+            }
+        };
+        let mut options = vec![
+            DialogOption::with_hint("default", "themes/default.toml"),
+            DialogOption::with_hint("random", "Choose a custom theme at random"),
+        ];
+        options.extend(names.into_iter().map(|name| {
+            let hint = if name == self.active_theme {
+                "Custom theme · active"
+            } else {
+                "Custom theme"
+            };
+            DialogOption::with_hint(name, hint)
+        }));
+        let selected = options
+            .iter()
+            .position(|option| option.label == self.theme_selection)
+            .unwrap_or(0);
+        let mut dialog = DialogState::new(
+            "Theme · Enter apply",
+            format!("Active: {}", self.active_theme),
+            DialogMode::SingleSelect,
+            DialogPurpose::ThemePicker,
+            options,
+        );
+        dialog.selected = selected;
+        self.open_dialog(dialog);
+    }
+
     fn refresh_command_palette(&mut self) {
         let query = self
             .dialog
@@ -1379,9 +1431,7 @@ impl App {
             AppCommand::EditAiConfig => {
                 return Some(Command::Edit(self.storage.ai_config_path.clone()))
             }
-            AppCommand::EditTheme => {
-                return Some(Command::Edit(self.storage.theme_path.clone()));
-            }
+            AppCommand::SwitchTheme => self.open_theme_picker(),
             AppCommand::EditAgentInstructions => {
                 return Some(Command::Edit(self.storage.agents_path.clone()));
             }
@@ -1403,7 +1453,7 @@ impl App {
             AppCommand::ArchiveCurrentNote => self.current_note_archived() == Some(false),
             AppCommand::RestoreCurrentNote => self.current_note_archived() == Some(true),
             AppCommand::EditAiConfig
-            | AppCommand::EditTheme
+            | AppCommand::SwitchTheme
             | AppCommand::EditAgentInstructions
             | AppCommand::EditAgentMemory => true,
         }
@@ -2669,6 +2719,7 @@ impl App {
             }
             DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
+            DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
             DialogPurpose::AgentPrompt | DialogPurpose::NewFile | DialogPurpose::RenameFile => {
                 return self.handle_text_dialog(key)
             }
@@ -2727,6 +2778,37 @@ impl App {
             DialogMode::FreeText => return self.handle_text_dialog(key),
             DialogMode::CommandPalette => return self.handle_command_palette(key),
             DialogMode::Approval | DialogMode::Informational => {}
+        }
+        None
+    }
+
+    fn handle_theme_picker(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_dialog(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
+            KeyCode::Enter => {
+                let selection = self
+                    .dialog
+                    .as_ref()
+                    .and_then(DialogState::selected_option)
+                    .map(|option| option.label.clone());
+                let selection = selection?;
+                match self.storage.select_theme(&selection) {
+                    Ok(loaded) => {
+                        let active = loaded.active.clone();
+                        self.apply_loaded_theme(loaded);
+                        self.set_status(if selection == active {
+                            format!("Theme: {active}")
+                        } else {
+                            format!("Theme: {active} ({selection})")
+                        });
+                        self.close_dialog();
+                    }
+                    Err(error) => self.set_status(format!("Theme switch error: {error}")),
+                }
+            }
+            _ => {}
         }
         None
     }
@@ -4716,7 +4798,6 @@ mod tests {
 
         for (query, expected) in [
             ("ai settings", app.storage.ai_config_path.clone()),
-            ("theme colors", app.storage.theme_path.clone()),
             ("agent instructions", app.storage.agents_path.clone()),
             ("agent memory", app.storage.memory_path.clone()),
         ] {
@@ -4726,6 +4807,32 @@ mod tests {
             assert_eq!(command, Some(Command::Edit(expected)));
             assert_eq!(app.overlay, None);
         }
+    }
+
+    #[test]
+    fn command_palette_switches_theme_and_persists_the_selection() {
+        let (mut app, _directory) = make_app();
+        let custom =
+            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        fs::write(app.storage.themes_dir.join("custom.toml"), custom).unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("theme switch");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::ThemePicker)
+        );
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.theme_selection, "custom");
+        assert_eq!(app.active_theme, "custom");
+        assert_eq!(app.storage.load_theme_selection().unwrap(), "custom");
+        assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
     }
 
     #[test]
@@ -5180,7 +5287,8 @@ mod tests {
         app.agent_vlist.width = 40;
         let custom =
             crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
-        fs::write(&app.storage.theme_path, custom).unwrap();
+        fs::write(app.storage.themes_dir.join("custom.toml"), custom).unwrap();
+        app.storage.write_theme_selection("custom").unwrap();
 
         app.reload_workspace();
 

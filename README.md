@@ -171,10 +171,13 @@ Data lives under `${NOLE_DIR}` when that environment variable is set, otherwise
 under `~/.nole`:
 
 ```text
-config/         # AI configuration
+config/         # private application configuration
   ai.toml       # Anthropic and optional Tavily configuration
+  settings.toml # selected theme
   AGENTS.md      # user-authored Agent instructions
-theme.toml      # application and MBDown colors
+themes/         # Agent-editable application and MBDown themes
+  default.toml   # generated current default colors
+  <name>.toml    # additional custom themes
 MEMORY.md       # Agent-maintained persistent memory
 daily/         # chat cards; absent dates have no file
   YYYY-MM-DD.md
@@ -197,13 +200,24 @@ overwriting an existing file.
 
 ### Theme
 
-On first start Nole also creates `theme.toml` directly under the Nole root. It
-contains semantic `#RRGGBB` tokens grouped under `[surface]`, `[text]`, `[ui]`,
-`[markdown]`, and `[animation]`. Tokens describe their role rather than a
-palette color, so UI and Markdown roles can be changed independently. Editing
-it changes the application chrome, Markdown styles, image fallback labels, and
-animated accents. Use `Theme: Edit colors` from the command palette; changes
-made by the editor or Agent are loaded automatically.
+On first start Nole creates `themes/default.toml` with its current colors and
+writes `theme = "default"` to `config/settings.toml`. Each direct
+`themes/<name>.toml` file contains semantic `#RRGGBB` tokens grouped under
+`[surface]`, `[text]`, `[ui]`, `[markdown]`, and `[animation]`. The reserved
+`default` option uses `themes/default.toml`, falling back to Nole's built-in
+colors if that file is absent. `random` chooses one valid custom theme when it
+is selected and on each startup. A selected custom theme that does not exist
+also falls back to `default`.
+
+Regular color tokens accept either `#RRGGBB` or `"terminal"`; the latter uses
+the terminal's own default color and is especially useful for `surface.canvas`
+and `surface.status_bar`. Animation gradient entries must remain `#RRGGBB`.
+
+Use `Theme: Switch` from the command palette to choose `default`, `random`, or
+any custom theme. The selection is saved to `config/settings.toml`. Changes to
+that file or to a direct TOML file under `themes/` are loaded automatically.
+Because `themes/` is outside `config/`, the Agent can create and edit custom
+themes without gaining access to private configuration.
 
 ### AI agent
 

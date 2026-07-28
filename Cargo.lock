@@ -1446,6 +1446,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "dirs",
+ "fastrand",
  "image",
  "mbdown",
  "mbtui",

@@ -153,7 +153,12 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) {
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) && event.paths.iter().any(|path| {
-                    path == &app.storage.theme_path
+                    path == &app.storage.settings_path
+                        || (path.parent() == Some(app.storage.themes_dir.as_path())
+                            && path
+                                .extension()
+                                .and_then(|extension| extension.to_str())
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml")))
                         || path
                             .extension()
                             .and_then(|extension| extension.to_str())
@@ -422,23 +427,37 @@ mod tests {
     }
 
     #[test]
-    fn root_theme_change_events_reload_the_theme() {
+    fn settings_and_theme_file_events_reload_the_theme() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         let mut app = App::new(storage).unwrap();
         let custom =
             crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
-        fs::write(&app.storage.theme_path, custom).unwrap();
+        let theme_path = app.storage.themes_dir.join("custom.toml");
+        fs::write(&theme_path, custom).unwrap();
+        app.storage.write_theme_selection("custom").unwrap();
 
         let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
-                .add_path(app.storage.theme_path.clone())))
+                .add_path(app.storage.settings_path.clone())))
             .unwrap();
         process_workspace_events(&receiver, &mut app);
 
         assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
+
+        let updated =
+            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#040506\"");
+        fs::write(&theme_path, updated).unwrap();
+        sender
+            .send(Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(theme_path)
+            ))
+            .unwrap();
+        process_workspace_events(&receiver, &mut app);
+
+        assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(4, 5, 6));
     }
 
     #[test]

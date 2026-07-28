@@ -3620,9 +3620,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
         fs::create_dir(directory.path().join("daily")).unwrap();
+        fs::create_dir(directory.path().join("themes")).unwrap();
         fs::write(directory.path().join("config/AGENTS.md"), "user rules\n").unwrap();
         fs::write(
-            directory.path().join("theme.toml"),
+            directory.path().join("themes/custom.toml"),
             "[ui]\naction = \"#94e2d5\"\n",
         )
         .unwrap();
@@ -3647,15 +3648,16 @@ mod tests {
             ensure_not_special(directory.path(), &directory.path().join("config/AGENTS.md"))
                 .is_err()
         );
-        read.execute(&json!({"path": "theme.toml"})).unwrap();
+        read.execute(&json!({"path": "themes/custom.toml"}))
+            .unwrap();
         update
             .execute(&json!({
-                "path": "theme.toml",
+                "path": "themes/custom.toml",
                 "edits": [{"start_line": 1, "end_line": 2, "content": "action = \"#010203\"\n"}]
             }))
             .unwrap();
         assert_eq!(
-            fs::read_to_string(directory.path().join("theme.toml")).unwrap(),
+            fs::read_to_string(directory.path().join("themes/custom.toml")).unwrap(),
             "[ui]\naction = \"#010203\"\n"
         );
 
