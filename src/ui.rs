@@ -79,6 +79,39 @@ fn clear_wide_cell(buffer: &mut Buffer, bounds: Rect, x: u16, y: u16) {
     }
 }
 
+/// Prevent Ratatui's VS16-specific diff path from emitting reset-style
+/// continuation cells. Crossterm can otherwise paint a default-background
+/// block after the emoji and shift the remainder of that terminal row.
+fn skip_vs16_continuation_cells(buffer: &mut Buffer) {
+    let area = buffer.area;
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+
+    for y in area.y..bottom {
+        for x in area.x..right {
+            let (cell_width, needs_skip) = {
+                let cell = &buffer[(x, y)];
+                let symbol = cell.symbol();
+                (
+                    UnicodeWidthStr::width(symbol)
+                        .max(1)
+                        .min((right - x) as usize),
+                    symbol.contains('\u{fe0f}')
+                        && matches!(
+                            cell.diff_option,
+                            CellDiffOption::None | CellDiffOption::AlwaysUpdate
+                        ),
+                )
+            };
+            if needs_skip && cell_width > 1 {
+                for offset in 1..cell_width {
+                    buffer[(x + offset as u16, y)].set_diff_option(CellDiffOption::Skip);
+                }
+            }
+        }
+    }
+}
+
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
 /// position without changing the terminal's hardware cursor.
 pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
@@ -116,6 +149,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
         let area = draw_overlay(frame, app, root, overlay, &mut cursor_position);
         app.layout.overlay = non_empty(area);
     }
+    skip_vs16_continuation_cells(frame.buffer_mut());
     cursor_position
 }
 
@@ -3215,6 +3249,26 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn vs16_continuation_cells_are_not_emitted_by_the_buffer_diff() {
+        let area = Rect::new(0, 0, 4, 1);
+        let previous = Buffer::with_lines(["abcd"]);
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "☀️xy", Style::default().bg(Color::Blue));
+
+        skip_vs16_continuation_cells(&mut next);
+
+        assert_eq!(next[(1, 0)].diff_option, CellDiffOption::Skip);
+        let updates = previous.diff(&next);
+        assert!(updates
+            .iter()
+            .any(|(x, _, cell)| *x == 0 && cell.symbol() == "☀️"));
+        assert!(!updates.iter().any(|(x, _, _)| *x == 1));
+        assert!(updates
+            .iter()
+            .any(|(x, _, cell)| *x == 2 && cell.symbol() == "x"));
+    }
+
     use crate::theme::catppuccin as ctp;
 
     fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
@@ -4665,7 +4719,7 @@ mod tests {
         app.focus = Focus::Center;
         app.center_view = CenterView::Document;
         let boxed = (0..40)
-            .map(|line| format!("boxed {line}"))
+            .map(|line| format!("boxed {line} ☀️"))
             .collect::<Vec<_>>()
             .join("\n\n");
         let plain = (0..40)
@@ -4686,11 +4740,24 @@ mod tests {
 
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = draw(frame, &mut app);
-            })
-            .unwrap();
+        {
+            let completed = terminal
+                .draw(|frame| {
+                    let _ = draw(frame, &mut app);
+                })
+                .unwrap();
+            let box_buffer = completed.buffer;
+            let mut saw_vs16 = false;
+            for y in 0..box_buffer.area.height {
+                for x in 0..box_buffer.area.width.saturating_sub(1) {
+                    if box_buffer[(x, y)].symbol().contains('\u{fe0f}') {
+                        saw_vs16 = true;
+                        assert_eq!(box_buffer[(x + 1, y)].diff_option, CellDiffOption::Skip);
+                    }
+                }
+            }
+            assert!(saw_vs16);
+        }
         assert!(terminal
             .backend()
             .buffer()
