@@ -64,6 +64,7 @@ pub struct ButtonHitbox {
 pub enum LinkTarget {
     External(String),
     WikiLink(String),
+    EmbeddedFile(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

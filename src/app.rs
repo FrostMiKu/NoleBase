@@ -156,6 +156,7 @@ pub enum Command {
     Quit,
     Edit(PathBuf),
     OpenLink(String),
+    OpenPath(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -935,7 +936,7 @@ impl App {
                     .and_then(|date| self.daily_notes.iter().position(|note| note.date == date))
                     .unwrap_or_else(|| self.selected.min(self.daily_notes.len().saturating_sub(1)));
             }
-            Err(error) => self.set_status(format!("Reload error: {error}")),
+            Err(error) => self.set_error(format!("Reload error: {error}")),
         }
     }
 
@@ -954,7 +955,7 @@ impl App {
         match self.combined_note_files() {
             Ok(files) => self.note_files = files,
             Err(error) => {
-                self.set_status(format!("Reload error: {error}"));
+                self.set_error(format!("Reload error: {error}"));
                 return;
             }
         }
@@ -1001,7 +1002,7 @@ impl App {
             .flatten();
         match self.storage.load_theme(previous_random_source) {
             Ok(loaded) => self.apply_loaded_theme(loaded),
-            Err(error) => self.set_status(format!("Theme reload error: {error}")),
+            Err(error) => self.set_error(format!("Theme reload error: {error}")),
         }
         self.reload();
         self.reload_files();
@@ -1031,7 +1032,7 @@ impl App {
                     self.document = None;
                     self.center_view = CenterView::Daily;
                     self.focus = Focus::Center;
-                    self.set_status(format!("Reload error: {error}"));
+                    self.set_error(format!("Reload error: {error}"));
                 }
             },
             Some(DocumentKind::Daily(date)) => {
@@ -1046,7 +1047,7 @@ impl App {
                         self.document = None;
                         self.center_view = CenterView::Daily;
                         self.focus = Focus::Center;
-                        self.set_status(format!("Reload error: {error}"));
+                        self.set_error(format!("Reload error: {error}"));
                     }
                 }
             }
@@ -1219,8 +1220,7 @@ impl App {
                             self.agent_panel
                                 .push(AgentPanelEntry::Error(format!("Agent failed: {error}")));
                             self.agent_scroll = u16::MAX;
-                            self.notifications.notify(format!("Agent failed: {error}"));
-                            self.set_status(format!("AI error: {error}"));
+                            self.set_error(format!("AI error: {error}"));
                         }
                     }
                     self.clear_ask_user();
@@ -1247,7 +1247,7 @@ impl App {
             ));
             self.agent_scroll = u16::MAX;
             self.clear_ask_user();
-            self.set_status("AI error: worker stopped unexpectedly");
+            self.set_error("AI error: worker stopped unexpectedly");
         }
         if disconnected && !self.ai_running {
             self.ai_events = None;
@@ -1377,7 +1377,7 @@ impl App {
         let names = match self.storage.list_theme_names() {
             Ok(names) => names,
             Err(error) => {
-                self.set_status(format!("Theme list error: {error}"));
+                self.set_error(format!("Theme list error: {error}"));
                 return;
             }
         };
@@ -2075,6 +2075,15 @@ impl App {
     fn activate_link(&mut self, target: LinkTarget) -> Option<Command> {
         match target {
             LinkTarget::External(target) => Some(Command::OpenLink(target)),
+            LinkTarget::EmbeddedFile(target) => {
+                match self.storage.validate_embedded_file(&target) {
+                    Ok(path) => Some(Command::OpenPath(path)),
+                    Err(error) => {
+                        self.set_error(format!("Embed error: {error}"));
+                        None
+                    }
+                }
+            }
             LinkTarget::WikiLink(target) => {
                 let requested = target.trim().to_string();
                 let mut candidates = self
@@ -2106,7 +2115,7 @@ impl App {
                             self.open_file_document(&path, DocumentReturn::Daily);
                             self.set_status(format!("Created note {}", path.display()));
                         }
-                        Err(error) => self.set_status(format!("Wiki note error: {error}")),
+                        Err(error) => self.set_error(format!("Wiki note error: {error}")),
                     }
                 } else if candidates.len() == 1 {
                     self.open_wiki_candidate(&candidates[0]);
@@ -2148,7 +2157,7 @@ impl App {
                 self.wiki_link_candidates.clear();
                 self.wiki_link_index = 0;
             }
-            Err(error) => self.set_status(format!("Wiki note error: {error}")),
+            Err(error) => self.set_error(format!("Wiki note error: {error}")),
         }
     }
 
@@ -2433,7 +2442,7 @@ impl App {
                             self.set_status(format!("Created note {}", path.display()));
                         }
                     }
-                    Err(error) => self.set_status(format!("Error: {error}")),
+                    Err(error) => self.set_error(format!("Error: {error}")),
                 }
                 None
             }
@@ -2502,7 +2511,7 @@ impl App {
                             self.reload_files();
                             self.files_context = FilesContext::Browse;
                         }
-                        Err(error) => self.set_status(format!("Error: {error}")),
+                        Err(error) => self.set_error(format!("Error: {error}")),
                     }
                 }
                 None
@@ -2919,7 +2928,7 @@ impl App {
                         });
                         self.close_dialog();
                     }
-                    Err(error) => self.set_status(format!("Theme switch error: {error}")),
+                    Err(error) => self.set_error(format!("Theme switch error: {error}")),
                 }
             }
             _ => {}
@@ -2995,7 +3004,7 @@ impl App {
         let plan = match TagRenamePlan::prepare(&self.storage, paths, &from, &to) {
             Ok(plan) => plan,
             Err(error) => {
-                self.set_status(format!("Tag rename error: {error}"));
+                self.set_error(format!("Tag rename error: {error}"));
                 return;
             }
         };
@@ -3011,7 +3020,7 @@ impl App {
                     outcome.from, outcome.to, outcome.documents, outcome.mentions
                 ));
             }
-            Err(error) => self.set_status(format!("Tag rename error: {error}")),
+            Err(error) => self.set_error(format!("Tag rename error: {error}")),
         }
     }
 
@@ -3452,7 +3461,7 @@ impl App {
                             self.reload_todos();
                         }
                         Ok(false) => self.set_status("Daily note not found"),
-                        Err(error) => self.set_status(format!("Error: {error}")),
+                        Err(error) => self.set_error(format!("Error: {error}")),
                     }
                 }
                 self.overlay = None;
@@ -3501,7 +3510,7 @@ impl App {
                             }
                             self.reload_files();
                         }
-                        Err(error) => self.set_status(format!("Error: {error}")),
+                        Err(error) => self.set_error(format!("Error: {error}")),
                     }
                 }
                 self.overlay = None;
@@ -3940,7 +3949,7 @@ impl App {
                 self.reload_files();
             }
             Ok(false) => self.set_status("No such task"),
-            Err(error) => self.set_status(format!("Error: {error}")),
+            Err(error) => self.set_error(format!("Error: {error}")),
         }
     }
 
@@ -4053,7 +4062,7 @@ impl App {
                 self.reload_files();
                 self.set_status("Note archived");
             }
-            Err(error) => self.set_status(format!("Error: {error}")),
+            Err(error) => self.set_error(format!("Error: {error}")),
         }
     }
 
@@ -4101,7 +4110,7 @@ impl App {
                     }
                     self.set_status("Daily note restored");
                 }
-                Err(error) => self.set_status(format!("Error: {error}")),
+                Err(error) => self.set_error(format!("Error: {error}")),
             }
             return;
         }
@@ -4113,7 +4122,7 @@ impl App {
                 self.reload_files();
                 self.set_status("Note restored");
             }
-            Err(error) => self.set_status(format!("Error: {error}")),
+            Err(error) => self.set_error(format!("Error: {error}")),
         }
     }
 
@@ -4134,7 +4143,7 @@ impl App {
                 self.center_view = CenterView::Document;
                 self.focus = Focus::Center;
             }
-            Err(error) => self.set_status(format!("Error: {error}")),
+            Err(error) => self.set_error(format!("Error: {error}")),
         }
     }
 
@@ -4244,7 +4253,7 @@ impl App {
                             self.set_status("Daily note archived");
                             self.reload_workspace();
                         }
-                        Err(error) => self.set_status(format!("Error: {error}")),
+                        Err(error) => self.set_error(format!("Error: {error}")),
                     }
                 }
                 None
@@ -4344,7 +4353,7 @@ impl App {
             }
         };
         if !queued {
-            self.set_status("Agent input buffer is unavailable");
+            self.set_error("Agent input buffer is unavailable");
             return false;
         }
         self.agent_panel.push(AgentPanelEntry::Prompt {
@@ -4558,7 +4567,7 @@ impl App {
                 self.center_view = CenterView::Daily;
                 self.reload_workspace();
             }
-            Err(error) => self.set_status(format!("Error: {error}")),
+            Err(error) => self.set_error(format!("Error: {error}")),
         }
     }
 
@@ -4578,7 +4587,7 @@ impl App {
             None => self.append_to_today(&body),
         };
         if let Err(error) = result {
-            self.set_status(format!("Error: {error}"));
+            self.set_error(format!("Error: {error}"));
         }
     }
 
@@ -4632,8 +4641,14 @@ impl App {
             .cloned()
     }
 
-    fn set_status(&mut self, status: impl Into<String>) {
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    pub(crate) fn set_error(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        self.notifications.notify(error.clone());
+        self.status = error;
     }
 
     fn record_undo(&mut self, operation: UndoOp) {
@@ -4683,7 +4698,11 @@ impl App {
                 }
             }
         };
-        self.set_status(status);
+        if status.starts_with("Undo error:") {
+            self.set_error(status);
+        } else {
+            self.set_status(status);
+        }
         self.reload_workspace();
         self.selected = self.daily_notes.len().saturating_sub(1);
         self.scroll = u16::MAX;
@@ -5467,9 +5486,40 @@ mod tests {
         assert_eq!(app.status, "AI error: network unavailable");
         assert_eq!(
             app.notifications.visible().as_deref(),
-            Some("Agent failed: network unavailable")
+            Some("AI error: network unavailable")
         );
         assert_eq!(app.notifications.take_bells(), 1);
+    }
+
+    #[test]
+    fn application_errors_notify_but_agent_tool_failures_do_not() {
+        let (mut app, _directory) = make_app();
+        app.set_error("Open error: application unavailable");
+        assert_eq!(app.status, "Open error: application unavailable");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Open error: application unavailable")
+        );
+        assert_eq!(app.notifications.take_bells(), 1);
+
+        let (sender, receiver) = mpsc::channel();
+        app.ai_events = Some(receiver);
+        sender
+            .send(AgentEvent::ToolStarted("Calling Read File...".to_string()))
+            .unwrap();
+        sender
+            .send(AgentEvent::ToolFinished(
+                "Failed Read File: file not found".to_string(),
+            ))
+            .unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.status, "Failed Read File: file not found");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Open error: application unavailable")
+        );
+        assert_eq!(app.notifications.take_bells(), 0);
     }
 
     #[test]
@@ -6588,6 +6638,57 @@ mod tests {
         assert_eq!(
             app.document.as_ref().map(|document| &document.kind),
             Some(&DocumentKind::File(path))
+        );
+    }
+
+    #[test]
+    fn file_embed_clicks_open_existing_files_from_any_location() {
+        let (mut app, _directory) = make_app();
+        let attachment = app.storage.data_dir.join("report.pdf");
+        fs::write(&attachment, b"report").unwrap();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::EmbeddedFile(attachment.clone()),
+            area: Rect::new(4, 3, 7, 1),
+        });
+        assert_eq!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(Command::OpenPath(fs::canonicalize(&attachment).unwrap()))
+        );
+
+        app.link_hitboxes.clear();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::EmbeddedFile(app.storage.data_dir.join("missing.pdf")),
+            area: Rect::new(4, 3, 7, 1),
+        });
+        assert!(app
+            .handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_none());
+        assert!(app.status.starts_with("Embed error:"));
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        app.link_hitboxes.clear();
+        app.link_hitboxes.push(LinkHitbox {
+            target: LinkTarget::EmbeddedFile(outside.path().to_path_buf()),
+            area: Rect::new(4, 3, 7, 1),
+        });
+        assert_eq!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(Command::OpenPath(fs::canonicalize(outside.path()).unwrap()))
         );
     }
 

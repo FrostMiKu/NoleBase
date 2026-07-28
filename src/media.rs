@@ -3,7 +3,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -18,6 +17,7 @@ use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::Resize;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
 
@@ -118,7 +118,7 @@ impl ImageService {
             let (key, source) = match self.resolve(&placement.source, base_dir, width, height) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    draw_image_label(
+                    draw_image_placeholder(
                         frame,
                         viewport,
                         top,
@@ -147,10 +147,18 @@ impl ImageService {
                     frame.render_widget(SlicedImage::new(protocol, position), viewport);
                 }
                 Some(ImageState::Failed(error)) => {
-                    draw_image_label(frame, viewport, top, placement, error, true, theme);
+                    draw_image_placeholder(frame, viewport, top, placement, error, true, theme);
                 }
                 Some(ImageState::Loading) | None => {
-                    draw_image_label(frame, viewport, top, placement, "loading", false, theme);
+                    draw_image_placeholder(
+                        frame,
+                        viewport,
+                        top,
+                        placement,
+                        "Loading...",
+                        false,
+                        theme,
+                    );
                 }
             }
         }
@@ -304,23 +312,9 @@ fn send_remote_image_request(
     url: &reqwest::Url,
     timeout: Duration,
 ) -> Result<reqwest::blocking::Response> {
-    let host = url.host_str().context("image URL has no host")?;
-    let port = url
-        .port_or_known_default()
-        .context("image URL has no known port")?;
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .context("resolving image host")?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
-        bail!("remote image host resolves to a non-public address");
-    }
-    let pinned: SocketAddr = addresses[0];
     let client = reqwest::blocking::Client::builder()
-        .no_proxy()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(host, pinned)
         .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
         .build()?;
     client.get(url.clone()).send().context("downloading image")
@@ -350,37 +344,6 @@ fn is_image_redirect(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
-fn is_public_ip(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            !address.is_private()
-                && !address.is_loopback()
-                && !address.is_link_local()
-                && !address.is_broadcast()
-                && !address.is_documentation()
-                && !address.is_unspecified()
-                && !address.is_multicast()
-                && octets[0] != 0
-                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
-                && !(octets[0] == 198 && matches!(octets[1], 18 | 19))
-                && octets[0] < 240
-        }
-        IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                return is_public_ip(IpAddr::V4(mapped));
-            }
-            let segments = address.segments();
-            !address.is_loopback()
-                && !address.is_unspecified()
-                && !address.is_multicast()
-                && segments[0] & 0xfe00 != 0xfc00
-                && segments[0] & 0xffc0 != 0xfe80
-                && segments[..2] != [0x2001, 0x0db8]
-        }
-    }
-}
-
 fn decode_image(bytes: Vec<u8>) -> Result<image::DynamicImage> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -393,7 +356,7 @@ fn decode_image(bytes: Vec<u8>) -> Result<image::DynamicImage> {
     reader.decode().context("decoding image")
 }
 
-fn draw_image_label(
+fn draw_image_placeholder(
     frame: &mut Frame,
     viewport: Rect,
     top: i64,
@@ -413,29 +376,141 @@ fn draw_image_label(
     let width = u16::try_from(placement.width)
         .unwrap_or(u16::MAX)
         .min(viewport.width - column);
+    let hidden_rows = top.saturating_neg().max(0) as usize;
+    let visible_height = placement
+        .height
+        .saturating_sub(hidden_rows)
+        .min(usize::from(viewport.height) - visible_y as usize);
+    if width == 0 || visible_height == 0 {
+        return;
+    }
     let alt = if placement.alt.is_empty() {
         placement.source.as_str()
     } else {
         placement.alt.as_str()
     };
-    let text = if failed {
-        format!("[image] {alt} ({detail})")
+    let detail = if failed {
+        format!("Failed: {detail}")
     } else {
-        format!("[image] {alt}")
+        detail.to_string()
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default()
-                .fg(if failed {
-                    theme.ui_error
-                } else {
-                    theme.text_muted
-                })
-                .add_modifier(Modifier::ITALIC),
-        ))),
-        Rect::new(viewport.x + column, viewport.y + visible_y as u16, width, 1),
+    let lines = image_placeholder_lines(
+        usize::from(width),
+        placement.height,
+        hidden_rows,
+        visible_height,
+        alt,
+        &detail,
+        failed,
+        theme,
     );
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            viewport.x + column,
+            viewport.y + visible_y as u16,
+            width,
+            visible_height as u16,
+        ),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn image_placeholder_lines(
+    width: usize,
+    height: usize,
+    first_row: usize,
+    visible_height: usize,
+    alt: &str,
+    detail: &str,
+    failed: bool,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let border_style = Style::default()
+        .fg(theme.ui_border_subtle)
+        .bg(theme.surface_panel);
+    let alt_style = Style::default()
+        .fg(theme.text_secondary)
+        .bg(theme.surface_panel)
+        .add_modifier(Modifier::BOLD);
+    let detail_style = Style::default()
+        .fg(if failed {
+            theme.ui_error
+        } else {
+            theme.text_muted
+        })
+        .bg(theme.surface_panel)
+        .add_modifier(Modifier::ITALIC);
+    let alt_row = height.saturating_sub(1) / 2;
+    let detail_row = (alt_row + 1).min(height.saturating_sub(2));
+
+    (first_row..first_row.saturating_add(visible_height))
+        .map(|row| {
+            if width < 2 {
+                return Line::from(Span::styled(" ".repeat(width), border_style));
+            }
+            if row == 0 {
+                return Line::from(Span::styled(
+                    format!("┌{}┐", "─".repeat(width.saturating_sub(2))),
+                    border_style,
+                ));
+            }
+            if row + 1 == height {
+                return Line::from(Span::styled(
+                    format!("└{}┘", "─".repeat(width.saturating_sub(2))),
+                    border_style,
+                ));
+            }
+            let (content, content_style) = if row == alt_row {
+                (alt, alt_style)
+            } else if row == detail_row {
+                (detail, detail_style)
+            } else {
+                ("", border_style)
+            };
+            placeholder_content_line(width, content, border_style, content_style)
+        })
+        .collect()
+}
+
+fn placeholder_content_line(
+    width: usize,
+    content: &str,
+    border_style: Style,
+    content_style: Style,
+) -> Line<'static> {
+    let inner_width = width.saturating_sub(2);
+    let content = truncate_to_width(content, inner_width);
+    let content_width = UnicodeWidthStr::width(content.as_str());
+    let left = inner_width.saturating_sub(content_width) / 2;
+    let right = inner_width.saturating_sub(content_width + left);
+    Line::from(vec![
+        Span::styled(format!("│{}", " ".repeat(left)), border_style),
+        Span::styled(content, content_style),
+        Span::styled(format!("{}│", " ".repeat(right)), border_style),
+    ])
+}
+
+fn truncate_to_width(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_string();
+    }
+    let suffix = "...";
+    let target = width.saturating_sub(suffix.len());
+    let mut output = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > target {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    if width >= suffix.len() {
+        output.push_str(suffix);
+    }
+    output
 }
 
 fn clamp_i16(value: i64) -> i16 {
@@ -490,23 +565,62 @@ mod tests {
     }
 
     #[test]
-    fn remote_images_reject_non_public_network_ranges() {
-        for address in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "100.64.0.1",
-            "169.254.1.1",
-            "192.168.1.1",
-            "::1",
-            "fc00::1",
-            "fe80::1",
-            "::ffff:127.0.0.1",
+    fn remote_image_urls_allow_private_and_loopback_hosts() {
+        for url in [
+            "http://127.0.0.1/image.png",
+            "http://10.0.0.1/image.png",
+            "http://192.168.1.20/image.png",
+            "http://[::1]/image.png",
+            "http://[fd00::1]/image.png",
         ] {
-            assert!(!is_public_ip(address.parse().unwrap()), "{address}");
+            assert!(
+                validate_remote_image_url(reqwest::Url::parse(url).unwrap()).is_ok(),
+                "{url}"
+            );
         }
-        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
-            assert!(is_public_ip(address.parse().unwrap()), "{address}");
-        }
+    }
+
+    #[test]
+    fn failed_image_placeholder_frames_the_alt_and_error() {
+        let placement = mbtui::ImagePlacement {
+            source: "https://example.test/image.png".to_string(),
+            title: String::new(),
+            alt: "Architecture diagram".to_string(),
+            row: 0,
+            column: 0,
+            width: 32,
+            height: 6,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(32, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_image_placeholder(
+                    frame,
+                    frame.area(),
+                    0,
+                    &placement,
+                    "connection refused",
+                    true,
+                    Theme::default(),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..6)
+            .map(|row| {
+                (0..32)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.starts_with('┌'));
+        assert!(rendered.lines().next().unwrap().ends_with('┐'));
+        assert!(rendered.contains("Architecture diagram"));
+        assert!(rendered.contains("Failed: connection refused"));
+        assert!(rendered.lines().last().unwrap().starts_with('└'));
+        assert!(rendered.lines().last().unwrap().ends_with('┘'));
     }
 
     #[test]

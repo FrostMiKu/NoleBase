@@ -117,7 +117,7 @@ fn handle_command(
             // run_editor re-enters the TUI itself; the outer guard in main
             // restores the terminal if anything here panics.
             if let Err(e) = run_editor(&path, terminal) {
-                app.status = format!("Editor error: {e}");
+                app.set_error(format!("Editor error: {e}"));
             }
             *cursor_visible = true;
             app.reload_workspace();
@@ -125,8 +125,15 @@ fn handle_command(
         }
         Some(Command::OpenLink(target)) => {
             match open::that_detached(&target) {
-                Ok(()) => app.status = format!("Opened {target}"),
-                Err(error) => app.status = format!("Link error: {error}"),
+                Ok(()) => app.set_status(format!("Opened {target}")),
+                Err(error) => app.set_error(format!("Link error: {error}")),
+            }
+            Ok(false)
+        }
+        Some(Command::OpenPath(path)) => {
+            match open::that_detached(&path) {
+                Ok(()) => app.set_status(format!("Opened {}", path.display())),
+                Err(error) => app.set_error(format!("Open error: {error}")),
             }
             Ok(false)
         }
@@ -196,7 +203,7 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::pat
         app.reload_workspace();
     }
     if let Some(error) = watcher_error {
-        app.status = format!("File watcher error: {error}");
+        app.set_error(format!("File watcher error: {error}"));
     }
     indexed_paths
 }

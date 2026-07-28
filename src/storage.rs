@@ -765,6 +765,17 @@ impl Storage {
         fs::read_to_string(canonical).context("reading document")
     }
 
+    /// Resolve an existing regular file embedded by a document.
+    pub fn validate_embedded_file(&self, path: &Path) -> Result<PathBuf> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("checking embedded file {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("embedded target must be a regular file: {}", path.display());
+        }
+        fs::canonicalize(path)
+            .with_context(|| format!("resolving embedded file {}", path.display()))
+    }
+
     /// Ensure a target is a flat data note.
     /// Existing targets are canonicalized in full; symlinks are always rejected.
     pub fn validate_target(&self, target: &Path) -> Result<PathBuf> {
@@ -1198,6 +1209,44 @@ mod tests {
     fn delete_file_rejects_outside_root() {
         let (_dir, st) = fresh();
         assert!(st.delete_file(Path::new("/etc/hosts")).is_err());
+    }
+
+    #[test]
+    fn embedded_files_must_exist_but_may_be_outside_the_workspace() {
+        let (_directory, st) = fresh();
+        let file = st.root.join("attachment.pdf");
+        fs::write(&file, b"attachment").unwrap();
+        assert_eq!(
+            st.validate_embedded_file(&file).unwrap(),
+            fs::canonicalize(&file).unwrap()
+        );
+        assert!(st
+            .validate_embedded_file(&st.root.join("missing.pdf"))
+            .is_err());
+
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("outside.pdf");
+        fs::write(&outside_file, b"outside").unwrap();
+        assert_eq!(
+            st.validate_embedded_file(&outside_file).unwrap(),
+            fs::canonicalize(&outside_file).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_files_follow_symlinks_to_regular_files() {
+        use std::os::unix::fs::symlink;
+
+        let (_directory, st) = fresh();
+        let file = st.root.join("attachment.pdf");
+        let link = st.root.join("attachment-link.pdf");
+        fs::write(&file, b"attachment").unwrap();
+        symlink(&file, &link).unwrap();
+        assert_eq!(
+            st.validate_embedded_file(&link).unwrap(),
+            fs::canonicalize(&file).unwrap()
+        );
     }
 
     #[test]

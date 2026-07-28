@@ -216,7 +216,9 @@ overwriting an existing file.
 On first start Nole creates `themes/default.toml` with its current colors and
 writes `theme = "default"` to `config/settings.toml`. Each direct
 `themes/<name>.toml` file contains semantic `#RRGGBB` tokens grouped under
-`[surface]`, `[text]`, `[ui]`, `[markdown]`, and `[animation]`. The reserved
+`[surface]`, `[selection]`, `[text]`, `[ui]`, `[markdown]`, and `[animation]`.
+The `[selection]` group defines the background, inactive background, foreground,
+and indicator color shared by selectable lists. The reserved
 `default` option uses `themes/default.toml`, falling back to Nole's built-in
 colors if that file is absent. `random` chooses one valid custom theme when it
 is selected and on each startup. A selected custom theme that does not exist

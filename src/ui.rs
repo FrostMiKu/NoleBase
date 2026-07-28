@@ -22,7 +22,7 @@ use crate::app::{
 };
 use crate::model::{
     Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
-    SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
+    LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
 };
 use crate::theme::Theme;
 
@@ -35,6 +35,7 @@ const PANEL_PADDING: u16 = 1;
 const DAILY_PADDING_X: usize = 1;
 const PAGE_PADDING_X: usize = DAILY_PADDING_X + 12;
 const DIALOG_WIDTH: u16 = 80;
+const SELECT_OPTION_HEIGHT: u16 = 2;
 
 /// Clear a widget's rectangle without leaving a wide-character continuation
 /// cell from the content underneath it. Ratatui's diff buffer can otherwise
@@ -292,7 +293,13 @@ fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         &image_base,
         app.theme,
     );
-    register_link_hitboxes(&mut app.link_hitboxes, &rendered_links, inner, scroll);
+    register_link_hitboxes(
+        &mut app.link_hitboxes,
+        &rendered_links,
+        inner,
+        scroll,
+        &image_base,
+    );
 }
 
 fn sync_agent_vlist(app: &mut App, width: usize) {
@@ -661,6 +668,56 @@ fn inset_horizontal(area: Rect, padding: u16) -> Rect {
     )
 }
 
+fn shared_selection_area(container: Rect, item_y: u16, item_height: u16) -> Rect {
+    let selection_y = item_y.saturating_sub(1).max(container.y);
+    let selection_end = item_y
+        .saturating_add(item_height)
+        .min(container.y.saturating_add(container.height));
+    Rect::new(
+        container.x,
+        selection_y,
+        container.width,
+        selection_end.saturating_sub(selection_y),
+    )
+}
+
+fn draw_selection_indicator(frame: &mut Frame, area: Rect, theme: Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    for y in area.y..area.y.saturating_add(area.height) {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "▌",
+                Style::default()
+                    .fg(theme.selection_indicator)
+                    .remove_modifier(Modifier::BOLD | Modifier::DIM),
+            )),
+            Rect::new(area.x, y, 1, 1),
+        );
+    }
+}
+
+fn selection_list_height(item_count: u16, item_height: u16) -> u16 {
+    if item_count == 0 {
+        0
+    } else {
+        1_u16.saturating_add(item_count.saturating_mul(item_height))
+    }
+}
+
+fn visible_selection_items(list_height: u16, item_height: u16) -> usize {
+    (list_height.saturating_sub(1) as usize).div_ceil(item_height as usize)
+}
+
+fn selection_item_y(container: Rect, row: usize, item_height: u16) -> u16 {
+    container.y.saturating_add(1).saturating_add(
+        u16::try_from(row)
+            .unwrap_or(u16::MAX)
+            .saturating_mul(item_height),
+    )
+}
+
 fn draw_files(
     frame: &mut Frame,
     app: &mut App,
@@ -783,26 +840,18 @@ fn draw_files(
         let selected = row_index == selected_row;
         let row_style = if selected {
             Style::default()
+                .fg(app.theme.selection_foreground)
                 .bg(if focused {
-                    app.theme.surface_selection
+                    app.theme.selection_background
                 } else {
-                    app.theme.surface_selection_inactive
+                    app.theme.selection_background_inactive
                 })
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let selection_area = if selected && matches!(row, FileListRow::File(_)) {
-            let selection_y = y.saturating_sub(1).max(list_area.y);
-            let selection_end = y
-                .saturating_add(3)
-                .min(list_area.y.saturating_add(list_area.height));
-            Some(Rect::new(
-                list_area.x,
-                selection_y,
-                list_area.width,
-                selection_end.saturating_sub(selection_y),
-            ))
+            Some(shared_selection_area(list_area, y, layout_height))
         } else {
             None
         };
@@ -824,7 +873,14 @@ fn draw_files(
                 frame.render_widget(Paragraph::new("").style(row_style), group_area);
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled(marker, Style::default().fg(app.theme.ui_group_marker)),
+                        Span::styled(
+                            marker,
+                            Style::default().fg(if selected {
+                                app.theme.selection_foreground
+                            } else {
+                                app.theme.ui_group_marker
+                            }),
+                        ),
                         Span::raw(format!(" {label}")),
                     ]))
                     .style(row_style),
@@ -835,7 +891,13 @@ fn draw_files(
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         count,
-                        Style::default().fg(app.theme.text_muted),
+                        if selected {
+                            Style::default()
+                                .fg(app.theme.selection_foreground)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default().fg(app.theme.text_muted)
+                        },
                     ))
                     .alignment(Alignment::Right),
                     Rect::new(
@@ -878,11 +940,13 @@ fn draw_files(
                     frame.render_widget(
                         Paragraph::new(Line::from(Span::styled(
                             format!("  {}", modified.format("%y/%m/%d %H:%M")),
-                            Style::default().fg(if selected {
-                                app.theme.text_secondary
+                            if selected {
+                                Style::default()
+                                    .fg(app.theme.selection_foreground)
+                                    .add_modifier(Modifier::DIM)
                             } else {
-                                app.theme.text_muted
-                            }),
+                                Style::default().fg(app.theme.text_muted)
+                            },
                         )))
                         .style(row_style),
                         Rect::new(list_area.x, y + 1, list_area.width, 1),
@@ -895,15 +959,7 @@ fn draw_files(
                     });
                 }
                 if let Some(selection_area) = selection_area {
-                    for rail_y in selection_area.y..selection_area.y + selection_area.height {
-                        frame.render_widget(
-                            Paragraph::new(Span::styled(
-                                "▌",
-                                Style::default().fg(app.theme.ui_selection_indicator),
-                            )),
-                            Rect::new(selection_area.x, rail_y, 1, 1),
-                        );
-                    }
+                    draw_selection_indicator(frame, selection_area, app.theme);
                 }
             }
         }
@@ -971,7 +1027,12 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             continue;
         };
         let checked = if item.checked { "[x]" } else { "[ ]" };
-        let marker_style = if item.checked {
+        let item_selected = focused && index == selected;
+        let marker_style = if item_selected {
+            Style::default()
+                .fg(app.theme.selection_foreground)
+                .add_modifier(Modifier::BOLD)
+        } else if item.checked {
             Style::default()
                 .fg(app.theme.ui_task_done)
                 .add_modifier(Modifier::BOLD)
@@ -983,8 +1044,10 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
         } else {
             Style::default()
         };
-        if focused && index == selected {
-            text_style = text_style.bg(app.theme.surface_selection);
+        if item_selected {
+            text_style = text_style
+                .fg(app.theme.selection_foreground)
+                .bg(app.theme.selection_background);
         }
         let wrapped = wrap_spans_to_width(
             &[Span::styled(item.text.replace('\n', " "), text_style)],
@@ -995,19 +1058,14 @@ fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
             .saturating_add(1)
             .min(inner.y.saturating_add(inner.height).saturating_sub(y));
         let visible_height = content_height.min(layout_height);
-        if focused && index == selected {
-            let selection_y = y.saturating_sub(1).max(inner.y);
-            let selection_end = y
-                .saturating_add(layout_height)
-                .min(inner.y.saturating_add(inner.height));
+        if item_selected {
             frame.render_widget(
-                Block::default().style(Style::default().bg(app.theme.surface_selection)),
-                Rect::new(
-                    inner.x,
-                    selection_y,
-                    inner.width,
-                    selection_end.saturating_sub(selection_y),
+                Block::default().style(
+                    Style::default()
+                        .fg(app.theme.selection_foreground)
+                        .bg(app.theme.selection_background),
                 ),
+                shared_selection_area(inner, y, layout_height),
             );
         }
         for (row, mut spans) in wrapped
@@ -1420,6 +1478,7 @@ fn draw_daily_notes(
             &rendered_links,
             interactive_area,
             scroll,
+            &app.storage.daily_dir,
         );
         register_tag_hitboxes(
             &mut app.tag_hitboxes,
@@ -1809,6 +1868,7 @@ fn register_link_hitboxes(
     links: &[crate::markdown::RenderedLink],
     viewport: Rect,
     scroll: usize,
+    base_dir: &Path,
 ) {
     let bottom = scroll.saturating_add(viewport.height as usize);
     for link in links
@@ -1822,8 +1882,14 @@ fn register_link_hitboxes(
         if width == 0 {
             continue;
         }
+        let target = match &link.target {
+            LinkTarget::EmbeddedFile(path) if !path.is_absolute() => {
+                LinkTarget::EmbeddedFile(base_dir.join(path))
+            }
+            target => target.clone(),
+        };
         hitboxes.push(LinkHitbox {
-            target: link.target.clone(),
+            target,
             area: Rect::new(
                 viewport.x.saturating_add(column as u16),
                 viewport.y.saturating_add((link.row - scroll) as u16),
@@ -2127,6 +2193,7 @@ fn draw_document(
             &rendered_links,
             interactive_document_area,
             document_scroll,
+            &image_base,
         );
         register_tag_hitboxes(
             &mut app.tag_hitboxes,
@@ -2262,7 +2329,7 @@ fn draw_search(
         return;
     }
 
-    let visible = results.height as usize;
+    let visible = visible_selection_items(results.height, SELECT_OPTION_HEIGHT);
     let selected = app
         .search_index
         .min(app.search_results.len().saturating_sub(1));
@@ -2277,6 +2344,18 @@ fn draw_search(
         .take(visible)
         .enumerate()
     {
+        let y = selection_item_y(results, row, SELECT_OPTION_HEIGHT);
+        let item_height =
+            SELECT_OPTION_HEIGHT.min(results.y.saturating_add(results.height).saturating_sub(y));
+        let item_area = Rect::new(results.x, y, results.width, item_height);
+        let is_selected = index == selected;
+        let metadata_style = if is_selected {
+            Style::default()
+                .fg(app.theme.selection_foreground)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(app.theme.text_muted)
+        };
         let spans = match hit {
             SearchHit::FileLine {
                 path,
@@ -2289,32 +2368,37 @@ fn draw_search(
                     .and_then(|name| name.to_str())
                     .unwrap_or("?");
                 vec![
-                    Span::styled(
-                        format!("{name}:{line_no} "),
-                        Style::default().fg(app.theme.text_muted),
-                    ),
+                    Span::styled(format!("{name}:{line_no} "), metadata_style),
                     Span::raw(text.clone()),
                 ]
             }
             SearchHit::DocumentLine { line_no, text } => vec![
-                Span::styled(
-                    format!("line {line_no} "),
-                    Style::default().fg(app.theme.text_muted),
-                ),
+                Span::styled(format!("line {line_no} "), metadata_style),
                 Span::raw(text.clone()),
             ],
         };
-        let style = if index == selected {
-            Style::default().bg(app.theme.surface_selection)
+        let style = if is_selected {
+            Style::default()
+                .fg(app.theme.selection_foreground)
+                .bg(app.theme.selection_background)
         } else {
             Style::default()
         };
-        let row_area = Rect::new(results.x, results.y + row as u16, results.width, 1);
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(style), row_area);
+        let selection_area = is_selected.then(|| shared_selection_area(results, y, item_height));
+        if let Some(selection_area) = selection_area {
+            frame.render_widget(Block::default().style(style), selection_area);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(style),
+            inset_horizontal(Rect::new(item_area.x, item_area.y, item_area.width, 1), 2),
+        );
+        if let Some(selection_area) = selection_area {
+            draw_selection_indicator(frame, selection_area, app.theme);
+        }
         if interactive {
             app.search_hitboxes.push(SearchHitbox {
                 index,
-                area: row_area,
+                area: item_area,
             });
         }
     }
@@ -2652,20 +2736,21 @@ fn draw_dialog(
         DialogMode::FreeText => 11,
         DialogMode::SelectOrInput => message_rows
             .min(8)
-            .saturating_add(option_count.saturating_add(1))
+            .saturating_add(selection_list_height(
+                option_count.saturating_add(1),
+                SELECT_OPTION_HEIGHT,
+            ))
             .saturating_add(4)
             .saturating_add(1)
             .saturating_add(2),
         DialogMode::SingleSelect | DialogMode::MultiSelect => message_rows
             .min(8)
-            .saturating_add(option_count)
+            .saturating_add(selection_list_height(option_count, SELECT_OPTION_HEIGHT))
             .saturating_add(1)
             .saturating_add(2),
         DialogMode::Approval => root.height.saturating_sub(4).min(36),
         DialogMode::Informational => root.height.saturating_sub(2).min(30),
-        DialogMode::CommandPalette => option_count
-            .min(8)
-            .saturating_mul(3)
+        DialogMode::CommandPalette => selection_list_height(option_count.min(8), 3)
             .saturating_add(6)
             .max(7),
     };
@@ -2675,7 +2760,7 @@ fn draw_dialog(
     // Keep the command palette's query field anchored while its result list
     // shrinks. Centering each filtered height would make the input jump.
     let area = if dialog.mode == DialogMode::CommandPalette {
-        let maximum_height = 8_u16.saturating_mul(3).saturating_add(6);
+        let maximum_height = selection_list_height(8, 3).saturating_add(6);
         let anchor_height =
             maximum_height.min(root.height.saturating_sub(2).max(root.height.min(1)));
         let anchor = centered_rect(root, width, anchor_height);
@@ -2870,7 +2955,7 @@ fn draw_command_palette(
         inner.width,
         gap_y.saturating_sub(inner.y.saturating_add(2)),
     );
-    let visible_items = (options.height as usize).div_ceil(3).max(1);
+    let visible_items = visible_selection_items(options.height, 3);
     if dialog.options.is_empty() {
         frame.render_widget(
             Paragraph::new("No matching commands")
@@ -2883,7 +2968,7 @@ fn draw_command_palette(
             .selected
             .saturating_sub(visible_items.saturating_sub(1));
         let options_end = options.y.saturating_add(options.height);
-        let mut y = options.y;
+        let mut y = options.y.saturating_add(1);
         for (index, option) in dialog
             .options
             .iter()
@@ -2898,29 +2983,15 @@ fn draw_command_palette(
             let item_area = Rect::new(options.x, y, options.width, item_height);
             let selected = index == dialog.selected;
             let selection_style = if selected {
-                Style::default().bg(app.theme.surface_selection)
+                Style::default()
+                    .fg(app.theme.selection_foreground)
+                    .bg(app.theme.selection_background)
             } else {
                 Style::default()
             };
-            if selected {
-                let selection_y = y.saturating_sub(1).max(options.y);
-                let selection_end = y.saturating_add(3).min(options_end);
-                let selection_area = Rect::new(
-                    options.x,
-                    selection_y,
-                    options.width,
-                    selection_end.saturating_sub(selection_y),
-                );
+            let selection_area = selected.then(|| shared_selection_area(options, y, item_height));
+            if let Some(selection_area) = selection_area {
                 frame.render_widget(Block::default().style(selection_style), selection_area);
-                for rail_y in selection_y..selection_end {
-                    frame.render_widget(
-                        Paragraph::new(Span::styled(
-                            "▌",
-                            Style::default().fg(app.theme.ui_selection_indicator),
-                        )),
-                        Rect::new(options.x, rail_y, 1, 1),
-                    );
-                }
             }
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -2928,7 +2999,11 @@ fn draw_command_palette(
                     Span::styled(
                         option.label.clone(),
                         Style::default()
-                            .fg(app.theme.text_secondary)
+                            .fg(if selected {
+                                app.theme.selection_foreground
+                            } else {
+                                app.theme.text_secondary
+                            })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])),
@@ -2944,7 +3019,16 @@ fn draw_command_palette(
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::raw(" "),
-                        Span::styled(description, Style::default().fg(app.theme.text_muted)),
+                        Span::styled(
+                            description,
+                            if selected {
+                                Style::default()
+                                    .fg(app.theme.selection_foreground)
+                                    .add_modifier(Modifier::DIM)
+                            } else {
+                                Style::default().fg(app.theme.text_muted)
+                            },
+                        ),
                     ])),
                     Rect::new(
                         options.x.saturating_add(1),
@@ -2953,6 +3037,9 @@ fn draw_command_palette(
                         1,
                     ),
                 );
+            }
+            if let Some(selection_area) = selection_area {
+                draw_selection_indicator(frame, selection_area, app.theme);
             }
             app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
                 index,
@@ -3015,13 +3102,13 @@ fn draw_select_dialog(
         .height
         .saturating_sub(footer_height)
         .saturating_sub(input_height);
-    let option_extra = u16::from(has_input);
-    let option_capacity = available.saturating_sub(message_height) as usize;
-    let option_height = dialog
-        .options
-        .len()
-        .saturating_add(option_extra as usize)
-        .min(option_capacity) as u16;
+    let option_capacity = available.saturating_sub(message_height);
+    let option_items = dialog.options.len() + usize::from(has_input);
+    let option_height = selection_list_height(
+        u16::try_from(option_items).unwrap_or(u16::MAX),
+        SELECT_OPTION_HEIGHT,
+    )
+    .min(option_capacity);
     let message = Rect::new(inner.x, inner.y, inner.width, message_height);
     let options = Rect::new(
         inner.x,
@@ -3049,40 +3136,45 @@ fn draw_select_dialog(
             message,
         );
     }
-    let total_rows = dialog.options.len() + usize::from(has_input);
-    let visible_rows = options.height as usize;
+    let visible_items = visible_selection_items(options.height, SELECT_OPTION_HEIGHT);
     let list_start = dialog
         .selected
-        .saturating_sub(visible_rows.saturating_sub(1))
-        .min(total_rows.saturating_sub(visible_rows));
+        .saturating_sub(visible_items.saturating_sub(1))
+        .min(option_items.saturating_sub(visible_items));
+    let options_end = options.y.saturating_add(options.height);
     for (index, option) in dialog
         .options
         .iter()
         .enumerate()
         .skip(list_start)
-        .take(options.height as usize)
+        .take(visible_items)
     {
         let row = index - list_start;
+        let y = selection_item_y(options, row, SELECT_OPTION_HEIGHT);
+        if y >= options_end {
+            break;
+        }
+        let item_height = SELECT_OPTION_HEIGHT.min(options_end.saturating_sub(y));
+        let item_area = Rect::new(options.x, y, options.width, item_height);
         let selected = dialog.selected == index;
         let style = if selected {
             Style::default()
-                .fg(app.theme.text_on_accent)
-                .bg(app.theme.ui_action)
+                .fg(app.theme.selection_foreground)
+                .bg(app.theme.selection_background)
         } else {
             Style::default().fg(app.theme.text_disabled)
         };
-        let marker = if dialog.mode == DialogMode::MultiSelect {
-            if dialog.checked.get(index).copied().unwrap_or(false) {
+        let label = if dialog.mode == DialogMode::MultiSelect {
+            let marker = if dialog.checked.get(index).copied().unwrap_or(false) {
                 "[x]"
             } else {
                 "[ ]"
-            }
-        } else if selected {
-            ">"
+            };
+            format!("{marker} {}", option.label)
         } else {
-            " "
+            option.label.clone()
         };
-        let mut spans = vec![Span::styled(format!("{marker} {}", option.label), style)];
+        let mut spans = vec![Span::styled(label, style)];
         if let Some(hint) = &option.hint {
             spans.push(Span::styled(
                 format!("  {hint}"),
@@ -3093,16 +3185,37 @@ fn draw_select_dialog(
                 },
             ));
         }
-        let row_area = Rect::new(options.x, options.y + row as u16, options.width, 1);
-        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+        let selection_area = selected.then(|| shared_selection_area(options, y, item_height));
+        if let Some(selection_area) = selection_area {
+            frame.render_widget(
+                Block::default().style(
+                    Style::default()
+                        .fg(app.theme.selection_foreground)
+                        .bg(app.theme.selection_background),
+                ),
+                selection_area,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(
+                item_area.x.saturating_add(2),
+                item_area.y,
+                item_area.width.saturating_sub(2),
+                1,
+            ),
+        );
+        if let Some(selection_area) = selection_area {
+            draw_selection_indicator(frame, selection_area, app.theme);
+        }
         app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
             index,
-            area: row_area,
+            area: item_area,
         });
         if dialog.purpose == DialogPurpose::WikiLinkChoice {
             app.wiki_link_hitboxes.push(crate::model::WikiLinkHitbox {
                 index,
-                area: row_area,
+                area: item_area,
             });
         }
     }
@@ -3126,25 +3239,47 @@ fn draw_select_dialog(
             *cursor_position = Some(position);
         }
         let other_index = dialog.options.len();
-        if other_index >= list_start && other_index < list_start + visible_rows {
+        if other_index >= list_start && other_index < list_start + visible_items {
             let row = other_index - list_start;
-            let row_area = Rect::new(options.x, options.y + row as u16, options.width, 1);
+            let y = selection_item_y(options, row, SELECT_OPTION_HEIGHT);
+            let item_height = SELECT_OPTION_HEIGHT.min(options_end.saturating_sub(y));
+            let item_area = Rect::new(options.x, y, options.width, item_height);
+            let selection_area =
+                custom_selected.then(|| shared_selection_area(options, y, item_height));
+            if let Some(selection_area) = selection_area {
+                frame.render_widget(
+                    Block::default().style(
+                        Style::default()
+                            .fg(app.theme.selection_foreground)
+                            .bg(app.theme.selection_background),
+                    ),
+                    selection_area,
+                );
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "> Other answer",
+                    "Other answer",
                     if custom_selected {
                         Style::default()
-                            .fg(app.theme.text_on_accent)
-                            .bg(app.theme.ui_action)
+                            .fg(app.theme.selection_foreground)
+                            .bg(app.theme.selection_background)
                     } else {
                         Style::default().fg(app.theme.text_disabled)
                     },
                 ))),
-                row_area,
+                Rect::new(
+                    item_area.x.saturating_add(2),
+                    item_area.y,
+                    item_area.width.saturating_sub(2),
+                    1,
+                ),
             );
+            if let Some(selection_area) = selection_area {
+                draw_selection_indicator(frame, selection_area, app.theme);
+            }
             app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
                 index: other_index,
-                area: row_area,
+                area: item_area,
             });
         }
     }
@@ -3514,6 +3649,15 @@ mod tests {
         let selected = &app.dialog_hitboxes[0].area;
         assert_eq!(selected.height, 3);
         assert_eq!(
+            terminal.backend().buffer()[(selected.x, selected.y - 1)].symbol(),
+            "▌",
+            "the first command needs an upper shared blank row"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(selected.x, selected.y - 1)].bg,
+            ctp::SURFACE_1
+        );
+        assert_eq!(
             terminal.backend().buffer()[(selected.x, selected.y)].symbol(),
             "▌"
         );
@@ -3536,7 +3680,7 @@ mod tests {
             .contains(Modifier::BOLD));
         assert_eq!(
             terminal.backend().buffer()[(selected.x + 2, selected.y + 1)].fg,
-            ctp::OVERLAY_0
+            app.theme.selection_foreground
         );
         let last = &app.dialog_hitboxes.last().unwrap().area;
         let gap_y = last.y + last.height;
@@ -3963,7 +4107,7 @@ mod tests {
         }
         assert_eq!(
             buffer[(selected_area.x + 1, selected_area.y + 1)].fg,
-            ctp::SUBTEXT_1,
+            app.theme.selection_foreground,
             "modified time must remain legible on the selected background"
         );
     }
@@ -4027,8 +4171,11 @@ mod tests {
             "selected background must include the lower shared spacing"
         );
         for rail_y in selected.area.y.saturating_sub(1)..=selected.area.y + 2 {
-            assert_eq!(buffer[(selected.area.x, rail_y)].symbol(), "▌");
-            assert_eq!(buffer[(selected.area.x, rail_y)].fg, ctp::MAUVE);
+            let cell = &buffer[(selected.area.x, rail_y)];
+            assert_eq!(cell.symbol(), "▌");
+            assert_eq!(cell.fg, ctp::MAUVE);
+            assert!(!cell.modifier.contains(Modifier::BOLD));
+            assert!(!cell.modifier.contains(Modifier::DIM));
         }
         assert_ne!(buffer[(notes.x, notes.y)].symbol(), "▌");
         assert_ne!(buffer[(archives.x, archives.y)].symbol(), "▌");
@@ -4118,7 +4265,7 @@ mod tests {
         app.search_results = vec![SearchHit::FileLine {
             path: PathBuf::from("2026-07-27.md"),
             line_no: 1,
-            text: "needle result".to_string(),
+            text: format!("needle result {}", "x".repeat(100)),
         }];
         let terminal = render(&mut app, 80, 18);
         let screen = buffer_string(&terminal);
@@ -4132,6 +4279,28 @@ mod tests {
             "only the centered searcher should have a border"
         );
         assert_eq!(app.search_hitboxes.len(), 1);
+        let result = app.search_hitboxes[0].area;
+        assert_eq!(result.height, SELECT_OPTION_HEIGHT);
+        for y in result.y - 1..result.y + result.height {
+            assert_eq!(
+                terminal.backend().buffer()[(result.x + result.width - 1, y)].bg,
+                app.theme.selection_background,
+                "search selections should include both full-width shared blank rows"
+            );
+            assert_eq!(terminal.backend().buffer()[(result.x, y)].symbol(), "▌");
+            assert_eq!(
+                terminal.backend().buffer()[(result.x, y)].fg,
+                app.theme.selection_indicator
+            );
+        }
+        assert_eq!(
+            terminal.backend().buffer()[(result.x + result.width - 2, result.y)].symbol(),
+            " "
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(result.x + result.width - 1, result.y)].symbol(),
+            " "
+        );
     }
 
     #[test]
@@ -4223,6 +4392,47 @@ mod tests {
         render(&mut app, 170, 24);
         assert!(app.link_hitboxes.iter().any(|hitbox| {
             hitbox.target == LinkTarget::External("https://agent.example".to_string())
+        }));
+    }
+
+    #[test]
+    fn file_embed_hitboxes_resolve_against_each_content_base() {
+        let (mut app, _directory) = make_app();
+        app.storage
+            .append_to_today("Open ![[daily-attachment.pdf]]")
+            .unwrap();
+        app.reload();
+        render(&mut app, 170, 24);
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target
+                == LinkTarget::EmbeddedFile(app.storage.daily_dir.join("daily-attachment.pdf"))
+        }));
+
+        let note = app.storage.data_dir.join("Article.md");
+        app.document = Some(Document {
+            kind: DocumentKind::File(note),
+            title: "Preview".to_string(),
+            source: "Open ![[article-attachment.pdf]]".to_string(),
+            scroll: 0,
+            target_line: None,
+            return_to: DocumentReturn::Daily,
+            render_cache: None,
+        });
+        app.center_view = CenterView::Document;
+        render(&mut app, 170, 24);
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target
+                == LinkTarget::EmbeddedFile(app.storage.data_dir.join("article-attachment.pdf"))
+        }));
+
+        app.agent_panel = vec![AgentPanelEntry::Assistant {
+            text: "Open ![[agent-attachment.pdf]]".to_string(),
+            streaming: false,
+            final_output: true,
+        }];
+        render(&mut app, 170, 24);
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target == LinkTarget::EmbeddedFile(app.storage.root.join("agent-attachment.pdf"))
         }));
     }
 
@@ -4320,7 +4530,7 @@ mod tests {
             question: "Which output format should be used?".to_string(),
             options: vec!["Markdown".to_string(), "MBDown".to_string()],
         });
-        app.ask_user_option = 1;
+        app.ask_user_option = 0;
         app.set_overlay(Overlay::AskUser);
         let terminal = render(&mut app, 100, 24);
         let screen = buffer_string(&terminal);
@@ -4330,9 +4540,45 @@ mod tests {
         assert!(screen.contains("MBDown"));
         assert!(screen.contains("Other answer"));
         assert!(screen.contains("Your answer"));
+        assert!(!screen.contains("> Markdown"));
+        assert!(!screen.contains("> Other answer"));
         let overlay = app.layout.overlay.expect("ask-user overlay");
         assert_eq!(overlay.width, DIALOG_WIDTH);
-        assert_eq!(overlay.height, 11);
+        assert_eq!(overlay.height, 15);
+        assert_eq!(app.dialog_hitboxes.len(), 3);
+        let selected = app
+            .dialog_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.index == 0)
+            .expect("selected Markdown option");
+        let mbdown = app
+            .dialog_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.index == 1)
+            .expect("MBDown option");
+        let other = app
+            .dialog_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.index == 2)
+            .expect("Other answer option");
+        assert_eq!(selected.area.height, SELECT_OPTION_HEIGHT);
+        assert_eq!(mbdown.area.height, SELECT_OPTION_HEIGHT);
+        assert_eq!(other.area.height, SELECT_OPTION_HEIGHT);
+        assert_eq!(mbdown.area.y, selected.area.y + SELECT_OPTION_HEIGHT);
+        assert_eq!(other.area.y, mbdown.area.y + SELECT_OPTION_HEIGHT);
+        let buffer = terminal.backend().buffer();
+        for y in selected.area.y.saturating_sub(1)..selected.area.y + selected.area.height {
+            assert_eq!(
+                buffer[(selected.area.x + selected.area.width - 1, y)].bg,
+                app.theme.selection_background,
+                "selection must include both shared blank rows across the full list width"
+            );
+            assert_eq!(buffer[(selected.area.x, y)].symbol(), "▌");
+            assert_eq!(
+                buffer[(selected.area.x, y)].fg,
+                app.theme.selection_indicator
+            );
+        }
         assert!(app.hitboxes.is_empty());
     }
 
@@ -4614,6 +4860,11 @@ mod tests {
             ctp::SURFACE_1,
             "the selected background should include the shared blank row"
         );
+        assert_eq!(
+            terminal.backend().buffer()[(first.x, first.y)].symbol(),
+            "["
+        );
+        assert_eq!(terminal.backend().buffer()[(last.x, last.y)].symbol(), "[");
         let last_margin = &terminal.backend().buffer()[(last.x, last.y + last.height - 1)];
         assert_eq!(last_margin.symbol(), " ");
         assert_eq!(last_margin.bg, ctp::SURFACE_1);

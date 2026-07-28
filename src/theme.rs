@@ -10,13 +10,17 @@ canvas = "terminal"
 panel = "#181825"
 compose = "#313244"
 overlay = "#11111b"
-selection = "#45475a"
-selection_inactive = "#313244"
 message_user = "#313244"
 message_agent = "#1e1e2e"
 status_bar = "terminal"
 status_context = "#89b4fa"
 status_mode = "#74c7ec"
+
+[selection]
+background = "#45475a"
+background_inactive = "#313244"
+foreground = "#cdd6f4"
+indicator = "#cba6f7"
 
 [text]
 primary = "#cdd6f4"
@@ -30,7 +34,6 @@ on_accent = "#11111b"
 border = "#6c7086"
 border_subtle = "#45475a"
 focus_border = "#a6e3a1"
-selection_indicator = "#cba6f7"
 input_prompt = "#a6e3a1"
 shortcut = "#a6e3a1"
 page_heading = "#b4befe"
@@ -81,7 +84,6 @@ pub mod catppuccin {
     pub const SKY: Color = Color::Rgb(137, 220, 235);
     pub const SAPPHIRE: Color = Color::Rgb(116, 199, 236);
     pub const BLUE: Color = Color::Rgb(137, 180, 250);
-    pub const SUBTEXT_1: Color = Color::Rgb(186, 194, 222);
     pub const OVERLAY_0: Color = Color::Rgb(108, 112, 134);
     pub const SURFACE_1: Color = Color::Rgb(69, 71, 90);
     pub const SURFACE_0: Color = Color::Rgb(49, 50, 68);
@@ -96,13 +98,15 @@ pub struct Theme {
     pub surface_panel: Color,
     pub surface_compose: Color,
     pub surface_overlay: Color,
-    pub surface_selection: Color,
-    pub surface_selection_inactive: Color,
     pub surface_message_user: Color,
     pub surface_message_agent: Color,
     pub surface_status_bar: Color,
     pub surface_status_context: Color,
     pub surface_status_mode: Color,
+    pub selection_background: Color,
+    pub selection_background_inactive: Color,
+    pub selection_foreground: Color,
+    pub selection_indicator: Color,
     pub text_primary: Color,
     pub text_secondary: Color,
     pub text_muted: Color,
@@ -112,7 +116,6 @@ pub struct Theme {
     pub ui_border: Color,
     pub ui_border_subtle: Color,
     pub ui_focus_border: Color,
-    pub ui_selection_indicator: Color,
     pub ui_input_prompt: Color,
     pub ui_shortcut: Color,
     pub ui_page_heading: Color,
@@ -152,6 +155,7 @@ pub struct Theme {
 #[serde(deny_unknown_fields)]
 struct ThemeFile {
     surface: SurfaceTokens,
+    selection: SelectionTokens,
     text: TextTokens,
     ui: UiTokens,
     markdown: MarkdownTokens,
@@ -165,13 +169,20 @@ struct SurfaceTokens {
     panel: String,
     compose: String,
     overlay: String,
-    selection: String,
-    selection_inactive: String,
     message_user: String,
     message_agent: String,
     status_bar: String,
     status_context: String,
     status_mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectionTokens {
+    background: String,
+    background_inactive: String,
+    foreground: String,
+    indicator: String,
 }
 
 #[derive(Deserialize)]
@@ -191,7 +202,6 @@ struct UiTokens {
     border: String,
     border_subtle: String,
     focus_border: String,
-    selection_indicator: String,
     input_prompt: String,
     shortcut: String,
     page_heading: String,
@@ -245,11 +255,6 @@ impl Theme {
             surface_panel: parse_color("surface.panel", &file.surface.panel)?,
             surface_compose: parse_color("surface.compose", &file.surface.compose)?,
             surface_overlay: parse_color("surface.overlay", &file.surface.overlay)?,
-            surface_selection: parse_color("surface.selection", &file.surface.selection)?,
-            surface_selection_inactive: parse_color(
-                "surface.selection_inactive",
-                &file.surface.selection_inactive,
-            )?,
             surface_message_user: parse_color("surface.message_user", &file.surface.message_user)?,
             surface_message_agent: parse_color(
                 "surface.message_agent",
@@ -261,6 +266,13 @@ impl Theme {
                 &file.surface.status_context,
             )?,
             surface_status_mode: parse_color("surface.status_mode", &file.surface.status_mode)?,
+            selection_background: parse_color("selection.background", &file.selection.background)?,
+            selection_background_inactive: parse_color(
+                "selection.background_inactive",
+                &file.selection.background_inactive,
+            )?,
+            selection_foreground: parse_color("selection.foreground", &file.selection.foreground)?,
+            selection_indicator: parse_color("selection.indicator", &file.selection.indicator)?,
             text_primary: parse_color("text.primary", &file.text.primary)?,
             text_secondary: parse_color("text.secondary", &file.text.secondary)?,
             text_muted: parse_color("text.muted", &file.text.muted)?,
@@ -270,10 +282,6 @@ impl Theme {
             ui_border: parse_color("ui.border", &file.ui.border)?,
             ui_border_subtle: parse_color("ui.border_subtle", &file.ui.border_subtle)?,
             ui_focus_border: parse_color("ui.focus_border", &file.ui.focus_border)?,
-            ui_selection_indicator: parse_color(
-                "ui.selection_indicator",
-                &file.ui.selection_indicator,
-            )?,
             ui_input_prompt: parse_color("ui.input_prompt", &file.ui.input_prompt)?,
             ui_shortcut: parse_color("ui.shortcut", &file.ui.shortcut)?,
             ui_page_heading: parse_color("ui.page_heading", &file.ui.page_heading)?,
@@ -407,6 +415,8 @@ mod tests {
         assert_eq!(theme.surface_canvas, Color::Reset);
         assert_eq!(theme.surface_status_bar, Color::Reset);
         assert_eq!(theme.surface_compose, Color::Rgb(49, 50, 68));
+        assert_eq!(theme.selection_background, Color::Rgb(69, 71, 90));
+        assert_eq!(theme.selection_foreground, Color::Rgb(205, 214, 244));
         assert_eq!(theme.ui_page_heading, Color::Rgb(180, 190, 254));
         assert_eq!(theme.markdown_code_block_background, Color::Rgb(49, 50, 68));
         assert_eq!(theme.surface_status_context, Color::Rgb(137, 180, 250));
@@ -423,6 +433,7 @@ mod tests {
     fn semantic_tokens_can_vary_independently() {
         let custom = DEFAULT_THEME_TOML
             .replace("panel = \"#181825\"", "panel = \"#010203\"")
+            .replace("foreground = \"#cdd6f4\"", "foreground = \"#0a0b0c\"")
             .replace("action = \"#94e2d5\"", "action = \"#070809\"")
             .replace(
                 "code_block_background = \"#313244\"",
@@ -430,6 +441,7 @@ mod tests {
             );
         let theme = Theme::from_toml(&custom).unwrap();
         assert_eq!(theme.surface_panel, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.selection_foreground, Color::Rgb(10, 11, 12));
         assert_eq!(theme.markdown_code_block_background, Color::Rgb(4, 5, 6));
         assert_eq!(theme.ui_action, Color::Rgb(7, 8, 9));
         assert_eq!(theme.ui_task_open, Color::Rgb(148, 226, 213));

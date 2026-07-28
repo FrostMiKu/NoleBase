@@ -1348,17 +1348,19 @@ fn system_prompt(
     memory: &str,
 ) -> String {
     let web_search_guidance = if has_web_search {
-        "- Use web_search for current information; use web_fetch when you already have a URL.\n"
+        "- Use web_search for current information when you do not already have a URL.\n"
     } else {
         ""
     };
     format!(
         r#"You are the AI assistant in Nole, a terminal note app.
-The conversation is multi-turn and completed history is retained in memory. Use ask_user when input is required before finishing the current task. Return only the useful final answer; it appears in the Agent panel.
+The conversation is multi-turn and its history is retained for the current Agent session. Return only the useful final answer; it appears in the Agent panel.
 The user may add input while you work. Nole buffers it and delivers it before pending tool calls; incorporate all newly delivered input before continuing.
 
 ## MBDown
-Nole renders CommonMark plus #tag and [[wikilink]]. Tags allow Unicode letters/numbers and _, -, /. Wikilinks resolve .md/.mb notes in data/ and archives/. Restricted BBCode is also available:
+Nole renders CommonMark plus #tag, [[wikilink]], and ![[file]] embeds. A Hashtag must start a source line or follow whitespace; its name allows Unicode letters/numbers and _, -, /. Wikilinks resolve .md/.mb notes in data/ and archives/.
+Embed paths are relative to the containing note, or to the Nole root when emitted in the Agent panel. png, jpg, jpeg, gif, and webp embeds render inline; local images must be under the Nole root, while remote http(s) images may use public or private-network hosts. Other existing regular files are clickable and open with the system application; absolute paths may point outside Nole.
+Restricted BBCode is also available:
 - inline: [b], [i], [u], [s], [dim], [red], [color=#12abef], [bg=blue], [link=https://example.com]label[/link]
 - layout: [center], [right], [indent first=4]
 - containers: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0], [columns gap=2], [column width=1fr]
@@ -1367,18 +1369,21 @@ Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never em
 ## Workspace
 Root: {root}
 - data/: ordinary .md/.mb articles and notes; create them here by default.
-- daily/: YYYY-MM-DD.md DailyNotes. Use only DailyNote tools.
+- daily/: YYYY-MM-DD.md DailyNotes; use only DailyNote tools.
 - archives/: archived DailyNotes and regular notes.
-- config/: user-owned configuration. Never modify, move, copy, rename, or delete anything here. Never read config/ai.toml.
+- themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
+- template.mb: editable content used only by Create note from template; ordinary New note does not use it.
+- config/: read-only user configuration. You may inspect it except config/ai.toml; never modify, move, copy, rename, or delete anything here.
 - config/AGENTS.md: user instructions injected below.
 - MEMORY.md: persistent Agent memory injected below; you may update it.
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
 - read_file is paginated; read only needed lines. Use list_directory for filesystem structure, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
-- write_file creates only new files. update_file uses exact zero-based line ranges. Every changed/deleted range must first be read in this run; insertions require adjacent lines. Unrelated lines need not be read.
-- Generic file tools cannot operate in daily/ or config/. Use read_daily before update_daily. append_daily creates/appends without approval; updates require approval unless bypassed.
-- Copy/move sources may be outside Nole; destinations must be new paths under Nole. Use move_files for batches and rename_file for file renames. Use rename_tag for exact workspace-wide tag renames. Deletes and tag renames require approval unless bypassed.
+- write_file creates only new files. update_file uses exact zero-based line ranges and requires diff approval unless bypassed. Every changed/deleted range must first be read in this run; insertions require adjacent lines. Unrelated lines need not be read.
+- Generic mutation tools cannot operate in daily/ or config/. Use read_daily before update_daily. append_daily creates/appends without approval; update_daily requires diff approval unless bypassed.
+- Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches and rename_file for file renames. Use rename_tag for exact workspace-wide tag renames. Deletes and tag renames require approval unless bypassed.
+- Use web_fetch when you already have a URL.
 {web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
 - Use open_file when the user should see an existing data/ or archives/ note in the TUI.
 - Final text is not saved automatically; call append_daily when it belongs in Daily.
@@ -4702,22 +4707,39 @@ mod tests {
     fn system_prompt_describes_multi_turn_conversation_and_ask_user() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("conversation is multi-turn"));
-        assert!(prompt.contains("history is retained in memory"));
+        assert!(prompt.contains("history is retained for the current Agent session"));
         assert!(prompt.contains("Use ask_user"));
         assert!(prompt.contains("buffers it and delivers it before pending tool calls"));
     }
 
     #[test]
-    fn system_prompt_describes_mbdown_tags_and_wikilinks() {
+    fn system_prompt_describes_current_mbdown_and_workspace_behavior() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("#tag"));
         assert!(prompt.contains("[[wikilink]]"));
+        assert!(prompt.contains("![[file]]"));
+        assert!(prompt.contains("must start a source line or follow whitespace"));
+        assert!(prompt.contains("png, jpg, jpeg, gif, and webp"));
+        assert!(prompt.contains("public or private-network hosts"));
+        assert!(prompt.contains("relative to the containing note"));
+        assert!(prompt.contains("Nole root when emitted in the Agent panel"));
+        assert!(prompt.contains("absolute paths may point outside Nole"));
         assert!(prompt.contains("archived DailyNotes and regular notes"));
         assert!(prompt.contains("create them here by default"));
-        assert!(prompt.contains("Use only DailyNote tools"));
+        assert!(prompt.contains("themes/: editable TOML theme definitions"));
+        assert!(
+            prompt.contains("template.mb: editable content used only by Create note from template")
+        );
+        assert!(prompt.contains("ordinary New note does not use it"));
+        assert!(prompt.contains("config/: read-only user configuration"));
+        assert!(prompt.contains("inspect it except config/ai.toml"));
         assert!(prompt.contains("Use list_directory for filesystem structure"));
-        assert!(prompt.contains("Generic file tools cannot operate in daily/ or config/"));
+        assert!(prompt.contains("Generic mutation tools cannot operate in daily/ or config/"));
+        assert!(prompt
+            .contains("update_file uses exact zero-based line ranges and requires diff approval"));
+        assert!(prompt.contains("Use web_fetch when you already have a URL"));
         assert!(prompt.contains("Use open_file"));
+        assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
     }
 
     #[test]

@@ -50,23 +50,29 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
                 .render(&document);
             let lines = rendered.text.lines;
             let specs = link_specs(document.nodes());
-            let links = locate_links(&lines, &specs, theme.markdown_link);
-            let tags = rendered
-                .semantics
-                .into_iter()
-                .filter_map(|semantic| match semantic.kind {
-                    mbtui::SemanticKind::Hashtag { name } => Some((name, semantic.regions)),
-                    _ => None,
-                })
-                .flat_map(|(name, regions)| {
-                    regions.into_iter().map(move |region| RenderedTag {
-                        name: name.clone(),
-                        row: region.row,
-                        column: region.column,
-                        width: region.width,
-                    })
-                })
-                .collect();
+            let mut links = locate_links(&lines, &specs, theme.markdown_link);
+            let mut tags = Vec::new();
+            for semantic in rendered.semantics {
+                match semantic.kind {
+                    mbtui::SemanticKind::Hashtag { name } => {
+                        tags.extend(semantic.regions.into_iter().map(|region| RenderedTag {
+                            name: name.clone(),
+                            row: region.row,
+                            column: region.column,
+                            width: region.width,
+                        }));
+                    }
+                    mbtui::SemanticKind::Embed { target } => {
+                        links.extend(semantic.regions.into_iter().map(|region| RenderedLink {
+                            target: LinkTarget::EmbeddedFile(target.clone().into()),
+                            row: region.row,
+                            column: region.column,
+                            width: region.width,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
             RenderedMarkup {
                 lines,
                 links,
@@ -182,6 +188,7 @@ fn visible_event_text(events: &[mbdown::SpannedEvent<'_>]) -> String {
                 text.push_str(tag);
             }
             Event::WikiLink(target) => text.push_str(&format!("[[{target}]]")),
+            Event::Embed(target) => text.push_str(&format!("![[{target}]]")),
             Event::SoftBreak | Event::HardBreak => text.push(' '),
             _ => {}
         }
@@ -455,6 +462,21 @@ mod tests {
         assert!(rendered.lines[image.row..image.row + image.height]
             .iter()
             .all(|line| line.spans.is_empty()));
+    }
+
+    #[test]
+    fn renders_image_and_file_embeds_through_distinct_outputs() {
+        let image = render_at_width("![[assets/pic.png]]", 30);
+        assert_eq!(image.images.len(), 1);
+        assert_eq!(image.images[0].source, "assets/pic.png");
+        assert!(image.links.is_empty());
+
+        let file = render_at_width("Open ![[attachments/report.pdf]]", 40);
+        assert!(file.images.is_empty());
+        assert!(file.links.iter().any(|link| {
+            link.target == LinkTarget::EmbeddedFile("attachments/report.pdf".into())
+        }));
+        assert!(text(&file.lines).contains("![[attachments/report.pdf]]"));
     }
 
     #[test]
