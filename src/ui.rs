@@ -731,11 +731,11 @@ fn draw_files(
 
     let focused = app.focus == Focus::Files;
     let title = match app.files_context {
-        FilesContext::Browse => " NoleBase ",
-        FilesContext::Search => " NoleBase · search ",
-        FilesContext::MoveTarget => " NoleBase · move to ",
-        FilesContext::NewTarget => " NoleBase · new ",
-        FilesContext::Rename => " NoleBase · rename ",
+        FilesContext::Browse => " NólëBase ",
+        FilesContext::Search => " NólëBase · search ",
+        FilesContext::MoveTarget => " NólëBase · move to ",
+        FilesContext::NewTarget => " NólëBase · new ",
+        FilesContext::Rename => " NólëBase · rename ",
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4039,7 +4039,7 @@ mod tests {
         assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 17)));
         assert!(app.layout.center.is_none());
         assert!(app.layout.todo.is_none());
-        assert_eq!(buffer_string(&terminal).matches("NoleBase").count(), 1);
+        assert_eq!(buffer_string(&terminal).matches("NólëBase").count(), 1);
         assert!(!app.file_hitboxes.is_empty());
         assert!(app
             .file_hitboxes
