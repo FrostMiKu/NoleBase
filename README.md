@@ -86,7 +86,9 @@ as a new `.md` file under `data/`.
 Hashtags are an exact navigation layer over workspace search. Clicking a
 `#tag` in Daily or a document opens all lines carrying that exact tag, so
 `#rust` does not include `#rustlang`. `Tags: Browse` in the command palette
-lists tags by document count and mention count. Nole builds this index for
+lists tags by document count and mention count. `Tags: Rename` performs an
+exact, workspace-wide rename without changing code spans, escaped text, or
+longer tag names. Nole builds this index for
 `daily/`, `data/`, and `archives/` on a background thread, then updates it
 incrementally from file-watcher events. Typing in global search queries the
 in-memory snapshot and never rescans files on the UI thread. Search results
@@ -285,6 +287,9 @@ task, clear its in-memory session, create or manage notes, or open `template.mb`
 The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
 Agent conversations persist across completed prompts. Continue in the compose
 box with `Ctrl+Enter`; the Agent receives the completed conversation history.
+The Agent can inspect the same shared tag index with `list_tags` and
+`search_tag`. Its `rename_tag` tool shows a multi-file diff and follows the
+normal approval/bypass policy before changing exact Hashtag source spans.
 You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
 An in-flight tool is allowed to finish, while later unstarted calls from the

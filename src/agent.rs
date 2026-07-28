@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use similar::TextDiff;
 
 use crate::storage::Storage;
+use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_ROUNDS: u32 = 25;
@@ -114,6 +115,7 @@ pub struct AgentRuntime {
     input_buffer: Arc<Mutex<Vec<String>>>,
     bypass: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    workspace_index: WorkspaceIndexHandle,
 }
 
 impl AgentRuntime {
@@ -132,7 +134,13 @@ impl AgentRuntime {
             input_buffer,
             bypass,
             cancelled,
+            workspace_index: WorkspaceIndexHandle::default(),
         }
+    }
+
+    pub fn with_workspace_index(mut self, workspace_index: WorkspaceIndexHandle) -> Self {
+        self.workspace_index = workspace_index;
+        self
     }
 }
 
@@ -458,6 +466,7 @@ impl Agent {
             input_buffer,
             bypass,
             cancelled,
+            workspace_index,
         } = runtime;
         let config = AgentConfig::load(config_path)?;
         let tavily_api_key = config.tavily_api_key.trim().to_string();
@@ -493,6 +502,9 @@ impl Agent {
         agent.register(ListNotes::new(nole_root)?);
         agent.register(SearchContent::new(nole_root)?);
         agent.register(SearchFiles::new(nole_root)?);
+        agent.register(ListTags::new(workspace_index.clone()));
+        agent.register(SearchTag::new(nole_root, workspace_index.clone())?);
+        agent.register(RenameTag::new(nole_root, workspace_index, gate.clone())?);
         agent.register(WriteFile::new(nole_root)?);
         agent.register(CopyFile::new(nole_root)?);
         let file_events = agent.events.clone();
@@ -1274,7 +1286,9 @@ fn tool_activity_target(call: &Value) -> Option<String> {
     };
     match name {
         "web_fetch" => text("url").map(|url| web_base_url(&url)),
-        "web_search" | "search_content" | "search_files" => text("query"),
+        "web_search" | "search_content" | "search_files" | "list_tags" => text("query"),
+        "search_tag" => text("tag"),
+        "rename_tag" => Some(format!("{} -> {}", text("from")?, text("to")?)),
         "read_daily" => {
             let start = text("start_date")?;
             let end = text("end_date")?;
@@ -1361,10 +1375,10 @@ Root: {root}
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
-- read_file is paginated; read only needed lines. Use list_directory for filesystem structure, and list_notes, search_content, or search_files to discover notes.
+- read_file is paginated; read only needed lines. Use list_directory for filesystem structure, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
 - write_file creates only new files. update_file uses exact zero-based line ranges. Every changed/deleted range must first be read in this run; insertions require adjacent lines. Unrelated lines need not be read.
 - Generic file tools cannot operate in daily/ or config/. Use read_daily before update_daily. append_daily creates/appends without approval; updates require approval unless bypassed.
-- Copy/move sources may be outside Nole; destinations must be new paths under Nole. Use move_files for batches and rename_file for renames. Deletes require approval unless bypassed.
+- Copy/move sources may be outside Nole; destinations must be new paths under Nole. Use move_files for batches and rename_file for file renames. Use rename_tag for exact workspace-wide tag renames. Deletes and tag renames require approval unless bypassed.
 {web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
 - Use open_file when the user should see an existing data/ or archives/ note in the TUI.
 - Final text is not saved automatically; call append_daily when it belongs in Daily.
@@ -1960,6 +1974,316 @@ impl Tool for SearchFiles {
             })
             .collect();
         paginated_search_result(query, offset, limit, matches)
+    }
+}
+
+struct ListTags {
+    index: WorkspaceIndexHandle,
+}
+
+impl ListTags {
+    fn new(index: WorkspaceIndexHandle) -> Self {
+        Self { index }
+    }
+}
+
+impl Tool for ListTags {
+    fn name(&self) -> &'static str {
+        "list_tags"
+    }
+
+    fn description(&self) -> &'static str {
+        "List indexed Hashtags with document and mention counts. Supports fuzzy filtering, workspace scope, sorting, and pagination."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional fuzzy tag-name filter" },
+                "scope": {
+                    "type": "string", "enum": ["all", "daily", "notes", "archives"],
+                    "default": "all"
+                },
+                "sort_by": {
+                    "type": "string", "enum": ["documents", "mentions", "name"],
+                    "default": "documents"
+                },
+                "order": { "type": "string", "enum": ["asc", "desc"], "default": "desc" },
+                "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": MAX_SEARCH_RESULTS, "default": DEFAULT_SEARCH_RESULTS
+                }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(&self, input: &Value) -> Result<String> {
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let scope = tag_scope(input)?;
+        let sort_by = input
+            .get("sort_by")
+            .and_then(Value::as_str)
+            .unwrap_or("documents");
+        if !matches!(sort_by, "documents" | "mentions" | "name") {
+            bail!("unsupported sort_by: {sort_by}");
+        }
+        let descending = match input.get("order").and_then(Value::as_str).unwrap_or("desc") {
+            "asc" => false,
+            "desc" => true,
+            other => bail!("unsupported order: {other}"),
+        };
+        let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
+        let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
+        let mut tags = self
+            .index
+            .with_index(|index| index.tags_scoped(scope))
+            .context("workspace tag index is still building")?;
+        if !query.is_empty() {
+            tags.retain(|tag| fuzzy_match(&tag.name, query));
+        }
+        tags.sort_by(|left, right| {
+            let ordering = match sort_by {
+                "documents" => left.documents.cmp(&right.documents),
+                "mentions" => left.mentions.cmp(&right.mentions),
+                "name" => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+                _ => unreachable!(),
+            };
+            let ordering = if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            ordering.then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        let total = tags.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        let entries = tags[start..end]
+            .iter()
+            .map(|tag| {
+                json!({
+                    "tag": tag.name,
+                    "documents": tag.documents,
+                    "mentions": tag.mentions,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&json!({
+            "query": query,
+            "scope": tag_scope_label(scope),
+            "sort_by": sort_by,
+            "order": if descending { "desc" } else { "asc" },
+            "offset": start,
+            "returned": end - start,
+            "total": total,
+            "has_more": end < total,
+            "entries": entries,
+        }))
+        .context("encoding tag list")
+    }
+}
+
+struct SearchTag {
+    root: PathBuf,
+    index: WorkspaceIndexHandle,
+}
+
+impl SearchTag {
+    fn new(root: &Path, index: WorkspaceIndexHandle) -> Result<Self> {
+        Ok(Self {
+            root: canonical_root(root)?,
+            index,
+        })
+    }
+}
+
+impl Tool for SearchTag {
+    fn name(&self) -> &'static str {
+        "search_tag"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search one exact Hashtag across indexed Markdown files. Returns paths, one-based line numbers, and source snippets with pagination."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tag": { "type": "string", "description": "Exact tag name, with or without #" },
+                "scope": {
+                    "type": "string", "enum": ["all", "daily", "notes", "archives"],
+                    "default": "all"
+                },
+                "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": MAX_SEARCH_RESULTS, "default": DEFAULT_SEARCH_RESULTS
+                }
+            },
+            "required": ["tag"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(&self, input: &Value) -> Result<String> {
+        let tag = required_string(input, "tag")?.trim();
+        if tag.is_empty() {
+            bail!("tag must not be empty");
+        }
+        let scope = tag_scope(input)?;
+        let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
+        let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
+        let hits = self
+            .index
+            .with_index(|index| index.exact_tag_hits(tag, scope))
+            .context("workspace tag index is still building")?;
+        let total = hits.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        let entries = hits[start..end]
+            .iter()
+            .filter_map(|hit| match hit {
+                crate::model::SearchHit::FileLine {
+                    path,
+                    line_no,
+                    text,
+                } => Some(json!({
+                    "path": display_path(&self.root, path),
+                    "line": line_no,
+                    "snippet": truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS),
+                })),
+                crate::model::SearchHit::DocumentLine { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&json!({
+            "tag": tag.trim_start_matches('#'),
+            "scope": tag_scope_label(scope),
+            "offset": start,
+            "returned": end - start,
+            "total": total,
+            "has_more": end < total,
+            "entries": entries,
+        }))
+        .context("encoding tag search")
+    }
+}
+
+struct RenameTag {
+    storage: Storage,
+    root: PathBuf,
+    index: WorkspaceIndexHandle,
+    gate: ApprovalGate,
+}
+
+impl RenameTag {
+    fn new(root: &Path, index: WorkspaceIndexHandle, gate: ApprovalGate) -> Result<Self> {
+        Ok(Self {
+            storage: Storage::new(root)?,
+            root: canonical_root(root)?,
+            index,
+            gate,
+        })
+    }
+}
+
+impl Tool for RenameTag {
+    fn name(&self) -> &'static str {
+        "rename_tag"
+    }
+
+    fn description(&self) -> &'static str {
+        "Rename one exact Hashtag across daily, notes, and archives using MBDown source spans. Shows a multi-file diff and requires approval unless bypassed."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Existing exact tag, with or without #" },
+                "to": { "type": "string", "description": "New valid tag, with or without #" }
+            },
+            "required": ["from", "to"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(&self, input: &Value) -> Result<String> {
+        let from = required_string(input, "from")?.trim();
+        let to = required_string(input, "to")?.trim();
+        let paths = self
+            .index
+            .with_index(|index| index.tag_paths(from))
+            .context("workspace tag index is still building")?;
+        let plan = TagRenamePlan::prepare(&self.storage, paths, from, to)?;
+        let mut diff = format!(
+            "Rename #{} to #{} in {} documents ({} mentions)\n\n",
+            plan.from,
+            plan.to,
+            plan.documents(),
+            plan.mentions()
+        );
+        for (path, before, after, _) in plan.changes() {
+            let label = display_path(&self.root, path);
+            diff.push_str(&limited_diff(before, after, &label, &label));
+            diff.push('\n');
+            if diff.len() > MAX_DIFF_BYTES {
+                let mut end = MAX_DIFF_BYTES;
+                while !diff.is_char_boundary(end) {
+                    end -= 1;
+                }
+                diff.truncate(end);
+                diff.push_str("\n... diff truncated ...\n");
+                break;
+            }
+        }
+        self.gate.request(ApprovalRequest {
+            title: format!("Rename #{} to #{}", plan.from, plan.to),
+            diff,
+        })?;
+        let outcome = plan.apply()?;
+        self.index
+            .refresh_paths(&self.storage, outcome.paths.clone());
+        serde_json::to_string_pretty(&json!({
+            "from": outcome.from,
+            "to": outcome.to,
+            "documents": outcome.documents,
+            "mentions": outcome.mentions,
+            "paths": outcome
+                .paths
+                .iter()
+                .map(|path| display_path(&self.root, path))
+                .collect::<Vec<_>>(),
+        }))
+        .context("encoding tag rename result")
+    }
+}
+
+fn tag_scope(input: &Value) -> Result<Option<TagScope>> {
+    Ok(
+        match input.get("scope").and_then(Value::as_str).unwrap_or("all") {
+            "all" => None,
+            "daily" => Some(TagScope::Daily),
+            "notes" => Some(TagScope::Notes),
+            "archives" => Some(TagScope::Archives),
+            other => bail!("unsupported tag scope: {other}"),
+        },
+    )
+}
+
+fn tag_scope_label(scope: Option<TagScope>) -> &'static str {
+    match scope {
+        None => "all",
+        Some(TagScope::Daily) => "daily",
+        Some(TagScope::Notes) => "notes",
+        Some(TagScope::Archives) => "archives",
     }
 }
 
@@ -4734,5 +5058,78 @@ mod tests {
             .send(AskUserResponse::Answer("MBDown".to_string()))
             .unwrap();
         assert_eq!(worker.join().unwrap().unwrap(), "MBDown");
+    }
+
+    #[test]
+    fn tag_tools_query_the_shared_index_with_exact_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(storage.data_dir.join("Tags.md"), "#rust #rust\n#rustlang\n").unwrap();
+        let handle = WorkspaceIndexHandle::default();
+        handle.replace(crate::workspace_index::WorkspaceIndex::build(&storage));
+
+        let listed: Value = serde_json::from_str(
+            &ListTags::new(handle.clone())
+                .execute(&json!({"query": "rust"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed["total"], 2);
+        assert_eq!(listed["entries"][0]["tag"], "rust");
+        assert_eq!(listed["entries"][0]["mentions"], 2);
+
+        let searched: Value = serde_json::from_str(
+            &SearchTag::new(directory.path(), handle)
+                .unwrap()
+                .execute(&json!({"tag": "#rust"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(searched["total"], 1);
+        assert_eq!(searched["entries"][0]["line"], 1);
+        assert!(searched["entries"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("#rust #rust"));
+    }
+
+    #[test]
+    fn rename_tag_tool_requires_approval_and_updates_the_shared_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let path = storage.data_dir.join("Tags.md");
+        fs::write(&path, "#old\n").unwrap();
+        let handle = WorkspaceIndexHandle::default();
+        handle.replace(crate::workspace_index::WorkspaceIndex::build(&storage));
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (decision_sender, decision_receiver) = std::sync::mpsc::channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            events: event_sender,
+            decisions: Arc::new(Mutex::new(decision_receiver)),
+        };
+        let tool = RenameTag::new(directory.path(), handle.clone(), gate).unwrap();
+        let worker = std::thread::spawn(move || tool.execute(&json!({"from": "old", "to": "new"})));
+
+        let AgentEvent::Approval(request) = event_receiver.recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        assert!(request.diff.contains("-#old"));
+        assert!(request.diff.contains("+#new"));
+        decision_sender.send(ApprovalDecision::Approve).unwrap();
+        let result: Value = serde_json::from_str(&worker.join().unwrap().unwrap()).unwrap();
+        assert_eq!(result["documents"], 1);
+        assert_eq!(fs::read_to_string(path).unwrap(), "#new\n");
+        assert!(handle
+            .with_index(|index| index.exact_tag_hits("old", None).is_empty())
+            .unwrap());
+        assert_eq!(
+            handle
+                .with_index(|index| index.exact_tag_hits("new", None).len())
+                .unwrap(),
+            1
+        );
     }
 }

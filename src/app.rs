@@ -24,7 +24,7 @@ use crate::model::{
 };
 use crate::notification::NotificationService;
 use crate::storage::{LoadedTheme, Storage};
-use crate::workspace_index::WorkspaceIndex;
+use crate::workspace_index::{TagRenamePlan, WorkspaceIndex, WorkspaceIndexHandle};
 
 fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
     col >= area.x
@@ -173,6 +173,7 @@ enum AppCommand {
     EditAiConfig,
     SwitchTheme,
     BrowseTags,
+    RenameTag,
     EditAgentInstructions,
     EditAgentMemory,
 }
@@ -274,6 +275,12 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Tags: Browse",
         description: "Browse tags by document and mention count",
         keywords: "tags hashtags browse search documents mentions",
+    },
+    AppCommandDefinition {
+        id: AppCommand::RenameTag,
+        label: "Tags: Rename",
+        description: "Rename a tag across the workspace",
+        keywords: "tags hashtags rename refactor workspace",
     },
 ];
 
@@ -398,6 +405,8 @@ pub enum DialogPurpose {
     CommandPalette,
     ThemePicker,
     TagPicker,
+    TagRenameSource,
+    TagRenameTarget,
     Custom,
 }
 
@@ -754,7 +763,8 @@ pub struct App {
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
-    workspace_index: Option<WorkspaceIndex>,
+    workspace_index: WorkspaceIndexHandle,
+    pending_tag_rename: Option<String>,
 
     pub help_scroll: u16,
     pub status: String,
@@ -864,7 +874,8 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
-            workspace_index: None,
+            workspace_index: WorkspaceIndexHandle::default(),
+            pending_tag_rename: None,
             help_scroll: 0,
             status: String::new(),
             animation_tick: 0,
@@ -1398,12 +1409,11 @@ impl App {
     }
 
     fn open_tag_picker(&mut self) {
-        let Some(index) = &self.workspace_index else {
+        let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
             self.set_status("Tag index is still building");
             return;
         };
-        let options = index
-            .tags()
+        let options = tags
             .into_iter()
             .map(|tag| {
                 DialogOption::with_hint(
@@ -1421,6 +1431,33 @@ impl App {
             String::new(),
             DialogMode::SingleSelect,
             DialogPurpose::TagPicker,
+            options,
+        ));
+    }
+
+    fn open_tag_rename_picker(&mut self) {
+        let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
+            self.set_status("Tag index is still building");
+            return;
+        };
+        let options = tags
+            .into_iter()
+            .map(|tag| {
+                DialogOption::with_hint(
+                    format!("#{}", tag.name),
+                    format!("{} documents · {} mentions", tag.documents, tag.mentions),
+                )
+            })
+            .collect::<Vec<_>>();
+        if options.is_empty() {
+            self.set_status("No tags found");
+            return;
+        }
+        self.open_dialog(DialogState::new(
+            "Rename tag · Select source",
+            String::new(),
+            DialogMode::SingleSelect,
+            DialogPurpose::TagRenameSource,
             options,
         ));
     }
@@ -1486,6 +1523,7 @@ impl App {
             }
             AppCommand::SwitchTheme => self.open_theme_picker(),
             AppCommand::BrowseTags => self.open_tag_picker(),
+            AppCommand::RenameTag => self.open_tag_rename_picker(),
             AppCommand::EditAgentInstructions => {
                 return Some(Command::Edit(self.storage.agents_path.clone()));
             }
@@ -1511,6 +1549,7 @@ impl App {
             AppCommand::EditAiConfig
             | AppCommand::SwitchTheme
             | AppCommand::BrowseTags
+            | AppCommand::RenameTag
             | AppCommand::EditAgentInstructions
             | AppCommand::EditAgentMemory => true,
         }
@@ -1884,6 +1923,7 @@ impl App {
                         | DialogPurpose::AskUser
                         | DialogPurpose::NewFile
                         | DialogPurpose::RenameFile
+                        | DialogPurpose::TagRenameTarget
                         | DialogPurpose::CommandPalette
                 )
             ) {
@@ -2792,9 +2832,11 @@ impl App {
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
             DialogPurpose::TagPicker => return self.handle_tag_picker(key),
-            DialogPurpose::AgentPrompt | DialogPurpose::NewFile | DialogPurpose::RenameFile => {
-                return self.handle_text_dialog(key)
-            }
+            DialogPurpose::TagRenameSource => return self.handle_tag_rename_source(key),
+            DialogPurpose::AgentPrompt
+            | DialogPurpose::NewFile
+            | DialogPurpose::RenameFile
+            | DialogPurpose::TagRenameTarget => return self.handle_text_dialog(key),
             DialogPurpose::Custom => {}
         }
 
@@ -2906,6 +2948,71 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    fn handle_tag_rename_source(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_dialog(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
+            KeyCode::Enter => {
+                let source = self
+                    .dialog
+                    .as_ref()
+                    .and_then(DialogState::selected_option)
+                    .map(|option| option.label.trim_start_matches('#').to_string())?;
+                self.pending_tag_rename = Some(source.clone());
+                self.open_dialog(DialogState::new(
+                    format!("Rename #{source}"),
+                    "Enter the new tag name",
+                    DialogMode::FreeText,
+                    DialogPurpose::TagRenameTarget,
+                    Vec::new(),
+                ));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn submit_tag_rename(&mut self) {
+        let Some(from) = self.pending_tag_rename.clone() else {
+            self.set_status("No source tag selected");
+            return;
+        };
+        let to = self
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.input.clone())
+            .unwrap_or_default();
+        let Some(paths) = self
+            .workspace_index
+            .with_index(|index| index.tag_paths(&from))
+        else {
+            self.set_status("Tag index is still building");
+            return;
+        };
+        let plan = match TagRenamePlan::prepare(&self.storage, paths, &from, &to) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.set_status(format!("Tag rename error: {error}"));
+                return;
+            }
+        };
+        match plan.apply() {
+            Ok(outcome) => {
+                self.workspace_index
+                    .refresh_paths(&self.storage, outcome.paths.clone());
+                self.pending_tag_rename = None;
+                self.close_dialog();
+                self.reload_workspace();
+                self.set_status(format!(
+                    "Renamed #{} to #{} in {} documents ({} mentions)",
+                    outcome.from, outcome.to, outcome.documents, outcome.mentions
+                ));
+            }
+            Err(error) => self.set_status(format!("Tag rename error: {error}")),
+        }
     }
 
     fn handle_command_palette(&mut self, key: KeyEvent) -> Option<Command> {
@@ -3204,6 +3311,7 @@ impl App {
                             self.close_dialog();
                         }
                     }
+                    Some(DialogPurpose::TagRenameTarget) => self.submit_tag_rename(),
                     _ => {
                         let text = self
                             .dialog
@@ -3225,6 +3333,9 @@ impl App {
                     Some(DialogPurpose::RenameFile) => {
                         self.pending_file = None;
                         self.files_context = FilesContext::Browse;
+                    }
+                    Some(DialogPurpose::TagRenameTarget) => {
+                        self.pending_tag_rename = None;
                     }
                     _ => self.dialog_result = Some(DialogResult::Cancelled),
                 }
@@ -3851,8 +3962,11 @@ impl App {
                 );
             }
         } else if !query.is_empty() {
-            if let Some(index) = &self.workspace_index {
-                results = index.search(&query);
+            if let Some(indexed) = self
+                .workspace_index
+                .with_index(|index| index.search(&query))
+            {
+                results = indexed;
             } else {
                 self.set_status("Workspace index is still building");
             }
@@ -3873,7 +3987,7 @@ impl App {
     }
 
     pub fn apply_workspace_index(&mut self, index: WorkspaceIndex) {
-        self.workspace_index = Some(index);
+        self.workspace_index.replace(index);
         if self.status == "Workspace index is still building" {
             self.status.clear();
         }
@@ -4301,6 +4415,7 @@ impl App {
         self.set_status("AI is working...");
         let bypass = self.permission_bypass.clone();
         let input_buffer = self.agent_input_buffer.clone();
+        let workspace_index = self.workspace_index.clone();
         let mut conversation = self.agent_conversation.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.ai_cancel = Some(cancelled.clone());
@@ -4315,7 +4430,8 @@ impl App {
                     input_buffer,
                     bypass,
                     cancelled,
-                ),
+                )
+                .with_workspace_index(workspace_index),
             )
             .and_then(|agent| agent.run(&prompt, &mut conversation))
             .map_err(|error| error.to_string());
@@ -4705,7 +4821,7 @@ mod tests {
             app.dialog.as_ref().map(|dialog| dialog.purpose),
             Some(DialogPurpose::CommandPalette)
         );
-        assert_eq!(app.command_matches.len(), 10);
+        assert_eq!(app.command_matches.len(), 11);
 
         app.handle_paste("clear");
         assert_eq!(
@@ -5036,6 +5152,51 @@ mod tests {
                 !text.contains("#rustlang")
             }
         }));
+    }
+
+    #[test]
+    fn command_palette_renames_an_exact_tag_across_the_workspace() {
+        let (mut app, _directory) = make_app();
+        add_daily_note(&mut app, "daily #old and `#old`");
+        let note = app.storage.data_dir.join("Project.md");
+        fs::write(&note, "note #old and #oldlang\n").unwrap();
+        refresh_test_index(&mut app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_paste("tags rename");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::TagRenameSource)
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.pending_tag_rename.as_deref(), Some("old"));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::TagRenameTarget)
+        );
+        app.handle_paste("new/tag");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.overlay, None);
+        assert!(app.status.contains("2 documents (2 mentions)"));
+        assert_eq!(
+            fs::read_to_string(note).unwrap(),
+            "note #new/tag and #oldlang\n"
+        );
+        let daily = app
+            .storage
+            .daily_file_path(&app.daily_notes[0].date.to_string())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(daily).unwrap(),
+            "daily #new/tag and `#old`\n"
+        );
+        assert_eq!(
+            app.workspace_index
+                .with_index(|index| index.exact_tag_hits("new/tag", None).len()),
+            Some(2)
+        );
     }
 
     #[test]
