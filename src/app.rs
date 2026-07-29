@@ -37,6 +37,10 @@ fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+fn agent_debug_logging_enabled() -> bool {
+    std::env::var("NOLE_DEBUG").is_ok_and(|value| value == "1")
+}
+
 fn in_area(col: u16, row: u16, area: Option<Rect>) -> bool {
     area.is_some_and(|area| point_in_rect(col, row, area))
 }
@@ -4604,8 +4608,16 @@ impl App {
                 )
                 .with_workspace_index(workspace_index),
             )
-            .and_then(|agent| agent.run(&prompt, &mut conversation))
-            .map_err(|error| error.to_string());
+            .and_then(|agent| agent.run(&prompt, &mut conversation));
+            let result = match result {
+                Ok(output) => Ok(output),
+                Err(error) => {
+                    if agent_debug_logging_enabled() {
+                        eprintln!("[nole debug] Agent error: {error:#}");
+                    }
+                    Err(error.to_string())
+                }
+            };
             if result.is_ok() {
                 let _ = event_sender.send(AgentEvent::ConversationUpdated(conversation));
             }

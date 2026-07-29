@@ -267,6 +267,16 @@ of older completed turns with a dense summary. The system prompt, current turn,
 recent history, and complete `tool_use`/`tool_result` pairs are retained.
 Compatible endpoints without token counting fall back to a conservative local
 estimate.
+To diagnose connection, DNS, TLS, timeout, or compatible-endpoint failures,
+start Nole with debug logging enabled and redirect standard error to a file:
+
+```sh
+NOLE_DEBUG=1 nole 2>nole-debug.log
+```
+
+The UI continues to show its concise error. The debug log includes the complete
+Agent error chain but does not include the API key, request headers, or request
+body.
 If a compatible endpoint stops at `max_tokens`, Nole preserves any partial text
 as intermediate output and automatically requests continuation. A response
 with no text is retried a limited number of times; persistent failures report
