@@ -20,6 +20,7 @@ use crate::app::{
     App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus, LayoutSnapshot,
     Overlay,
 };
+use crate::embedded_terminal::TerminalSnapshot;
 use crate::model::{
     Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
     LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
@@ -2606,6 +2607,9 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
     if width < 28 {
         return "";
     }
+    if app.overlay == Some(Overlay::Terminal) {
+        return "Ctrl+` close terminal";
+    }
     if width < 55 {
         return match (app.focus, app.center_view) {
             (Focus::Compose, CenterView::Document) => "Esc document",
@@ -2640,7 +2644,7 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
         (Focus::Agent, _) if app.ai_running => "c cancel · C clear session · ↑↓ scroll · ← center",
         (Focus::Agent, _) => "C clear session · ↑↓ scroll · ← center",
         (_, CenterView::Daily) if width >= 95 => {
-            "i compose · f files · T todo · / search · Ctrl+P commands · ? help"
+            "i compose · f files · t todo · / search · Ctrl+P commands · ? help"
         }
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {
@@ -2662,7 +2666,7 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
         (_, CenterView::Document) => "↑↓ scroll · e edit DailyNote · / find · Esc back",
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
         (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
-        _ => "f files · T todo · Ctrl+P commands · ? help",
+        _ => "f files · t todo · Ctrl+P commands · ? help",
     }
 }
 
@@ -2691,8 +2695,111 @@ fn draw_overlay(
     overlay: Overlay,
     cursor_position: &mut Option<Position>,
 ) -> Rect {
-    let _ = overlay;
-    draw_dialog(frame, app, root, cursor_position)
+    match overlay {
+        Overlay::Terminal => draw_terminal(frame, app, root, cursor_position),
+        _ => draw_dialog(frame, app, root, cursor_position),
+    }
+}
+
+fn draw_terminal(
+    frame: &mut Frame,
+    app: &mut App,
+    root: Rect,
+    cursor_position: &mut Option<Position>,
+) -> Rect {
+    let maximum_width = root.width.saturating_sub(4).max(root.width.min(1));
+    let maximum_height = root.height.saturating_sub(2).max(root.height.min(1));
+    let width = root
+        .width
+        .saturating_mul(4)
+        .div_ceil(5)
+        .max(root.width.min(40))
+        .min(maximum_width);
+    let height = root
+        .height
+        .saturating_mul(4)
+        .div_ceil(5)
+        .max(root.height.min(12))
+        .min(maximum_height);
+    let area = centered_rect(root, width, height);
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+
+    clear_widget(frame, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Terminal ")
+        .style(Style::default().bg(app.theme.surface_overlay))
+        .border_style(focus_border(true, app.theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_animated_border(frame, area, app.animation_tick, app.theme);
+    if inner.width == 0 || inner.height == 0 {
+        return area;
+    }
+
+    if let Some(snapshot) = app.terminal_snapshot(inner.height, inner.width) {
+        draw_terminal_snapshot(frame, inner, &snapshot, app.theme, cursor_position);
+    }
+    area
+}
+
+fn draw_terminal_snapshot(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &TerminalSnapshot,
+    theme: Theme,
+    cursor_position: &mut Option<Position>,
+) {
+    let (rows, cols) = snapshot.size();
+    let rows = rows.min(area.height);
+    let cols = cols.min(area.width);
+    let buffer = frame.buffer_mut();
+    for row in 0..rows {
+        for col in 0..cols {
+            let Some(cell) = snapshot.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let mut foreground = terminal_color(cell.fgcolor(), theme.text_primary);
+            let mut background = terminal_color(cell.bgcolor(), theme.surface_overlay);
+            if cell.inverse() {
+                std::mem::swap(&mut foreground, &mut background);
+            }
+            let mut style = Style::default().fg(foreground).bg(background);
+            if cell.bold() {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.italic() {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if cell.underline() {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            let contents = cell.contents();
+            buffer[(area.x + col, area.y + row)]
+                .set_symbol(if contents.is_empty() { " " } else { &contents })
+                .set_style(style);
+        }
+    }
+
+    if !snapshot.hide_cursor() {
+        let (row, col) = snapshot.cursor_position();
+        if row < area.height && col < area.width {
+            *cursor_position = Some(Position::new(area.x + col, area.y + row));
+        }
+    }
+}
+
+fn terminal_color(color: vt100::Color, default: Color) -> Color {
+    match color {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
 }
 
 /// Render every modal interaction through one fixed-width, bounded-height
@@ -2848,7 +2955,7 @@ fn draw_dialog(
                     input,
                     &dialog.input,
                     dialog.cursor,
-                    "Optional prompt; empty uses the card content",
+                    "Optional prompt; empty formats this daily note",
                     true,
                     app.theme,
                 ) {
@@ -3316,10 +3423,11 @@ fn help_lines(theme: Theme) -> Vec<Line<'static>> {
     };
     vec![
         heading("Workspace"),
-        key("f / T", "focus Files / Todo"),
+        key("f / t", "focus Files / Todo"),
         key("← → / ↑ ↓", "move focus between panes"),
         key("Tab", "toggle approve / bypass mode"),
         key("Ctrl+P", "open command palette"),
+        key("Ctrl+`", "toggle workspace terminal"),
         key("Esc", "return / cancel"),
         key("?", "open this help"),
         Line::default(),
@@ -3473,6 +3581,62 @@ mod tests {
                 assert_eq!(frame.buffer_mut()[(6, 4)].diff_option, CellDiffOption::None);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn terminal_snapshot_renders_ansi_styles_and_cursor() {
+        let backend = TestBackend::new(12, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let snapshot = TerminalSnapshot::from_bytes(2, 5, b"\x1b[31;44;1mX");
+        let mut cursor = None;
+        terminal
+            .draw(|frame| {
+                draw_terminal_snapshot(
+                    frame,
+                    Rect::new(2, 1, 5, 2),
+                    &snapshot,
+                    Theme::default(),
+                    &mut cursor,
+                );
+            })
+            .unwrap();
+
+        let cell = &terminal.backend().buffer()[(2, 1)];
+        assert_eq!(cell.symbol(), "X");
+        assert_eq!(cell.fg, Color::Indexed(1));
+        assert_eq!(cell.bg, Color::Indexed(4));
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert_eq!(cursor, Some(Position::new(3, 1)));
+    }
+
+    #[test]
+    fn terminal_overlay_uses_the_shared_animated_border() {
+        let (mut app, _directory) = make_app();
+        app.animation_tick = 7;
+        app.overlay = Some(Overlay::Terminal);
+
+        let terminal = render(&mut app, 100, 24);
+        let overlay = app.layout.overlay.expect("terminal overlay");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(overlay.x, overlay.y)].symbol(), "┌");
+        assert_eq!(
+            buffer[(overlay.x, overlay.y)].fg,
+            animated_color(0, app.animation_tick)
+        );
+        assert_eq!(
+            buffer[(overlay.x + 1, overlay.y)].fg,
+            animated_color(1, app.animation_tick)
+        );
+    }
+
+    #[test]
+    fn terminal_overlay_advertises_its_close_shortcut_in_the_footer() {
+        let (mut app, _directory) = make_app();
+        app.overlay = Some(Overlay::Terminal);
+
+        let terminal = render(&mut app, 80, 24);
+        let footer = buffer_string(&terminal).lines().last().unwrap().to_string();
+        assert!(footer.contains("Ctrl+` close terminal"));
     }
 
     #[test]

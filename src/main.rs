@@ -3,6 +3,7 @@
 mod agent;
 mod agent_session;
 mod app;
+mod embedded_terminal;
 mod markdown;
 mod media;
 mod model;
@@ -260,6 +261,7 @@ fn run(
             app.apply_workspace_index(index);
         }
         app.poll_agent();
+        app.poll_terminal();
         let pending_bells = app.notifications.take_bells();
         if pending_bells > 0 {
             let mut output = io::stdout();
@@ -302,13 +304,18 @@ fn run(
             }
             flush_wheel(&mut pending_wheel, app);
             match event {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        || (key.kind == KeyEventKind::Repeat
+                            && app.overlay == Some(app::Overlay::Terminal)) =>
+                {
                     if handle_command(app.handle_key(key), app, terminal, &mut cursor_visible)? {
                         quit = true;
                         break;
                     }
                 }
-                // Ignore key release/repeat events (kitty protocol).
+                // Base Nole interactions ignore key repeat. The embedded
+                // terminal accepts it so shell input behaves normally.
                 Event::Key(_) => {}
                 Event::Mouse(_) => unreachable!("mouse events handled above"),
                 Event::Paste(text) => {

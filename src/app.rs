@@ -18,6 +18,7 @@ use crate::agent::{
     AskUserRequest, AskUserResponse, PermissionMode,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
+use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
 use crate::model::{
     Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
     FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
@@ -26,6 +27,8 @@ use crate::model::{
 use crate::notification::NotificationService;
 use crate::storage::{LoadedTheme, Storage};
 use crate::workspace_index::{TagRenamePlan, WorkspaceIndex, WorkspaceIndexHandle};
+
+const FORMAT_DAILY_NOTE_PROMPT: &str = "Read this daily note, then edit it in place to improve its Markdown formatting and readability. Preserve every fact, idea, task, link, and the author's meaning. Only improve structure and presentation, such as headings, paragraphs, lists, spacing, and emphasis. Do not add new factual content, and do not merely describe the changes.";
 
 fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
     col >= area.x
@@ -164,6 +167,7 @@ pub enum Command {
 enum AppCommand {
     InterruptAgent,
     ClearAgentSession,
+    OpenTerminal,
     NewNote,
     NewNoteFromTemplate,
     EditTemplate,
@@ -199,6 +203,12 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Agent: Clear session",
         description: "Delete the saved conversation and panel history",
         keywords: "agent clear reset new session context conversation",
+    },
+    AppCommandDefinition {
+        id: AppCommand::OpenTerminal,
+        label: "Terminal: Open",
+        description: "Open the workspace terminal",
+        keywords: "terminal shell console pty open toggle workspace",
     },
     AppCommandDefinition {
         id: AppCommand::NewNote,
@@ -372,6 +382,7 @@ pub enum Overlay {
     Approval,
     AskUser,
     WikiLinkChoice,
+    Terminal,
     /// A caller-provided command dialog. Its mode and purpose live in
     /// [`DialogState`], allowing new command-style interactions without
     /// adding another overlay variant.
@@ -772,6 +783,9 @@ pub struct App {
     /// deliver their result directly to their existing subsystem channels.
     pub dialog_result: Option<DialogResult>,
     command_matches: Vec<AppCommand>,
+    terminal: Option<EmbeddedTerminal>,
+    terminal_return_overlay: Option<Overlay>,
+    terminal_return_dialog: Option<DialogState>,
 
     ai_events: Option<Receiver<AgentEvent>>,
     ai_approval_sender: Option<mpsc::Sender<ApprovalDecision>>,
@@ -887,6 +901,9 @@ impl App {
             dialog: None,
             dialog_result: None,
             command_matches: Vec::new(),
+            terminal: None,
+            terminal_return_overlay: None,
+            terminal_return_dialog: None,
             ai_events: None,
             ai_approval_sender: None,
             ai_user_sender: None,
@@ -1358,6 +1375,97 @@ impl App {
         self.set_overlay(Overlay::Help);
     }
 
+    pub fn toggle_terminal(&mut self) {
+        if self.overlay == Some(Overlay::Terminal) {
+            self.restore_terminal_return_overlay();
+            return;
+        }
+        if self.terminal.is_none() {
+            match EmbeddedTerminal::spawn(&self.storage.root) {
+                Ok(terminal) => self.terminal = Some(terminal),
+                Err(error) => {
+                    self.set_error(format!("Terminal error: {error}"));
+                    return;
+                }
+            }
+        }
+        self.terminal_return_overlay = self.overlay.take();
+        self.terminal_return_dialog = self.dialog.take();
+        self.overlay = Some(Overlay::Terminal);
+    }
+
+    pub fn poll_terminal(&mut self) {
+        let result = self.terminal.as_mut().map(EmbeddedTerminal::try_wait);
+        match result {
+            Some(Ok(Some(_))) => {
+                self.terminal = None;
+                if self.overlay == Some(Overlay::Terminal) {
+                    self.restore_terminal_return_overlay();
+                }
+                self.set_status("Terminal session ended");
+            }
+            Some(Err(error)) => self.close_terminal_with_error(error),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn terminal_snapshot(&mut self, rows: u16, cols: u16) -> Option<TerminalSnapshot> {
+        let resize = self
+            .terminal
+            .as_mut()
+            .map(|terminal| terminal.resize(rows, cols));
+        if let Some(Err(error)) = resize {
+            self.close_terminal_with_error(error);
+            return None;
+        }
+        self.terminal.as_ref().map(EmbeddedTerminal::snapshot)
+    }
+
+    fn write_terminal_key(&mut self, key: KeyEvent) {
+        let result = self
+            .terminal
+            .as_mut()
+            .map(|terminal| terminal.write_key(key));
+        if let Some(Err(error)) = result {
+            self.close_terminal_with_error(error);
+        }
+    }
+
+    fn write_terminal_paste(&mut self, text: &str) {
+        let result = self
+            .terminal
+            .as_mut()
+            .map(|terminal| terminal.write_paste(text));
+        if let Some(Err(error)) = result {
+            self.close_terminal_with_error(error);
+        }
+    }
+
+    fn close_terminal_with_error(&mut self, error: impl std::fmt::Display) {
+        self.terminal = None;
+        if self.overlay == Some(Overlay::Terminal) {
+            self.restore_terminal_return_overlay();
+        }
+        self.set_error(format!("Terminal error: {error}"));
+    }
+
+    #[cfg(test)]
+    fn terminal_process_id(&self) -> Option<u32> {
+        self.terminal
+            .as_ref()
+            .and_then(EmbeddedTerminal::process_id)
+    }
+
+    fn restore_terminal_return_overlay(&mut self) {
+        self.overlay = self.terminal_return_overlay.take();
+        self.dialog = self.terminal_return_dialog.take();
+    }
+
+    fn discard_terminal_return_overlay(&mut self) {
+        self.terminal_return_overlay = None;
+        self.terminal_return_dialog = None;
+    }
+
     fn open_command_palette(&mut self) {
         let dialog = DialogState::new(
             "Command Palette · Ctrl+P",
@@ -1503,6 +1611,7 @@ impl App {
         match command {
             AppCommand::InterruptAgent => self.cancel_agent(),
             AppCommand::ClearAgentSession => self.clear_agent_session(),
+            AppCommand::OpenTerminal => self.toggle_terminal(),
             AppCommand::NewNote => self.begin_new_note(),
             AppCommand::NewNoteFromTemplate => self.begin_new_note_from_template(),
             AppCommand::EditTemplate => {
@@ -1535,6 +1644,7 @@ impl App {
         match command {
             AppCommand::InterruptAgent
             | AppCommand::ClearAgentSession
+            | AppCommand::OpenTerminal
             | AppCommand::NewNote
             | AppCommand::NewNoteFromTemplate
             | AppCommand::EditTemplate => true,
@@ -1612,6 +1722,9 @@ impl App {
     /// resulting value with [`App::take_dialog_result`] after the dialog
     /// closes.
     pub fn open_dialog(&mut self, dialog: DialogState) {
+        if self.overlay == Some(Overlay::Terminal) {
+            self.discard_terminal_return_overlay();
+        }
         self.dialog_result = None;
         self.dialog = Some(dialog);
         self.overlay = Some(Overlay::Dialog);
@@ -1623,8 +1736,15 @@ impl App {
     }
 
     pub(crate) fn set_overlay(&mut self, overlay: Overlay) {
+        if self.overlay == Some(Overlay::Terminal) && overlay != Overlay::Terminal {
+            self.discard_terminal_return_overlay();
+        }
         self.overlay = Some(overlay);
-        self.dialog = Some(self.dialog_for_overlay(overlay));
+        self.dialog = if overlay == Overlay::Terminal {
+            None
+        } else {
+            Some(self.dialog_for_overlay(overlay))
+        };
     }
 
     fn open_file_name_dialog(&mut self, purpose: DialogPurpose) {
@@ -1649,6 +1769,9 @@ impl App {
     }
 
     pub(crate) fn ensure_file_input_dialog(&mut self) {
+        if self.overlay == Some(Overlay::Terminal) {
+            return;
+        }
         let purpose = match self.files_context {
             FilesContext::NewTarget => Some(DialogPurpose::NewFile),
             FilesContext::Rename => Some(DialogPurpose::RenameFile),
@@ -1817,6 +1940,7 @@ impl App {
                 dialog.selected = self.wiki_link_index;
                 dialog
             }
+            Overlay::Terminal => unreachable!("terminal overlay does not use a dialog"),
             Overlay::Dialog => match self.dialog.as_ref().map(|dialog| dialog.purpose) {
                 Some(DialogPurpose::NewFile) => {
                     let mut dialog = DialogState::new(
@@ -1856,6 +1980,14 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
+        if is_terminal_toggle(key) {
+            self.toggle_terminal();
+            return None;
+        }
+        if self.overlay == Some(Overlay::Terminal) {
+            self.write_terminal_key(key);
+            return None;
+        }
         if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self
                 .dialog
@@ -1888,7 +2020,7 @@ impl App {
                     self.open_files();
                     return None;
                 }
-                KeyCode::Char('T') => {
+                KeyCode::Char('t') => {
                     self.open_todo();
                     return None;
                 }
@@ -1911,6 +2043,10 @@ impl App {
 
     /// Paste into whichever orthogonal state currently owns a text buffer.
     pub fn handle_paste(&mut self, text: &str) {
+        if self.overlay == Some(Overlay::Terminal) {
+            self.write_terminal_paste(text);
+            return;
+        }
         if self.overlay.is_some() {
             let purpose = self.dialog.as_ref().map(|dialog| dialog.purpose);
             if matches!(
@@ -1975,6 +2111,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<Command> {
+        if self.overlay == Some(Overlay::Terminal) {
+            return None;
+        }
         match event.kind {
             MouseEventKind::ScrollDown => {
                 self.route_wheel(event.column, event.row, 1);
@@ -1993,6 +2132,14 @@ impl App {
     }
 
     pub fn handle_wheel(&mut self, column: u16, row: u16, delta: i32) {
+        if self.overlay == Some(Overlay::Terminal) {
+            if self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay) {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.scroll(delta);
+                }
+            }
+            return;
+        }
         self.route_wheel(column, row, delta);
     }
 
@@ -4301,24 +4448,42 @@ impl App {
             self.overlay = None;
             return;
         };
-        let Some(note) = self.daily_note_clone(date) else {
+        let Ok(path) = self.storage.daily_file_path(&date.to_string()) else {
             self.overlay = None;
             self.set_status("Daily note not found");
             return;
         };
+        if !path.is_file() {
+            self.overlay = None;
+            self.set_status("Daily note not found");
+            return;
+        }
+        let display_path = path
+            .strip_prefix(&self.storage.root)
+            .unwrap_or(&path)
+            .to_string_lossy();
         let requested = self.ai_prompt_input.trim();
-        let content = if requested.is_empty() {
-            note.body
+        let (prompt, display_prompt) = if requested.is_empty() {
+            (
+                format!(
+                    "The user wants you to format the daily note at: {display_path}\n\n{FORMAT_DAILY_NOTE_PROMPT}"
+                ),
+                format!("Format {display_path}"),
+            )
         } else {
-            requested.to_string()
+            (
+                format!(
+                    "The user wants you to work on the daily note at: {display_path}\n\n{requested}"
+                ),
+                requested.to_string(),
+            )
         };
-        let prompt = format!("Source Nole daily date: {date}\n\n{content}");
         self.overlay = None;
         self.dialog = None;
         if self.ai_running {
-            self.buffer_agent_prompt(prompt, content);
+            self.buffer_agent_prompt(prompt, display_prompt);
         } else {
-            self.start_agent(prompt, content);
+            self.start_agent(prompt, display_prompt);
         }
     }
 
@@ -4853,7 +5018,13 @@ mod tests {
             app.dialog.as_ref().map(|dialog| dialog.purpose),
             Some(DialogPurpose::CommandPalette)
         );
-        assert_eq!(app.command_matches.len(), 11);
+        assert_eq!(
+            app.command_matches.len(),
+            APP_COMMANDS
+                .iter()
+                .filter(|command| app.command_available(command.id))
+                .count()
+        );
 
         app.handle_paste("clear");
         assert_eq!(
@@ -5348,6 +5519,63 @@ mod tests {
         assert_eq!(app.ai_prompt_input, "custom prompt");
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn daily_ai_custom_prompt_includes_the_daily_file_path() {
+        let (mut app, _directory) = make_app();
+        add_daily_note(&mut app, "card body that should not become the prompt");
+        let date = app.selected_date().unwrap();
+        let path = app.storage.daily_file_path(&date.to_string()).unwrap();
+        let display_path = path
+            .strip_prefix(&app.storage.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        app.ai_running = true;
+
+        app.dispatch_action(date, Action::Ai);
+        app.handle_paste("Extract the action items");
+        app.handle_key(key(KeyCode::Enter));
+
+        let prompts = app.agent_input_buffer.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains(&display_path));
+        assert!(prompts[0].contains("Extract the action items"));
+        assert!(!prompts[0].contains("card body that should not become the prompt"));
+        assert!(matches!(
+            app.agent_panel.last(),
+            Some(AgentPanelEntry::Prompt { text, muted: true })
+                if text == "Extract the action items"
+        ));
+    }
+
+    #[test]
+    fn empty_daily_ai_prompt_requests_in_place_markdown_formatting() {
+        let (mut app, _directory) = make_app();
+        add_daily_note(&mut app, "unformatted card body");
+        let date = app.selected_date().unwrap();
+        let path = app.storage.daily_file_path(&date.to_string()).unwrap();
+        let display_path = path
+            .strip_prefix(&app.storage.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        app.ai_running = true;
+
+        app.dispatch_action(date, Action::Ai);
+        app.handle_key(key(KeyCode::Enter));
+
+        let prompts = app.agent_input_buffer.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains(&display_path));
+        assert!(prompts[0].contains(FORMAT_DAILY_NOTE_PROMPT));
+        assert!(!prompts[0].contains("unformatted card body"));
+        assert!(matches!(
+            app.agent_panel.last(),
+            Some(AgentPanelEntry::Prompt { text, muted: true })
+                if text == &format!("Format {display_path}")
+        ));
     }
 
     #[test]
@@ -5919,7 +6147,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(app.focus, Focus::Files);
         assert_eq!(app.center_view, CenterView::Daily);
-        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.focus, Focus::Todo);
         assert_eq!(app.center_view, CenterView::Daily);
     }
@@ -6908,6 +7136,59 @@ mod tests {
         assert_eq!(app.files_context, FilesContext::Rename);
         assert!(app.pending_file.is_some());
         assert!(app.status.starts_with("Error:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_toggle_retains_one_session_and_shell_exit_discards_it() {
+        let (mut app, _directory) = make_app();
+        let toggle = KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL);
+        app.handle_key(toggle);
+        assert_eq!(app.overlay, Some(Overlay::Terminal));
+        let process_id = app.terminal_process_id();
+        assert!(process_id.is_some());
+
+        app.handle_key(toggle);
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.terminal_process_id(), process_id);
+
+        app.open_help();
+        app.handle_key(toggle);
+        assert_eq!(app.overlay, Some(Overlay::Terminal));
+        assert_eq!(app.terminal_process_id(), process_id);
+        app.handle_key(toggle);
+        assert_eq!(app.overlay, Some(Overlay::Help));
+        assert_eq!(app.terminal_process_id(), process_id);
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(toggle);
+        assert_eq!(app.overlay, Some(Overlay::Terminal));
+
+        for character in "exit".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while app.terminal_process_id().is_some() && std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.terminal_process_id(), None);
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn command_palette_includes_workspace_terminal() {
+        let (mut app, _directory) = make_app();
+        app.open_command_palette();
+        assert!(app.command_matches.contains(&AppCommand::OpenTerminal));
+        assert!(app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .options
+            .iter()
+            .any(|option| option.label == "Terminal: Open"));
     }
 
     #[test]

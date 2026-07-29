@@ -37,7 +37,7 @@ shown as one card. Each card provides:
 - `new` — name a new note in Files and move it there
 - `edit` — edit that message in `$EDITOR` through a temporary Markdown file
 - `del` — delete it after confirmation
-- `AI` — open an optional prompt, then run the configured Anthropic agent
+- `AI` — ask the Agent to work on this daily file, or format it when left blank
 
 Messages render Markdown directly in Daily. Press `v` when a dedicated document
 view is useful for scrolling through a long message.
@@ -251,7 +251,9 @@ max_rounds = 25
 
 Set the Anthropic API key directly in `api_key`. The card's `AI` button runs the
 Anthropic Messages API in the background. It first opens a prompt dialog; an
-empty prompt sends the source card content. The lower two-thirds of the right
+entered prompt is sent with the daily file path, while an empty prompt asks the
+Agent to improve that file's Markdown formatting in place without changing its
+meaning or adding facts. The lower two-thirds of the right
 sidebar shows a chronological Agent timeline: user prompts, tool activity,
 intermediate text, and final responses; Todo uses the upper third.
 `max_rounds` is the request-round budget for one Agent segment, not a tool-call
@@ -288,6 +290,10 @@ Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
 task, clear its saved session, create or manage notes, or open `template.mb`,
 `ai.toml`, `AGENTS.md`, and `MEMORY.md` with `$EDITOR`.
+Press `Ctrl+\`` or run `Terminal: Open` from the command palette to open a
+PTY-backed floating terminal. Its shell starts in the active Nole directory
+(`~/.nole` by default, or `NOLE_DIR` when configured). Hiding the terminal
+retains its single shell session; exiting the shell closes and discards it.
 The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
 Agent conversations and their visible panel history persist in the single
 `config/agent-session.json` file across prompts and application restarts. Each
