@@ -786,11 +786,8 @@ impl Storage {
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
     }
 
-    /// Append to an article in either `data/` or `archives/`.
-    pub fn append_document(&self, path: &Path, body: &str) -> Result<()> {
-        self.append_document_tracked(path, body).map(|_| ())
-    }
-
+    /// Append to an article in either `data/` or `archives/` and return the
+    /// receipt required to undo that exact write.
     pub(crate) fn append_document_tracked(&self, path: &Path, body: &str) -> Result<AppendReceipt> {
         if body.trim().is_empty() {
             bail!("note content must not be empty");
@@ -1499,15 +1496,15 @@ mod tests {
         let (_dir, st) = fresh();
         let path = st.create_named_file("Article").unwrap();
         fs::write(&path, "# Article\n").unwrap();
-        st.append_document(&path, "new paragraph").unwrap();
+        st.append_document_tracked(&path, "new paragraph").unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# Article\n\nnew paragraph\n"
         );
         assert!(st
-            .append_document(Path::new("/tmp/outside.md"), "no")
+            .append_document_tracked(Path::new("/tmp/outside.md"), "no")
             .is_err());
-        assert!(st.append_document(&path, "   ").is_err());
+        assert!(st.append_document_tracked(&path, "   ").is_err());
     }
 
     #[test]
@@ -1635,7 +1632,7 @@ mod tests {
         let (_directory, storage) = fresh();
         let note = storage.create_named_file("Journal").unwrap();
         let archived = storage.archive_note(&note).unwrap();
-        storage.append_document(&archived, "later").unwrap();
+        storage.append_document_tracked(&archived, "later").unwrap();
         assert!(fs::read_to_string(archived).unwrap().ends_with("\nlater\n"));
     }
 

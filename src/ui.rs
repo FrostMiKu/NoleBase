@@ -3190,7 +3190,12 @@ fn draw_dialog(
         return area;
     }
     clear_widget(frame, area);
+    let destructive = matches!(
+        dialog.purpose,
+        DialogPurpose::DeleteDaily | DialogPurpose::DeleteFile
+    );
     let border = match dialog.mode {
+        _ if destructive => app.theme.ui_error,
         DialogMode::Approval => app.theme.ui_warning,
         DialogMode::FreeText => app.theme.ui_dialog_input,
         DialogMode::SelectOrInput
@@ -3236,10 +3241,37 @@ fn draw_dialog(
             frame.render_widget(
                 Paragraph::new(dialog.message.clone())
                     .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: false }),
+                    .wrap(Wrap { trim: false })
+                    .style(if destructive {
+                        Style::default()
+                            .fg(app.theme.ui_error)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    }),
                 body,
             );
-            draw_dialog_footer(frame, inner, "Enter/Y confirm · N/Esc cancel", app.theme);
+            if destructive {
+                draw_dialog_footer_line(
+                    frame,
+                    inner,
+                    Line::from(vec![
+                        Span::styled(
+                            "Enter/Y confirm",
+                            Style::default()
+                                .fg(app.theme.ui_error)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" · ", Style::default().fg(app.theme.text_muted)),
+                        Span::styled(
+                            "N/Esc cancel",
+                            Style::default().fg(app.theme.text_secondary),
+                        ),
+                    ]),
+                );
+            } else {
+                draw_dialog_footer(frame, inner, "Enter/Y confirm · N/Esc cancel", app.theme);
+            }
         }
         DialogMode::FreeText => {
             let (input, footer) = split_last_row(inner);
@@ -3479,6 +3511,14 @@ fn draw_command_palette(
 }
 
 fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str, theme: Theme) {
+    draw_dialog_footer_line(
+        frame,
+        area,
+        Line::styled(text.to_string(), Style::default().fg(theme.text_muted)),
+    );
+}
+
+fn draw_dialog_footer_line(frame: &mut Frame, area: Rect, line: Line<'static>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -3488,12 +3528,7 @@ fn draw_dialog_footer(frame: &mut Frame, area: Rect, text: &str, theme: Theme) {
         area.width,
         1,
     );
-    frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.text_muted)),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), footer);
 }
 
 fn draw_select_dialog(
