@@ -1542,6 +1542,7 @@ fn system_prompt_text(
 
 ## MBDown
 Nole renders CommonMark plus #tag, [[wikilink]], and ![[file]] embeds. A Hashtag must start a source line or follow whitespace; its name allows Unicode letters/numbers and _, -, /. Wikilinks resolve .md/.mb notes in data/ and archives/.
+Fenced mermaid code blocks render locally as width-aware Unicode character diagrams. Use them when a diagram communicates structure more clearly than prose.
 Embed paths are relative to the containing note, or to the Nole root when emitted in the Agent panel. png, jpg, jpeg, gif, and webp embeds render inline; local images must be under the Nole root, while remote http(s) images may use public or private-network hosts. Other existing regular files are clickable and open with the system application; absolute paths may point outside Nole.
 Restricted BBCode is also available:
 - inline: [b], [i], [u], [s], [dim], [red], [color=#12abef], [bg=blue], [link=https://example.com]label[/link]
@@ -5644,6 +5645,7 @@ mod tests {
         assert!(prompt.contains("#tag"));
         assert!(prompt.contains("[[wikilink]]"));
         assert!(prompt.contains("![[file]]"));
+        assert!(prompt.contains("Fenced mermaid code blocks render locally"));
         assert!(prompt.contains("must start a source line or follow whitespace"));
         assert!(prompt.contains("png, jpg, jpeg, gif, and webp"));
         assert!(prompt.contains("public or private-network hosts"));

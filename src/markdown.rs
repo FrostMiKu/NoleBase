@@ -423,6 +423,24 @@ mod tests {
     }
 
     #[test]
+    fn renders_mermaid_fences_as_unicode_diagrams() {
+        let lines = to_lines_at_width(
+            "```mermaid\nsequenceDiagram\n    Alice->>Bob: Hello\n```",
+            60,
+        );
+        let output = text(&lines);
+
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Bob"));
+        assert!(output.contains("Hello"));
+        assert!(!output.contains("sequenceDiagram"));
+        assert!(!output.contains("mermaid"));
+        assert!(output
+            .lines()
+            .all(|line| UnicodeWidthStr::width(line) <= 60));
+    }
+
+    #[test]
     fn renders_bbcode_foreground_and_background_colors() {
         let lines = to_lines_at_width(
             "[color=#12abef]foreground[/color] [bg=196]background[/bg]",

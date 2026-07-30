@@ -65,6 +65,20 @@ Columns stack when the center pane is too narrow. Widths are Unicode terminal
 columns, and background colors fill the complete Box or column rectangle. The
 full syntax rules live in the sibling MBDown workspace.
 
+Fenced `mermaid` blocks render directly as width-aware Unicode character
+diagrams. Rendering is local and does not require a browser, an image-capable
+terminal, or a network service. Flowchart, sequence, state, class, ER, Gantt,
+pie, mindmap, and other common Mermaid diagram types are supported. Invalid
+diagrams, or diagrams that cannot fit the available width, remain visible as
+ordinary source code blocks.
+
+````markdown
+```mermaid
+flowchart LR
+    Draft --> Review --> Published
+```
+````
+
 CommonMark images (`![alt](source)`) render in Daily cards, document views, and
 Agent messages. Nole detects Kitty, Sixel, and iTerm2 graphics after entering
 the alternate screen and otherwise falls back to true-color Unicode half
