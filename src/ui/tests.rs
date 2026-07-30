@@ -1,0 +1,2151 @@
+use std::fs;
+use std::path::PathBuf;
+
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use tempfile::tempdir;
+
+use super::*;
+
+#[test]
+fn clearing_a_floating_widget_sanitizes_wide_characters_at_its_edges() {
+    let backend = TestBackend::new(12, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| {
+            frame.render_widget(Paragraph::new("界"), Rect::new(4, 2, 2, 1));
+            frame.render_widget(Paragraph::new("界"), Rect::new(8, 2, 2, 1));
+
+            clear_widget(frame, Rect::new(5, 1, 4, 3));
+
+            let left_outside = &frame.buffer_mut()[(4, 2)];
+            assert_eq!(left_outside.symbol(), " ");
+            assert_eq!(left_outside.diff_option, CellDiffOption::None);
+            assert_eq!(frame.buffer_mut()[(5, 2)].symbol(), " ");
+
+            assert_eq!(frame.buffer_mut()[(8, 2)].symbol(), " ");
+            let right_outside = &frame.buffer_mut()[(9, 2)];
+            assert_eq!(right_outside.symbol(), " ");
+            assert_eq!(right_outside.diff_option, CellDiffOption::None);
+
+            assert_eq!(frame.buffer_mut()[(6, 0)].diff_option, CellDiffOption::None);
+            assert_eq!(frame.buffer_mut()[(6, 4)].diff_option, CellDiffOption::None);
+        })
+        .unwrap();
+}
+
+#[test]
+fn terminal_snapshot_renders_ansi_styles_and_cursor() {
+    let backend = TestBackend::new(12, 5);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let snapshot = TerminalSnapshot::from_bytes(2, 5, b"\x1b[31;44;1mX");
+    let mut cursor = None;
+    terminal
+        .draw(|frame| {
+            draw_terminal_snapshot(
+                frame,
+                Rect::new(2, 1, 5, 2),
+                &snapshot,
+                Theme::default(),
+                &mut cursor,
+            );
+        })
+        .unwrap();
+
+    let cell = &terminal.backend().buffer()[(2, 1)];
+    assert_eq!(cell.symbol(), "X");
+    assert_eq!(cell.fg, Color::Indexed(1));
+    assert_eq!(cell.bg, Color::Indexed(4));
+    assert!(cell.modifier.contains(Modifier::BOLD));
+    assert_eq!(cursor, Some(Position::new(3, 1)));
+}
+
+#[test]
+fn terminal_overlay_uses_the_shared_animated_border() {
+    let (mut app, _directory) = make_app();
+    app.animation_tick = 7;
+    app.overlay = Some(Overlay::Terminal);
+
+    let terminal = render(&mut app, 100, 24);
+    let overlay = app.layout.overlay.expect("terminal overlay");
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(overlay.x, overlay.y)].symbol(), "┌");
+    assert_eq!(
+        buffer[(overlay.x, overlay.y)].fg,
+        animated_color(0, app.animation_tick)
+    );
+    assert_eq!(
+        buffer[(overlay.x + 1, overlay.y)].fg,
+        animated_color(1, app.animation_tick)
+    );
+}
+
+#[test]
+fn terminal_overlay_advertises_its_close_shortcut_in_the_footer() {
+    let (mut app, _directory) = make_app();
+    app.overlay = Some(Overlay::Terminal);
+
+    let terminal = render(&mut app, 80, 24);
+    let footer = buffer_string(&terminal).lines().last().unwrap().to_string();
+    assert!(footer.contains("Ctrl+` close terminal"));
+}
+
+#[test]
+fn vs16_continuation_cells_are_not_emitted_by_the_buffer_diff() {
+    let area = Rect::new(0, 0, 4, 1);
+    let previous = Buffer::with_lines(["abcd"]);
+    let mut next = Buffer::empty(area);
+    next.set_string(0, 0, "☀️xy", Style::default().bg(Color::Blue));
+
+    skip_vs16_continuation_cells(&mut next);
+
+    assert_eq!(next[(1, 0)].diff_option, CellDiffOption::Skip);
+    let updates = previous.diff(&next);
+    assert!(updates
+        .iter()
+        .any(|(x, _, cell)| *x == 0 && cell.symbol() == "☀️"));
+    assert!(!updates.iter().any(|(x, _, _)| *x == 1));
+    assert!(updates
+        .iter()
+        .any(|(x, _, cell)| *x == 2 && cell.symbol() == "x"));
+}
+
+use crate::theme::catppuccin as ctp;
+
+fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
+    super::animated_activity_lines(text, width, tick, Theme::default())
+}
+
+fn activity_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    super::activity_lines(text, width, Theme::default())
+}
+
+fn render_agent_entry(
+    entry: &crate::agent_session::AgentPanelEntry,
+    width: usize,
+    tick: u64,
+    animate: bool,
+) -> (
+    Vec<Line<'static>>,
+    Vec<crate::markdown::RenderedLink>,
+    Vec<mbtui::ImagePlacement>,
+) {
+    super::render_agent_entry(entry, width, tick, animate, Theme::default())
+}
+
+fn render_daily_note(
+    note: &crate::model::DailyNote,
+    date_label: String,
+    width: usize,
+) -> crate::app::DailyCardRenderCache {
+    super::render_daily_note(note, date_label, width, Theme::default())
+}
+
+fn animated_color(position: usize, tick: u64) -> Color {
+    super::animated_color(position, tick, Theme::default())
+}
+use crate::agent::ApprovalRequest;
+use crate::agent::AskUserKind;
+use crate::agent_session::AgentPanelEntry;
+use crate::app::{Document, DocumentKind, DocumentReturn};
+use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate};
+use crate::storage::Storage;
+
+fn make_app() -> (App, tempfile::TempDir) {
+    let directory = tempdir().unwrap();
+    let storage = Storage::new(directory.path()).unwrap();
+    storage.ensure_files().unwrap();
+    (App::new(storage).unwrap(), directory)
+}
+
+fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = draw(frame, app);
+        })
+        .unwrap();
+    terminal
+}
+
+fn buffer_string(terminal: &Terminal<TestBackend>) -> String {
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area();
+    let mut output = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+#[test]
+fn rendering_uses_colors_loaded_from_the_app_theme() {
+    let (mut app, _directory) = make_app();
+    let custom = crate::theme::DEFAULT_THEME_TOML
+        .replace("canvas = \"terminal\"", "canvas = \"#0a0b0c\"")
+        .replace("panel = \"#181825\"", "panel = \"#010203\"")
+        .replace("compose = \"#313244\"", "compose = \"#0d0e0f\"")
+        .replace("status_bar = \"terminal\"", "status_bar = \"#101112\"")
+        .replace(
+            "status_context = \"#89b4fa\"",
+            "status_context = \"#040506\"",
+        )
+        .replace("heading_1 = \"#b4befe\"", "heading_1 = \"#070809\"");
+    app.theme = Theme::from_toml(&custom).unwrap();
+
+    let terminal = render(&mut app, 220, 24);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(1, 1)].bg, Color::Rgb(1, 2, 3));
+    let center = app.layout.center.unwrap();
+    assert_eq!(buffer[(center.x, 0)].bg, Color::Rgb(10, 11, 12));
+    let compose = app.layout.compose.unwrap();
+    assert_eq!(
+        buffer[(compose.x + 1, compose.y + 1)].bg,
+        Color::Rgb(13, 14, 15)
+    );
+    assert_eq!(buffer[(0, 23)].bg, app.theme.ui_shortcut);
+    assert_eq!(buffer[(1, 23)].bg, Color::Rgb(4, 5, 6));
+    assert_eq!(buffer[(219, 23)].bg, Color::Rgb(16, 17, 18));
+
+    let markdown = crate::markdown::render_at_width("# Heading", 40, app.theme);
+    assert!(markdown
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .any(|span| span.style.fg == Some(Color::Rgb(7, 8, 9))));
+}
+
+#[test]
+fn agent_header_shows_rounds_session_usage_tps_and_cache() {
+    assert_eq!(human_token_count(999), "999");
+    assert_eq!(human_token_count(1_000), "1k");
+    assert_eq!(human_token_count(12_400), "12.4k");
+    assert_eq!(human_token_count(1_250_000), "1.2m");
+
+    let (mut app, _directory) = make_app();
+    app.agent_round = 3;
+    app.agent_round_limit = 25;
+    app.agent_usage = crate::agent_session::TokenUsage {
+        input_tokens: 500,
+        output_tokens: 1_234,
+        cache_creation_input_tokens: 1_000,
+        cache_read_input_tokens: 2_000,
+    };
+    app.agent_timed_output_tokens = 1_234;
+    app.agent_response_duration = std::time::Duration::from_secs(2);
+    app.agent_retry_count = 2;
+    let terminal = render(&mut app, 220, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Agent · ↻3/25"));
+    assert!(screen.contains("↑3.5k ↓1.2k"));
+    assert!(screen.contains("617.0t/s"));
+    assert!(screen.contains("C2k 57%"));
+    assert!(screen.contains("R2"));
+}
+
+#[test]
+fn agent_header_shows_retries_without_confirmed_usage() {
+    let (mut app, _directory) = make_app();
+    app.agent_retry_count = 2;
+
+    let terminal = render(&mut app, 170, 24);
+    assert!(buffer_string(&terminal).contains("Retry 2"));
+}
+
+#[test]
+fn command_palette_is_fixed_width_and_renders_query_and_commands() {
+    let (mut app, _directory) = make_app();
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    app.handle_paste("agent");
+
+    let terminal = render(&mut app, 120, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Command Palette · Ctrl+P"));
+    assert!(screen.contains("/ agent"));
+    assert!(screen.contains("Agent: Interrupt task"));
+    assert!(screen.contains("Stop the active Agent task"));
+    assert!(screen.contains("Agent: Clear session"));
+    let palette = app.layout.overlay.unwrap();
+    assert_eq!(palette.width, 80);
+    assert_eq!(
+        terminal.backend().buffer()[(palette.x, palette.y)].fg,
+        ctp::GREEN
+    );
+    assert!(app.dialog_hitboxes.len() >= 4);
+    let selected = &app.dialog_hitboxes[0].area;
+    assert_eq!(selected.height, 3);
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x, selected.y - 1)].symbol(),
+        "▌",
+        "the first command needs an upper shared blank row"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x, selected.y - 1)].bg,
+        ctp::SURFACE_1
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x, selected.y)].symbol(),
+        "▌"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x, selected.y + 1)].symbol(),
+        "▌"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x, selected.y + 2)].symbol(),
+        "▌",
+        "selection rail should fill the shared blank row"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x, selected.y + 2)].bg,
+        ctp::SURFACE_1,
+        "selection should include the shared blank row"
+    );
+    assert!(terminal.backend().buffer()[(selected.x + 2, selected.y)]
+        .modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(
+        terminal.backend().buffer()[(selected.x + 2, selected.y + 1)].fg,
+        app.theme.selection_foreground
+    );
+    let last = &app.dialog_hitboxes.last().unwrap().area;
+    let gap_y = last.y + last.height;
+    assert_eq!(
+        gap_y,
+        palette.y + palette.height - 3,
+        "one blank row should separate commands from the footer"
+    );
+}
+
+#[test]
+fn command_palette_keeps_its_query_field_position_when_filtering() {
+    let (mut app, _directory) = make_app();
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+    let _terminal = render(&mut app, 120, 40);
+    let initial = app.layout.overlay.unwrap();
+
+    app.handle_paste("theme");
+    let _terminal = render(&mut app, 120, 40);
+    let filtered = app.layout.overlay.unwrap();
+
+    assert!(filtered.height < initial.height);
+    assert_eq!(filtered.y, initial.y);
+}
+
+fn contains(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x.saturating_add(inner.width) <= outer.x.saturating_add(outer.width)
+        && inner.y.saturating_add(inner.height) <= outer.y.saturating_add(outer.height)
+}
+
+#[test]
+fn narrow_center_surface_fills_body_while_content_axis_is_capped() {
+    for width in [60, 80, 120, 169] {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        let terminal = render(&mut app, width, 24);
+        let center = app.layout.center.expect("center surface");
+        assert_eq!(center, Rect::new(0, 0, width, 23), "width {width}");
+        let content = center_content_axis(center);
+        assert_eq!(content.width, width.min(CENTER_MAX_WIDTH), "width {width}");
+        assert_eq!(
+            content.x,
+            width.saturating_sub(content.width) / 2,
+            "width {width}"
+        );
+        assert!(app.layout.files.is_none());
+        assert!(app.layout.todo.is_none());
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+        assert!(buffer_string(&terminal).contains("Daily"));
+    }
+}
+
+#[test]
+fn wide_layout_uses_terminal_edges_and_center_content_axis() {
+    for width in [170, 171, 220] {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Center;
+        render(&mut app, width, 24);
+        let files = app.layout.files.unwrap();
+        let center = app.layout.center.unwrap();
+        let todo = app.layout.todo.unwrap();
+        let agent = app.layout.agent.unwrap();
+        assert_eq!(files, Rect::new(0, 0, FILES_WIDTH, 23), "width {width}");
+        assert_eq!(todo.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
+        assert_eq!(todo.x + todo.width, width, "width {width}");
+        assert_eq!(todo.height, 23u16.div_ceil(3), "width {width}");
+        assert_eq!(agent.y, todo.y + todo.height, "width {width}");
+        assert_eq!(agent.height, 23 - todo.height, "width {width}");
+        let region_width = width - FILES_WIDTH - RIGHT_SIDEBAR_WIDTH;
+        assert_eq!(center, Rect::new(FILES_WIDTH, 0, region_width, 23));
+        let content = center_content_axis(center);
+        assert_eq!(content.width, region_width.min(CENTER_MAX_WIDTH));
+        assert_eq!(
+            content.x,
+            FILES_WIDTH + region_width.saturating_sub(content.width) / 2,
+            "width {width}"
+        );
+    }
+}
+
+#[test]
+fn footer_uses_full_terminal_width() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Center;
+    app.status = "saved-at-left".to_string();
+    let terminal = render(&mut app, 220, 12);
+    let buffer = terminal.backend().buffer();
+    let footer: String = (0..220)
+        .map(|x| buffer[(x, 11)].symbol().to_string())
+        .collect();
+    assert!(footer.starts_with("  DAILY "));
+    assert_eq!(buffer[(0, 11)].bg, app.theme.ui_shortcut);
+    assert!(footer.contains("saved-at-left"));
+    assert!(footer.trim_end().ends_with("? help"));
+
+    app.mouse_captured = false;
+    let terminal = render(&mut app, 220, 12);
+    assert_eq!(
+        terminal.backend().buffer()[(0, 11)].bg,
+        app.theme.ui_warning
+    );
+}
+
+#[test]
+fn archived_document_footer_offers_restore_instead_of_archive() {
+    let (mut app, _directory) = make_app();
+    let path = app.storage.archives_dir.join("Archived.md");
+    fs::write(&path, "archived").unwrap();
+    app.reload_files();
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    app.document = Some(Document {
+        kind: DocumentKind::File(path),
+        title: "Archived".to_string(),
+        source: "archived".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+
+    assert!(footer_hint(&app, 120).contains("u restore"));
+    assert!(!footer_hint(&app, 120).contains("a archive"));
+    assert!(footer_hint(&app, 54).contains("u restore"));
+    assert!(!footer_hint(&app, 54).contains("a archive"));
+}
+
+#[test]
+fn running_agent_animates_its_border_and_current_activity_only() {
+    let (mut app, _directory) = make_app();
+    app.ai_running = true;
+    app.agent_panel = vec![
+        AgentPanelEntry::Prompt {
+            text: "Analyze this".to_string(),
+            muted: false,
+        },
+        AgentPanelEntry::Tool {
+            text: "Completed Read File.".to_string(),
+            active: false,
+        },
+        AgentPanelEntry::Tool {
+            text: "Fetching Web...".to_string(),
+            active: true,
+        },
+        AgentPanelEntry::Assistant {
+            text: "I will compare **multiple sources**.".to_string(),
+            streaming: false,
+            final_output: false,
+        },
+        AgentPanelEntry::Prompt {
+            text: "Consumed follow-up".to_string(),
+            muted: false,
+        },
+        AgentPanelEntry::Prompt {
+            text: "Queued follow-up".to_string(),
+            muted: true,
+        },
+    ];
+    app.status = "AI is working".to_string();
+    app.animation_tick = 0;
+    let first = render(&mut app, 170, 40);
+    let agent = app.layout.agent.unwrap();
+    let first_corner = first.backend().buffer()[(agent.x, agent.y)].fg;
+    let top_colors = (agent.x..agent.x + agent.width)
+        .map(|x| first.backend().buffer()[(x, agent.y)].fg)
+        .collect::<Vec<_>>();
+    assert!(top_colors
+        .iter()
+        .all(|color| matches!(color, Color::Rgb(..))));
+    assert!(top_colors.windows(2).any(|colors| colors[0] != colors[1]));
+    let first_footer = buffer_string(&first).lines().last().unwrap().to_string();
+    let first_footer_colors = (0..170)
+        .map(|x| first.backend().buffer()[(x, 39)].fg)
+        .collect::<Vec<_>>();
+    let first_activity_colors = (agent.y + 1..agent.y + agent.height - 1)
+        .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
+        .map(|(x, y)| first.backend().buffer()[(x, y)].fg)
+        .collect::<Vec<_>>();
+    let first_screen = buffer_string(&first);
+    let completed = first_screen.find("• Completed Read File.").unwrap();
+    let active = first_screen.find("• Fetching Web...").unwrap();
+    let intermediate = first_screen
+        .find("I will compare multiple sources.")
+        .unwrap();
+    let consumed = first_screen.find("Consumed follow-up").unwrap();
+    let queued = first_screen.find("Queued follow-up").unwrap();
+    assert!(completed < active && active < intermediate && intermediate < consumed);
+    assert!(consumed < queued);
+    let screen_lines = first_screen.lines().collect::<Vec<_>>();
+    let consumed_y = screen_lines
+        .iter()
+        .position(|line| line.contains("Consumed follow-up"))
+        .unwrap() as u16;
+    let queued_y = screen_lines
+        .iter()
+        .position(|line| line.contains("Queued follow-up"))
+        .unwrap() as u16;
+    let consumed_byte = screen_lines[consumed_y as usize]
+        .find("Consumed follow-up")
+        .unwrap();
+    let queued_byte = screen_lines[queued_y as usize]
+        .find("Queued follow-up")
+        .unwrap();
+    let consumed_x = screen_lines[consumed_y as usize][..consumed_byte].width() as u16;
+    let queued_x = screen_lines[queued_y as usize][..queued_byte].width() as u16;
+    assert_ne!(
+        first.backend().buffer()[(consumed_x, consumed_y)].fg,
+        ctp::OVERLAY_0
+    );
+    assert_eq!(
+        first.backend().buffer()[(queued_x, queued_y)].fg,
+        ctp::OVERLAY_0
+    );
+
+    app.animation_tick = 1;
+    let second = render(&mut app, 170, 40);
+    let second_corner = second.backend().buffer()[(agent.x, agent.y)].fg;
+    let second_footer = buffer_string(&second).lines().last().unwrap().to_string();
+    let second_footer_colors = (0..170)
+        .map(|x| second.backend().buffer()[(x, 39)].fg)
+        .collect::<Vec<_>>();
+    let second_activity_colors = (agent.y + 1..agent.y + agent.height - 1)
+        .flat_map(|y| (agent.x + 1..agent.x + agent.width - 1).map(move |x| (x, y)))
+        .map(|(x, y)| second.backend().buffer()[(x, y)].fg)
+        .collect::<Vec<_>>();
+    assert_ne!(first_corner, second_corner);
+    assert_eq!(first_footer, second_footer);
+    assert_eq!(first_footer_colors, second_footer_colors);
+    assert_ne!(first_activity_colors, second_activity_colors);
+
+    app.ai_running = false;
+    app.agent_panel.push(AgentPanelEntry::Assistant {
+        text: "Final response".to_string(),
+        streaming: false,
+        final_output: true,
+    });
+    app.agent_scroll = u16::MAX;
+    let final_frame = render(&mut app, 170, 40);
+    let final_screen = buffer_string(&final_frame);
+    assert!(final_screen.contains("User"));
+    assert!(!final_screen.contains("Prompt"));
+    assert!(!final_screen.contains("Response"));
+    assert!(final_screen.contains("Final response"));
+    for retained in [
+        "Completed Read File.",
+        "Fetching Web...",
+        "multiple sources",
+        "Consumed follow-up",
+        "Queued follow-up",
+    ] {
+        assert!(final_screen.contains(retained));
+    }
+}
+
+#[test]
+fn animated_activity_respects_terminal_cell_width() {
+    let lines = animated_activity_lines("正在调用工具", 19, 4);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].to_string(), " • 正在调用工具");
+    assert_eq!(lines[0].width(), 15);
+    assert_eq!(
+        lines[0]
+            .spans
+            .iter()
+            .skip(1)
+            .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
+            .count(),
+        6
+    );
+    assert!(lines[0]
+        .spans
+        .iter()
+        .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
+        .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+}
+
+#[test]
+fn tool_activity_places_detail_on_a_connected_second_line() {
+    let text = "Calling Read File...\ndata/a very long project filename.md";
+    for lines in [
+        activity_lines(text, 24),
+        animated_activity_lines(text, 24, 4),
+    ] {
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].to_string(), " • Calling Read File...");
+        assert_eq!(lines[1].width(), 24);
+        assert!(lines[1].to_string().starts_with("   └─ "));
+        assert!(lines[1].to_string().ends_with('…'));
+    }
+
+    assert_eq!(activity_lines("tool", 1)[0].width(), 1);
+    assert_eq!(activity_lines("tool", 2)[0].width(), 2);
+    assert_eq!(activity_lines("tool\ndetail", 1)[1].to_string(), "└");
+    assert_eq!(activity_lines("tool\ndetail", 2)[1].to_string(), "└─");
+}
+
+#[test]
+fn bypass_mode_animates_in_the_footer_and_daily_advertises_commands() {
+    let (mut app, _directory) = make_app();
+    let approve = render(&mut app, 170, 24);
+    let approve_screen = buffer_string(&approve);
+    let approve_footer = approve_screen.lines().last().unwrap();
+    assert!(!approve_footer.contains("DAILY · APPROVE"));
+    assert!(approve_footer.contains("DAILY  APPROVE"));
+    let surface_x = approve_footer.find("DAILY").unwrap() as u16;
+    let approve_byte = approve_footer.find("APPROVE").unwrap();
+    let approve_x = approve_footer[..approve_byte].width() as u16;
+    assert_eq!(approve.backend().buffer()[(surface_x, 23)].bg, ctp::BLUE);
+    assert_eq!(
+        approve.backend().buffer()[(approve_x, 23)].bg,
+        ctp::SAPPHIRE
+    );
+
+    app.permission_mode = PermissionMode::Bypass;
+    app.animation_tick = 0;
+    let first = render(&mut app, 170, 24);
+    let footer_y = 23;
+    let first_screen = buffer_string(&first);
+    let first_footer = first_screen.lines().last().unwrap();
+    let bypass_byte = first_footer.find("BYPASS").unwrap();
+    let bypass_x = first_footer[..bypass_byte].width() as u16;
+    let first_colors = (bypass_x..bypass_x + "BYPASS".width() as u16)
+        .map(|x| first.backend().buffer()[(x, footer_y)].fg)
+        .collect::<Vec<_>>();
+    assert!(first_footer.contains("Ctrl+P commands"));
+    assert!(first_colors
+        .iter()
+        .all(|color| matches!(color, Color::Rgb(..))));
+    assert!((bypass_x..bypass_x + "BYPASS".width() as u16)
+        .all(|x| first.backend().buffer()[(x, footer_y)].bg == ctp::CRUST));
+
+    app.animation_tick = 1;
+    let second = render(&mut app, 170, 24);
+    let second_colors = (bypass_x..bypass_x + "BYPASS".width() as u16)
+        .map(|x| second.backend().buffer()[(x, footer_y)].fg)
+        .collect::<Vec<_>>();
+    assert_ne!(first_colors, second_colors);
+}
+
+#[test]
+fn virtual_line_window_clones_only_visible_rows() {
+    let lines = (0..10_000)
+        .map(|index| Line::from(format!("row {index}")))
+        .collect::<Vec<_>>();
+    let visible = visible_line_window(&lines, 9_990, 5);
+
+    assert_eq!(visible.len(), 5);
+    assert_eq!(visible.first().unwrap().to_string(), "row 9990");
+    assert_eq!(visible.last().unwrap().to_string(), "row 9994");
+    assert!(visible_line_window(&lines, lines.len(), 5).is_empty());
+}
+
+#[test]
+fn narrow_files_and_todo_each_use_the_full_body_without_duplicates() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    app.reload_files();
+    app.focus = Focus::Files;
+    let terminal = render(&mut app, 80, 18);
+    assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 17)));
+    assert!(app.layout.center.is_none());
+    assert!(app.layout.todo.is_none());
+    assert_eq!(buffer_string(&terminal).matches("NólëBase").count(), 1);
+    assert!(!app.file_hitboxes.is_empty());
+    assert!(app
+        .file_hitboxes
+        .iter()
+        .all(|hitbox| contains(app.layout.files.unwrap(), hitbox.area)));
+
+    app.focus = Focus::Todo;
+    app.todo_items = vec![TodoItem {
+        checked: false,
+        text: "buy milk".to_string(),
+    }];
+    let terminal = render(&mut app, 60, 18);
+    assert_eq!(app.layout.todo, Some(Rect::new(0, 0, 60, 17)));
+    assert!(app.layout.files.is_none());
+    assert!(app.layout.center.is_none());
+    let screen = buffer_string(&terminal);
+    assert_eq!(screen.matches("Todo").count(), 1);
+    assert!(screen.contains("buy milk"));
+    assert_eq!(app.todo_hitboxes.len(), 1);
+}
+
+#[test]
+fn sidebars_use_mantle_background_with_square_ui_borders() {
+    let (mut app, _directory) = make_app();
+    let terminal = render(&mut app, 170, 24);
+    let buffer = terminal.backend().buffer();
+    let files = app.layout.files.expect("files panel");
+    let todo = app.layout.todo.expect("todo panel");
+    let agent = app.layout.agent.expect("agent panel");
+    let center = app.layout.center.expect("center region");
+
+    for area in [files, todo, agent] {
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
+        assert_eq!(
+            buffer[(area.x + 2, area.y + area.height - 2)].bg,
+            ctp::MANTLE
+        );
+    }
+    assert_eq!(buffer[(center.x, center.y)].bg, Color::Reset);
+}
+
+#[test]
+fn selected_file_background_covers_name_and_modified_time_rows() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    app.reload_files();
+    app.focus = Focus::Files;
+    let modified: DateTime<Local> = app.note_files[app.file_index].modified.into();
+    let expected_timestamp = modified.format("%y/%m/%d %H:%M").to_string();
+
+    let terminal = render(&mut app, 170, 18);
+    assert!(buffer_string(&terminal).contains(&expected_timestamp));
+    let selected_path = app.note_files[app.file_index].path.clone();
+    let selected_area = app
+        .file_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.path == selected_path)
+        .expect("selected file hitbox")
+        .area;
+    assert_eq!(selected_area.height, 2);
+    let buffer = terminal.backend().buffer();
+    for y in selected_area.y..selected_area.y + selected_area.height {
+        for x in selected_area.x..selected_area.x + selected_area.width {
+            assert_eq!(buffer[(x, y)].bg, ctp::SURFACE_1);
+        }
+    }
+    assert_eq!(
+        buffer[(selected_area.x + 1, selected_area.y + 1)].fg,
+        app.theme.selection_foreground,
+        "modified time must remain legible on the selected background"
+    );
+}
+
+#[test]
+fn archived_file_metadata_does_not_repeat_its_group() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.archives_dir.join("Old.md"), "old").unwrap();
+    app.reload_files();
+    app.archives_expanded = true;
+
+    let terminal = render(&mut app, 170, 18);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Old"));
+    assert!(!screen.contains("Archived ·"));
+}
+
+#[test]
+fn file_selection_includes_both_shared_spacing_lines() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.data_dir.join("First.md"), "first").unwrap();
+    fs::write(app.storage.data_dir.join("Second.md"), "second").unwrap();
+    app.reload_files();
+    app.focus = Focus::Files;
+
+    let terminal = render(&mut app, 170, 22);
+    let mut files = app.file_hitboxes.clone();
+    files.sort_by_key(|hitbox| hitbox.area.y);
+    let notes = app
+        .file_group_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.group == FileGroup::Notes)
+        .expect("Notes group")
+        .area;
+    let archives = app
+        .file_group_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.group == FileGroup::Archives)
+        .expect("Archives group")
+        .area;
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].area.y, notes.y + 2);
+    assert_eq!(files[1].area.y, files[0].area.y + 3);
+    assert_eq!(archives.y, files[1].area.y + 3);
+    assert_eq!(files[0].area.height, 2);
+    assert_eq!(files[1].area.height, 2);
+    let buffer = terminal.backend().buffer();
+    let selected = files
+        .iter()
+        .find(|hitbox| Some(&hitbox.path) == app.selected_file.as_ref())
+        .expect("selected file");
+    assert_eq!(
+        buffer[(selected.area.x, selected.area.y.saturating_sub(1))].bg,
+        ctp::SURFACE_1,
+        "selected background must include the upper shared spacing"
+    );
+    assert_eq!(
+        buffer[(selected.area.x, selected.area.y + 2)].bg,
+        ctp::SURFACE_1,
+        "selected background must include the lower shared spacing"
+    );
+    for rail_y in selected.area.y.saturating_sub(1)..=selected.area.y + 2 {
+        let cell = &buffer[(selected.area.x, rail_y)];
+        assert_eq!(cell.symbol(), "▌");
+        assert_eq!(cell.fg, ctp::MAUVE);
+        assert!(!cell.modifier.contains(Modifier::BOLD));
+        assert!(!cell.modifier.contains(Modifier::DIM));
+    }
+    assert_ne!(buffer[(notes.x, notes.y)].symbol(), "▌");
+    assert_ne!(buffer[(archives.x, archives.y)].symbol(), "▌");
+}
+
+#[test]
+fn file_groups_use_teal_markers_and_muted_counts() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    app.reload_files();
+    app.focus = Focus::Files;
+
+    let terminal = render(&mut app, 170, 18);
+    let notes = app
+        .file_group_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.group == FileGroup::Notes)
+        .expect("Notes group hitbox")
+        .area;
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(notes.x, notes.y)].fg, ctp::TEAL);
+    assert_eq!(
+        buffer[(notes.x + notes.width - 1, notes.y)].fg,
+        ctp::OVERLAY_0
+    );
+}
+
+#[test]
+fn file_name_inputs_render_as_modals_while_search_stays_inline() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Center;
+    app.files_context = FilesContext::NewTarget;
+    app.new_file_input = "Project".to_string();
+    app.new_file_cursor = app.new_file_input.chars().count();
+    let terminal = render(&mut app, 80, 16);
+    assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 15)));
+    assert!(app.layout.center.is_none());
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("New file · Enter create"));
+    assert!(screen.contains("Name  Project"));
+    assert!(app.layout.overlay.is_some());
+    assert!(app.file_hitboxes.is_empty());
+    let modal = app.layout.overlay.unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(modal.x + 1, modal.y + 1)].bg,
+        ctp::MANTLE,
+        "modal padding should have an opaque background"
+    );
+
+    app.files_context = FilesContext::Rename;
+    app.rename_input = "Renamed".to_string();
+    app.rename_cursor = app.rename_input.chars().count();
+    let terminal = render(&mut app, 80, 16);
+    assert!(buffer_string(&terminal).contains("Name  Renamed"));
+    assert!(app.layout.overlay.is_some());
+
+    app.files_context = FilesContext::Search;
+    app.file_query = "work".to_string();
+    let terminal = render(&mut app, 80, 16);
+    assert!(buffer_string(&terminal).contains("/ work"));
+    let files = app.layout.files.unwrap();
+    let underline = &terminal.backend().buffer()[(files.x + 2, files.y + 2)];
+    assert_eq!(underline.symbol(), "─");
+    assert_eq!(underline.fg, ctp::OVERLAY_0);
+    assert!(app.layout.overlay.is_none());
+}
+
+#[test]
+fn narrow_center_renders_each_center_view_in_place() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Document;
+    app.document = Some(Document {
+        kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),
+        title: "Preview".to_string(),
+        source: "# Heading".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    let terminal = render(&mut app, 80, 18);
+    assert!(buffer_string(&terminal).contains("Heading"));
+
+    app.center_view = CenterView::Search;
+    app.search_query = "needle".to_string();
+    app.search_results = vec![SearchHit::FileLine {
+        path: PathBuf::from("2026-07-27.md"),
+        line_no: 1,
+        text: format!("needle result {}", "x".repeat(100)),
+    }];
+    let terminal = render(&mut app, 80, 18);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Searcher · 1"));
+    assert!(screen.contains("2026-07-27:1"));
+    assert!(screen.contains("needle result"));
+    assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+    assert_ne!(
+        terminal.backend().buffer()[(4, 0)].symbol(),
+        " ",
+        "only the centered searcher should have a border"
+    );
+    assert_eq!(app.search_hitboxes.len(), 1);
+    let result = app.search_hitboxes[0].area;
+    assert_eq!(result.height, SELECT_OPTION_HEIGHT);
+    for y in result.y - 1..result.y + result.height {
+        assert_eq!(
+            terminal.backend().buffer()[(result.x + result.width - 1, y)].bg,
+            app.theme.selection_background,
+            "search selections should include both full-width shared blank rows"
+        );
+        assert_eq!(terminal.backend().buffer()[(result.x, y)].symbol(), "▌");
+        assert_eq!(
+            terminal.backend().buffer()[(result.x, y)].fg,
+            app.theme.selection_indicator
+        );
+    }
+    assert_eq!(
+        terminal.backend().buffer()[(result.x + result.width - 2, result.y)].symbol(),
+        " "
+    );
+
+    app.center_view = CenterView::DocumentSearch;
+    let terminal = render(&mut app, 80, 18);
+    assert!(buffer_string(&terminal).contains("Search in Note · 1"));
+    assert_eq!(
+        terminal.backend().buffer()[(result.x + result.width - 1, result.y)].symbol(),
+        " "
+    );
+}
+
+#[test]
+fn chat_compose_and_button_hitboxes_stay_inside_visible_center_viewport() {
+    for width in [60, 80, 120, 169, 170, 171, 220] {
+        let (mut app, _directory) = make_app();
+        for index in 0..30 {
+            app.storage
+                .append_to_today(&format!("message {index}"))
+                .unwrap();
+        }
+        app.reload();
+        app.selected = app.daily_notes.len() - 1;
+        app.focus = Focus::Center;
+        app.scroll = u16::MAX;
+        render(&mut app, width, 24);
+        let center = app.layout.center.unwrap();
+        let compose = app.layout.compose.unwrap();
+        assert!(compose.width <= CENTER_MAX_WIDTH, "width {width}");
+        assert!(contains(center, compose), "width {width}");
+        assert!(!app.hitboxes.is_empty(), "width {width}");
+        for hitbox in &app.hitboxes {
+            assert!(contains(center, hitbox.area), "width {width}");
+            assert!(
+                hitbox.area.y < compose.y.saturating_sub(1),
+                "button behind compose at width {width}: {:?}",
+                hitbox.area
+            );
+        }
+    }
+}
+
+#[test]
+fn overlay_records_geometry_and_disables_all_background_hitboxes() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    app.reload_files();
+    app.storage.append_to_today("hello").unwrap();
+    app.reload();
+    app.todo_items = vec![TodoItem {
+        checked: false,
+        text: "task".to_string(),
+    }];
+    app.focus = Focus::Center;
+    app.set_overlay(Overlay::Help);
+    render(&mut app, 220, 24);
+    assert!(app.layout.overlay.is_some());
+    assert!(app.hitboxes.is_empty());
+    assert!(app.link_hitboxes.is_empty());
+    assert!(app.tag_hitboxes.is_empty());
+    assert!(app.file_hitboxes.is_empty());
+    assert!(app.todo_hitboxes.is_empty());
+    assert!(app.search_hitboxes.is_empty());
+}
+
+#[test]
+fn links_are_clickable_in_daily_documents_and_agent_output() {
+    let (mut app, _directory) = make_app();
+    app.storage
+        .append_to_today("Open [site](https://example.test)")
+        .unwrap();
+    app.reload();
+    render(&mut app, 170, 24);
+    assert!(app.link_hitboxes.iter().any(|hitbox| {
+        hitbox.target == LinkTarget::External("https://example.test".to_string())
+    }));
+
+    app.document = Some(Document {
+        kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),
+        title: "Preview".to_string(),
+        source: "See [[Project]]".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    render(&mut app, 170, 24);
+    assert!(app
+        .link_hitboxes
+        .iter()
+        .any(|hitbox| { hitbox.target == LinkTarget::WikiLink("Project".to_string()) }));
+
+    app.agent_panel = vec![AgentPanelEntry::Assistant {
+        text: "[result](https://agent.example)".to_string(),
+        streaming: false,
+        final_output: true,
+    }];
+    render(&mut app, 170, 24);
+    assert!(app.link_hitboxes.iter().any(|hitbox| {
+        hitbox.target == LinkTarget::External("https://agent.example".to_string())
+    }));
+}
+
+#[test]
+fn file_embed_hitboxes_resolve_against_each_content_base() {
+    let (mut app, _directory) = make_app();
+    app.storage
+        .append_to_today("Open ![[daily-attachment.pdf]]")
+        .unwrap();
+    app.reload();
+    render(&mut app, 170, 24);
+    assert!(app.link_hitboxes.iter().any(|hitbox| {
+        hitbox.target
+            == LinkTarget::EmbeddedFile(app.storage.daily_dir.join("daily-attachment.pdf"))
+    }));
+
+    let note = app.storage.data_dir.join("Article.md");
+    app.document = Some(Document {
+        kind: DocumentKind::File(note),
+        title: "Preview".to_string(),
+        source: "Open ![[article-attachment.pdf]]".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    render(&mut app, 170, 24);
+    assert!(app.link_hitboxes.iter().any(|hitbox| {
+        hitbox.target
+            == LinkTarget::EmbeddedFile(app.storage.data_dir.join("article-attachment.pdf"))
+    }));
+
+    app.agent_panel = vec![AgentPanelEntry::Assistant {
+        text: "Open ![[agent-attachment.pdf]]".to_string(),
+        streaming: false,
+        final_output: true,
+    }];
+    render(&mut app, 170, 24);
+    assert!(app.link_hitboxes.iter().any(|hitbox| {
+        hitbox.target == LinkTarget::EmbeddedFile(app.storage.root.join("agent-attachment.pdf"))
+    }));
+}
+
+#[test]
+fn hashtags_are_clickable_in_daily_and_document_views() {
+    let (mut app, _directory) = make_app();
+    app.storage.append_to_today("Daily #rust").unwrap();
+    app.reload();
+    render(&mut app, 170, 24);
+    let daily = app
+        .tag_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.name == "rust")
+        .expect("Daily Hashtag hitbox")
+        .area;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: daily.x,
+        row: daily.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.center_view, CenterView::Search);
+    assert_eq!(app.search_query, "#rust");
+
+    app.document = Some(Document {
+        kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),
+        title: "Preview".to_string(),
+        source: "Document #design".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    render(&mut app, 170, 24);
+    assert!(app
+        .tag_hitboxes
+        .iter()
+        .any(|hitbox| hitbox.name == "design"));
+}
+
+#[test]
+fn wikilink_choice_marks_archive_and_file_format_as_muted_metadata() {
+    let (mut app, directory) = make_app();
+    app.wiki_link_target = Some("Project".to_string());
+    app.wiki_link_candidates = vec![
+        WikiLinkCandidate {
+            path: directory.path().join("data/Project.md"),
+            archived: false,
+        },
+        WikiLinkCandidate {
+            path: directory.path().join("archives/Project.mb"),
+            archived: true,
+        },
+    ];
+    app.set_overlay(Overlay::WikiLinkChoice);
+    let terminal = render(&mut app, 100, 18);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Project.md"));
+    assert!(screen.contains("MD"));
+    assert!(screen.contains("Archived"));
+    assert!(screen.contains("MB"));
+    assert_eq!(app.wiki_link_hitboxes.len(), 2);
+}
+
+#[test]
+fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
+    let (mut app, _directory) = make_app();
+    app.ai_prompt_input = "summarize this".to_string();
+    app.ai_prompt_cursor = app.ai_prompt_input.chars().count();
+    app.set_overlay(Overlay::AiPrompt);
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Agent prompt"));
+    assert!(screen.contains("summarize this"));
+
+    app.approval_request = Some(ApprovalRequest {
+        title: "Update data/note.md".to_string(),
+        diff: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+    });
+    app.set_overlay(Overlay::Approval);
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Update data/note.md"));
+    assert!(screen.contains("-old value"));
+    assert!(screen.contains("+new value"));
+    assert!(screen.contains("Tab bypass"));
+}
+
+#[test]
+fn agent_diff_approval_switches_layout_with_terminal_width() {
+    let (mut app, _directory) = make_app();
+    app.approval_request = Some(ApprovalRequest {
+        title: "Update data/note.md".to_string(),
+        diff: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+    });
+    app.set_overlay(Overlay::Approval);
+
+    let narrow = render(&mut app, 130, 24);
+    let narrow_screen = buffer_string(&narrow);
+    assert_eq!(app.layout.overlay.unwrap().width, APPROVAL_UNIFIED_WIDTH);
+    assert!(!narrow_screen
+        .lines()
+        .any(|line| line.contains("-old value") && line.contains("+new value")));
+
+    let wide = render(&mut app, 180, 24);
+    let wide_screen = buffer_string(&wide);
+    assert_eq!(
+        app.layout.overlay.unwrap().width,
+        APPROVAL_SIDE_BY_SIDE_WIDTH
+    );
+    let changed_line = wide_screen
+        .lines()
+        .find(|line| line.contains("-old value") && line.contains("+new value"))
+        .expect("side-by-side change row");
+    assert!(changed_line.contains("  1 │ -old value"));
+    assert!(changed_line.contains(" ┃ "));
+    assert!(changed_line.contains("  1 │ +new value"));
+
+    let hunk_line = wide_screen
+        .lines()
+        .find(|line| line.contains("@@ -1 +1 @@"))
+        .expect("hunk row");
+    assert!(hunk_line.contains(" ┃ "));
+}
+
+#[test]
+fn side_by_side_diff_pairs_change_blocks_and_repeats_context() {
+    let rows = side_by_side_diff_rows(
+        "--- old\n+++ new\n@@ -1,3 +1,3 @@\n same\n-old one\n-old two\n+new one\n tail\n",
+    );
+
+    assert_eq!(
+        rows,
+        vec![
+            SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(
+                    "--- old",
+                    DiffLineKind::Header,
+                    None,
+                )),
+                after: Some(SideBySideDiffCell::new(
+                    "+++ new",
+                    DiffLineKind::Header,
+                    None,
+                )),
+            },
+            SideBySideDiffRow::Full("@@ -1,3 +1,3 @@", DiffLineKind::Hunk),
+            SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(
+                    " same",
+                    DiffLineKind::Context,
+                    Some(1),
+                )),
+                after: Some(SideBySideDiffCell::new(
+                    " same",
+                    DiffLineKind::Context,
+                    Some(1),
+                )),
+            },
+            SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(
+                    "-old one",
+                    DiffLineKind::Deletion,
+                    Some(2),
+                )),
+                after: Some(SideBySideDiffCell::new(
+                    "+new one",
+                    DiffLineKind::Addition,
+                    Some(2),
+                )),
+            },
+            SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(
+                    "-old two",
+                    DiffLineKind::Deletion,
+                    Some(3),
+                )),
+                after: None,
+            },
+            SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(
+                    " tail",
+                    DiffLineKind::Context,
+                    Some(4),
+                )),
+                after: Some(SideBySideDiffCell::new(
+                    " tail",
+                    DiffLineKind::Context,
+                    Some(3),
+                )),
+            },
+        ]
+    );
+}
+
+#[test]
+fn side_by_side_diff_does_not_treat_changed_prefixes_as_file_headers() {
+    let rows = side_by_side_diff_rows(
+        "--- note.md\n+++ note.md\n@@ -1 +1 @@\n--- old heading\n+++ new heading\n",
+    );
+
+    assert_eq!(
+        rows[2],
+        SideBySideDiffRow::Columns {
+            before: Some(SideBySideDiffCell::new(
+                "--- old heading",
+                DiffLineKind::Deletion,
+                Some(1),
+            )),
+            after: Some(SideBySideDiffCell::new(
+                "+++ new heading",
+                DiffLineKind::Addition,
+                Some(1),
+            )),
+        }
+    );
+}
+
+#[test]
+fn side_by_side_diff_tracks_line_numbers_across_multiple_hunks() {
+    let rows = side_by_side_diff_rows(
+        "@@ -8,2 +10,3 @@\n old\n-removed\n+added\n+extra\n@@ -40 +50 @@\n-last\n+next\n",
+    );
+
+    let numbered = rows
+        .into_iter()
+        .filter_map(|row| match row {
+            SideBySideDiffRow::Columns { before, after } => Some((
+                before.and_then(|cell| cell.line_number),
+                after.and_then(|cell| cell.line_number),
+            )),
+            SideBySideDiffRow::Full(_, _) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        numbered,
+        [
+            (Some(8), Some(10)),
+            (Some(9), Some(11)),
+            (None, Some(12)),
+            (Some(40), Some(50)),
+        ]
+    );
+}
+
+#[test]
+fn ask_user_overlay_renders_choices_and_free_text_input() {
+    let (mut app, _directory) = make_app();
+    app.ask_user_request = Some(crate::agent::AskUserRequest {
+        kind: AskUserKind::Tool,
+        question: "Which output format should be used?".to_string(),
+        options: vec!["Markdown".to_string(), "MBDown".to_string()],
+    });
+    app.ask_user_option = 0;
+    app.set_overlay(Overlay::AskUser);
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Agent question"));
+    assert!(screen.contains("Which output format should be used?"));
+    assert!(screen.contains("Markdown"));
+    assert!(screen.contains("MBDown"));
+    assert!(screen.contains("Other answer"));
+    assert!(screen.contains("Your answer"));
+    assert!(!screen.contains("> Markdown"));
+    assert!(!screen.contains("> Other answer"));
+    let overlay = app.layout.overlay.expect("ask-user overlay");
+    assert_eq!(overlay.width, DIALOG_WIDTH);
+    assert_eq!(overlay.height, 15);
+    assert_eq!(app.dialog_hitboxes.len(), 3);
+    let selected = app
+        .dialog_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == 0)
+        .expect("selected Markdown option");
+    let mbdown = app
+        .dialog_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == 1)
+        .expect("MBDown option");
+    let other = app
+        .dialog_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == 2)
+        .expect("Other answer option");
+    assert_eq!(selected.area.height, SELECT_OPTION_HEIGHT);
+    assert_eq!(mbdown.area.height, SELECT_OPTION_HEIGHT);
+    assert_eq!(other.area.height, SELECT_OPTION_HEIGHT);
+    assert_eq!(mbdown.area.y, selected.area.y + SELECT_OPTION_HEIGHT);
+    assert_eq!(other.area.y, mbdown.area.y + SELECT_OPTION_HEIGHT);
+    let buffer = terminal.backend().buffer();
+    for y in selected.area.y.saturating_sub(1)..selected.area.y + selected.area.height {
+        assert_eq!(
+            buffer[(selected.area.x + selected.area.width - 1, y)].bg,
+            app.theme.selection_background,
+            "selection must include both shared blank rows across the full list width"
+        );
+        assert_eq!(buffer[(selected.area.x, y)].symbol(), "▌");
+        assert_eq!(
+            buffer[(selected.area.x, y)].fg,
+            app.theme.selection_indicator
+        );
+    }
+    assert!(app.hitboxes.is_empty());
+}
+
+#[test]
+fn round_limit_dialog_only_offers_continue_or_stop() {
+    let (mut app, _directory) = make_app();
+    app.ask_user_request = Some(crate::agent::AskUserRequest {
+        kind: AskUserKind::RoundLimit,
+        question: "Continue for up to 25 more rounds?".to_string(),
+        options: vec!["Continue".to_string(), "Stop".to_string()],
+    });
+    app.set_overlay(Overlay::AskUser);
+
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Agent round limit"));
+    assert!(screen.contains("Continue"));
+    assert!(screen.contains("Stop"));
+    assert!(!screen.contains("Other answer"));
+    assert!(!screen.contains("Your answer"));
+    assert!(screen.contains("Esc stop"));
+}
+
+#[test]
+fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
+    let (mut app, _directory) = make_app();
+    app.agent_panel = vec![
+        AgentPanelEntry::Prompt {
+            text: "Explain the selected note".to_string(),
+            muted: false,
+        },
+        AgentPanelEntry::Assistant {
+            text: "Here is the explanation".to_string(),
+            streaming: false,
+            final_output: true,
+        },
+    ];
+    app.focus = Focus::Agent;
+
+    let terminal = render(&mut app, 170, 24);
+    let screen = buffer_string(&terminal);
+    let prompt = screen.find("Explain the selected note").unwrap();
+    let response = screen.find("Here is the explanation").unwrap();
+    assert!(prompt < response);
+
+    let (user_lines, _, _) = render_agent_entry(&app.agent_panel[0], 40, 0, false);
+    let (agent_lines, _, _) = render_agent_entry(&app.agent_panel[1], 40, 0, false);
+    assert_eq!(user_lines[1].to_string().trim_end(), "User");
+    assert_eq!(agent_lines[1].to_string().trim_end(), "Agent");
+    assert!(user_lines.first().unwrap().to_string().trim().is_empty());
+    assert!(user_lines.last().unwrap().to_string().trim().is_empty());
+    assert!(agent_lines.first().unwrap().to_string().trim().is_empty());
+    assert!(agent_lines.last().unwrap().to_string().trim().is_empty());
+    assert!(user_lines.iter().all(|line| {
+        UnicodeWidthStr::width(line.to_string().as_str()) == 40
+            && line
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(ctp::SURFACE_0))
+    }));
+    assert!(agent_lines.iter().all(|line| {
+        UnicodeWidthStr::width(line.to_string().as_str()) == 40
+            && line
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(ctp::BASE))
+    }));
+
+    let agent_area = app.layout.agent.unwrap();
+    let rows = screen.lines().collect::<Vec<_>>();
+    let user_text_row = rows
+        .iter()
+        .position(|line| line.contains("Explain the selected note"))
+        .unwrap();
+    let agent_text_row = rows
+        .iter()
+        .position(|line| line.contains("Here is the explanation"))
+        .unwrap();
+    assert_eq!(agent_text_row - user_text_row, 4);
+    for (needle, background) in [
+        ("Explain the selected note", ctp::SURFACE_0),
+        ("Here is the explanation", ctp::BASE),
+    ] {
+        let y = rows.iter().position(|line| line.contains(needle)).unwrap() as u16;
+        for x in agent_area.x + 1..agent_area.x + agent_area.width - 1 {
+            assert_eq!(terminal.backend().buffer()[(x, y)].bg, background);
+        }
+    }
+}
+
+#[test]
+fn daily_and_agent_render_caches_offset_markdown_images() {
+    let date = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
+    let daily = crate::model::DailyNote {
+        date,
+        body: "![Daily diagram](../data/diagram.png)".to_string(),
+    };
+    let cached = render_daily_note(&daily, "2026-07-27".to_string(), 100);
+    assert_eq!(cached.images.len(), 1);
+    assert!(cached.images[0].row >= 4);
+    assert!(cached.images[0].column > 0);
+    assert_eq!(cached.images[0].height, 12);
+
+    let entry = AgentPanelEntry::Assistant {
+        text: "![Agent diagram](https://example.com/diagram.png)".to_string(),
+        streaming: false,
+        final_output: true,
+    };
+    let (lines, _, images) = render_agent_entry(&entry, 40, 0, false);
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].row, 2);
+    assert_eq!(images[0].width, 40);
+    assert_eq!(lines.len(), 15);
+}
+
+#[test]
+fn document_keeps_compose_visible_and_notification_uses_top_right() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
+        title: "Article".to_string(),
+        source: "# Reading\n\nUseful paragraph".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.notifications.notify("Recorded in Daily");
+    let terminal = render(&mut app, 120, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Reading"));
+    assert!(screen.contains("Compose"));
+    assert!(screen.contains("Notification"));
+    assert!(screen.contains("Recorded in Daily"));
+    let compose = app.layout.compose.expect("document compose");
+    assert!(compose.y > 12);
+}
+
+#[test]
+fn focused_compose_floats_over_the_document_with_an_animated_border() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Compose;
+    app.animation_tick = 3;
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.data_dir.join("Article.md")),
+        title: "Article".to_string(),
+        source: (0..40)
+            .map(|line| format!("paragraph {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        scroll: u16::MAX,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+
+    let terminal = render(&mut app, 120, 30);
+    let compose = app.layout.compose.expect("document compose");
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(compose.x, compose.y)].symbol(), "┌");
+    assert_eq!(
+        buffer[(compose.x, compose.y)].fg,
+        animated_color(0, app.animation_tick)
+    );
+    assert_eq!(
+        buffer[(compose.x + 1, compose.y)].fg,
+        animated_color(1, app.animation_tick)
+    );
+
+    let center = app.layout.center.expect("center area");
+    let content = inset_horizontal(center_content_axis(center), 2);
+    assert!(compose.x > content.x);
+    assert_eq!(buffer[(content.x, compose.y + 1)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::SURFACE_0);
+    let last_paragraph_y = (0..buffer.area().height)
+        .find(|y| {
+            (0..buffer.area().width)
+                .map(|x| buffer[(x, *y)].symbol())
+                .collect::<String>()
+                .contains("paragraph 39")
+        })
+        .expect("the final paragraph should remain visible above Compose");
+    assert!(last_paragraph_y < compose.y.saturating_sub(1));
+}
+
+#[test]
+fn tiny_terminals_and_requested_widths_do_not_panic() {
+    for (width, height) in [
+        (1, 1),
+        (2, 2),
+        (5, 3),
+        (20, 4),
+        (60, 8),
+        (80, 8),
+        (120, 8),
+        (169, 8),
+        (170, 8),
+        (171, 8),
+        (220, 8),
+    ] {
+        let (mut app, _directory) = make_app();
+        app.input = "wide 字\nsecond line".to_string();
+        app.input_cursor = app.input.chars().count();
+        render(&mut app, width, height);
+    }
+}
+
+#[test]
+fn multiline_chat_and_compose_content_render() {
+    let (mut app, _directory) = make_app();
+    app.storage.append_to_today("alpha\nbeta **bold**").unwrap();
+    app.reload();
+    app.focus = Focus::Compose;
+    app.input = "first\nsecond".to_string();
+    app.input_cursor = app.input.chars().count();
+    let terminal = render(&mut app, 120, 24);
+    let screen = buffer_string(&terminal);
+    for expected in ["alpha", "beta bold", "first", "second"] {
+        assert!(screen.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn todo_items_wrap_and_keep_the_whole_item_clickable() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Todo;
+    app.todo_items = vec![TodoItem {
+        checked: false,
+        text: "a todo item whose content is deliberately longer than the panel".to_string(),
+    }];
+    let terminal = render(&mut app, 170, 18);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("a todo item whose content"));
+    assert!(screen.contains("longer"));
+    assert!(screen.contains("panel"));
+    assert_eq!(app.todo_hitboxes.len(), 1);
+    assert!(app.todo_hitboxes[0].area.height > 1);
+}
+
+#[test]
+fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Todo;
+    app.todo_items = vec![
+        TodoItem {
+            checked: false,
+            text: "first task".to_string(),
+        },
+        TodoItem {
+            checked: true,
+            text: "second task".to_string(),
+        },
+    ];
+    app.todo_index = 1;
+
+    let terminal = render(&mut app, 170, 24);
+    let screen = buffer_string(&terminal);
+    let lines = screen.lines().collect::<Vec<_>>();
+    let first_row = lines
+        .iter()
+        .position(|line| line.contains("first task"))
+        .unwrap();
+    let second_row = lines
+        .iter()
+        .position(|line| line.contains("second task"))
+        .unwrap();
+    assert_eq!(second_row, first_row + 2);
+    assert_eq!(app.todo_hitboxes.len(), 2);
+    assert_eq!(app.todo_hitboxes[0].area.height, 2);
+    let todo = app.layout.todo.unwrap();
+    let first = app.todo_hitboxes[0].area;
+    let last = app.todo_hitboxes[1].area;
+    assert_eq!(first.y, todo.y + 2, "the first item needs a top margin");
+    assert_eq!(
+        terminal.backend().buffer()[(first.x, first.y + first.height - 1)].bg,
+        ctp::SURFACE_1,
+        "the selected background should include the shared blank row"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(first.x, first.y)].symbol(),
+        "["
+    );
+    assert_eq!(terminal.backend().buffer()[(last.x, last.y)].symbol(), "[");
+    let last_margin = &terminal.backend().buffer()[(last.x, last.y + last.height - 1)];
+    assert_eq!(last_margin.symbol(), " ");
+    assert_eq!(last_margin.bg, ctp::SURFACE_1);
+    assert!(!last_margin.modifier.contains(Modifier::CROSSED_OUT));
+    assert!(!terminal.backend().buffer()[(last.x, last.y - 1)]
+        .modifier
+        .contains(Modifier::CROSSED_OUT));
+    assert!((last.x..last.x + last.width).any(|x| {
+        let cell = &terminal.backend().buffer()[(x, last.y)];
+        cell.modifier.contains(Modifier::CROSSED_OUT) && cell.symbol() != " "
+    }));
+}
+
+#[test]
+fn todo_display_groups_open_items_before_completed_items() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Todo;
+    app.todo_items = vec![
+        TodoItem {
+            checked: true,
+            text: "finished task".to_string(),
+        },
+        TodoItem {
+            checked: false,
+            text: "open task".to_string(),
+        },
+    ];
+    app.todo_index = 1;
+    let terminal = render(&mut app, 170, 18);
+    let screen = buffer_string(&terminal);
+    assert!(screen.find("open task") < screen.find("finished task"));
+    assert_eq!(
+        app.todo_hitboxes
+            .iter()
+            .map(|hitbox| hitbox.index)
+            .collect::<Vec<_>>(),
+        vec![1, 0],
+        "hitboxes must retain daily task source indices"
+    );
+}
+
+#[test]
+fn chat_renders_block_markdown_on_colored_cards() {
+    let (mut app, _directory) = make_app();
+    app.storage
+        .append_to_today(concat!(
+            "# Heading\n\n- first\n- second\n\n`code`\n\n",
+            "[columns gap=2]\n",
+            "[column]Left[/column]\n",
+            "[column]Right[/column]\n",
+            "[/columns]\n\n",
+            "[bg=196]colored[/bg]"
+        ))
+        .unwrap();
+    app.reload();
+    let date = app.daily_notes[0].date.format("%Y-%m-%d").to_string();
+    let terminal = render(&mut app, 170, 40);
+    let screen = buffer_string(&terminal);
+    let screen_lines = screen.lines().collect::<Vec<_>>();
+    let date_row = screen_lines
+        .iter()
+        .position(|line| line.contains(&date))
+        .expect("missing DailyNote date");
+    let heading_row = screen_lines
+        .iter()
+        .position(|line| line.contains("Heading"))
+        .expect("missing body heading");
+    assert_eq!(
+        heading_row,
+        date_row + 2,
+        "date and body need one blank row"
+    );
+    assert!(
+        screen_lines[heading_row].find("Heading").unwrap()
+            >= screen_lines[date_row].find(&date).unwrap(),
+        "date and body should use the same centered content axis"
+    );
+    let buffer = terminal.backend().buffer();
+    assert!(buffer.content().iter().any(|cell| {
+        cell.symbol() == date.chars().next().unwrap().to_string()
+            && cell.modifier.contains(Modifier::BOLD)
+            && cell.modifier.contains(Modifier::UNDERLINED)
+    }));
+    for expected in ["Heading", "• first", "• second", "code"] {
+        assert!(screen.contains(expected), "missing {expected}");
+    }
+    assert!(screen
+        .lines()
+        .any(|line| line.contains("Left") && line.contains("Right")));
+    assert!(buffer
+        .content()
+        .iter()
+        .any(|cell| cell.symbol() == "c" && cell.bg == Color::Indexed(196)));
+    assert!(!screen.contains("[view]"));
+    assert!(
+        app.hitboxes
+            .iter()
+            .all(|hitbox| hitbox.action != Action::View),
+        "DailyNotes no longer need a preview button"
+    );
+    assert!(
+        buffer.content().iter().any(|cell| {
+            cell.symbol() == "H"
+                && cell.modifier.contains(Modifier::BOLD)
+                && cell.bg == ctp::MANTLE
+        }),
+        "selection should not alter the Markdown body background"
+    );
+    let ai = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == Action::Ai)
+        .expect("AI button");
+    let center = app.layout.center.expect("center");
+    let daily_area = inset_horizontal(center_content_axis(center), 2);
+    assert_eq!(
+        ai.area.x + ai.area.width,
+        daily_area.x + daily_area.width - PAGE_PADDING_X as u16,
+        "AI button should share the body content axis"
+    );
+}
+
+#[test]
+fn selected_daily_card_uses_an_animated_gradient_border() {
+    let (mut app, _directory) = make_app();
+    app.storage.append_to_today("A daily note").unwrap();
+    app.reload();
+    app.animation_tick = 0;
+
+    let first = render(&mut app, 170, 30);
+    let center = app.layout.center.unwrap();
+    let daily = inset_horizontal(center_content_axis(center), 2);
+    let top = daily.y + 2;
+    let first_buffer = first.backend().buffer();
+    assert_eq!(first_buffer[(daily.x, top)].symbol(), "┌");
+    assert_eq!(first_buffer[(daily.x, top)].fg, animated_color(0, 0));
+    assert_eq!(first_buffer[(daily.x + 1, top)].fg, animated_color(1, 0));
+    assert_ne!(
+        first_buffer[(daily.x, top)].fg,
+        first_buffer[(daily.x + 1, top)].fg
+    );
+
+    app.animation_tick = 1;
+    let second = render(&mut app, 170, 30);
+    assert_eq!(
+        second.backend().buffer()[(daily.x, top)].fg,
+        animated_color(0, 1)
+    );
+    assert_ne!(
+        second.backend().buffer()[(daily.x, top)].fg,
+        first_buffer[(daily.x, top)].fg
+    );
+}
+
+#[test]
+fn daily_body_axis_has_symmetric_gutters() {
+    let width = 100;
+    let metadata_and_gap = DAILY_PADDING_X + UnicodeWidthStr::width("2026-07-27") + 2;
+    let (start, body_width) = centered_daily_body_axis(width, metadata_and_gap);
+    let trailing = width - start - body_width;
+
+    assert_eq!(start, metadata_and_gap);
+    assert_eq!(trailing, start);
+    assert_eq!(body_width, 74);
+    assert_eq!(PAGE_PADDING_X, metadata_and_gap);
+}
+
+#[test]
+fn oversized_selected_card_keeps_a_stable_scroll_position() {
+    let (mut app, _directory) = make_app();
+    let body = (0..80)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.storage.append_to_today(&body).unwrap();
+    app.reload();
+    app.selected = app.daily_notes.len() - 1;
+    app.scroll = u16::MAX;
+    app.focus = Focus::Center;
+
+    let first = render(&mut app, 80, 24);
+    let first_scroll = app.scroll;
+    let first_screen = buffer_string(&first);
+    assert!(first_scroll > 0);
+
+    let second = render(&mut app, 80, 24);
+    assert_eq!(app.scroll, first_scroll);
+    assert_eq!(buffer_string(&second), first_screen);
+}
+
+#[test]
+fn oversized_card_scroll_can_rest_anywhere_inside_the_card() {
+    assert_eq!(stable_card_scroll(10, 10, 100, 20), 10);
+    assert_eq!(stable_card_scroll(50, 10, 100, 20), 50);
+    assert_eq!(stable_card_scroll(100, 10, 100, 20), 81);
+    assert_eq!(stable_card_scroll(81, 10, 100, 20), 81);
+}
+
+#[test]
+fn manual_scroll_can_cross_an_oversized_selected_card_boundary() {
+    let (mut app, _directory) = make_app();
+    app.storage
+        .append_daily("2026-07-26", "previous day")
+        .unwrap();
+    let long_body = (0..80)
+        .map(|line| format!("long line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.storage.append_daily("2026-07-27", &long_body).unwrap();
+    app.reload();
+    app.selected = 1;
+    app.scroll = u16::MAX;
+    app.reveal_selected_daily = true;
+    render(&mut app, 80, 24);
+    assert!(app.scroll > 0);
+
+    app.scroll = 0;
+    app.reveal_selected_daily = false;
+    let terminal = render(&mut app, 80, 24);
+    assert_eq!(app.scroll, 0);
+    assert!(buffer_string(&terminal).contains("previous day"));
+    assert_eq!(app.selected, 1);
+}
+
+#[test]
+fn single_line_daily_card_spaces_date_body_and_buttons() {
+    let (mut app, _directory) = make_app();
+    app.storage.append_to_today("one line").unwrap();
+    app.reload();
+    let date = app.daily_notes[0].date.format(DATE_FMT).to_string();
+
+    let terminal = render(&mut app, 170, 30);
+    let screen = buffer_string(&terminal);
+    let rows = screen.lines().collect::<Vec<_>>();
+    let date_row = rows
+        .iter()
+        .position(|line| line.contains(&date))
+        .expect("date row");
+    assert!(rows[date_row + 2].contains("one line"));
+    let button_row = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == Action::Delete)
+        .expect("delete button")
+        .area
+        .y as usize;
+    assert_eq!(button_row, date_row + 4);
+    let buffer = terminal.backend().buffer();
+    let center = app.layout.center.expect("center area");
+    let sample_x = center.x + center.width / 2;
+    assert!(date_row >= 2);
+    assert_eq!(buffer[(sample_x, date_row as u16 - 1)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(sample_x, date_row as u16 - 2)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(sample_x, button_row as u16 + 1)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(sample_x, button_row as u16 + 2)].bg, ctp::MANTLE);
+    let card_left = inset_horizontal(center_content_axis(center), 2).x;
+    assert_eq!(buffer[(card_left, date_row as u16 - 2)].symbol(), "┌");
+    assert_eq!(buffer[(card_left, date_row as u16)].symbol(), "│");
+    assert_eq!(buffer[(card_left, button_row as u16 + 2)].symbol(), "└");
+}
+
+#[test]
+fn document_view_uses_a_padded_page_background_without_an_outer_border() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Document;
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
+        title: "Archive".to_string(),
+        source: "# Heading\n\nintro\n\nneedle".to_string(),
+        scroll: 0,
+        target_line: Some(5),
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    let terminal = render(&mut app, 80, 30);
+    let buffer = terminal.backend().buffer();
+    let header: String = (0..80)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(header.contains("Archive"));
+    assert!(!header.contains("Esc back"));
+    assert_eq!(buffer[(0, 0)].symbol(), " ");
+    assert!(buffer_string(&terminal).contains("Compose"));
+    assert!(buffer_string(&terminal).contains("  Archive"));
+    assert_eq!(app.document.as_ref().unwrap().scroll, 0);
+    assert_eq!(app.document.as_ref().unwrap().target_line, None);
+    let first_document_row: String = (0..80)
+        .map(|x| buffer[(x, 4)].symbol().to_string())
+        .collect();
+    assert!(first_document_row.contains("Heading"));
+    assert_eq!(buffer[(2, 2)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(2, 3)].bg, ctp::MANTLE);
+    let heading_x = first_document_row.find("Heading").unwrap() as u16;
+    assert!(heading_x >= 2 + PAGE_PADDING_X as u16);
+    assert!(buffer_string(&terminal).contains("needle"));
+}
+
+#[test]
+fn document_scroll_overwrites_box_borders_from_the_previous_frame() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Document;
+    let boxed = (0..40)
+        .map(|line| format!("boxed {line} ☀️"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let plain = (0..40)
+        .map(|line| format!("plain {line}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.data_dir.join("scroll.md")),
+        title: "Scroll".to_string(),
+        source: format!(
+            "{plain}\n\n[box width=full border=single border-color=#df7f3f bg=16]\n{boxed}\n[/box]"
+        ),
+        scroll: u16::MAX,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    {
+        let completed = terminal
+            .draw(|frame| {
+                let _ = draw(frame, &mut app);
+            })
+            .unwrap();
+        let box_buffer = completed.buffer;
+        let mut saw_vs16 = false;
+        for y in 0..box_buffer.area.height {
+            for x in 0..box_buffer.area.width.saturating_sub(1) {
+                if box_buffer[(x, y)].symbol().contains('\u{fe0f}') {
+                    saw_vs16 = true;
+                    assert_eq!(box_buffer[(x + 1, y)].diff_option, CellDiffOption::Skip);
+                }
+            }
+        }
+        assert!(saw_vs16);
+    }
+    assert!(terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|cell| cell.symbol() == "│"));
+
+    app.document.as_mut().unwrap().scroll = 0;
+    terminal
+        .draw(|frame| {
+            let _ = draw(frame, &mut app);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let page = app.layout.center.unwrap();
+    let border = Color::Rgb(223, 127, 63);
+    assert!(buffer_string(&terminal).contains("plain 0"));
+    assert!((page.y..page.y + page.height).all(|y| {
+        (page.x..page.x + page.width)
+            .all(|x| buffer[(x, y)].symbol() != "│" || buffer[(x, y)].fg != border)
+    }));
+}
+
+#[test]
+fn document_code_block_background_has_no_wrapped_gaps() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Document;
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
+        title: "Code".to_string(),
+        source: "```rust\nfn main() {\n    println!(\"hello\");\n}\n```".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+
+    let terminal = render(&mut app, 80, 30);
+    let buffer = terminal.backend().buffer();
+    let background = mbtui::Theme::default()
+        .code_block
+        .bg
+        .expect("the default code block theme has a background");
+    let compose = app.layout.compose.expect("document compose");
+    let rows = (0..compose.y)
+        .filter(|y| (0..buffer.area().width).any(|x| buffer[(x, *y)].bg == background))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 7);
+    assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
+}
+
+#[test]
+fn daily_vlist_only_renders_visible_cards_and_invalidates_changed_content() {
+    let (mut app, _directory) = make_app();
+    let first_date = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+    app.daily_notes = (0..40)
+        .map(|day| crate::model::DailyNote {
+            date: first_date + chrono::Days::new(day),
+            body: format!("# DailyNote {day}\n\nA DailyNote that may be off screen."),
+        })
+        .collect();
+
+    sync_daily_vlist(&mut app, 80);
+    assert!(app
+        .daily_vlist
+        .items
+        .iter()
+        .all(|item| item.cache.is_none()));
+    let scroll = measure_visible_daily_cards(&mut app, 0, 8, 8, false);
+    assert_eq!(scroll, 0);
+    let rendered = app
+        .daily_vlist
+        .items
+        .iter()
+        .filter(|item| item.cache.is_some())
+        .count();
+    assert!(rendered > 0 && rendered < app.daily_notes.len());
+    assert!(app.daily_vlist.items[20].cache.is_none());
+    let original = app.daily_vlist.items[0].cache.clone();
+
+    measure_visible_daily_cards(&mut app, 0, 8, 8, false);
+    assert_eq!(app.daily_vlist.items[0].cache, original);
+
+    app.daily_notes[0].body.push_str("\n\nChanged");
+    sync_daily_vlist(&mut app, 80);
+    assert!(app.daily_vlist.items[0].cache.is_none());
+    assert!(!app.daily_vlist.geometry.is_measured(0));
+
+    sync_daily_vlist(&mut app, 72);
+    assert!(app
+        .daily_vlist
+        .items
+        .iter()
+        .all(|item| item.cache.is_none()));
+    assert_eq!(app.daily_vlist.width, 72);
+}
+
+#[test]
+fn agent_vlist_only_renders_visible_entries_and_keeps_animation_out_of_cache() {
+    let (mut app, _directory) = make_app();
+    app.agent_panel.push(AgentPanelEntry::Tool {
+        text: "Fetching Web...".to_string(),
+        active: true,
+    });
+    app.agent_panel
+        .extend((1..40).map(|index| AgentPanelEntry::Prompt {
+            text: format!("Prompt {index}"),
+            muted: false,
+        }));
+
+    sync_agent_vlist(&mut app, 40);
+    assert!(app.agent_vlist.caches.iter().all(Option::is_none));
+    let scroll = measure_visible_agent_entries(&mut app, 0, 6, false);
+    assert_eq!(scroll, 0);
+    let rendered = app
+        .agent_vlist
+        .caches
+        .iter()
+        .filter(|cache| cache.is_some())
+        .count();
+    assert!(rendered > 0 && rendered < app.agent_panel.len());
+    assert!(app.agent_vlist.caches[20].is_none());
+    let original = app.agent_vlist.caches[0].clone();
+    let (visible, _, _) = visible_agent_lines(&mut app, 0, 6);
+    assert_eq!(visible.len(), 6);
+
+    app.animation_tick = 10;
+    sync_agent_vlist(&mut app, 40);
+    assert_eq!(app.agent_vlist.caches[0], original);
+
+    if let AgentPanelEntry::Tool { text, .. } = &mut app.agent_panel[0] {
+        text.push_str(" now");
+    }
+    sync_agent_vlist(&mut app, 40);
+    assert!(app.agent_vlist.caches[0].is_none());
+    assert!(!app.agent_vlist.geometry.is_measured(0));
+}
