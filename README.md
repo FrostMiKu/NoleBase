@@ -244,7 +244,8 @@ editor = "code -w"
 
 Each direct
 `themes/<name>.toml` file contains semantic `#RRGGBB` tokens grouped under
-`[surface]`, `[selection]`, `[text]`, `[ui]`, `[markdown]`, and `[animation]`.
+`[surface]`, `[selection]`, `[text]`, `[ui]`, `[diff]`, `[markdown]`, and
+`[animation]`.
 The `[selection]` group defines the background, inactive background, foreground,
 and indicator color shared by selectable lists. The reserved
 `default` option uses `themes/default.toml`, falling back to Nole's built-in

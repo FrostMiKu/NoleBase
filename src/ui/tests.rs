@@ -1179,17 +1179,18 @@ fn agent_diff_approval_switches_layout_with_terminal_width() {
 
     let narrow = render(&mut app, 130, 24);
     let narrow_screen = buffer_string(&narrow);
-    assert_eq!(app.layout.overlay.unwrap().width, APPROVAL_UNIFIED_WIDTH);
+    let narrow_overlay = app.layout.overlay.unwrap();
+    assert_eq!(narrow_overlay.width, APPROVAL_UNIFIED_WIDTH);
+    assert_eq!(narrow_overlay.height, 8);
     assert!(!narrow_screen
         .lines()
         .any(|line| line.contains("-old value") && line.contains("+new value")));
 
     let wide = render(&mut app, 180, 24);
     let wide_screen = buffer_string(&wide);
-    assert_eq!(
-        app.layout.overlay.unwrap().width,
-        APPROVAL_SIDE_BY_SIDE_WIDTH
-    );
+    let wide_overlay = app.layout.overlay.unwrap();
+    assert_eq!(wide_overlay.width, APPROVAL_SIDE_BY_SIDE_WIDTH);
+    assert_eq!(wide_overlay.height, 6);
     let changed_line = wide_screen
         .lines()
         .find(|line| line.contains("-old value") && line.contains("+new value"))
@@ -1203,6 +1204,54 @@ fn agent_diff_approval_switches_layout_with_terminal_width() {
         .find(|line| line.contains("@@ -1 +1 @@"))
         .expect("hunk row");
     assert!(hunk_line.contains(" ┃ "));
+
+    let buffer = wide.backend().buffer();
+    let changed_y = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("-old value")
+        })
+        .expect("changed row");
+    let content_start = wide_overlay.x + 2;
+    let divider = content_start + (wide_overlay.width - 4 - 3) / 2;
+    assert!((content_start..divider)
+        .all(|x| buffer[(x, changed_y)].bg == app.theme.diff_deletion_background));
+    assert!((divider + 3..wide_overlay.x + wide_overlay.width - 2)
+        .all(|x| buffer[(x, changed_y)].bg == app.theme.diff_addition_background));
+}
+
+#[test]
+fn unified_diff_uses_full_width_change_backgrounds() {
+    let theme = Theme::default();
+    let lines = unified_diff_lines("@@ -1 +1 @@\n-old\n+new\n", 12, theme);
+
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1]
+        .spans
+        .iter()
+        .all(|span| span.style.bg == Some(theme.diff_deletion_background)));
+    assert_eq!(lines[1].width(), 12);
+    assert!(lines[2]
+        .spans
+        .iter()
+        .all(|span| span.style.bg == Some(theme.diff_addition_background)));
+    assert_eq!(lines[2].width(), 12);
+}
+
+#[test]
+fn long_approval_diff_keeps_the_bounded_height() {
+    let (mut app, _directory) = make_app();
+    app.approval_request = Some(ApprovalRequest {
+        title: "Update data/note.md".to_string(),
+        diff: (0..50).map(|line| format!("+line {line}\n")).collect(),
+    });
+    app.set_overlay(Overlay::Approval);
+
+    render(&mut app, 130, 50);
+
+    assert_eq!(app.layout.overlay.unwrap().height, 36);
 }
 
 #[test]

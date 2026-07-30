@@ -159,15 +159,55 @@ pub(super) fn diff_line_style(kind: DiffLineKind, theme: Theme) -> Style {
     let base = Style::default().bg(theme.markdown_code_block_background);
     match kind {
         DiffLineKind::Context => base.fg(theme.markdown_code_block_text),
-        DiffLineKind::Deletion => base.fg(theme.ui_error),
-        DiffLineKind::Addition => base.fg(theme.ui_task_done),
+        DiffLineKind::Deletion => base.fg(theme.ui_error).bg(theme.diff_deletion_background),
+        DiffLineKind::Addition => base
+            .fg(theme.ui_task_done)
+            .bg(theme.diff_addition_background),
         DiffLineKind::Header => base.fg(theme.ui_warning).add_modifier(Modifier::BOLD),
         DiffLineKind::Hunk => base.fg(theme.ui_dialog_choice).add_modifier(Modifier::BOLD),
         DiffLineKind::Metadata => base.fg(theme.text_muted),
     }
 }
 
-pub(super) fn side_by_side_diff_lines(diff: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
+pub(super) fn unified_diff_lines(diff: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut in_hunk = false;
+    diff.lines()
+        .flat_map(|text| {
+            let kind = if text.starts_with("@@") {
+                in_hunk = true;
+                DiffLineKind::Hunk
+            } else if is_changed_diff_line(text, in_hunk) {
+                if text.starts_with('-') {
+                    DiffLineKind::Deletion
+                } else {
+                    DiffLineKind::Addition
+                }
+            } else if text.starts_with("--- ") || text.starts_with("+++ ") {
+                DiffLineKind::Header
+            } else if text.starts_with(' ') {
+                DiffLineKind::Context
+            } else {
+                DiffLineKind::Metadata
+            };
+            if text.is_empty() || text.starts_with("diff ") {
+                in_hunk = false;
+            }
+            let style = diff_line_style(kind, theme);
+            wrap_spans_to_width(&[Span::styled(text.to_string(), style)], width)
+                .into_iter()
+                .map(move |spans| Line::from(pad_spans(spans, width, style)))
+        })
+        .collect()
+}
+
+pub(super) fn side_by_side_diff_lines(
+    diff: &str,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let rows = side_by_side_diff_rows(diff);
     let line_number_width = rows
         .iter()
@@ -252,9 +292,7 @@ pub(super) fn diff_cell_lines(
         } else {
             " ".repeat(line_number_width)
         };
-        let gutter_style = Style::default()
-            .fg(theme.text_muted)
-            .bg(theme.markdown_code_block_background);
+        let gutter_style = content_style.fg(theme.text_muted);
         let mut spans = vec![
             Span::styled(number, gutter_style),
             Span::styled(" │ ", gutter_style),
@@ -265,7 +303,11 @@ pub(super) fn diff_cell_lines(
     .collect()
 }
 
-pub(super) fn pad_spans(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Vec<Span<'static>> {
+pub(super) fn pad_spans(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    style: Style,
+) -> Vec<Span<'static>> {
     let used = spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))

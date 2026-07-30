@@ -52,6 +52,10 @@ action_ai = "#f5c2e7"
 warning = "#f9e2af"
 error = "#f5c2e7"
 
+[diff]
+addition_background = "#29423c"
+deletion_background = "#49313f"
+
 [markdown]
 heading_1 = "#b4befe"
 heading_2 = "#89b4fa"
@@ -133,6 +137,8 @@ pub struct Theme {
     pub ui_action_ai: Color,
     pub ui_warning: Color,
     pub ui_error: Color,
+    pub diff_addition_background: Color,
+    pub diff_deletion_background: Color,
     pub markdown_heading_1: Color,
     pub markdown_heading_2: Color,
     pub markdown_heading_3: Color,
@@ -158,6 +164,7 @@ struct ThemeFile {
     selection: SelectionTokens,
     text: TextTokens,
     ui: UiTokens,
+    diff: DiffTokens,
     markdown: MarkdownTokens,
     animation: AnimationTokens,
 }
@@ -219,6 +226,13 @@ struct UiTokens {
     action_ai: String,
     warning: String,
     error: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiffTokens {
+    addition_background: String,
+    deletion_background: String,
 }
 
 #[derive(Deserialize)]
@@ -299,6 +313,14 @@ impl Theme {
             ui_action_ai: parse_color("ui.action_ai", &file.ui.action_ai)?,
             ui_warning: parse_color("ui.warning", &file.ui.warning)?,
             ui_error: parse_color("ui.error", &file.ui.error)?,
+            diff_addition_background: parse_color(
+                "diff.addition_background",
+                &file.diff.addition_background,
+            )?,
+            diff_deletion_background: parse_color(
+                "diff.deletion_background",
+                &file.diff.deletion_background,
+            )?,
             markdown_heading_1: parse_color("markdown.heading_1", &file.markdown.heading_1)?,
             markdown_heading_2: parse_color("markdown.heading_2", &file.markdown.heading_2)?,
             markdown_heading_3: parse_color("markdown.heading_3", &file.markdown.heading_3)?,
@@ -418,6 +440,8 @@ mod tests {
         assert_eq!(theme.selection_background, Color::Rgb(69, 71, 90));
         assert_eq!(theme.selection_foreground, Color::Rgb(205, 214, 244));
         assert_eq!(theme.ui_page_heading, Color::Rgb(180, 190, 254));
+        assert_eq!(theme.diff_addition_background, Color::Rgb(41, 66, 60));
+        assert_eq!(theme.diff_deletion_background, Color::Rgb(73, 49, 63));
         assert_eq!(theme.markdown_code_block_background, Color::Rgb(49, 50, 68));
         assert_eq!(theme.surface_status_context, Color::Rgb(137, 180, 250));
         let markdown = theme.markdown_theme();
@@ -436,6 +460,10 @@ mod tests {
             .replace("foreground = \"#cdd6f4\"", "foreground = \"#0a0b0c\"")
             .replace("action = \"#94e2d5\"", "action = \"#070809\"")
             .replace(
+                "addition_background = \"#29423c\"",
+                "addition_background = \"#111213\"",
+            )
+            .replace(
                 "code_block_background = \"#313244\"",
                 "code_block_background = \"#040506\"",
             );
@@ -444,6 +472,7 @@ mod tests {
         assert_eq!(theme.selection_foreground, Color::Rgb(10, 11, 12));
         assert_eq!(theme.markdown_code_block_background, Color::Rgb(4, 5, 6));
         assert_eq!(theme.ui_action, Color::Rgb(7, 8, 9));
+        assert_eq!(theme.diff_addition_background, Color::Rgb(17, 18, 19));
         assert_eq!(theme.ui_task_open, Color::Rgb(148, 226, 213));
     }
 

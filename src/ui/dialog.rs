@@ -8,6 +8,14 @@ pub(super) fn approval_dialog_width(root_width: u16) -> u16 {
     }
 }
 
+fn approval_diff_lines(message: &str, content_width: u16, theme: Theme) -> Vec<Line<'static>> {
+    if content_width >= APPROVAL_SIDE_BY_SIDE_MIN_WIDTH {
+        side_by_side_diff_lines(message, content_width as usize, theme)
+    } else {
+        unified_diff_lines(message, content_width as usize, theme)
+    }
+}
+
 /// Render every modal interaction through one fixed-width, bounded-height
 /// command surface. The body changes by mode, but title, scrolling, option
 /// selection, input and footer geometry remain identical.
@@ -28,6 +36,10 @@ pub(super) fn draw_dialog(
     }
     .min(root.width.saturating_sub(4).max(root.width.min(1)));
     let text_width = width.saturating_sub(4).max(1) as usize;
+    let approval_rows = (dialog.mode == DialogMode::Approval).then(|| {
+        u16::try_from(approval_diff_lines(&dialog.message, text_width as u16, app.theme).len())
+            .unwrap_or(u16::MAX)
+    });
     let message_rows = if dialog.purpose == DialogPurpose::Help {
         help_lines(app.theme).len() as u16
     } else {
@@ -61,7 +73,10 @@ pub(super) fn draw_dialog(
             .saturating_add(selection_list_height(option_count, SELECT_OPTION_HEIGHT))
             .saturating_add(1)
             .saturating_add(2),
-        DialogMode::Approval => root.height.saturating_sub(4).min(36),
+        DialogMode::Approval => approval_rows
+            .unwrap_or_default()
+            .saturating_add(3)
+            .min(root.height.saturating_sub(4).min(36)),
         DialogMode::Informational => root.height.saturating_sub(2).min(30),
         DialogMode::CommandPalette => selection_list_height(option_count.min(8), 3)
             .saturating_add(6)
@@ -209,15 +224,7 @@ pub(super) fn draw_dialog(
         }
         DialogMode::Approval => {
             let (content, footer) = split_last_row(inner);
-            let lines = if content.width >= APPROVAL_SIDE_BY_SIDE_MIN_WIDTH {
-                side_by_side_diff_lines(&dialog.message, content.width as usize, app.theme)
-            } else {
-                crate::markdown::to_lines_at_width(
-                    &format!("```diff\n{}\n```", dialog.message),
-                    content.width as usize,
-                    app.theme,
-                )
-            };
+            let lines = approval_diff_lines(&dialog.message, content.width, app.theme);
             let maximum = lines.len().saturating_sub(content.height as usize);
             let scroll = dialog.scroll.min(maximum as u16);
             if let Some(state) = app.dialog.as_mut() {
@@ -713,4 +720,3 @@ pub(super) fn help_lines(theme: Theme) -> Vec<Line<'static>> {
         key("C", "clear Agent conversation and start a new session"),
     ]
 }
-
