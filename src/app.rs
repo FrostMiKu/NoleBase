@@ -12,8 +12,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::agent::{
-    AgentEvent, AgentRuntime, AgentWorker, ApprovalDecision, ApprovalRequest, AskUserKind,
-    AskUserRequest, AskUserResponse, PermissionMode, AGENT_STREAM_BUFFER,
+    AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision, ApprovalRequest,
+    AskUserKind, AskUserRequest, AskUserResponse, PermissionMode, AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
@@ -1122,7 +1122,9 @@ impl App {
             }
         }
         for event in events {
-            if self.ai_cancelling && !matches!(&event, AgentEvent::Finished(_)) {
+            if self.ai_cancelling
+                && !matches!(&event, AgentEvent::Stopped(_) | AgentEvent::Finished(_))
+            {
                 continue;
             }
             match event {
@@ -1265,6 +1267,43 @@ impl App {
                     self.ask_user_request = Some(request);
                     self.set_overlay(Overlay::AskUser);
                 }
+                AgentEvent::Stopped(reason) => {
+                    self.active_agent = None;
+                    if self.ai_cancelling {
+                        self.ai_cancelling = false;
+                        self.ai_cancel = None;
+                        continue;
+                    }
+                    self.ai_running = false;
+                    self.ai_cancel = None;
+                    self.agent_scroll = u16::MAX;
+                    let (notification, status) = match reason {
+                        AgentStopReason::RequestRoundLimit => (
+                            "Agent stopped at the request-round limit",
+                            "Agent paused at the request-round limit",
+                        ),
+                        AgentStopReason::ToolApprovalDenied => (
+                            "Agent stopped after tool approval was denied",
+                            "Agent stopped after tool approval was denied",
+                        ),
+                    };
+                    self.notifications.notify(notification);
+                    self.set_status(status);
+                    self.clear_ask_user();
+                    self.reload_workspace();
+                    if let Err(error) = self.persist_agent_session() {
+                        self.set_error(format!("Agent session save error: {error}"));
+                    }
+                    let pending = self
+                        .agent_input_buffer
+                        .lock()
+                        .map(|mut buffer| std::mem::take(&mut *buffer))
+                        .unwrap_or_default();
+                    if !pending.is_empty() {
+                        self.mark_buffered_prompts_consumed(pending.len());
+                        self.start_agent_worker(pending.join("\n\n"));
+                    }
+                }
                 AgentEvent::Finished(result) => {
                     self.active_agent = None;
                     if self.ai_cancelling {
@@ -1276,16 +1315,10 @@ impl App {
                     self.ai_running = false;
                     self.ai_cancel = None;
                     match result {
-                        Ok(output) => {
+                        Ok(_) => {
                             self.agent_scroll = u16::MAX;
-                            if output.is_empty() {
-                                self.notifications
-                                    .notify("Agent stopped at the request-round limit");
-                                self.set_status("Agent paused at the request-round limit");
-                            } else {
-                                self.notifications.notify("Agent finished");
-                                self.set_status("Agent finished");
-                            }
+                            self.notifications.notify("Agent finished");
+                            self.set_status("Agent finished");
                         }
                         Err(error) => {
                             for entry in &mut self.agent_panel {
@@ -5864,7 +5897,7 @@ mod tests {
         app.ai_running = true;
 
         sender
-            .send(AgentEvent::Finished(Ok(String::new())))
+            .send(AgentEvent::Stopped(AgentStopReason::RequestRoundLimit))
             .unwrap();
         app.poll_agent();
 
@@ -5872,6 +5905,20 @@ mod tests {
         assert_eq!(
             app.notifications.visible().as_deref(),
             Some("Agent stopped at the request-round limit")
+        );
+        assert_eq!(app.notifications.take_bells(), 1);
+
+        let sender = install_agent_observable(&mut app);
+        app.ai_running = true;
+        sender
+            .send(AgentEvent::Stopped(AgentStopReason::ToolApprovalDenied))
+            .unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.status, "Agent stopped after tool approval was denied");
+        assert_eq!(
+            app.notifications.visible().as_deref(),
+            Some("Agent stopped after tool approval was denied")
         );
         assert_eq!(app.notifications.take_bells(), 1);
 

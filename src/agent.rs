@@ -118,7 +118,14 @@ pub enum AgentEvent {
     OpenFile(PathBuf),
     Approval(ApprovalRequest),
     AskUser(AskUserRequest),
+    Stopped(AgentStopReason),
     Finished(Result<String, String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStopReason {
+    RequestRoundLimit,
+    ToolApprovalDenied,
 }
 
 pub(crate) const AGENT_STREAM_BUFFER: usize = 16_384;
@@ -161,6 +168,32 @@ fn report_provider_metrics(
 pub struct AgentRunOutput {
     pub text: String,
     pub conversation: AgentConversation,
+}
+
+enum AgentRunCompletion {
+    Finished(String),
+    Stopped(AgentStopReason),
+}
+
+#[derive(Debug)]
+struct ApprovalDenied;
+
+impl std::fmt::Display for ApprovalDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("change denied by user")
+    }
+}
+
+impl std::error::Error for ApprovalDenied {}
+
+enum ToolCallExecution {
+    Completed(ToolResult),
+    Denied(ToolResult),
+}
+
+enum ToolBatchExecution {
+    Completed(Vec<Message>),
+    Denied(Vec<Message>),
 }
 
 #[derive(Clone)]
@@ -326,8 +359,9 @@ impl FileReadState {
     fn ensure_edit_read(&self, start_line: usize, end_line: usize) -> Result<()> {
         if start_line < end_line {
             if !self.covers(start_line, end_line) {
+                let last_line = end_line.saturating_sub(1);
                 bail!(
-                    "edit_file must read changed zero-based lines {start_line}..{end_line} first"
+                    "edit_file must read changed zero-based lines {start_line} through {last_line} first"
                 );
             }
         } else if self.total_lines > 0 {
@@ -359,7 +393,7 @@ impl ApprovalGate {
         .await?;
         match decision {
             ApprovalDecision::Approve => Ok(()),
-            ApprovalDecision::Deny => bail!("change denied by user"),
+            ApprovalDecision::Deny => Err(ApprovalDenied.into()),
         }
     }
 }
@@ -558,12 +592,21 @@ impl AgentWorker {
                         }
                     })
                 })();
-                let result = match result {
-                    Ok(text) => Ok(AgentRunOutput {
-                        text,
-                        conversation: conversation.clone(),
-                    }),
-                    Err(error) => Err(format!("{error:#}")),
+                let (result, stop_reason) = match result {
+                    Ok(completion) => {
+                        let (text, stop_reason) = match completion {
+                            AgentRunCompletion::Finished(text) => (text, None),
+                            AgentRunCompletion::Stopped(reason) => (String::new(), Some(reason)),
+                        };
+                        (
+                            Ok(AgentRunOutput {
+                                text,
+                                conversation: conversation.clone(),
+                            }),
+                            stop_reason,
+                        )
+                    }
+                    Err(error) => (Err(format!("{error:#}")), None),
                 };
                 if let Ok(run_output) = &result {
                     let _ = runtime.events.send(AgentEvent::ConversationUpdated(
@@ -575,7 +618,11 @@ impl AgentWorker {
                     .as_ref()
                     .map(|output| output.text.clone())
                     .map_err(Clone::clone);
-                let _ = runtime.events.send(AgentEvent::Finished(finished));
+                let _ = runtime.events.send(if let Some(reason) = stop_reason {
+                    AgentEvent::Stopped(reason)
+                } else {
+                    AgentEvent::Finished(finished)
+                });
             }
         });
         Self {
@@ -774,7 +821,11 @@ impl Agent {
         self.tools.insert(name, Box::new(tool));
     }
 
-    pub async fn run(&self, prompt: &str, conversation: &mut AgentConversation) -> Result<String> {
+    async fn run(
+        &self,
+        prompt: &str,
+        conversation: &mut AgentConversation,
+    ) -> Result<AgentRunCompletion> {
         let prompt = prompt_with_datetime(prompt, Local::now());
         conversation.messages.push(Message::user(prompt));
         self.checkpoint_conversation(conversation);
@@ -870,7 +921,7 @@ impl Agent {
                         text: output.clone(),
                         final_output: true,
                     });
-                    return Ok(output);
+                    return Ok(AgentRunCompletion::Finished(output));
                 }
 
                 empty_response_retries = 0;
@@ -886,8 +937,19 @@ impl Agent {
                 let results = self
                     .execute_tool_batch(&tool_uses, &response.tool_input_errors)
                     .await?;
-                conversation.messages.extend(results);
-                self.checkpoint_conversation(conversation);
+                match results {
+                    ToolBatchExecution::Completed(results) => {
+                        conversation.messages.extend(results);
+                        self.checkpoint_conversation(conversation);
+                    }
+                    ToolBatchExecution::Denied(results) => {
+                        conversation.messages.extend(results);
+                        self.checkpoint_conversation(conversation);
+                        return Ok(AgentRunCompletion::Stopped(
+                            AgentStopReason::ToolApprovalDenied,
+                        ));
+                    }
+                }
             }
             let buffered = self.take_buffered_prompts()?;
             if !buffered.is_empty() {
@@ -900,7 +962,9 @@ impl Agent {
                 continue;
             }
             if !self.request_round_limit_decision(round).await? {
-                return Ok(String::new());
+                return Ok(AgentRunCompletion::Stopped(
+                    AgentStopReason::RequestRoundLimit,
+                ));
             }
             round_limit = round_limit.saturating_add(self.config.max_rounds);
         }
@@ -1138,7 +1202,7 @@ impl Agent {
         &self,
         tool_uses: &[ToolCall],
         tool_input_errors: &HashMap<String, String>,
-    ) -> Result<Vec<Message>> {
+    ) -> Result<ToolBatchExecution> {
         let mut results = Vec::with_capacity(tool_uses.len() + 1);
         let mut buffered = Vec::new();
         for (index, call) in tool_uses.iter().enumerate() {
@@ -1159,9 +1223,13 @@ impl Agent {
                 )));
             let input_error = call.id.as_str();
             let input_error = tool_input_errors.get(input_error);
-            let result = match input_error {
-                Some(error) => failed_tool_result(call, error),
+            let execution = match input_error {
+                Some(error) => ToolCallExecution::Completed(failed_tool_result(call, error)),
                 None => self.execute_tool_call(call).await,
+            };
+            let (result, denied) = match execution {
+                ToolCallExecution::Completed(result) => (result, false),
+                ToolCallExecution::Denied(result) => (result, true),
             };
             let error = if result.is_error {
                 Some(result.content.as_str())
@@ -1175,6 +1243,14 @@ impl Agent {
                     error,
                 )));
             results.push(Message::tool(result));
+            if denied {
+                results.extend(
+                    tool_uses[index + 1..]
+                        .iter()
+                        .map(|call| Message::tool(skipped_after_denial_tool_result(call))),
+                );
+                return Ok(ToolBatchExecution::Denied(results));
+            }
         }
         buffered.extend(self.take_buffered_prompts()?);
         if !buffered.is_empty() {
@@ -1183,19 +1259,19 @@ impl Agent {
                 format_buffered_prompts(buffered)
             )));
         }
-        Ok(results)
+        Ok(ToolBatchExecution::Completed(results))
     }
 
-    async fn execute_tool_call(&self, call: &ToolCall) -> ToolResult {
+    async fn execute_tool_call(&self, call: &ToolCall) -> ToolCallExecution {
         let id = call.id.as_str();
         let name = call.name.as_str();
         let input = &call.input;
         if let Err(error) = self.ensure_active() {
-            return ToolResult {
+            return ToolCallExecution::Completed(ToolResult {
                 tool_use_id: id.to_string(),
                 content: error.to_string(),
                 is_error: true,
-            };
+            });
         }
         let result = self.tools.get(name).context("unknown tool");
         let result = match result {
@@ -1203,16 +1279,24 @@ impl Agent {
             Err(error) => Err(error),
         };
         match result {
-            Ok(content) => ToolResult {
+            Ok(content) => ToolCallExecution::Completed(ToolResult {
                 tool_use_id: id.to_string(),
                 content,
                 is_error: false,
-            },
-            Err(error) => ToolResult {
-                tool_use_id: id.to_string(),
-                content: error.to_string(),
-                is_error: true,
-            },
+            }),
+            Err(error) => {
+                let denied = error.downcast_ref::<ApprovalDenied>().is_some();
+                let result = ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: error.to_string(),
+                    is_error: true,
+                };
+                if denied {
+                    ToolCallExecution::Denied(result)
+                } else {
+                    ToolCallExecution::Completed(result)
+                }
+            }
         }
     }
 }
@@ -1253,6 +1337,14 @@ fn failed_tool_result(call: &ToolCall, error: &str) -> ToolResult {
     ToolResult {
         tool_use_id: call.id.clone(),
         content: error.to_string(),
+        is_error: true,
+    }
+}
+
+fn skipped_after_denial_tool_result(call: &ToolCall) -> ToolResult {
+    ToolResult {
+        tool_use_id: call.id.clone(),
+        content: "Tool call not executed because the user denied an earlier tool call.".to_string(),
         is_error: true,
     }
 }
@@ -1474,7 +1566,7 @@ Root: {root} (the user's `.nole` workspace)
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
 - read_file is paginated and returns each line with its absolute zero-based line number and text without the line ending; read only needed lines. Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery. Search results also use zero-based source line numbers.
-- create_file creates only new files. edit_file uses exact zero-based line ranges from the latest unchanged read_file snapshot and requires diff approval unless bypassed. Edits provide complete lines without line-ending characters; the tool adds separators. Every changed/deleted range must have been read since the file last changed; insertions require adjacent lines. Unrelated lines need not be read.
+- create_file creates only new files. edit_file uses exact zero-based line numbers from the latest unchanged read_file snapshot and requires diff approval unless bypassed. Replace operations use inclusive start_line and end_line values; insert operations use a separate line field and insert before that line. Edits provide complete lines without line-ending characters; the tool adds separators. Every changed/deleted range must have been read since the file last changed; insertions require adjacent lines. Unrelated lines need not be read.
 - Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md without approval; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
 - Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches and rename_file for file renames. Use rename_tag for exact workspace-wide tag renames. Deletes and tag renames require approval unless bypassed.
 - Use web_fetch when you already have a URL.
@@ -2423,7 +2515,7 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root, outside config/, while preserving all other content. Every [start_line, end_line) range refers to the latest unchanged read_file snapshot; equal bounds insert before that source line. lines contains complete lines without line-ending characters; use an empty array to delete. Changed/deleted lines, or adjacent anchors for insertions, must have been read since the file last changed. Requires user diff approval unless bypassed."
+        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root, outside config/, while preserving all other content. A replace operation uses inclusive start_line and end_line values from the latest unchanged read_file snapshot; for example, 1 through 3 is start_line=1 and end_line=3. Use an empty lines array to delete that range. An insert operation inserts complete lines before its line value. Changed/deleted lines, or adjacent anchors for insertions, must have been read since the file last changed. Requires user diff approval unless bypassed."
     }
 
     fn input_schema(&self) -> Value {
@@ -2434,24 +2526,46 @@ impl Tool for EditFile {
                 "edits": {
                     "type": "array", "minItems": 1, "maxItems": 100,
                     "items": {
-                        "type": "object",
-                        "properties": {
-                            "start_line": {
-                                "type": "integer", "minimum": 0,
-                                "description": "Zero-based inclusive line in the original read_file snapshot; equal to end_line inserts before this line"
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "operation": { "type": "string", "const": "replace" },
+                                    "start_line": {
+                                        "type": "integer", "minimum": 0,
+                                        "description": "Zero-based first line to replace, inclusive"
+                                    },
+                                    "end_line": {
+                                        "type": "integer", "minimum": 0,
+                                        "description": "Zero-based last line to replace, inclusive"
+                                    },
+                                    "lines": {
+                                        "type": "array",
+                                        "description": "Complete replacement lines without line-ending characters. Use an empty array to delete the inclusive range",
+                                        "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
+                                    }
+                                },
+                                "required": ["operation", "start_line", "end_line", "lines"],
+                                "additionalProperties": false
                             },
-                            "end_line": {
-                                "type": "integer", "minimum": 0,
-                                "description": "Zero-based exclusive line in the original read_file snapshot"
-                            },
-                            "lines": {
-                                "type": "array",
-                                "description": "Complete inserted/replacement lines without line-ending characters or unchanged adjacent anchor text. Use an empty array to delete; the tool adds line separators",
-                                "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "operation": { "type": "string", "const": "insert" },
+                                    "line": {
+                                        "type": "integer", "minimum": 0,
+                                        "description": "Zero-based source line before which to insert; use the total line count to append"
+                                    },
+                                    "lines": {
+                                        "type": "array", "minItems": 1,
+                                        "description": "Complete lines to insert without line-ending characters",
+                                        "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
+                                    }
+                                },
+                                "required": ["operation", "line", "lines"],
+                                "additionalProperties": false
                             }
-                        },
-                        "required": ["start_line", "end_line", "lines"],
-                        "additionalProperties": false
+                        ]
                     }
                 }
             },
@@ -2488,14 +2602,17 @@ impl Tool for EditFile {
         let offsets = line_byte_offsets(&old);
         let total_lines = offsets.len().saturating_sub(1);
         for edit in &edits {
-            if edit.start_line > edit.end_line || edit.end_line > total_lines {
-                bail!(
-                    "invalid edit range {}..{} for file with {total_lines} lines",
-                    edit.start_line,
-                    edit.end_line
-                );
+            if edit.end_line_exclusive > total_lines {
+                if edit.insertion {
+                    bail!(
+                        "invalid insertion line {} for file with {total_lines} lines",
+                        edit.start_line
+                    );
+                }
+                let end_line = edit.end_line_exclusive.saturating_sub(1);
+                bail!("invalid inclusive edit range {} through {end_line} for file with {total_lines} lines", edit.start_line);
             }
-            state.ensure_edit_read(edit.start_line, edit.end_line)?;
+            state.ensure_edit_read(edit.start_line, edit.end_line_exclusive)?;
         }
         let content = apply_line_edits(&old, &offsets, &edits);
         if content.len() as u64 > MAX_FILE_BYTES {
@@ -2525,8 +2642,9 @@ impl Tool for EditFile {
 #[derive(Debug)]
 struct LineEdit {
     start_line: usize,
-    end_line: usize,
+    end_line_exclusive: usize,
     lines: Vec<String>,
+    insertion: bool,
 }
 
 fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
@@ -2540,42 +2658,75 @@ fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
     let mut edits = values
         .iter()
         .map(|value| {
-            let start_line = value
-                .get("start_line")
-                .and_then(Value::as_u64)
-                .context("edit start_line must be a non-negative integer")?;
-            let end_line = value
-                .get("end_line")
-                .and_then(Value::as_u64)
-                .context("edit end_line must be a non-negative integer")?;
-            Ok(LineEdit {
-                start_line: usize::try_from(start_line).context("start_line is too large")?,
-                end_line: usize::try_from(end_line).context("end_line is too large")?,
-                lines: value
-                    .get("lines")
-                    .and_then(Value::as_array)
-                    .context("edit lines must be an array")?
-                    .iter()
-                    .map(|line| {
-                        let line = line.as_str().context("each edit line must be a string")?;
-                        if line.contains('\r') || line.contains('\n') {
-                            bail!("edit lines must not contain line-ending characters");
-                        }
-                        Ok(line.to_string())
+            let lines = parse_edit_lines(value)?;
+            match value.get("operation").and_then(Value::as_str) {
+                Some("replace") => {
+                    let start_line = edit_line_number(value, "start_line")?;
+                    let end_line = edit_line_number(value, "end_line")?;
+                    if start_line > end_line {
+                        bail!("replace start_line must not exceed inclusive end_line");
+                    }
+                    Ok(LineEdit {
+                        start_line,
+                        end_line_exclusive: end_line
+                            .checked_add(1)
+                            .context("end_line is too large")?,
+                        lines,
+                        insertion: false,
                     })
-                    .collect::<Result<Vec<_>>>()?,
-            })
+                }
+                Some("insert") => {
+                    if lines.is_empty() {
+                        bail!("insert lines must not be empty");
+                    }
+                    let line = edit_line_number(value, "line")?;
+                    Ok(LineEdit {
+                        start_line: line,
+                        end_line_exclusive: line,
+                        lines,
+                        insertion: true,
+                    })
+                }
+                Some(operation) => bail!("unsupported edit operation: {operation}"),
+                None => bail!("edit operation must be 'replace' or 'insert'"),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
-    edits.sort_by_key(|edit| (edit.start_line, edit.end_line));
+    edits.sort_by_key(|edit| (edit.start_line, edit.end_line_exclusive));
     for pair in edits.windows(2) {
         let previous = &pair[0];
         let current = &pair[1];
-        if current.start_line < previous.end_line || current.start_line == previous.start_line {
+        if current.start_line < previous.end_line_exclusive
+            || current.start_line == previous.start_line
+        {
             bail!("edits must not overlap or share a start_line");
         }
     }
     Ok(edits)
+}
+
+fn edit_line_number(value: &Value, field: &str) -> Result<usize> {
+    let line = value
+        .get(field)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("edit {field} must be a non-negative integer"))?;
+    usize::try_from(line).with_context(|| format!("{field} is too large"))
+}
+
+fn parse_edit_lines(value: &Value) -> Result<Vec<String>> {
+    value
+        .get("lines")
+        .and_then(Value::as_array)
+        .context("edit lines must be an array")?
+        .iter()
+        .map(|line| {
+            let line = line.as_str().context("each edit line must be a string")?;
+            if line.contains('\r') || line.contains('\n') {
+                bail!("edit lines must not contain line-ending characters");
+            }
+            Ok(line.to_string())
+        })
+        .collect()
 }
 
 fn source_lines(content: &str) -> Vec<&str> {
@@ -2611,7 +2762,7 @@ fn apply_line_edits(old: &str, offsets: &[usize], edits: &[LineEdit]) -> String 
         } else {
             format!("{}{}", edit.lines.join(line_ending), line_ending)
         };
-        if edit.start_line == edit.end_line
+        if edit.insertion
             && edit.start_line == offsets.len().saturating_sub(1)
             && !old.is_empty()
             && !old.ends_with('\n')
@@ -2620,7 +2771,7 @@ fn apply_line_edits(old: &str, offsets: &[usize], edits: &[LineEdit]) -> String 
             replacement.insert_str(0, line_ending);
         }
         content.replace_range(
-            offsets[edit.start_line]..offsets[edit.end_line],
+            offsets[edit.start_line]..offsets[edit.end_line_exclusive],
             &replacement,
         );
     }
@@ -3843,7 +3994,19 @@ mod tests {
         prompt: &str,
         conversation: &mut AgentConversation,
     ) -> Result<String> {
-        test_runtime().block_on(agent.run(prompt, conversation))
+        test_runtime()
+            .block_on(agent.run(prompt, conversation))
+            .map(|completion| match completion {
+                AgentRunCompletion::Finished(output) => output,
+                AgentRunCompletion::Stopped(_) => String::new(),
+            })
+    }
+
+    fn completed_tool_results(execution: ToolBatchExecution) -> Vec<Message> {
+        match execution {
+            ToolBatchExecution::Completed(results) => results,
+            ToolBatchExecution::Denied(_) => panic!("expected completed tool batch"),
+        }
     }
 
     const TEST_MESSAGES_CONFIG: &str = "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'https://api.anthropic.com'\n";
@@ -4028,7 +4191,7 @@ mod tests {
         assert!(edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"start_line": 450, "end_line": 450, "lines": ["done"]}]
+                "edits": [{"operation": "insert", "line": 450, "lines": ["done"]}]
             }))
             .is_err());
 
@@ -4036,7 +4199,7 @@ mod tests {
             .unwrap();
         edit.execute(&json!({
             "path": "data/large.md",
-            "edits": [{"start_line": 450, "end_line": 450, "lines": ["done"]}]
+            "edits": [{"operation": "insert", "line": 450, "lines": ["done"]}]
         }))
         .unwrap();
     }
@@ -4168,7 +4331,7 @@ mod tests {
         assert!(edit
             .execute(&json!({
                 "path": "config/AGENTS.md",
-                "edits": [{"start_line": 0, "end_line": 1, "lines": ["changed"]}]
+                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["changed"]}]
             }))
             .is_err());
         assert!(create
@@ -4187,7 +4350,7 @@ mod tests {
             .unwrap();
         edit.execute(&json!({
             "path": "themes/custom.toml",
-                "edits": [{"start_line": 1, "end_line": 2, "lines": ["action = \"#010203\""]}]
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["action = \"#010203\""]}]
         }))
         .unwrap();
         assert_eq!(
@@ -4198,7 +4361,7 @@ mod tests {
         read.execute(&json!({"path": "MEMORY.md"})).unwrap();
         edit.execute(&json!({
             "path": "MEMORY.md",
-                "edits": [{"start_line": 0, "end_line": 1, "lines": ["new memory"]}]
+                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new memory"]}]
         }))
         .unwrap();
         assert_eq!(
@@ -4545,7 +4708,8 @@ mod tests {
             },
         ];
 
-        let results = agent.execute_tool_batch(&calls, &HashMap::new()).unwrap();
+        let results =
+            completed_tool_results(agent.execute_tool_batch(&calls, &HashMap::new()).unwrap());
         assert_eq!(results.len(), 2);
         let activities = drain_events(&mut event_receiver)
             .into_iter()
@@ -4991,6 +5155,112 @@ mod tests {
     }
 
     #[test]
+    fn denied_tool_approval_stops_the_run_and_skips_remaining_tools() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = json!({
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "delete-first",
+                    "name": "delete_file",
+                    "input": {"path": "data/first.md"}
+                },
+                {
+                    "type": "tool_use",
+                    "id": "delete-second",
+                    "name": "delete_file",
+                    "input": {"path": "data/second.md"}
+                }
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        });
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request = vec![0; content_length];
+            reader.read_exact(&mut request).unwrap();
+            let body = serde_json::to_vec(&response).unwrap();
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            reader.get_mut().write_all(&body).unwrap();
+            reader.get_mut().flush().unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(storage.data_dir.join("first.md"), "first").unwrap();
+        fs::write(storage.data_dir.join("second.md"), "second").unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!("api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\n"),
+        )
+        .unwrap();
+        let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        approval_sender.send(ApprovalDecision::Deny).unwrap();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let mut conversation = AgentConversation::default();
+
+        let completion = test_runtime()
+            .block_on(agent.run("Delete both", &mut conversation))
+            .unwrap();
+
+        assert!(matches!(
+            completion,
+            AgentRunCompletion::Stopped(AgentStopReason::ToolApprovalDenied)
+        ));
+        server.join().unwrap();
+        assert!(storage.data_dir.join("first.md").exists());
+        assert!(storage.data_dir.join("second.md").exists());
+        assert_eq!(conversation.messages.len(), 4);
+        let results = conversation.messages[2..]
+            .iter()
+            .map(|message| match &message.parts[0] {
+                MessagePart::ToolResult(result) => result,
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+        assert!(results[0].content.contains("denied by user"));
+        assert!(results[1].content.contains("not executed"));
+        let activities = drain_events(&mut event_receiver)
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::ToolStarted(_)))
+            .count();
+        assert_eq!(activities, 1);
+    }
+
+    #[test]
     fn failed_tool_result_is_checkpointed_as_complete_protocol_history() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -5343,7 +5613,8 @@ mod tests {
             input: json!({"path": "data/missing.md"}),
         }];
 
-        let results = agent.execute_tool_batch(&calls, &HashMap::new()).unwrap();
+        let results =
+            completed_tool_results(agent.execute_tool_batch(&calls, &HashMap::new()).unwrap());
 
         assert_eq!(results.len(), 2);
         let MessagePart::ToolResult(result) = &results[0].parts[0] else {
@@ -5396,7 +5667,7 @@ mod tests {
         assert!(prompt.contains("daily/: ordinary Markdown files named YYYY-MM-DD.md"));
         assert!(prompt.contains("Existing daily Markdown files may be read, edited, or deleted"));
         assert!(prompt
-            .contains("edit_file uses exact zero-based line ranges from the latest unchanged"));
+            .contains("edit_file uses exact zero-based line numbers from the latest unchanged"));
         assert!(prompt.contains("Use web_fetch when you already have a URL"));
         assert!(prompt.contains("Use open_file"));
         assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
@@ -5648,7 +5919,7 @@ mod tests {
         let edit = EditFile::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
         let input = json!({
             "path": "data/note.md",
-            "edits": [{"start_line": 0, "end_line": 1, "lines": ["new"]}]
+            "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new"]}]
         });
         assert!(edit.execute(&input).is_err());
 
@@ -5662,7 +5933,7 @@ mod tests {
         assert!(edit
             .execute(&json!({
                 "path": "data/note.md",
-                "edits": [{"start_line": 0, "end_line": 1, "lines": ["again"]}]
+                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["again"]}]
             }))
             .is_err());
 
@@ -5670,6 +5941,43 @@ mod tests {
         assert!(create
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
             .is_err());
+    }
+
+    #[test]
+    fn file_edit_replace_uses_an_inclusive_end_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let path = storage.data_dir.join("range.md");
+        fs::write(&path, "zero\none\ntwo\nthree\nfour\n").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        ReadFile::new(directory.path(), reads.clone())
+            .unwrap()
+            .execute(&json!({"path": "data/range.md"}))
+            .unwrap();
+        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+
+        edit.execute(&json!({
+            "path": "data/range.md",
+            "edits": [{
+                "operation": "replace",
+                "start_line": 1,
+                "end_line": 3,
+                "lines": ["replacement"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "zero\nreplacement\nfour\n"
+        );
+        assert!(parse_line_edits(&json!({
+            "edits": [{"start_line": 1, "end_line": 4, "lines": ["legacy"]}]
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("operation must be 'replace' or 'insert'"));
     }
 
     #[test]
@@ -5691,7 +5999,7 @@ mod tests {
             .unwrap();
         edit.execute(&json!({
             "path": "data/large.md",
-            "edits": [{"start_line": 10, "end_line": 11, "lines": ["changed 10"]}]
+            "edits": [{"operation": "replace", "start_line": 10, "end_line": 10, "lines": ["changed 10"]}]
         }))
         .unwrap();
 
@@ -5704,11 +6012,11 @@ mod tests {
         let error = edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"start_line": 2, "end_line": 3, "lines": ["changed 2"]}]
+                "edits": [{"operation": "replace", "start_line": 2, "end_line": 2, "lines": ["changed 2"]}]
             }))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("changed zero-based lines 2..3"));
+        assert!(error.contains("changed zero-based lines 2 through 2"));
 
         fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
@@ -5719,7 +6027,7 @@ mod tests {
         let error = edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"start_line": 1, "end_line": 1, "lines": ["inserted"]}]
+                "edits": [{"operation": "insert", "line": 1, "lines": ["inserted"]}]
             }))
             .unwrap_err()
             .to_string();
@@ -5745,8 +6053,8 @@ mod tests {
             .execute(&json!({
                 "path": "data/table.md",
                 "edits": [{
-                    "start_line": 2,
-                    "end_line": 2,
+                    "operation": "insert",
+                    "line": 2,
                     "lines": ["| SAC | 0.639 |\n| MM26"]
                 }]
             }))
@@ -5759,8 +6067,8 @@ mod tests {
         edit.execute(&json!({
                 "path": "data/table.md",
                 "edits": [{
-                    "start_line": 2,
-                    "end_line": 2,
+                    "operation": "insert",
+                    "line": 2,
                     "lines": ["| SAC | 0.639 |"]
                 }]
         }))
@@ -5781,7 +6089,7 @@ mod tests {
             .unwrap()
             .execute(&json!({
                 "path": "data/eof.md",
-                "edits": [{"start_line": 1, "end_line": 1, "lines": ["new"]}]
+                "edits": [{"operation": "insert", "line": 1, "lines": ["new"]}]
             }))
             .unwrap();
         assert_eq!(fs::read_to_string(&eof_path).unwrap(), "old\nnew\n");
@@ -5797,7 +6105,7 @@ mod tests {
             .unwrap()
             .execute(&json!({
                 "path": "data/crlf.md",
-                "edits": [{"start_line": 1, "end_line": 2, "lines": ["changed"]}]
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["changed"]}]
             }))
             .unwrap();
         assert_eq!(fs::read_to_string(crlf_path).unwrap(), "old\r\nchanged\r\n");
@@ -5818,7 +6126,7 @@ mod tests {
             .unwrap()
             .execute(&json!({
                 "path": "daily/2026-07-27.md",
-                "edits": [{"start_line": 0, "end_line": 1, "lines": ["edited"]}]
+                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["edited"]}]
             }))
             .unwrap();
         assert_eq!(storage.load_daily_notes().unwrap()[0].body, "edited");
@@ -5895,7 +6203,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(edit.execute(&json!({
                 "path": "data/note.md",
-                "edits": [{"start_line": 0, "end_line": 1, "lines": ["new"]}]
+                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new"]}]
             })))
         });
 

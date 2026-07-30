@@ -403,17 +403,19 @@ filename matching as the Files sidebar. Both search tools support result
 `offset`/`limit` pagination.
 
 `create_file` creates new files and refuses existing paths. `edit_file` accepts
-one or more zero-based `[start_line, end_line)` replacements and preserves the
-rest of the file internally, so large files do not need to be read or submitted
-in full. Every range refers to the original `read_file` snapshot. Each edit
-provides a `lines` array of complete lines without line-ending characters; the
-tool adds separators and never requires the Agent to repeat adjacent anchor
-text. Changed/deleted ranges must have been covered by `read_file` since the
-file last changed; insertions require adjacent anchor lines. Existing
-`daily/YYYY-MM-DD.md` files use the same `read_file`, `edit_file`, and
-`delete_file` operations as other Markdown files. `add_daily_entry` remains the
-high-level create-or-append operation and does not require approval. Its optional
-`date` uses `YYYY-MM-DD`; omitting it records content on the current local date.
+one or more zero-based edits and preserves the rest of the file internally, so
+large files do not need to be read or submitted in full. `replace` operations
+use inclusive `start_line` and `end_line` values from the original `read_file`
+snapshot; `insert` operations use a separate `line` value and insert before it.
+Each edit provides a `lines` array of complete lines without line-ending
+characters; the tool adds separators and never requires the Agent to repeat
+adjacent anchor text. Changed/deleted ranges must have been covered by
+`read_file` since the file last changed; insertions require adjacent anchor
+lines. Existing `daily/YYYY-MM-DD.md` files use the same `read_file`,
+`edit_file`, and `delete_file` operations as other Markdown files.
+`add_daily_entry` remains the high-level create-or-append operation and does not
+require approval. Its optional `date` uses `YYYY-MM-DD`; omitting it records
+content on the current local date.
 The Agent can list `daily/` to discover available dates before reading the
 relevant files.
 
