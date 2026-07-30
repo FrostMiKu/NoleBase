@@ -1,4 +1,4 @@
-//! Entry point: terminal lifecycle, event loop, and `$EDITOR` integration.
+//! Entry point: terminal lifecycle, event loop, and external-editor integration.
 
 mod agent;
 mod agent_session;
@@ -8,6 +8,8 @@ mod markdown;
 mod media;
 mod model;
 mod notification;
+mod observable;
+mod provider;
 mod storage;
 mod theme;
 mod ui;
@@ -83,13 +85,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Suspend the TUI, open `path` in `$EDITOR`/`$VISUAL` (fallback `vi`),
-/// then resume the TUI. Inheriting stdio lets the editor take over the tty.
-fn run_editor(path: &std::path::Path, terminal: &mut Tui) -> Result<()> {
+/// Suspend the TUI, open `path` in the configured editor, then resume the TUI.
+/// Inheriting stdio lets the editor take over the tty.
+fn run_editor(path: &std::path::Path, editor: &str, terminal: &mut Tui) -> Result<()> {
     leave_tui()?;
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
     // Allow a multi-word editor command (e.g. "code -w").
     let mut parts = editor.split_whitespace();
     let program = parts.next().unwrap_or("vi");
@@ -118,8 +117,13 @@ fn handle_command(
         Some(Command::Edit(path)) => {
             // run_editor re-enters the TUI itself; the outer guard in main
             // restores the terminal if anything here panics.
-            if let Err(e) = run_editor(&path, terminal) {
-                app.set_error(format!("Editor error: {e}"));
+            match app.storage.editor_command() {
+                Ok(editor) => {
+                    if let Err(e) = run_editor(&path, &editor, terminal) {
+                        app.set_error(format!("Editor error: {e}"));
+                    }
+                }
+                Err(error) => app.set_error(format!("Editor settings error: {error}")),
             }
             *cursor_visible = true;
             app.reload_workspace();
@@ -160,6 +164,9 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::pat
     let mut indexed_paths = Vec::new();
     let mut watcher_error = None;
     for event in events.try_iter() {
+        if let Ok(event) = &event {
+            app.invalidate_agent_reads(&event.paths);
+        }
         match event {
             Ok(event)
                 if matches!(

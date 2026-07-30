@@ -3,9 +3,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -14,8 +12,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::agent::{
-    Agent, AgentEvent, AgentRuntime, ApprovalDecision, ApprovalRequest, AskUserKind,
-    AskUserRequest, AskUserResponse, PermissionMode,
+    AgentEvent, AgentRuntime, AgentWorker, ApprovalDecision, ApprovalRequest, AskUserKind,
+    AskUserRequest, AskUserResponse, PermissionMode, AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
@@ -25,6 +23,7 @@ use crate::model::{
     TodoItem, WikiLinkCandidate, WikiLinkHitbox,
 };
 use crate::notification::NotificationService;
+use crate::observable::Observable;
 use crate::storage::{LoadedTheme, Storage};
 use crate::workspace_index::{TagRenamePlan, WorkspaceIndex, WorkspaceIndexHandle};
 
@@ -791,9 +790,10 @@ pub struct App {
     terminal_return_overlay: Option<Overlay>,
     terminal_return_dialog: Option<DialogState>,
 
-    ai_events: Option<Receiver<AgentEvent>>,
-    ai_approval_sender: Option<mpsc::Sender<ApprovalDecision>>,
-    ai_user_sender: Option<mpsc::Sender<AskUserResponse>>,
+    active_agent: Option<Observable<crate::agent::AgentRunOutput, AgentEvent>>,
+    ai_approval_sender: Option<tokio::sync::mpsc::UnboundedSender<ApprovalDecision>>,
+    ai_user_sender: Option<tokio::sync::mpsc::UnboundedSender<AskUserResponse>>,
+    agent_worker: AgentWorker,
     agent_input_buffer: Arc<Mutex<Vec<String>>>,
     pub ai_running: bool,
     pub permission_mode: PermissionMode,
@@ -804,6 +804,7 @@ pub struct App {
     pub agent_usage: TokenUsage,
     pub agent_timed_output_tokens: u64,
     pub agent_response_duration: Duration,
+    pub agent_retry_count: u64,
     pub agent_round: u32,
     pub agent_round_limit: u32,
     agent_conversation: AgentConversation,
@@ -822,6 +823,7 @@ pub struct App {
     pub wiki_link_index: usize,
 
     ai_cancel: Option<Arc<AtomicBool>>,
+    ai_cancelling: bool,
 
     undo_stack: Vec<UndoOp>,
 }
@@ -848,6 +850,26 @@ impl App {
         let file_row = usize::from(first_note.is_some());
         let todo_items = storage.load_todo_tasks();
         let images = crate::media::ImageService::new(&storage.root);
+        let workspace_index = WorkspaceIndexHandle::default();
+        let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
+        let permission_bypass = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (event_sender, _) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
+        let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let agent_worker = AgentWorker::spawn(
+            storage.ai_config_path.clone(),
+            storage.root.clone(),
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                agent_input_buffer.clone(),
+                permission_bypass.clone(),
+                cancelled.clone(),
+            )
+            .with_workspace_index(workspace_index.clone()),
+        );
         Ok(Self {
             storage,
             theme: loaded_theme.theme,
@@ -887,7 +909,7 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
-            workspace_index: WorkspaceIndexHandle::default(),
+            workspace_index,
             pending_tag_rename: None,
             help_scroll: 0,
             status: String::new(),
@@ -908,19 +930,21 @@ impl App {
             terminal: None,
             terminal_return_overlay: None,
             terminal_return_dialog: None,
-            ai_events: None,
-            ai_approval_sender: None,
-            ai_user_sender: None,
-            agent_input_buffer: Arc::new(Mutex::new(Vec::new())),
+            active_agent: None,
+            ai_approval_sender: Some(approval_sender),
+            ai_user_sender: Some(user_sender),
+            agent_worker,
+            agent_input_buffer,
             ai_running: false,
             permission_mode: PermissionMode::Approve,
-            permission_bypass: Arc::new(AtomicBool::new(false)),
+            permission_bypass,
             agent_panel,
             agent_vlist: AgentVirtualList::default(),
             agent_scroll,
             agent_usage,
             agent_timed_output_tokens,
             agent_response_duration,
+            agent_retry_count: 0,
             agent_round: 0,
             agent_round_limit: 0,
             agent_conversation,
@@ -938,6 +962,7 @@ impl App {
             wiki_link_candidates: Vec::new(),
             wiki_link_index: 0,
             ai_cancel: None,
+            ai_cancelling: false,
             undo_stack: Vec::new(),
         })
     }
@@ -1010,7 +1035,7 @@ impl App {
         }
     }
 
-    /// Reload everything that may have changed while `$EDITOR` was running.
+    /// Reload everything that may have changed while the external editor was running.
     pub fn reload_workspace(&mut self) {
         let previous_random_source = (self.theme_selection == "random")
             .then_some(self.theme_source.as_deref())
@@ -1074,19 +1099,32 @@ impl App {
     pub fn poll_agent(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
-        if let Some(receiver) = &self.ai_events {
+        if let Some(observable) = &mut self.active_agent {
             loop {
-                match receiver.try_recv() {
+                match observable.events.try_recv() {
                     Ok(event) => events.push(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                         disconnected = true;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        observable.cancel.cancel();
+                        self.agent_worker
+                            .cancellation_token()
+                            .store(true, Ordering::Relaxed);
+                        events.push(AgentEvent::Finished(Err(
+                            "Agent event stream lagged; task cancelled".to_string(),
+                        )));
                         break;
                     }
                 }
             }
         }
         for event in events {
+            if self.ai_cancelling && !matches!(&event, AgentEvent::Finished(_)) {
+                continue;
+            }
             match event {
                 AgentEvent::AssistantDelta(delta) => {
                     match self.agent_panel.last_mut() {
@@ -1101,19 +1139,30 @@ impl App {
                     }
                     self.agent_scroll = u16::MAX;
                 }
-                AgentEvent::AssistantMessageFinished { final_output } => {
+                AgentEvent::AssistantMessageFinished { text, final_output } => {
+                    let mut replaced = false;
                     for entry in &mut self.agent_panel {
                         if let AgentPanelEntry::Assistant {
+                            text: entry_text,
                             streaming,
                             final_output: entry_final,
                             ..
                         } = entry
                         {
                             if *streaming {
+                                *entry_text = text.clone();
                                 *streaming = false;
                                 *entry_final = final_output;
+                                replaced = true;
                             }
                         }
+                    }
+                    if !replaced && !text.trim().is_empty() {
+                        self.agent_panel.push(AgentPanelEntry::Assistant {
+                            text,
+                            streaming: false,
+                            final_output,
+                        });
                     }
                 }
                 AgentEvent::BufferedInputConsumed(count) => {
@@ -1163,6 +1212,9 @@ impl App {
                         self.agent_timed_output_tokens.saturating_add(output_tokens);
                     self.agent_response_duration =
                         self.agent_response_duration.saturating_add(elapsed);
+                }
+                AgentEvent::Retry => {
+                    self.agent_retry_count = self.agent_retry_count.saturating_add(1);
                 }
                 AgentEvent::Round { current, limit } => {
                     self.agent_round = current;
@@ -1214,6 +1266,12 @@ impl App {
                     self.set_overlay(Overlay::AskUser);
                 }
                 AgentEvent::Finished(result) => {
+                    self.active_agent = None;
+                    if self.ai_cancelling {
+                        self.ai_cancelling = false;
+                        self.ai_cancel = None;
+                        continue;
+                    }
                     let completed_successfully = result.is_ok();
                     self.ai_running = false;
                     self.ai_cancel = None;
@@ -1243,6 +1301,9 @@ impl App {
                     }
                     self.clear_ask_user();
                     self.reload_workspace();
+                    if let Err(error) = self.persist_agent_session() {
+                        self.set_error(format!("Agent session save error: {error}"));
+                    }
                     if completed_successfully {
                         let pending = self
                             .agent_input_buffer
@@ -1266,11 +1327,6 @@ impl App {
             self.agent_scroll = u16::MAX;
             self.clear_ask_user();
             self.set_error("AI error: worker stopped unexpectedly");
-        }
-        if disconnected && !self.ai_running {
-            self.ai_events = None;
-            self.ai_approval_sender = None;
-            self.ai_user_sender = None;
         }
     }
 
@@ -4153,6 +4209,12 @@ impl App {
         }
     }
 
+    pub fn invalidate_agent_reads(&mut self, paths: &[PathBuf]) {
+        if let Err(error) = self.agent_worker.invalidate_reads(paths) {
+            self.set_error(format!("Agent read-state error: {error:#}"));
+        }
+    }
+
     fn jump_to_search_result(&mut self, index: usize) {
         let Some(hit) = self.search_results.get(index).cloned() else {
             return;
@@ -4556,7 +4618,7 @@ impl App {
     }
 
     fn start_agent(&mut self, prompt: String, display_prompt: String) -> bool {
-        if self.ai_running {
+        if self.ai_running || self.ai_cancelling {
             self.set_status("AI is already working");
             return false;
         }
@@ -4569,61 +4631,38 @@ impl App {
     }
 
     fn start_agent_worker(&mut self, prompt: String) -> bool {
-        if self.ai_running {
+        if self.ai_running || self.ai_cancelling {
             self.set_status("AI is already working");
             return false;
         }
-        let config_path = self.storage.ai_config_path.clone();
-        let root = self.storage.root.clone();
-        let (event_sender, event_receiver) = mpsc::channel();
-        let (approval_sender, approval_receiver) = mpsc::channel();
-        let (user_sender, user_receiver) = mpsc::channel();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }
-        self.ai_events = Some(event_receiver);
-        self.ai_approval_sender = Some(approval_sender);
-        self.ai_user_sender = Some(user_sender);
         self.ai_running = true;
         self.agent_round = 0;
         self.agent_round_limit = 0;
         self.set_status("AI is working...");
-        let bypass = self.permission_bypass.clone();
-        let input_buffer = self.agent_input_buffer.clone();
-        let workspace_index = self.workspace_index.clone();
-        let mut conversation = self.agent_conversation.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = self.agent_worker.cancellation_token();
+        cancelled.store(false, Ordering::Relaxed);
         self.ai_cancel = Some(cancelled.clone());
-        thread::spawn(move || {
-            let result = Agent::from_config(
-                &config_path,
-                &root,
-                AgentRuntime::new(
-                    event_sender.clone(),
-                    approval_receiver,
-                    user_receiver,
-                    input_buffer,
-                    bypass,
-                    cancelled,
-                )
-                .with_workspace_index(workspace_index),
-            )
-            .and_then(|agent| agent.run(&prompt, &mut conversation));
-            let result = match result {
-                Ok(output) => Ok(output),
-                Err(error) => {
-                    if agent_debug_logging_enabled() {
-                        eprintln!("[nole debug] Agent error: {error:#}");
-                    }
-                    Err(error.to_string())
-                }
-            };
-            if result.is_ok() {
-                let _ = event_sender.send(AgentEvent::ConversationUpdated(conversation));
+        match self
+            .agent_worker
+            .run(prompt, self.agent_conversation.clone())
+        {
+            Ok(observable) => {
+                self.active_agent = Some(observable);
+                true
             }
-            let _ = event_sender.send(AgentEvent::Finished(result));
-        });
-        true
+            Err(error) => {
+                self.ai_running = false;
+                self.ai_cancel = None;
+                if agent_debug_logging_enabled() {
+                    eprintln!("[nole debug] Agent error: {error:#}");
+                }
+                self.set_error(format!("AI error: {error:#}"));
+                false
+            }
+        }
     }
 
     fn mark_buffered_prompts_consumed(&mut self, count: usize) {
@@ -4648,10 +4687,11 @@ impl App {
         if let Some(cancelled) = self.ai_cancel.take() {
             cancelled.store(true, Ordering::Relaxed);
         }
+        if let Some(observable) = &self.active_agent {
+            observable.cancel.cancel();
+        }
         self.ai_running = false;
-        self.ai_events = None;
-        self.ai_approval_sender = None;
-        self.ai_user_sender = None;
+        self.ai_cancelling = true;
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }
@@ -4692,6 +4732,9 @@ impl App {
             }
         };
         let had_history = self.agent_conversation.clear();
+        if let Err(error) = self.agent_worker.clear_read_state() {
+            self.set_error(format!("Agent state clear error: {error:#}"));
+        }
         let had_panel_content = !self.agent_panel.is_empty();
         self.agent_panel.clear();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
@@ -4701,6 +4744,7 @@ impl App {
         self.agent_usage = TokenUsage::default();
         self.agent_timed_output_tokens = 0;
         self.agent_response_duration = Duration::ZERO;
+        self.agent_retry_count = 0;
         self.agent_round = 0;
         self.agent_round_limit = 0;
         if was_running || had_saved_session || had_history || had_panel_content {
@@ -4906,6 +4950,16 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn install_agent_observable(app: &mut App) -> tokio::sync::broadcast::Sender<AgentEvent> {
+        let (sender, events) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
+        app.active_agent = Some(Observable {
+            output: Box::pin(std::future::pending()),
+            events,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        sender
+    }
+
     fn make_app() -> (App, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
@@ -5103,8 +5157,7 @@ mod tests {
             streaming: false,
             final_output: true,
         });
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
 
         sender
             .send(AgentEvent::ConversationUpdated(
@@ -5593,7 +5646,7 @@ mod tests {
     #[test]
     fn approval_overlay_sends_the_user_decision() {
         let (mut app, _directory) = make_app();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         app.ai_approval_sender = Some(sender);
         app.approval_request = Some(ApprovalRequest {
             title: "Update note".to_string(),
@@ -5609,9 +5662,8 @@ mod tests {
     #[test]
     fn ask_user_overlay_accepts_options_and_custom_text() {
         let (mut app, _directory) = make_app();
-        let (event_sender, event_receiver) = mpsc::channel();
-        let (answer_sender, answer_receiver) = mpsc::channel();
-        app.ai_events = Some(event_receiver);
+        let event_sender = install_agent_observable(&mut app);
+        let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
         app.ai_user_sender = Some(answer_sender);
         event_sender
             .send(AgentEvent::AskUser(AskUserRequest {
@@ -5651,9 +5703,8 @@ mod tests {
     #[test]
     fn round_limit_dialog_submits_continue_and_escape_submits_stop() {
         let (mut app, _directory) = make_app();
-        let (event_sender, event_receiver) = mpsc::channel();
-        let (answer_sender, answer_receiver) = mpsc::channel();
-        app.ai_events = Some(event_receiver);
+        let event_sender = install_agent_observable(&mut app);
+        let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
         app.ai_user_sender = Some(answer_sender);
         let request = AskUserRequest {
             kind: AskUserKind::RoundLimit,
@@ -5685,8 +5736,7 @@ mod tests {
     #[test]
     fn agent_panel_appends_streaming_activity_and_final_reply() {
         let (mut app, _directory) = make_app();
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
         app.ai_running = true;
         app.agent_panel = vec![
             AgentPanelEntry::Prompt {
@@ -5764,6 +5814,7 @@ mod tests {
 
         sender
             .send(AgentEvent::AssistantMessageFinished {
+                text: "I need to inspect the source first.".to_string(),
                 final_output: false,
             })
             .unwrap();
@@ -5771,7 +5822,10 @@ mod tests {
             .send(AgentEvent::AssistantDelta("final reply".to_string()))
             .unwrap();
         sender
-            .send(AgentEvent::AssistantMessageFinished { final_output: true })
+            .send(AgentEvent::AssistantMessageFinished {
+                text: "final reply".to_string(),
+                final_output: true,
+            })
             .unwrap();
         sender
             .send(AgentEvent::Finished(Ok("final reply".to_string())))
@@ -5792,10 +5846,21 @@ mod tests {
     }
 
     #[test]
+    fn agent_retry_events_accumulate_in_session_metrics() {
+        let (mut app, _directory) = make_app();
+        let sender = install_agent_observable(&mut app);
+
+        sender.send(AgentEvent::Retry).unwrap();
+        sender.send(AgentEvent::Retry).unwrap();
+        app.poll_agent();
+
+        assert_eq!(app.agent_retry_count, 2);
+    }
+
+    #[test]
     fn agent_terminal_outcomes_send_distinct_notifications() {
         let (mut app, _directory) = make_app();
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
         app.ai_running = true;
 
         sender
@@ -5810,8 +5875,7 @@ mod tests {
         );
         assert_eq!(app.notifications.take_bells(), 1);
 
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
         app.ai_running = true;
         sender
             .send(AgentEvent::Finished(Err("network unavailable".to_string())))
@@ -5837,8 +5901,7 @@ mod tests {
         );
         assert_eq!(app.notifications.take_bells(), 1);
 
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
         sender
             .send(AgentEvent::ToolStarted("Calling Read File...".to_string()))
             .unwrap();
@@ -5863,8 +5926,7 @@ mod tests {
         let note = app.storage.data_dir.join("Agent View.md");
         fs::write(&note, "# Opened by Agent\n").unwrap();
         let note = fs::canonicalize(note).unwrap();
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
 
         sender.send(AgentEvent::OpenFile(note.clone())).unwrap();
         app.poll_agent();
@@ -5881,6 +5943,13 @@ mod tests {
     #[test]
     fn c_cancels_a_running_agent_only_from_the_agent_panel() {
         let (mut app, _directory) = make_app();
+        let observable_cancel = tokio_util::sync::CancellationToken::new();
+        let (_sender, events) = tokio::sync::broadcast::channel(1);
+        app.active_agent = Some(Observable {
+            output: Box::pin(std::future::pending()),
+            events,
+            cancel: observable_cancel.clone(),
+        });
         let cancelled = Arc::new(AtomicBool::new(false));
         app.ai_cancel = Some(cancelled.clone());
         app.ai_running = true;
@@ -5893,11 +5962,13 @@ mod tests {
         app.handle_key(key(KeyCode::Char('c')));
         assert!(app.ai_running);
         assert!(!cancelled.load(Ordering::Relaxed));
+        assert!(!observable_cancel.is_cancelled());
 
         app.focus = Focus::Agent;
         app.handle_key(key(KeyCode::Char('c')));
         assert!(!app.ai_running);
         assert!(cancelled.load(Ordering::Relaxed));
+        assert!(observable_cancel.is_cancelled());
         assert!(
             matches!(app.agent_panel.last(), Some(AgentPanelEntry::Error(text)) if text == "Cancelled")
         );
@@ -5905,9 +5976,8 @@ mod tests {
             &app.agent_panel[0],
             AgentPanelEntry::Tool { active: false, .. }
         ));
-        assert!(app.ai_events.is_none());
-        assert!(app.ai_approval_sender.is_none());
-        assert!(app.ai_user_sender.is_none());
+        assert!(app.ai_approval_sender.is_some());
+        assert!(app.ai_user_sender.is_some());
         assert_eq!(app.status, "Agent task cancelled");
         assert_eq!(
             app.notifications.visible().as_deref(),
@@ -6691,8 +6761,7 @@ mod tests {
         let to = destination_dir.join("Renamed.md");
         fs::rename(&from, &to).unwrap();
 
-        let (sender, receiver) = mpsc::channel();
-        app.ai_events = Some(receiver);
+        let sender = install_agent_observable(&mut app);
         app.ai_running = true;
 
         // The filesystem watcher can run before the Agent event is polled.

@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -25,8 +26,12 @@ const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 const MAX_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
 const MAX_CACHED_IMAGES: usize = 64;
+const MAX_CACHED_REMOTE_SOURCES: usize = 16;
 const MAX_IMAGE_REDIRECTS: usize = 5;
+const MAX_IMAGE_DOWNLOAD_ATTEMPTS: usize = 3;
 const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+const IMAGE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
+const IMAGE_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(600)];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ImageKey {
@@ -45,7 +50,34 @@ enum ResolvedSource {
 enum ImageState {
     Loading,
     Ready(SlicedProtocol),
-    Failed(String),
+    Failed { error: String, retry_at: Instant },
+}
+
+enum RemoteDownloadState {
+    Empty,
+    Loading,
+    Ready(Arc<[u8]>),
+    Failed { error: String, retry_at: Instant },
+}
+
+struct RemoteDownload {
+    state: Mutex<RemoteDownloadState>,
+    ready: Condvar,
+}
+
+impl RemoteDownload {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RemoteDownloadState::Empty),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RemoteSourceCache {
+    entries: HashMap<String, Arc<RemoteDownload>>,
+    order: VecDeque<String>,
 }
 
 struct LoadResult {
@@ -61,6 +93,7 @@ pub(crate) struct ImageService {
     order: VecDeque<ImageKey>,
     sender: Sender<LoadResult>,
     receiver: Receiver<LoadResult>,
+    remote_sources: Arc<Mutex<RemoteSourceCache>>,
 }
 
 impl ImageService {
@@ -74,6 +107,7 @@ impl ImageService {
             order: VecDeque::new(),
             sender,
             receiver,
+            remote_sources: Arc::new(Mutex::new(RemoteSourceCache::default())),
         }
     }
 
@@ -146,7 +180,7 @@ impl ImageService {
                     };
                     frame.render_widget(SlicedImage::new(protocol, position), viewport);
                 }
-                Some(ImageState::Failed(error)) => {
+                Some(ImageState::Failed { error, .. }) => {
                     draw_image_placeholder(frame, viewport, top, placement, error, true, theme);
                 }
                 Some(ImageState::Loading) | None => {
@@ -217,17 +251,26 @@ impl ImageService {
     }
 
     fn request_if_needed(&mut self, key: ImageKey, source: ResolvedSource) {
-        if self.states.contains_key(&key) {
-            return;
+        match self.states.get(&key) {
+            Some(ImageState::Failed { retry_at, .. }) if Instant::now() >= *retry_at => {}
+            Some(_) => return,
+            None => {}
         }
         self.states.insert(key.clone(), ImageState::Loading);
+        self.order.retain(|cached| cached != &key);
         self.order.push_back(key.clone());
         self.evict_old_entries();
         let sender = self.sender.clone();
         let picker = self.picker.clone();
+        let remote_sources = Arc::clone(&self.remote_sources);
         std::thread::spawn(move || {
-            let result = load_protocol(&picker, &source, Size::new(key.width, key.height))
-                .map_err(|error| error.to_string());
+            let result = load_protocol(
+                &picker,
+                &source,
+                Size::new(key.width, key.height),
+                &remote_sources,
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send(LoadResult { key, result });
         });
     }
@@ -239,7 +282,10 @@ impl ImageService {
             {
                 entry.insert(match loaded.result {
                     Ok(protocol) => ImageState::Ready(protocol),
-                    Err(error) => ImageState::Failed(error),
+                    Err(error) => ImageState::Failed {
+                        error,
+                        retry_at: Instant::now() + IMAGE_FAILURE_CACHE_TTL,
+                    },
                 });
             }
         }
@@ -255,53 +301,179 @@ impl ImageService {
     }
 }
 
-fn load_protocol(picker: &Picker, source: &ResolvedSource, size: Size) -> Result<SlicedProtocol> {
+fn load_protocol(
+    picker: &Picker,
+    source: &ResolvedSource,
+    size: Size,
+    remote_sources: &Arc<Mutex<RemoteSourceCache>>,
+) -> Result<SlicedProtocol> {
     let bytes = match source {
-        ResolvedSource::Local(path) => {
-            fs::read(path).with_context(|| format!("reading image {}", path.display()))?
-        }
-        ResolvedSource::Remote(url) => download_image(url)?,
+        ResolvedSource::Local(path) => Arc::<[u8]>::from(
+            fs::read(path).with_context(|| format!("reading image {}", path.display()))?,
+        ),
+        ResolvedSource::Remote(url) => remote_image_bytes(remote_sources, url)?,
     };
-    let image = decode_image(bytes)?;
+    let image = decode_image(bytes.as_ref())?;
     SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None))
         .context("encoding image for the terminal")
 }
 
+fn remote_image_bytes(cache: &Arc<Mutex<RemoteSourceCache>>, url: &str) -> Result<Arc<[u8]>> {
+    let download = {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(download) = cache.entries.get(url) {
+            Arc::clone(download)
+        } else {
+            let download = Arc::new(RemoteDownload::new());
+            cache.entries.insert(url.to_string(), Arc::clone(&download));
+            cache.order.push_back(url.to_string());
+            while cache.entries.len() > MAX_CACHED_REMOTE_SOURCES {
+                let Some(oldest) = cache.order.pop_front() else {
+                    break;
+                };
+                cache.entries.remove(&oldest);
+            }
+            download
+        }
+    };
+
+    loop {
+        let mut state = download
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*state {
+            RemoteDownloadState::Ready(bytes) => return Ok(Arc::clone(bytes)),
+            RemoteDownloadState::Failed { error, retry_at } if Instant::now() < *retry_at => {
+                bail!("{error}");
+            }
+            RemoteDownloadState::Empty | RemoteDownloadState::Failed { .. } => {
+                *state = RemoteDownloadState::Loading;
+                drop(state);
+
+                let result = download_image(url).map(Arc::<[u8]>::from);
+                let mut state = download
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match result {
+                    Ok(bytes) => {
+                        *state = RemoteDownloadState::Ready(Arc::clone(&bytes));
+                        download.ready.notify_all();
+                        return Ok(bytes);
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        *state = RemoteDownloadState::Failed {
+                            error: error.clone(),
+                            retry_at: Instant::now() + IMAGE_FAILURE_CACHE_TTL,
+                        };
+                        download.ready.notify_all();
+                        bail!("{error}");
+                    }
+                }
+            }
+            RemoteDownloadState::Loading => {
+                drop(
+                    download
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+            }
+        }
+    }
+}
+
+enum DownloadError {
+    Retryable(anyhow::Error),
+    Permanent(anyhow::Error),
+}
+
 fn download_image(url: &str) -> Result<Vec<u8>> {
-    let mut current =
-        validate_remote_image_url(reqwest::Url::parse(url).context("parsing image URL")?)?;
-    let started = Instant::now();
+    let url = validate_remote_image_url(reqwest::Url::parse(url).context("parsing image URL")?)?;
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let deadline = Instant::now() + IMAGE_DOWNLOAD_TIMEOUT;
+    let mut last_error = None;
+
+    for attempt in 0..MAX_IMAGE_DOWNLOAD_ATTEMPTS {
+        match download_image_attempt(&client, &url, deadline) {
+            Ok(bytes) => return Ok(bytes),
+            Err(DownloadError::Permanent(error)) => return Err(error),
+            Err(DownloadError::Retryable(error)) => last_error = Some(error),
+        }
+        let Some(delay) = IMAGE_RETRY_DELAYS.get(attempt).copied() else {
+            break;
+        };
+        if Instant::now() + delay >= deadline {
+            break;
+        }
+        std::thread::sleep(delay);
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("image download timed out")))
+}
+
+fn download_image_attempt(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    deadline: Instant,
+) -> std::result::Result<Vec<u8>, DownloadError> {
+    let mut current = url.clone();
     for redirects in 0..=MAX_IMAGE_REDIRECTS {
-        let remaining = IMAGE_DOWNLOAD_TIMEOUT
-            .checked_sub(started.elapsed())
-            .context("image download timed out")?;
-        let response = send_remote_image_request(&current, remaining)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| DownloadError::Retryable(anyhow::anyhow!("image download timed out")))?;
+        let response = send_remote_image_request(client, &current, remaining)
+            .map_err(DownloadError::Retryable)?;
         if is_image_redirect(response.status()) {
             if redirects == MAX_IMAGE_REDIRECTS {
-                bail!("remote image exceeded 5 redirects");
+                return Err(DownloadError::Permanent(anyhow::anyhow!(
+                    "remote image exceeded 5 redirects"
+                )));
             }
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
-                .context("image redirect has no Location header")?
+                .context("image redirect has no Location header")
+                .map_err(DownloadError::Permanent)?
                 .to_str()
-                .context("image redirect Location is not valid text")?;
-            current = redirected_image_url(&current, location)?;
+                .context("image redirect Location is not valid text")
+                .map_err(DownloadError::Permanent)?;
+            current = redirected_image_url(&current, location).map_err(DownloadError::Permanent)?;
             continue;
         }
         if !response.status().is_success() {
-            bail!("image server returned HTTP {}", response.status());
+            let error = anyhow::anyhow!("image server returned HTTP {}", response.status());
+            return Err(if is_retryable_image_status(response.status()) {
+                DownloadError::Retryable(error)
+            } else {
+                DownloadError::Permanent(error)
+            });
         }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_IMAGE_BYTES)
         {
-            bail!("remote image exceeds 8 MB");
+            return Err(DownloadError::Permanent(anyhow::anyhow!(
+                "remote image exceeds 8 MB"
+            )));
         }
         let mut bytes = Vec::new();
-        response.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
+        response
+            .take(MAX_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("reading image response")
+            .map_err(DownloadError::Retryable)?;
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            bail!("remote image exceeds 8 MB");
+            return Err(DownloadError::Permanent(anyhow::anyhow!(
+                "remote image exceeds 8 MB"
+            )));
         }
         return Ok(bytes);
     }
@@ -309,15 +481,15 @@ fn download_image(url: &str) -> Result<Vec<u8>> {
 }
 
 fn send_remote_image_request(
+    client: &reqwest::blocking::Client,
     url: &reqwest::Url,
     timeout: Duration,
 ) -> Result<reqwest::blocking::Response> {
-    let client = reqwest::blocking::Client::builder()
+    client
+        .get(url.clone())
         .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
-        .build()?;
-    client.get(url.clone()).send().context("downloading image")
+        .send()
+        .context("downloading image")
 }
 
 fn redirected_image_url(current: &reqwest::Url, location: &str) -> Result<reqwest::Url> {
@@ -344,7 +516,11 @@ fn is_image_redirect(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
-fn decode_image(bytes: Vec<u8>) -> Result<image::DynamicImage> {
+fn is_retryable_image_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
+}
+
+fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("detecting image format")?;
@@ -522,6 +698,38 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn png_bytes() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    fn read_request(stream: &TcpStream) {
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn write_response(mut stream: TcpStream, status: &str, body: &[u8]) {
+        read_request(&stream);
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    }
 
     #[test]
     fn local_images_are_confined_to_the_nole_root() {
@@ -547,7 +755,7 @@ mod tests {
         let image = image::DynamicImage::new_rgb8(8, 4);
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        let decoded = decode_image(bytes.into_inner()).unwrap();
+        let decoded = decode_image(&bytes.into_inner()).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (8, 4));
     }
 
@@ -578,6 +786,99 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    #[test]
+    fn remote_download_retries_transient_http_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = png_bytes();
+        let server = std::thread::spawn(move || {
+            write_response(
+                listener.accept().unwrap().0,
+                "503 Service Unavailable",
+                b"busy",
+            );
+            write_response(listener.accept().unwrap().0, "200 OK", &body);
+        });
+
+        let downloaded = download_image(&format!("http://{address}/image.png")).unwrap();
+        assert!(decode_image(&downloaded).is_ok());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remote_download_does_not_retry_permanent_http_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            write_response(stream, "404 Not Found", b"missing");
+        });
+
+        let error = download_image(&format!("http://{address}/missing.png")).unwrap_err();
+        assert!(error.to_string().contains("HTTP 404"));
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_remote_requests_share_one_download() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let expected = png_bytes();
+        let response = expected.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            write_response(stream, "200 OK", &response);
+        });
+
+        let cache = Arc::new(Mutex::new(RemoteSourceCache::default()));
+        let url = format!("http://{address}/shared.png");
+        let first_cache = Arc::clone(&cache);
+        let first_url = url.clone();
+        let first =
+            std::thread::spawn(move || remote_image_bytes(&first_cache, &first_url).unwrap());
+        let second_cache = Arc::clone(&cache);
+        let second = std::thread::spawn(move || remote_image_bytes(&second_cache, &url).unwrap());
+
+        assert_eq!(first.join().unwrap().as_ref(), expected.as_slice());
+        assert_eq!(second.join().unwrap().as_ref(), expected.as_slice());
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn expired_remote_failure_is_downloaded_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = png_bytes();
+        let response = expected.clone();
+        let server = std::thread::spawn(move || {
+            write_response(listener.accept().unwrap().0, "200 OK", &response);
+        });
+
+        let url = format!("http://{address}/recovered.png");
+        let download = Arc::new(RemoteDownload::new());
+        *download.state.lock().unwrap() = RemoteDownloadState::Failed {
+            error: "temporary failure".to_string(),
+            retry_at: Instant::now() - Duration::from_millis(1),
+        };
+        let cache = Arc::new(Mutex::new(RemoteSourceCache {
+            entries: HashMap::from([(url.clone(), download)]),
+            order: VecDeque::from([url.clone()]),
+        }));
+
+        let bytes = remote_image_bytes(&cache, &url).unwrap();
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+        server.join().unwrap();
     }
 
     #[test]

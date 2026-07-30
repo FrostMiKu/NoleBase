@@ -36,7 +36,46 @@ const PANEL_PADDING: u16 = 1;
 const DAILY_PADDING_X: usize = 1;
 const PAGE_PADDING_X: usize = DAILY_PADDING_X + 12;
 const DIALOG_WIDTH: u16 = 80;
+const APPROVAL_UNIFIED_WIDTH: u16 = 110;
+const APPROVAL_SIDE_BY_SIDE_WIDTH: u16 = 160;
+const APPROVAL_SIDE_BY_SIDE_MIN_WIDTH: u16 = 140;
 const SELECT_OPTION_HEIGHT: u16 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffLineKind {
+    Context,
+    Deletion,
+    Addition,
+    Header,
+    Hunk,
+    Metadata,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SideBySideDiffRow<'a> {
+    Full(&'a str, DiffLineKind),
+    Columns {
+        before: Option<SideBySideDiffCell<'a>>,
+        after: Option<SideBySideDiffCell<'a>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SideBySideDiffCell<'a> {
+    text: &'a str,
+    kind: DiffLineKind,
+    line_number: Option<usize>,
+}
+
+impl<'a> SideBySideDiffCell<'a> {
+    fn new(text: &'a str, kind: DiffLineKind, line_number: Option<usize>) -> Self {
+        Self {
+            text,
+            kind,
+            line_number,
+        }
+    }
+}
 
 /// Clear a widget's rectangle without leaving a wide-character continuation
 /// cell from the content underneath it. Ratatui's diff buffer can otherwise
@@ -577,8 +616,14 @@ fn visible_agent_lines(
 }
 
 fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
-    if app.agent_usage.is_empty() {
+    if app.agent_usage.is_empty() && app.agent_retry_count == 0 {
         return None;
+    }
+    if app.agent_usage.is_empty() {
+        return Some(Line::from(Span::styled(
+            format!("Retry {}", app.agent_retry_count),
+            Style::default().fg(app.theme.text_subtle),
+        )));
     }
     let input = human_token_count(app.agent_usage.total_input());
     let output = human_token_count(app.agent_usage.output_tokens);
@@ -597,13 +642,23 @@ fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
             app.agent_timed_output_tokens as f64 / app.agent_response_duration.as_secs_f64()
         )
     };
-    let text = if width >= 44 {
-        format!("↑{input} ↓{output} · {tps} t/s · Cache {cache_read} {cache_rate:.0}%")
-    } else if width >= 30 {
-        format!("↑{input} ↓{output} · {tps}t/s · C{cache_read} {cache_rate:.0}%")
+    let tokens = format!("↑{input} ↓{output}");
+    let full = format!("{tokens} · {tps} t/s · Cache {cache_read} {cache_rate:.0}%");
+    let compact = format!("{tokens} · {tps}t/s · C{cache_read} {cache_rate:.0}%");
+    let candidates = if app.agent_retry_count > 0 {
+        vec![
+            format!("{full} · Retry {}", app.agent_retry_count),
+            format!("{compact} · R{}", app.agent_retry_count),
+            format!("{tokens} · R{}", app.agent_retry_count),
+            tokens,
+        ]
     } else {
-        format!("↑{input} ↓{output}")
+        vec![full, compact, tokens]
     };
+    let text = candidates
+        .into_iter()
+        .find(|candidate| candidate.width() <= usize::from(width))
+        .unwrap_or_default();
     Some(Line::from(Span::styled(
         text,
         Style::default().fg(app.theme.text_subtle),
@@ -2802,6 +2857,254 @@ fn terminal_color(color: vt100::Color, default: Color) -> Color {
     }
 }
 
+fn approval_dialog_width(root_width: u16) -> u16 {
+    if root_width >= APPROVAL_SIDE_BY_SIDE_MIN_WIDTH.saturating_add(8) {
+        APPROVAL_SIDE_BY_SIDE_WIDTH
+    } else {
+        APPROVAL_UNIFIED_WIDTH
+    }
+}
+
+fn side_by_side_diff_rows(diff: &str) -> Vec<SideBySideDiffRow<'_>> {
+    let lines = diff.lines().collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut index = 0;
+    let mut in_hunk = false;
+    let mut before_line = None;
+    let mut after_line = None;
+
+    while index < lines.len() {
+        let line = lines[index];
+        if !in_hunk
+            && line.starts_with("--- ")
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with("+++ "))
+        {
+            rows.push(SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(line, DiffLineKind::Header, None)),
+                after: Some(SideBySideDiffCell::new(
+                    lines[index + 1],
+                    DiffLineKind::Header,
+                    None,
+                )),
+            });
+            index += 2;
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            rows.push(SideBySideDiffRow::Full(line, DiffLineKind::Hunk));
+            in_hunk = true;
+            (before_line, after_line) = parse_diff_hunk_starts(line)
+                .map(|(before, after)| (Some(before), Some(after)))
+                .unwrap_or((None, None));
+            index += 1;
+            continue;
+        }
+
+        if is_changed_diff_line(line, in_hunk) {
+            let start = index;
+            while index < lines.len() && is_changed_diff_line(lines[index], in_hunk) {
+                index += 1;
+            }
+            let block = &lines[start..index];
+            let before = block
+                .iter()
+                .copied()
+                .filter(|line| line.starts_with('-'))
+                .collect::<Vec<_>>();
+            let after = block
+                .iter()
+                .copied()
+                .filter(|line| line.starts_with('+'))
+                .collect::<Vec<_>>();
+            for row in 0..before.len().max(after.len()) {
+                rows.push(SideBySideDiffRow::Columns {
+                    before: before.get(row).copied().map(|line| {
+                        let cell =
+                            SideBySideDiffCell::new(line, DiffLineKind::Deletion, before_line);
+                        before_line = before_line.map(|line| line + 1);
+                        cell
+                    }),
+                    after: after.get(row).copied().map(|line| {
+                        let cell =
+                            SideBySideDiffCell::new(line, DiffLineKind::Addition, after_line);
+                        after_line = after_line.map(|line| line + 1);
+                        cell
+                    }),
+                });
+            }
+            continue;
+        }
+
+        let kind = if line.starts_with(' ') {
+            DiffLineKind::Context
+        } else {
+            DiffLineKind::Metadata
+        };
+        if kind == DiffLineKind::Context {
+            let before_number = before_line;
+            let after_number = after_line;
+            rows.push(SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(line, kind, before_number)),
+                after: Some(SideBySideDiffCell::new(line, kind, after_number)),
+            });
+            before_line = before_line.map(|line| line + 1);
+            after_line = after_line.map(|line| line + 1);
+        } else {
+            rows.push(SideBySideDiffRow::Full(line, kind));
+        }
+        if line.is_empty() || line.starts_with("diff ") {
+            in_hunk = false;
+            before_line = None;
+            after_line = None;
+        }
+        index += 1;
+    }
+
+    rows
+}
+
+fn parse_diff_hunk_starts(line: &str) -> Option<(usize, usize)> {
+    let ranges = line.strip_prefix("@@ -")?;
+    let (before, after_and_context) = ranges.split_once(" +")?;
+    let (after, _) = after_and_context.split_once(" @@")?;
+    let before = before.split(',').next()?.parse().ok()?;
+    let after = after.split(',').next()?.parse().ok()?;
+    Some((before, after))
+}
+
+fn is_changed_diff_line(line: &str, in_hunk: bool) -> bool {
+    if in_hunk {
+        line.starts_with('-') || line.starts_with('+')
+    } else {
+        (line.starts_with('-') && !line.starts_with("--- "))
+            || (line.starts_with('+') && !line.starts_with("+++ "))
+    }
+}
+
+fn diff_line_style(kind: DiffLineKind, theme: Theme) -> Style {
+    let base = Style::default().bg(theme.markdown_code_block_background);
+    match kind {
+        DiffLineKind::Context => base.fg(theme.markdown_code_block_text),
+        DiffLineKind::Deletion => base.fg(theme.ui_error),
+        DiffLineKind::Addition => base.fg(theme.ui_task_done),
+        DiffLineKind::Header => base.fg(theme.ui_warning).add_modifier(Modifier::BOLD),
+        DiffLineKind::Hunk => base.fg(theme.ui_dialog_choice).add_modifier(Modifier::BOLD),
+        DiffLineKind::Metadata => base.fg(theme.text_muted),
+    }
+}
+
+fn side_by_side_diff_lines(diff: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    let rows = side_by_side_diff_rows(diff);
+    let line_number_width = rows
+        .iter()
+        .flat_map(|row| match row {
+            SideBySideDiffRow::Full(_, _) => [None, None],
+            SideBySideDiffRow::Columns { before, after } => [
+                before.and_then(|cell| cell.line_number),
+                after.and_then(|cell| cell.line_number),
+            ],
+        })
+        .flatten()
+        .map(|line| line.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max(3);
+    let divider_width = 3;
+    let columns_width = width.saturating_sub(divider_width);
+    let before_width = columns_width / 2;
+    let after_width = columns_width.saturating_sub(before_width);
+    let line_number_gutter_width = line_number_width + 3;
+    if before_width <= line_number_gutter_width || after_width <= line_number_gutter_width {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for row in rows {
+        let (before, after) = match row {
+            SideBySideDiffRow::Full(text, kind) => {
+                (Some(SideBySideDiffCell::new(text, kind, None)), None)
+            }
+            SideBySideDiffRow::Columns { before, after } => (before, after),
+        };
+        let before_lines = diff_cell_lines(before, before_width, line_number_width, theme);
+        let after_lines = diff_cell_lines(after, after_width, line_number_width, theme);
+        let height = before_lines.len().max(after_lines.len()).max(1);
+        for row in 0..height {
+            let mut spans = pad_spans(
+                before_lines.get(row).cloned().unwrap_or_default(),
+                before_width,
+                Style::default().bg(theme.markdown_code_block_background),
+            );
+            spans.push(Span::styled(
+                " ┃ ",
+                Style::default()
+                    .fg(theme.ui_dialog_choice)
+                    .bg(theme.surface_overlay)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.extend(pad_spans(
+                after_lines.get(row).cloned().unwrap_or_default(),
+                after_width,
+                Style::default().bg(theme.markdown_code_block_background),
+            ));
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+fn diff_cell_lines(
+    cell: Option<SideBySideDiffCell<'_>>,
+    width: usize,
+    line_number_width: usize,
+    theme: Theme,
+) -> Vec<Vec<Span<'static>>> {
+    let Some(cell) = cell else {
+        return Vec::new();
+    };
+    let content_width = width.saturating_sub(line_number_width + 3);
+    let content_style = diff_line_style(cell.kind, theme);
+    wrap_spans_to_width(
+        &[Span::styled(cell.text.to_string(), content_style)],
+        content_width,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(row, content)| {
+        let number = if row == 0 {
+            cell.line_number
+                .map(|line| format!("{line:>line_number_width$}"))
+                .unwrap_or_else(|| " ".repeat(line_number_width))
+        } else {
+            " ".repeat(line_number_width)
+        };
+        let gutter_style = Style::default()
+            .fg(theme.text_muted)
+            .bg(theme.markdown_code_block_background);
+        let mut spans = vec![
+            Span::styled(number, gutter_style),
+            Span::styled(" │ ", gutter_style),
+        ];
+        spans.extend(content);
+        pad_spans(spans, width, content_style)
+    })
+    .collect()
+}
+
+fn pad_spans(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Vec<Span<'static>> {
+    let used = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), style));
+    }
+    spans
+}
+
 /// Render every modal interaction through one fixed-width, bounded-height
 /// command surface. The body changes by mode, but title, scrolling, option
 /// selection, input and footer geometry remain identical.
@@ -2815,7 +3118,7 @@ fn draw_dialog(
         return Rect::new(root.x, root.y, 0, 0);
     };
     let width = match dialog.mode {
-        DialogMode::Approval => 110,
+        DialogMode::Approval => approval_dialog_width(root.width),
         DialogMode::Informational => 92,
         DialogMode::CommandPalette => DIALOG_WIDTH,
         _ => DIALOG_WIDTH,
@@ -2971,11 +3274,15 @@ fn draw_dialog(
         }
         DialogMode::Approval => {
             let (content, footer) = split_last_row(inner);
-            let lines = crate::markdown::to_lines_at_width(
-                &format!("```diff\n{}\n```", dialog.message),
-                content.width as usize,
-                app.theme,
-            );
+            let lines = if content.width >= APPROVAL_SIDE_BY_SIDE_MIN_WIDTH {
+                side_by_side_diff_lines(&dialog.message, content.width as usize, app.theme)
+            } else {
+                crate::markdown::to_lines_at_width(
+                    &format!("```diff\n{}\n```", dialog.message),
+                    content.width as usize,
+                    app.theme,
+                )
+            };
             let maximum = lines.len().saturating_sub(content.height as usize);
             let scroll = dialog.scroll.min(maximum as u16);
             if let Some(state) = app.dialog.as_mut() {
@@ -3785,10 +4092,23 @@ mod tests {
         };
         app.agent_timed_output_tokens = 1_234;
         app.agent_response_duration = std::time::Duration::from_secs(2);
-        let terminal = render(&mut app, 170, 24);
+        app.agent_retry_count = 2;
+        let terminal = render(&mut app, 220, 24);
         let screen = buffer_string(&terminal);
         assert!(screen.contains("Agent · ↻3/25"));
-        assert!(screen.contains("↑3.5k ↓1.2k · 617.0 t/s · Cache 2k 57%"));
+        assert!(screen.contains("↑3.5k ↓1.2k"));
+        assert!(screen.contains("617.0t/s"));
+        assert!(screen.contains("C2k 57%"));
+        assert!(screen.contains("R2"));
+    }
+
+    #[test]
+    fn agent_header_shows_retries_without_confirmed_usage() {
+        let (mut app, _directory) = make_app();
+        app.agent_retry_count = 2;
+
+        let terminal = render(&mut app, 170, 24);
+        assert!(buffer_string(&terminal).contains("Retry 2"));
     }
 
     #[test]
@@ -4685,6 +5005,163 @@ mod tests {
         assert!(screen.contains("-old value"));
         assert!(screen.contains("+new value"));
         assert!(screen.contains("Tab bypass"));
+    }
+
+    #[test]
+    fn agent_diff_approval_switches_layout_with_terminal_width() {
+        let (mut app, _directory) = make_app();
+        app.approval_request = Some(ApprovalRequest {
+            title: "Update data/note.md".to_string(),
+            diff: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        });
+        app.set_overlay(Overlay::Approval);
+
+        let narrow = render(&mut app, 130, 24);
+        let narrow_screen = buffer_string(&narrow);
+        assert_eq!(app.layout.overlay.unwrap().width, APPROVAL_UNIFIED_WIDTH);
+        assert!(!narrow_screen
+            .lines()
+            .any(|line| line.contains("-old value") && line.contains("+new value")));
+
+        let wide = render(&mut app, 180, 24);
+        let wide_screen = buffer_string(&wide);
+        assert_eq!(
+            app.layout.overlay.unwrap().width,
+            APPROVAL_SIDE_BY_SIDE_WIDTH
+        );
+        let changed_line = wide_screen
+            .lines()
+            .find(|line| line.contains("-old value") && line.contains("+new value"))
+            .expect("side-by-side change row");
+        assert!(changed_line.contains("  1 │ -old value"));
+        assert!(changed_line.contains(" ┃ "));
+        assert!(changed_line.contains("  1 │ +new value"));
+
+        let hunk_line = wide_screen
+            .lines()
+            .find(|line| line.contains("@@ -1 +1 @@"))
+            .expect("hunk row");
+        assert!(hunk_line.contains(" ┃ "));
+    }
+
+    #[test]
+    fn side_by_side_diff_pairs_change_blocks_and_repeats_context() {
+        let rows = side_by_side_diff_rows(
+            "--- old\n+++ new\n@@ -1,3 +1,3 @@\n same\n-old one\n-old two\n+new one\n tail\n",
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                SideBySideDiffRow::Columns {
+                    before: Some(SideBySideDiffCell::new(
+                        "--- old",
+                        DiffLineKind::Header,
+                        None,
+                    )),
+                    after: Some(SideBySideDiffCell::new(
+                        "+++ new",
+                        DiffLineKind::Header,
+                        None,
+                    )),
+                },
+                SideBySideDiffRow::Full("@@ -1,3 +1,3 @@", DiffLineKind::Hunk),
+                SideBySideDiffRow::Columns {
+                    before: Some(SideBySideDiffCell::new(
+                        " same",
+                        DiffLineKind::Context,
+                        Some(1),
+                    )),
+                    after: Some(SideBySideDiffCell::new(
+                        " same",
+                        DiffLineKind::Context,
+                        Some(1),
+                    )),
+                },
+                SideBySideDiffRow::Columns {
+                    before: Some(SideBySideDiffCell::new(
+                        "-old one",
+                        DiffLineKind::Deletion,
+                        Some(2),
+                    )),
+                    after: Some(SideBySideDiffCell::new(
+                        "+new one",
+                        DiffLineKind::Addition,
+                        Some(2),
+                    )),
+                },
+                SideBySideDiffRow::Columns {
+                    before: Some(SideBySideDiffCell::new(
+                        "-old two",
+                        DiffLineKind::Deletion,
+                        Some(3),
+                    )),
+                    after: None,
+                },
+                SideBySideDiffRow::Columns {
+                    before: Some(SideBySideDiffCell::new(
+                        " tail",
+                        DiffLineKind::Context,
+                        Some(4),
+                    )),
+                    after: Some(SideBySideDiffCell::new(
+                        " tail",
+                        DiffLineKind::Context,
+                        Some(3),
+                    )),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn side_by_side_diff_does_not_treat_changed_prefixes_as_file_headers() {
+        let rows = side_by_side_diff_rows(
+            "--- note.md\n+++ note.md\n@@ -1 +1 @@\n--- old heading\n+++ new heading\n",
+        );
+
+        assert_eq!(
+            rows[2],
+            SideBySideDiffRow::Columns {
+                before: Some(SideBySideDiffCell::new(
+                    "--- old heading",
+                    DiffLineKind::Deletion,
+                    Some(1),
+                )),
+                after: Some(SideBySideDiffCell::new(
+                    "+++ new heading",
+                    DiffLineKind::Addition,
+                    Some(1),
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn side_by_side_diff_tracks_line_numbers_across_multiple_hunks() {
+        let rows = side_by_side_diff_rows(
+            "@@ -8,2 +10,3 @@\n old\n-removed\n+added\n+extra\n@@ -40 +50 @@\n-last\n+next\n",
+        );
+
+        let numbered = rows
+            .into_iter()
+            .filter_map(|row| match row {
+                SideBySideDiffRow::Columns { before, after } => Some((
+                    before.and_then(|cell| cell.line_number),
+                    after.and_then(|cell| cell.line_number),
+                )),
+                SideBySideDiffRow::Full(_, _) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            numbered,
+            [
+                (Some(8), Some(10)),
+                (Some(9), Some(11)),
+                (None, Some(12)),
+                (Some(40), Some(50)),
+            ]
+        );
     }
 
     #[test]

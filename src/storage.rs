@@ -33,6 +33,8 @@ const ARCHIVES_DIR: &str = "archives";
 #[serde(deny_unknown_fields)]
 struct SettingsFile {
     theme: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +56,32 @@ impl LoadedTheme {
     }
 }
 
-fn serialize_settings(theme: &str) -> Result<String> {
-    toml::to_string_pretty(&SettingsFile {
-        theme: theme.to_string(),
-    })
-    .context("serializing settings")
+fn serialize_settings(settings: &SettingsFile) -> Result<String> {
+    toml::to_string_pretty(settings).context("serializing settings")
+}
+
+fn nonempty_setting(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn initial_settings(editor_env: Option<String>) -> SettingsFile {
+    SettingsFile {
+        theme: "default".to_string(),
+        editor: nonempty_setting(editor_env),
+    }
+}
+
+fn resolve_editor_command(
+    configured: Option<&str>,
+    editor_env: Option<&str>,
+    visual_env: Option<&str>,
+) -> String {
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| editor_env.filter(|value| !value.trim().is_empty()))
+        .or_else(|| visual_env.filter(|value| !value.trim().is_empty()))
+        .unwrap_or("vi")
+        .to_string()
 }
 
 /// Filesystem locations backing the notes.
@@ -138,6 +161,8 @@ impl Storage {
     fn write_default_ai_config(&self) -> Result<()> {
         const DEFAULT: &str = concat!(
             "# AI service credentials. Keep this file private.\n",
+            "# API protocol: \"messages\" or \"completions\".\n",
+            "api_format = \"messages\"\n",
             "api_key = \"\"\n",
             "tavily_api_key = \"\"\n",
             "model = \"claude-sonnet-4-5\"\n",
@@ -166,7 +191,8 @@ impl Storage {
             .create_new(true)
             .open(&self.settings_path)
             .with_context(|| format!("creating {}", self.settings_path.display()))?;
-        file.write_all(serialize_settings("default")?.as_bytes())?;
+        let settings = initial_settings(std::env::var("EDITOR").ok());
+        file.write_all(serialize_settings(&settings)?.as_bytes())?;
         Ok(())
     }
 
@@ -186,24 +212,42 @@ impl Storage {
     }
 
     pub fn load_theme_selection(&self) -> Result<String> {
+        Ok(self.load_settings()?.theme)
+    }
+
+    pub fn editor_command(&self) -> Result<String> {
+        let settings = self.load_settings()?;
+        Ok(resolve_editor_command(
+            settings.editor.as_deref(),
+            std::env::var("EDITOR").ok().as_deref(),
+            std::env::var("VISUAL").ok().as_deref(),
+        ))
+    }
+
+    pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
+        let mut settings = self.load_settings()?;
+        settings.theme = selection.to_string();
+        fs::create_dir_all(&self.config_dir)
+            .with_context(|| format!("creating {}", self.config_dir.display()))?;
+        fs::write(&self.settings_path, serialize_settings(&settings)?)
+            .with_context(|| format!("writing {}", self.settings_path.display()))
+    }
+
+    fn load_settings(&self) -> Result<SettingsFile> {
         let source = match fs::read_to_string(&self.settings_path) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok("default".to_string())
+                return Ok(SettingsFile {
+                    theme: "default".to_string(),
+                    editor: None,
+                });
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("reading {}", self.settings_path.display()))
             }
         };
-        let settings: SettingsFile = toml::from_str(&source)
-            .with_context(|| format!("parsing {}", self.settings_path.display()))?;
-        Ok(settings.theme)
-    }
-
-    pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
-        fs::write(&self.settings_path, serialize_settings(selection)?)
-            .with_context(|| format!("writing {}", self.settings_path.display()))
+        toml::from_str(&source).with_context(|| format!("parsing {}", self.settings_path.display()))
     }
 
     pub fn load_agent_session(&self) -> Result<Option<AgentSession>> {
@@ -1558,6 +1602,8 @@ mod tests {
         assert_eq!(st.themes_dir.parent(), Some(st.root.as_path()));
         assert_eq!(st.template_path.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
+        assert!(config.contains("# API protocol: \"messages\" or \"completions\"."));
+        assert!(config.contains("api_format = \"messages\""));
         assert!(config.contains("api_key = \"\""));
         assert!(config.contains("tavily_api_key = \"\""));
         assert!(config.contains("max_tokens = 8192"));
@@ -1585,10 +1631,7 @@ mod tests {
         let (_directory, storage) = fresh();
         let first = AgentSession::from_parts(
             &AgentConversation {
-                messages: vec![serde_json::json!({
-                    "role": "user",
-                    "content": "first"
-                })],
+                messages: vec![crate::provider::Message::user("first")],
             },
             &[AgentPanelEntry::Prompt {
                 text: "first".to_string(),
@@ -1603,10 +1646,7 @@ mod tests {
 
         let second = AgentSession::from_parts(
             &AgentConversation {
-                messages: vec![serde_json::json!({
-                    "role": "user",
-                    "content": "second"
-                })],
+                messages: vec![crate::provider::Message::user("second")],
             },
             &[AgentPanelEntry::Assistant {
                 text: "second reply".to_string(),
@@ -1694,6 +1734,46 @@ mod tests {
             loaded.theme.surface_message_agent,
             ratatui::style::Color::Rgb(1, 2, 3)
         );
+    }
+
+    #[test]
+    fn editor_setting_precedes_environment_fallbacks() {
+        assert_eq!(
+            resolve_editor_command(Some("code -w"), Some("nvim"), Some("vim")),
+            "code -w"
+        );
+        assert_eq!(
+            resolve_editor_command(None, Some("nvim"), Some("vim")),
+            "nvim"
+        );
+        assert_eq!(resolve_editor_command(None, None, Some("vim")), "vim");
+        assert_eq!(resolve_editor_command(None, None, None), "vi");
+        assert_eq!(
+            resolve_editor_command(Some("  "), Some("nvim"), None),
+            "nvim"
+        );
+    }
+
+    #[test]
+    fn initial_settings_capture_editor_and_theme_changes_preserve_it() {
+        let with_editor = initial_settings(Some("code -w".to_string()));
+        assert_eq!(with_editor.editor.as_deref(), Some("code -w"));
+        assert!(serialize_settings(&with_editor)
+            .unwrap()
+            .contains("editor = \"code -w\""));
+        assert_eq!(initial_settings(Some(" ".to_string())).editor, None);
+
+        let (_directory, storage) = fresh();
+        fs::write(
+            &storage.settings_path,
+            "theme = \"default\"\neditor = \"hx\"\n",
+        )
+        .unwrap();
+        storage.write_theme_selection("custom").unwrap();
+        let settings = storage.load_settings().unwrap();
+        assert_eq!(settings.theme, "custom");
+        assert_eq!(settings.editor.as_deref(), Some("hx"));
+        assert_eq!(storage.editor_command().unwrap(), "hx");
     }
 
     #[test]

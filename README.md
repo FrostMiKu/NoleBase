@@ -35,7 +35,7 @@ shown as one card. Each card provides:
 - `move` — select an existing note in Files
 - `archive` — move the complete daily file into `archives/`
 - `new` — name a new note in Files and move it there
-- `edit` — edit that message in `$EDITOR` through a temporary Markdown file
+- `edit` — edit that message in the configured editor through a temporary Markdown file
 - `del` — delete it after confirmation
 - `AI` — ask the Agent to work on this daily file, or format it when left blank
 
@@ -73,9 +73,11 @@ for Daily cards) and must remain inside the Nole root; HTTP(S) sources are
 loaded through at most five validated redirects. PNG, JPEG, GIF first frames,
 and WebP are supported.
 Downloads are limited to 8 MB and decoded images to 4096x4096 with a 64 MB
-allocation budget. Localhost, private-network, and link-local remote targets are
-rejected. Images reserve twelve terminal rows, scale proportionally,
-and are sliced to the visible virtual-scroll window. While loading, or after a
+allocation budget. Localhost, private-network, and link-local HTTP(S) sources
+are allowed. Remote bytes are shared across display sizes; transient network
+and server failures are retried, and terminal failures are retried after a
+short cooldown. Images reserve twelve terminal rows, scale proportionally, and
+are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
 Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
@@ -96,7 +98,7 @@ in-memory snapshot and never rescans files on the UI thread. Search results
 remain grouped as Daily, Notes, then Archives.
 
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
-opens that file in `$EDITOR` (then `$VISUAL`, then `vi`). Search and message
+opens that file in the configured editor (then `$EDITOR`, `$VISUAL`, and `vi`). Search and message
 editing also use Center instead of covering the workspace with a popup. External
 changes to `.md` and `.mb` files under the note directory are detected
 automatically; Daily, ToDo, Files, Search, and an open document refresh without
@@ -141,7 +143,7 @@ restarting Nole.
 | `f` | refresh and focus Files |
 | `j`/`k`, `↓`/`↑`, mouse wheel | select a file |
 | `Enter`, `v`, click | open the file in Center |
-| `e` | open the selected file in `$EDITOR` |
+| `e` | open the selected file in the configured editor |
 | `/` | filter directly inside Files |
 | `r` / `d` | rename inline / delete with confirmation |
 | `Esc`, `q` | return to Center |
@@ -160,15 +162,15 @@ Errors leave the active input/context in place so they can be corrected.
   to the current article, keeps it open, and scrolls directly to the new content.
   `Ctrl+Enter` instead sends the buffer directly to Agent and includes the path
   of the note currently being viewed as context.
-  On a file, `e` invokes `$EDITOR`; on a message, `e` opens the in-app message
+  On a file, `e` invokes the configured editor; on a message, `e` opens the in-app message
   editor. `/` opens the same search surface as workspace search, scoped to the
   current article; Enter jumps to the selected source line and Esc returns to
   the article.
 - **Search:** type to filter; arrows select; `Enter` or click opens a result;
   `Esc` returns to Daily. Closing a search result first returns to Search.
 
-Message card edits suspend the TUI and open a temporary `.md` file in
-`$EDITOR` (then `$VISUAL`, then `vi`). When the editor exits successfully, Nole
+Message card edits suspend the TUI and open a temporary `.md` file in the
+configured editor (then `$EDITOR`, `$VISUAL`, and `vi`). When the editor exits successfully, Nole
 writes the content back to the original daily date and removes the temporary
 file. Editing from a message preview keeps that preview open and refreshes it.
 
@@ -184,8 +186,8 @@ under `~/.nole`:
 
 ```text
 config/         # private application configuration
-  ai.toml       # Anthropic and optional Tavily configuration
-  settings.toml # selected theme
+  ai.toml       # LLM provider and optional Tavily configuration
+  settings.toml # selected theme and external editor
   agent-session.json # current Agent conversation; absent when empty
   AGENTS.md      # user-authored Agent instructions
 themes/         # Agent-editable application and MBDown themes
@@ -215,7 +217,17 @@ overwriting an existing file.
 ### Theme
 
 On first start Nole creates `themes/default.toml` with its current colors and
-writes `theme = "default"` to `config/settings.toml`. Each direct
+writes `theme = "default"` to `config/settings.toml`. If `$EDITOR` is nonempty,
+its current value is captured as `editor` for subsequent launches. When the
+setting is absent or blank, Nole falls back to `$EDITOR`, then `$VISUAL`, then
+`vi`:
+
+```toml
+theme = "default"
+editor = "code -w"
+```
+
+Each direct
 `themes/<name>.toml` file contains semantic `#RRGGBB` tokens grouped under
 `[surface]`, `[selection]`, `[text]`, `[ui]`, `[markdown]`, and `[animation]`.
 The `[selection]` group defines the background, inactive background, foreground,
@@ -230,7 +242,8 @@ the terminal's own default color and is especially useful for `surface.canvas`
 and `surface.status_bar`. Animation gradient entries must remain `#RRGGBB`.
 
 Use `Theme: Switch` from the command palette to choose `default`, `random`, or
-any custom theme. The selection is saved to `config/settings.toml`. Changes to
+any custom theme. The selection is saved to `config/settings.toml` without
+overwriting `editor`. Changes to
 that file or to a direct TOML file under `themes/` are loaded automatically.
 Because `themes/` is outside `config/`, the Agent can create and edit custom
 themes without gaining access to private configuration.
@@ -240,6 +253,7 @@ themes without gaining access to private configuration.
 On first start Nole creates `config/ai.toml` with private file permissions:
 
 ```toml
+api_format = "messages"
 api_key = ""
 tavily_api_key = ""
 model = "claude-sonnet-4-5"
@@ -249,8 +263,13 @@ context_window_tokens = 200000
 max_rounds = 25
 ```
 
-Set the Anthropic API key directly in `api_key`. The card's `AI` button runs the
-Anthropic Messages API in the background. It first opens a prompt dialog; an
+Set `api_format` to `messages` for the Anthropic Messages protocol, or to
+`completions` for the OpenAI-compatible Chat Completions protocol. Set the
+provider credential in `api_key`; `completions` also permits an empty key for
+local endpoints. `base_url` must not include `/v1`; Nole appends
+`/v1/messages`, `/v1/messages/count_tokens`, or `/v1/chat/completions` itself.
+
+The card's `AI` button runs the configured provider in the background. It first opens a prompt dialog; an
 entered prompt is sent with the daily file path, while an empty prompt asks the
 Agent to improve that file's Markdown formatting in place without changing its
 meaning or adding facts. The lower two-thirds of the right
@@ -262,11 +281,18 @@ bell and asks whether to continue with another segment or stop. Stopping keeps
 the completed conversation and tool history, so a later prompt can continue it.
 `context_window_tokens` is the model's total context size. Nole reserves
 `max_tokens` for the next response and, before the remaining input budget is
-exhausted, uses Anthropic's token-counting endpoint and replaces a safe prefix
+exhausted, uses provider token counting when available and replaces a safe prefix
 of older completed turns with a dense summary. The system prompt, current turn,
 recent history, and complete `tool_use`/`tool_result` pairs are retained.
 Compatible endpoints without token counting fall back to a conservative local
 estimate.
+Provider requests retry connection failures and HTTP 408, 425, 429, and 5xx
+responses up to three attempts with jittered exponential backoff (or a bounded
+`Retry-After`). A stream is never replayed after it has started. Confirmed
+stream usage is retained even when the stream later breaks. The Agent header's
+`↑` and `↓` values are confirmed input and output tokens, `Cache` is the
+provider-reported prompt-cache read count and ratio, `t/s` excludes retry
+waiting time, and `R`/`Retry` reports attempts that required a retry.
 To diagnose connection, DNS, TLS, timeout, or compatible-endpoint failures,
 start Nole with debug logging enabled and redirect standard error to a file:
 
@@ -282,7 +308,8 @@ as intermediate output and automatically requests continuation. A response
 with no text is retried a limited number of times; persistent failures report
 the stop reason and returned content-block types.
 Agent output enters a daily card only when the Agent explicitly calls
-`add_daily_entry`.
+`add_daily_entry`; omitting its date records the content on the current local
+date.
 
 Set `tavily_api_key` to enable the Agent's Tavily `web_search` tool. When the
 key is empty or absent, Nole omits the tool and its instructions entirely, so
@@ -293,13 +320,13 @@ and the current tool uses the same animated full-text color gradient. Messages
 API text is streamed into the current Agent entry and rendered as MBDown. The
 panel header shows request rounds plus session-cumulative input/output tokens,
 observed output throughput in `t/s`, and cache-read tokens with their share of
-total input tokens. These statistics reset only when the Agent session is
-cleared. Multiple tool calls returned in one model response still count as one
-round.
+total input tokens. Token and throughput statistics reset when the Agent session
+is cleared; the retry count covers the current application run. Multiple tool
+calls returned in one model response still count as one round.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
 task, clear its saved session, create or manage notes, or open `template.mb`,
-`ai.toml`, `AGENTS.md`, and `MEMORY.md` with `$EDITOR`.
+`ai.toml`, `AGENTS.md`, and `MEMORY.md` with the configured editor.
 Press `Ctrl+\`` or run `Terminal: Open` from the command palette to open a
 PTY-backed floating terminal. Its shell starts in the active Nole directory
 (`~/.nole` by default, or `NOLE_DIR` when configured). Hiding the terminal
@@ -310,6 +337,19 @@ Agent conversations and their visible panel history persist in the single
 completed conversation update atomically replaces that file; Nole does not
 maintain multiple sessions. Continue in the compose box with `Ctrl+Enter`; the
 Agent receives the completed conversation history.
+One Agent worker lives for the lifetime of the application. It reuses its HTTP
+connection pool, tool instances, precomputed tool definitions, and unchanged
+file-read snapshots across prompts. Before each task it checks the actual
+contents of `ai.toml`, `AGENTS.md`, and `MEMORY.md`, rebuilding the Agent only
+when one changed. File-read snapshots remain valid across prompts while the
+file content is unchanged; editing consumes the relevant snapshot, workspace
+file events invalidate only affected paths, a final content comparison catches
+missed events, and clearing the Agent session clears all remaining read state.
+Tool definitions are emitted in fixed registration order instead of hash-map
+iteration order. For the Messages protocol, the final tool definition and the
+stable, project-instruction, and memory system sections carry cache breakpoints,
+keeping the longest unchanged tools/system/conversation prefix eligible for
+prompt-cache reuse while the current timestamp stays in the newest user message.
 The Agent can inspect the same shared tag index with `list_tags` and
 `search_tag`. Its `rename_tag` tool shows a multi-file diff and follows the
 normal approval/bypass policy before changing exact Hashtag source spans.
@@ -322,9 +362,9 @@ uses normal MBDown colors once the Agent consumes it. Final responses and later
 prompts append to the same virtual-scrolling timeline. Only clearing the Agent
 session removes panel history.
 Focus the Agent panel and press `c` to cancel the current task, or `C` to clear
-the conversation and start a new session. Cancellation is
-cooperative: no later tools will start, although an in-flight HTTP request or
-tool call may need to return before its worker thread exits.
+the conversation and start a new session. Cancellation stops in-flight provider
+and tool HTTP requests and interactive waits promptly. A bounded local file
+operation that has already started is allowed to finish before the worker exits.
 
 All scrollable TUI surfaces use virtual row windows. Daily cards, note previews,
 Agent output, approval diffs, help, searches, file/Todo lists, and multiline
@@ -334,9 +374,10 @@ retained as scroll state rather than rendered.
 The Agent can read arbitrary text files with zero-based `offset`/`limit` line
 pagination. Each returned line includes its absolute zero-based line number
 and text without the line ending. It can write only inside the Nole directory,
-and fetch HTTP(S) text. When
+and fetch HTTP(S) text, converting HTML responses to Markdown. When
 configured, `web_search` queries Tavily with optional topic, depth, time range,
-answer, and result-count controls, then returns compact ranked results.
+answer, result-count, and included/excluded domain controls, then returns compact
+ranked results.
 Every user prompt sent to the Agent includes the current local date and time.
 `read_file` defaults to 200 lines and accepts at most 2,000 lines per call. Its
 structured response includes the total line count and whether more content
@@ -367,13 +408,14 @@ rest of the file internally, so large files do not need to be read or submitted
 in full. Every range refers to the original `read_file` snapshot. Each edit
 provides a `lines` array of complete lines without line-ending characters; the
 tool adds separators and never requires the Agent to repeat adjacent anchor
-text. Changed/deleted ranges must have been covered by `read_file` in the same
-Agent run; insertions require adjacent anchor lines. Existing
+text. Changed/deleted ranges must have been covered by `read_file` since the
+file last changed; insertions require adjacent anchor lines. Existing
 `daily/YYYY-MM-DD.md` files use the same `read_file`, `edit_file`, and
 `delete_file` operations as other Markdown files. `add_daily_entry` remains the
-high-level create-or-append operation for recording content on a date and does
-not require approval. The Agent can list `daily/` to discover available dates
-before reading the relevant files.
+high-level create-or-append operation and does not require approval. Its optional
+`date` uses `YYYY-MM-DD`; omitting it records content on the current local date.
+The Agent can list `daily/` to discover available dates before reading the
+relevant files.
 
 `copy_file` and `move_file` accept a regular source file anywhere on the
 filesystem, but the destination must be a new path inside the Nole directory;

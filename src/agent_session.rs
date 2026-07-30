@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::time::Duration;
+
+use crate::provider::Message;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConversation {
-    pub(crate) messages: Vec<Value>,
+    pub(crate) messages: Vec<Message>,
 }
 
 impl AgentConversation {
@@ -18,10 +19,7 @@ impl AgentConversation {
     #[cfg(test)]
     pub(crate) fn seeded_for_test() -> Self {
         Self {
-            messages: vec![serde_json::json!({
-                "role": "user",
-                "content": "previous prompt"
-            })],
+            messages: vec![Message::user("previous prompt")],
         }
     }
 }
@@ -54,6 +52,19 @@ impl TokenUsage {
             .saturating_add(usage.cache_read_input_tokens);
     }
 
+    pub fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_sub(previous.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_sub(previous.cache_read_input_tokens),
+        }
+    }
+
     pub fn is_empty(self) -> bool {
         self.total_input() == 0 && self.output_tokens == 0
     }
@@ -81,7 +92,7 @@ pub enum AgentPanelEntry {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSession {
-    messages: Vec<Value>,
+    messages: Vec<Message>,
     panel: Vec<AgentPanelEntry>,
     usage: TokenUsage,
     timed_output_tokens: u64,
@@ -198,5 +209,19 @@ mod tests {
             &panel[2],
             AgentPanelEntry::Tool { active: false, .. }
         ));
+    }
+
+    #[test]
+    fn retry_count_is_not_part_of_the_persisted_session_schema() {
+        let session = AgentSession::from_parts(
+            &AgentConversation::default(),
+            &[],
+            TokenUsage::default(),
+            0,
+            Duration::ZERO,
+        );
+
+        let json = serde_json::to_value(session).unwrap();
+        assert!(json.get("retry_count").is_none());
     }
 }
