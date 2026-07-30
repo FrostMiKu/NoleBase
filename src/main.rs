@@ -119,6 +119,10 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
                 }
                 Err(error) => app.set_error(format!("Editor settings error: {error}")),
             }
+            if let Err(error) = set_mouse_capture(terminal.backend_mut(), app.mouse_captured) {
+                app.mouse_captured = true;
+                app.set_error(format!("Mouse support error: {error}"));
+            }
             app.reload_workspace();
             Ok(false)
         }
@@ -136,7 +140,22 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
             }
             Ok(false)
         }
+        Some(Command::SetMouseCapture(enabled)) => {
+            if let Err(error) = set_mouse_capture(terminal.backend_mut(), enabled) {
+                app.mouse_captured = !enabled;
+                app.set_error(format!("Mouse support error: {error}"));
+            }
+            Ok(false)
+        }
         None => Ok(false),
+    }
+}
+
+fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(output, EnableMouseCapture)
+    } else {
+        execute!(output, DisableMouseCapture)
     }
 }
 

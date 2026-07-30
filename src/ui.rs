@@ -2602,11 +2602,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let surface_segment = format!(" {surface} ");
     let permission_segment = format!(" {} ", app.permission_mode.label());
+    let mouse_status = Span::styled(
+        " ",
+        Style::default().bg(if app.mouse_captured {
+            app.theme.ui_shortcut
+        } else {
+            app.theme.ui_warning
+        }),
+    );
     let surface_style = Style::default()
         .bg(app.theme.surface_status_context)
         .fg(app.theme.text_on_accent);
     let mode_line = if app.permission_mode == PermissionMode::Bypass {
-        let mut spans = vec![Span::styled(surface_segment.clone(), surface_style)];
+        let mut spans = vec![
+            mouse_status,
+            Span::styled(surface_segment.clone(), surface_style),
+        ];
         let bypass_style = Style::default().bg(app.theme.surface_overlay);
         spans.push(Span::styled(" ", bypass_style));
         spans.extend("BYPASS".chars().enumerate().map(|(index, character)| {
@@ -2621,6 +2632,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     } else {
         Line::from(vec![
+            mouse_status,
             Span::styled(surface_segment.clone(), surface_style),
             Span::styled(
                 permission_segment.clone(),
@@ -2634,8 +2646,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(mode_line).style(status_bar_style), area);
 
     let hint = footer_hint(app, area.width);
-    let mode_width = surface_segment
-        .width()
+    let mode_width = 1usize
+        .saturating_add(surface_segment.width())
         .saturating_add(permission_segment.width()) as u16;
     let available_status = area
         .width
@@ -4107,7 +4119,8 @@ mod tests {
             buffer[(compose.x + 1, compose.y + 1)].bg,
             Color::Rgb(13, 14, 15)
         );
-        assert_eq!(buffer[(0, 23)].bg, Color::Rgb(4, 5, 6));
+        assert_eq!(buffer[(0, 23)].bg, app.theme.ui_shortcut);
+        assert_eq!(buffer[(1, 23)].bg, Color::Rgb(4, 5, 6));
         assert_eq!(buffer[(219, 23)].bg, Color::Rgb(16, 17, 18));
 
         let markdown = crate::markdown::render_at_width("# Heading", 40, app.theme);
@@ -4303,9 +4316,17 @@ mod tests {
         let footer: String = (0..220)
             .map(|x| buffer[(x, 11)].symbol().to_string())
             .collect();
-        assert!(footer.starts_with(" DAILY "));
+        assert!(footer.starts_with("  DAILY "));
+        assert_eq!(buffer[(0, 11)].bg, app.theme.ui_shortcut);
         assert!(footer.contains("saved-at-left"));
         assert!(footer.trim_end().ends_with("? help"));
+
+        app.mouse_captured = false;
+        let terminal = render(&mut app, 220, 12);
+        assert_eq!(
+            terminal.backend().buffer()[(0, 11)].bg,
+            app.theme.ui_warning
+        );
     }
 
     #[test]

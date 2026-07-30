@@ -164,6 +164,7 @@ pub enum Command {
     Edit(PathBuf),
     OpenLink(String),
     OpenPath(PathBuf),
+    SetMouseCapture(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +172,7 @@ enum AppCommand {
     InterruptAgent,
     ClearAgentSession,
     OpenTerminal,
+    ToggleMouseSupport,
     NewNote,
     NewNoteFromTemplate,
     EditTemplate,
@@ -212,6 +214,12 @@ const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Terminal: Open",
         description: "Open the workspace terminal",
         keywords: "terminal shell console pty open toggle workspace",
+    },
+    AppCommandDefinition {
+        id: AppCommand::ToggleMouseSupport,
+        label: "Interface: Mouse support",
+        description: "Toggle mouse support for interaction or terminal text selection",
+        keywords: "interface mouse support enable disable selection select copy terminal",
     },
     AppCommandDefinition {
         id: AppCommand::NewNote,
@@ -771,6 +779,7 @@ pub struct App {
     pub help_scroll: u16,
     pub status: String,
     pub animation_tick: u64,
+    pub mouse_captured: bool,
     pub layout: LayoutSnapshot,
 
     /// Rebuilt every frame by the renderer.
@@ -918,6 +927,7 @@ impl App {
             help_scroll: 0,
             status: String::new(),
             animation_tick: 0,
+            mouse_captured: true,
             layout: LayoutSnapshot::default(),
             hitboxes: Vec::new(),
             link_hitboxes: Vec::new(),
@@ -1683,8 +1693,25 @@ impl App {
         let options = self
             .command_matches
             .iter()
-            .filter_map(|id| command_definition(*id))
-            .map(|command| DialogOption::with_hint(command.label, command.description))
+            .filter_map(|id| {
+                let command = command_definition(*id)?;
+                let (label, description) = if *id == AppCommand::ToggleMouseSupport {
+                    if self.mouse_captured {
+                        (
+                            "Interface: Disable mouse support",
+                            "Disable mouse support to select and copy text with the terminal",
+                        )
+                    } else {
+                        (
+                            "Interface: Enable mouse support",
+                            "Restore mouse clicking and scrolling",
+                        )
+                    }
+                } else {
+                    (command.label, command.description)
+                };
+                Some(DialogOption::with_hint(label, description))
+            })
             .collect::<Vec<_>>();
         if let Some(dialog) = self.dialog.as_mut() {
             dialog.options = options;
@@ -1709,6 +1736,15 @@ impl App {
             AppCommand::InterruptAgent => self.cancel_agent(),
             AppCommand::ClearAgentSession => self.clear_agent_session(),
             AppCommand::OpenTerminal => self.toggle_terminal(),
+            AppCommand::ToggleMouseSupport => {
+                self.mouse_captured = !self.mouse_captured;
+                self.set_status(if self.mouse_captured {
+                    "Mouse support enabled"
+                } else {
+                    "Mouse support disabled; terminal text selection available"
+                });
+                return Some(Command::SetMouseCapture(self.mouse_captured));
+            }
             AppCommand::NewNote => self.begin_new_note(),
             AppCommand::NewNoteFromTemplate => self.begin_new_note_from_template(),
             AppCommand::EditTemplate => {
@@ -1742,6 +1778,7 @@ impl App {
             AppCommand::InterruptAgent
             | AppCommand::ClearAgentSession
             | AppCommand::OpenTerminal
+            | AppCommand::ToggleMouseSupport
             | AppCommand::NewNote
             | AppCommand::NewNoteFromTemplate
             | AppCommand::EditTemplate => true,
@@ -2421,11 +2458,11 @@ impl App {
                 self.move_daily_selection(-1);
                 None
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.open_files();
                 None
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 self.open_todo();
                 None
             }
@@ -2494,7 +2531,7 @@ impl App {
                 self.move_file_selection(-1);
                 None
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 if self.center_view == CenterView::Daily {
                     self.focus = Focus::Center;
                 } else if let Some(group) = self.selected_file_group() {
@@ -2515,7 +2552,7 @@ impl App {
                 }
                 None
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 if let Some(group) = self.selected_file_group() {
                     match group {
                         FileGroup::Notes => self.notes_expanded = false,
@@ -2853,7 +2890,7 @@ impl App {
                 self.move_todo_selection(-1);
                 None
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = Focus::Center;
                 None
             }
@@ -2868,7 +2905,7 @@ impl App {
     fn handle_agent(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Char('C') => self.execute_app_command(AppCommand::ClearAgentSession),
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
                 self.focus = Focus::Center;
                 None
             }
@@ -2950,11 +2987,11 @@ impl App {
                 self.scroll_document(-1);
                 None
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.open_files();
                 None
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 self.open_todo();
                 None
             }
@@ -5180,6 +5217,45 @@ mod tests {
         app.permission_mode = PermissionMode::Bypass;
         app.advance_animation();
         assert_eq!(app.animation_tick, 5);
+    }
+
+    #[test]
+    fn command_palette_names_mouse_support_action_for_the_next_state() {
+        let (mut app, _directory) = make_app();
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_p);
+        app.handle_paste("mouse support");
+        let disable = app
+            .dialog
+            .as_ref()
+            .and_then(DialogState::selected_option)
+            .unwrap();
+        assert_eq!(disable.label, "Interface: Disable mouse support");
+        assert!(disable.hint.as_deref().unwrap().contains("select and copy"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::SetMouseCapture(false))
+        );
+        assert!(!app.mouse_captured);
+
+        app.handle_key(ctrl_p);
+        app.handle_paste("mouse support");
+        let enable = app
+            .dialog
+            .as_ref()
+            .and_then(DialogState::selected_option)
+            .unwrap();
+        assert_eq!(enable.label, "Interface: Enable mouse support");
+        assert_eq!(
+            enable.hint.as_deref(),
+            Some("Restore mouse clicking and scrolling")
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::SetMouseCapture(true))
+        );
+        assert!(app.mouse_captured);
     }
 
     #[test]
