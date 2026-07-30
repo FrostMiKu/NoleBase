@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::util::{
     DEFAULT_SEARCH_RESULTS, MAX_DIFF_BYTES, MAX_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
     MAX_SEARCH_SNIPPET_CHARS, display_path, fuzzy_match, limited_diff, optional_usize,
-    required_string, truncate_chars,
+    required_string, truncate_chars, validate_mbdown,
 };
 use crate::agent::{ApprovalGate, ApprovalRequest, Tool, canonical_root};
 use crate::model::SearchHit;
@@ -32,7 +32,7 @@ impl Tool for ListTags {
     }
 
     fn description(&self) -> &'static str {
-        "List indexed Hashtags with document and mention counts. Supports fuzzy filtering, workspace scope, sorting, and pagination."
+        "List Hashtags with document and mention counts. Supports fuzzy filtering, workspace scope, sorting, and pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -150,7 +150,7 @@ impl Tool for SearchTag {
     }
 
     fn description(&self) -> &'static str {
-        "Search one exact Hashtag across indexed Markdown files. Returns paths, zero-based source line numbers, and source snippets with pagination."
+        "Search one exact Hashtag across Markdown files. Returns paths, zero-based source line numbers, and source snippets with pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -241,7 +241,7 @@ impl Tool for RenameTag {
     }
 
     fn description(&self) -> &'static str {
-        "Rename one exact Hashtag across daily, notes, and archives using MBDown source spans. Shows a multi-file diff and requires approval unless bypassed."
+        "Rename one exact Hashtag across daily notes, active notes, and archives."
     }
 
     fn input_schema(&self) -> Value {
@@ -328,7 +328,7 @@ impl Tool for AddDailyEntry {
     }
 
     fn description(&self) -> &'static str {
-        "Add content to daily/YYYY-MM-DD.md, creating the file if absent and otherwise appending it after a blank line. This operation does not require approval."
+        "Add content to daily/YYYY-MM-DD.md, creating the file if absent and otherwise appending it after a blank line."
     }
 
     fn input_schema(&self) -> Value {
@@ -349,11 +349,31 @@ impl Tool for AddDailyEntry {
         if content.len() as u64 > MAX_FILE_BYTES {
             bail!("daily entry content exceeds 1 MB");
         }
-        let note = match input.get("date") {
-            Some(date) => self.storage.append_daily(
-                date.as_str().context("field date must be a string")?,
-                content,
-            )?,
+        let requested_date = input
+            .get("date")
+            .map(|date| {
+                date.as_str()
+                    .context("field date must be a string")
+                    .map(str::to_owned)
+            })
+            .transpose()?;
+        let date = requested_date
+            .clone()
+            .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+        let path = self.storage.daily_file_path(&date)?;
+        let mut candidate = match std::fs::read_to_string(&path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        if !candidate.is_empty() {
+            candidate.push('\n');
+        }
+        candidate.push_str(content);
+        candidate.push('\n');
+        validate_mbdown(&path, &candidate)?;
+        let note = match requested_date {
+            Some(date) => self.storage.append_daily(&date, content)?,
             None => self.storage.append_to_today(content)?,
         };
         serde_json::to_string(&json!({ "date": note.date.to_string() }))

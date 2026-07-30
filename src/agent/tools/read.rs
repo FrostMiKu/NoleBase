@@ -544,7 +544,7 @@ impl Tool for SearchFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Fuzzy, case-insensitive filename search across active and archived .md/.mb notes, using the same matching as the Files sidebar. Supports result pagination."
+        "Fuzzy, case-insensitive filename search across active and archived .md/.mb notes with result pagination."
     }
 
     fn input_schema(&self) -> Value {

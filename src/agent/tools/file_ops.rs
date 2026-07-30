@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::util::{MAX_FILE_BYTES, display_path, limited_diff, required_string};
+use super::util::{MAX_FILE_BYTES, display_path, limited_diff, required_string, validate_mbdown};
 use crate::agent::{
     AgentEvent, AgentEventSender, ApprovalGate, ApprovalRequest, ReadTracker, Tool, canonical_root,
 };
@@ -39,7 +39,7 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Apply one or more zero-based line edits to an existing UTF-8 file under the Nole root, outside config/, while preserving all other content. A replace operation uses inclusive start_line and end_line values from the latest unchanged read_file snapshot; for example, 1 through 3 is start_line=1 and end_line=3. Use an empty lines array to delete that range. An insert operation inserts complete lines before its line value. Changed/deleted lines, or adjacent anchors for insertions, must have been read since the file last changed. Requires user diff approval unless bypassed."
+        "Edit an existing UTF-8 file under the Nole root outside config/ using zero-based lines from the latest read_file result. Only previously read ranges and adjacent insertion anchors may change."
     }
 
     fn input_schema(&self) -> Value {
@@ -145,6 +145,7 @@ impl Tool for EditFile {
         if old == content {
             return Ok(format!("no changes needed for {relative}"));
         }
+        validate_mbdown(&path, &content)?;
         self.gate
             .request(ApprovalRequest {
                 title: format!("Edit {relative}"),
@@ -155,7 +156,7 @@ impl Tool for EditFile {
             fs::read_to_string(&path).with_context(|| format!("rechecking {}", path.display()))?;
         if current != old {
             self.reads.consume_file(&path)?;
-            bail!("file changed while awaiting approval; read it again before editing");
+            bail!("file changed before editing; read it again and retry");
         }
         fs::write(&path, &content).with_context(|| format!("editing {}", path.display()))?;
         self.reads.consume_file(&path)?;
@@ -403,7 +404,7 @@ impl Tool for CopyFile {
     }
 
     fn description(&self) -> &'static str {
-        "Copy a regular file from any absolute path (or a Nole-relative source) to a new path under the Nole root, outside config/ and daily/. Never overwrites and does not require approval."
+        "Copy a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/ and daily/."
     }
 
     fn input_schema(&self) -> Value {
@@ -440,7 +441,7 @@ impl Tool for MoveFile {
     }
 
     fn description(&self) -> &'static str {
-        "Move a regular file from any absolute path (or a Nole-relative source) to a new path under the Nole root, outside config/ and daily/. Never overwrites and does not require approval."
+        "Move a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/ and daily/."
     }
 
     fn input_schema(&self) -> Value {
@@ -478,7 +479,7 @@ impl Tool for MoveFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Move multiple regular files into one existing directory under the Nole root, outside config/ and daily/, preserving each basename. Sources may be absolute or Nole-relative. Preflights duplicate names and destination conflicts, never overwrites, and does not require approval."
+        "Move multiple regular files from absolute or Nole-relative sources into one existing directory under the Nole root outside config/ and daily/, preserving each basename. Each destination must be new."
     }
 
     fn input_schema(&self) -> Value {
@@ -630,7 +631,7 @@ impl Tool for RenameFile {
     }
 
     fn description(&self) -> &'static str {
-        "Rename one regular file under the Nole root outside config/ and daily/ without changing its directory. The new name must be a basename, never overwrites, and does not require approval."
+        "Rename one regular file under the Nole root outside config/ and daily/ without changing its directory. The new name must be a basename and the destination must be new."
     }
 
     fn input_schema(&self) -> Value {
@@ -725,7 +726,7 @@ impl Tool for DeleteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Delete a regular file under the Nole root outside config/ after user approval, unless permission checks are bypassed."
+        "Delete a regular file under the Nole root outside config/."
     }
 
     fn input_schema(&self) -> Value {
@@ -773,7 +774,7 @@ impl Tool for DeleteFile {
             || current.modified().ok() != modified
             || fs::canonicalize(&unresolved)? != path
         {
-            bail!("file changed while awaiting approval; delete it again to review the current target");
+            bail!("file changed before deletion; inspect it again and retry");
         }
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
         Ok(format!("deleted {relative}"))
@@ -803,7 +804,7 @@ impl Tool for CreateFile {
         "create_file"
     }
     fn description(&self) -> &'static str {
-        "Create a new UTF-8 text file under the Nole root, outside config/ and daily/. Fails if the path already exists."
+        "Create a UTF-8 text file at a new path under the Nole root outside config/ and daily/."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -825,6 +826,7 @@ impl Tool for CreateFile {
         if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
             bail!("generic file tools cannot operate on this special file");
         }
+        validate_mbdown(&path, content)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

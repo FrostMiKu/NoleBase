@@ -77,6 +77,19 @@ pub(super) fn required_string<'a>(input: &'a Value, key: &str) -> Result<&'a str
         .with_context(|| format!("missing string field {key}"))
 }
 
+pub(super) fn validate_mbdown(path: &Path, content: &str) -> Result<()> {
+    let is_mbdown = path.extension().and_then(|extension| extension.to_str()).is_some_and(
+        |extension| extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb"),
+    );
+    if !is_mbdown {
+        return Ok(());
+    }
+    if let Err(error) = mbdown::parse(content) {
+        bail!("MBDown validation failed for {}: {error}", path.display());
+    }
+    Ok(())
+}
+
 pub(super) fn limited_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
     let diff = TextDiff::from_lines(old, new)
         .unified_diff()

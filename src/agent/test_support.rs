@@ -15,7 +15,7 @@ use crate::provider::Message;
 pub(crate) trait TestFutureResultExt<T> {
     fn unwrap(self) -> T;
     fn unwrap_err(self) -> anyhow::Error;
-    fn is_err(self) -> bool;
+    fn returns_err(self) -> bool;
 }
 
 impl<F, T> TestFutureResultExt<T> for F
@@ -33,7 +33,7 @@ where
         }
     }
 
-    fn is_err(self) -> bool {
+    fn returns_err(self) -> bool {
         test_runtime().block_on(self).is_err()
     }
 }

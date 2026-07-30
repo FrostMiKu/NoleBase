@@ -420,10 +420,8 @@ impl AgentConfig {
             .with_context(|| format!("reading AI config {}", path.display()))?;
         let config: Self = toml::from_str(&text)
             .with_context(|| format!("parsing AI config {}", path.display()))?;
-        if config.api_key.trim().is_empty() {
-            if config.api_format == ApiFormat::Messages {
-                bail!("set api_key in {}", path.display());
-            }
+        if config.api_key.trim().is_empty() && config.api_format == ApiFormat::Messages {
+            bail!("set api_key in {}", path.display());
         }
         if config.model.trim().is_empty() {
             bail!("model is empty in {}", path.display());
@@ -1535,7 +1533,7 @@ Embed paths are relative to the containing note, or to the Nole root when emitte
 Restricted BBCode is also available:
 - inline: [b], [i], [u], [s], [dim], [red], [color=#12abef], [bg=blue], [link=https://example.com]label[/link]
 - layout: [center], [right], [indent first=4]
-- containers: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0], [columns gap=2], [column width=1fr]
+- containers: [box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0], [columns gap=2], [column width=1fr]. A box border only accepts `single` or `none`; no other border styles are valid.
 Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never emit terminal escape sequences.
 
 ## Workspace
@@ -1554,10 +1552,9 @@ Root: {root} (the user's `.nole` workspace)
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
-- read_file is paginated and returns each line with its absolute zero-based line number and text without the line ending; read only needed lines. Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery. Search results also use zero-based source line numbers.
-- create_file creates only new files. edit_file uses exact zero-based line numbers from the latest unchanged read_file snapshot and requires diff approval unless bypassed. Replace operations use inclusive start_line and end_line values; insert operations use a separate line field and insert before that line. Edits provide complete lines without line-ending characters; the tool adds separators. Every changed/deleted range must have been read since the file last changed; insertions require adjacent lines. Unrelated lines need not be read.
-- Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md without approval; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
-- Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches and rename_file for file renames. Use rename_tag for exact workspace-wide tag renames. Deletes and tag renames require approval unless bypassed.
+- Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
+- Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
+- Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches, rename_file for file renames, and rename_tag for exact workspace-wide tag renames.
 - Use web_fetch when you already have a URL.
 {web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
 - Use open_file when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
@@ -1761,7 +1758,7 @@ mod tests {
                 "path": "data/large.md",
                 "edits": [{"operation": "insert", "line": 450, "lines": ["done"]}]
             }))
-            .is_err());
+            .returns_err());
 
         read.execute(&json!({"path": "data/large.md", "offset": 400, "limit": 50}))
             .unwrap();
@@ -1865,7 +1862,9 @@ mod tests {
         fs::write(directory.path().join("config/ai.toml"), "api_key='secret'").unwrap();
         fs::write(directory.path().join("daily/2026-07-27.md"), "daily entry").unwrap();
         let read = ReadFile::new(directory.path(), Arc::new(ReadTracker::default())).unwrap();
-        assert!(read.execute(&json!({"path": "config/ai.toml"})).is_err());
+        assert!(read
+            .execute(&json!({"path": "config/ai.toml"}))
+            .returns_err());
         let daily: Value = serde_json::from_str(
             &read
                 .execute(&json!({"path": "daily/2026-07-27.md"}))
@@ -1901,14 +1900,14 @@ mod tests {
                 "path": "config/AGENTS.md",
                 "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["changed"]}]
             }))
-            .is_err());
+            .returns_err());
         assert!(create
             .execute(&json!({"path": "config/new.md", "content": "forbidden"}))
-            .is_err());
+            .returns_err());
         assert!(DeleteFile::new(directory.path(), bypass_gate())
             .unwrap()
             .execute(&json!({"path": "config/AGENTS.md"}))
-            .is_err());
+            .returns_err());
         assert!(directory.path().join("config/AGENTS.md").exists());
         assert!(
             ensure_not_special(directory.path(), &directory.path().join("config/AGENTS.md"))
@@ -2062,13 +2061,13 @@ mod tests {
                 "source": copy_source,
                 "destination": "data/copied.md"
             }))
-            .is_err());
+            .returns_err());
         assert!(copy
             .execute(&json!({
                 "source": copy_source,
                 "destination": "../escaped.md"
             }))
-            .is_err());
+            .returns_err());
 
         let (event_sender, mut event_receiver) = event_channel();
         let move_file = MoveFile::new(directory.path(), event_sender).unwrap();
@@ -2153,7 +2152,7 @@ mod tests {
                 "path": "data/collected/renamed.md",
                 "new_name": "beta.md"
             }))
-            .is_err());
+            .returns_err());
     }
 
     #[test]
@@ -2173,7 +2172,9 @@ mod tests {
             decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         };
         let delete = DeleteFile::new(directory.path(), gate).unwrap();
-        assert!(delete.execute(&json!({"path": outside.path()})).is_err());
+        assert!(delete
+            .execute(&json!({"path": outside.path()}))
+            .returns_err());
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(delete.execute(&json!({"path": "data/delete.md"})))
         });
@@ -2910,7 +2911,7 @@ mod tests {
                 AgentEvent::ConversationUpdated(conversation) => Some(conversation),
                 _ => None,
             })
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(checkpoint.messages.len(), 3);
         let MessagePart::ToolResult(result) = &checkpoint.messages[2].parts[0] else {
@@ -3219,6 +3220,7 @@ mod tests {
         assert!(prompt.contains("relative to the containing note"));
         assert!(prompt.contains("Nole root when emitted in the Agent panel"));
         assert!(prompt.contains("absolute paths may point outside Nole"));
+        assert!(prompt.contains("A box border only accepts `single` or `none`"));
         assert!(prompt.contains("archived daily and regular Markdown files"));
         assert!(prompt.contains("create them here by default"));
         assert!(prompt.contains("themes/: editable TOML theme definitions"));
@@ -3235,8 +3237,10 @@ mod tests {
         assert!(prompt.contains("Use list_directory on daily/ to discover dates"));
         assert!(prompt.contains("daily/: ordinary Markdown files named YYYY-MM-DD.md"));
         assert!(prompt.contains("Existing daily Markdown files may be read, edited, or deleted"));
-        assert!(prompt
-            .contains("edit_file uses exact zero-based line numbers from the latest unchanged"));
+        assert!(!prompt.contains("latest unchanged read_file snapshot"));
+        assert!(!prompt.contains("approval"));
+        assert!(!prompt.contains("bypass"));
+        assert!(!prompt.contains("prevalidated"));
         assert!(prompt.contains("Use web_fetch when you already have a URL"));
         assert!(prompt.contains("Use open_file"));
         assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
@@ -3323,6 +3327,15 @@ mod tests {
         assert_eq!(without_key.system.len(), 3);
         assert!(without_key.system.iter().all(|block| block.cache));
         assert!(without_key.definitions.last().unwrap().cache);
+        for definition in &without_key.definitions {
+            for detail in ["approval", "bypass", "prevalidated", "source spans", "Tavily"] {
+                assert!(
+                    !definition.description.contains(detail),
+                    "tool {} exposes runtime detail {detail:?}",
+                    definition.name
+                );
+            }
+        }
         let second_without_key = make_agent("");
         assert_eq!(without_key.definitions, second_without_key.definitions);
 
@@ -3490,7 +3503,7 @@ mod tests {
             "path": "data/note.md",
             "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new"]}]
         });
-        assert!(edit.execute(&input).is_err());
+        assert!(edit.execute(&input).returns_err());
 
         let read = ReadFile::new(directory.path(), reads).unwrap();
         read.execute(&json!({"path": "data/note.md"})).unwrap();
@@ -3504,12 +3517,68 @@ mod tests {
                 "path": "data/note.md",
                 "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["again"]}]
             }))
-            .is_err());
+            .returns_err());
 
         let create = CreateFile::new(directory.path()).unwrap();
         assert!(create
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
-            .is_err());
+            .returns_err());
+    }
+
+    #[test]
+    fn markdown_writes_fail_mbdown_validation_before_mutation_or_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let invalid = "[box border=double]\nbody\n[/box]\n";
+
+        let create = CreateFile::new(directory.path()).unwrap();
+        let error = create
+            .execute(&json!({"path": "data/invalid.md", "content": invalid}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("box border must be single or none"));
+        assert!(!storage.data_dir.join("invalid.md").exists());
+        create
+            .execute(&json!({"path": "data/plain.txt", "content": invalid}))
+            .unwrap();
+        assert_eq!(fs::read_to_string(storage.data_dir.join("plain.txt")).unwrap(), invalid);
+
+        let path = storage.data_dir.join("note.md");
+        fs::write(&path, "valid\n").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        ReadFile::new(directory.path(), reads.clone())
+            .unwrap()
+            .execute(&json!({"path": "data/note.md"}))
+            .unwrap();
+        let (event_sender, mut event_receiver) = event_channel();
+        let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let edit = EditFile::new(
+            directory.path(),
+            ApprovalGate {
+                bypass: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                events: event_sender,
+                decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+            },
+            reads,
+        )
+        .unwrap();
+        let error = test_runtime()
+            .block_on(edit.execute(&json!({
+                "path": "data/note.md",
+                "edits": [{
+                    "operation": "replace",
+                    "start_line": 0,
+                    "end_line": 0,
+                    "lines": ["[box border=double]", "body", "[/box]"]
+                }]
+            })))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("box border must be single or none"));
+        assert!(event_receiver.try_recv().is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "valid\n");
     }
 
     #[test]
@@ -3711,7 +3780,7 @@ mod tests {
                 "path": "daily/2026-07-27.md",
                 "content": "must use add_daily_entry"
             }))
-            .is_err());
+            .returns_err());
     }
 
     #[test]
@@ -3746,6 +3815,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("YYYY-MM-DD"));
+
+        add.execute(&json!({"date": "2026-07-28", "content": "existing"}))
+            .unwrap();
+        let path = storage.daily_file_path("2026-07-28").unwrap();
+        let error = add
+            .execute(&json!({
+                "date": "2026-07-28",
+                "content": "[box border=double]\ninvalid\n[/box]"
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("box border must be single or none"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "existing\n");
     }
 
     #[test]

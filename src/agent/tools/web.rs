@@ -25,7 +25,7 @@ impl Tool for WebSearch {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web with Tavily for current information. Returns a compact JSON object containing an optional answer and ranked results with titles, URLs, snippets, scores, and publication dates when available."
+        "Search the web for current information. Returns an optional answer and ranked results with titles, URLs, snippets, scores, and publication dates when available."
     }
 
     fn input_schema(&self) -> Value {
