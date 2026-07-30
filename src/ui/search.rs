@@ -97,9 +97,13 @@ pub(super) fn draw_search(
     let selected = app
         .search_index
         .min(app.search_results.len().saturating_sub(1));
-    let start = selected
-        .saturating_sub(visible.saturating_sub(1))
-        .min(app.search_results.len().saturating_sub(visible));
+    let start = selection_viewport_start(
+        app.search_list_start,
+        selected,
+        visible,
+        app.search_results.len(),
+    );
+    app.search_list_start = start;
     for (row, (index, hit)) in app
         .search_results
         .iter()
@@ -167,4 +171,3 @@ pub(super) fn draw_search(
         }
     }
 }
-

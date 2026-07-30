@@ -102,16 +102,17 @@ pub(super) fn draw_files(
         FileListRow::File(_) => 3u16,
     };
     let selected_row = app.file_row.min(rows.len().saturating_sub(1));
-    let mut start = selected_row;
-    let mut used = row_height(&rows[selected_row]);
-    while start > 0 {
-        let previous = row_height(&rows[start - 1]);
-        if used.saturating_add(previous) > list_area.height {
-            break;
-        }
-        start -= 1;
-        used = used.saturating_add(previous);
-    }
+    let row_heights = rows
+        .iter()
+        .map(|row| row_height(row) as usize)
+        .collect::<Vec<_>>();
+    let start = variable_selection_viewport_start(
+        app.file_list_start,
+        selected_row,
+        &row_heights,
+        list_area.height as usize,
+    );
+    app.file_list_start = start;
 
     let mut y = list_area.y;
     for (row_index, row) in rows.iter().copied().enumerate().skip(start) {
@@ -293,12 +294,13 @@ pub(super) fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactiv
     if viewport_height == 0 {
         return;
     }
-    let mut start = selected_position;
-    let mut used = item_heights[selected_position];
-    while start > 0 && used + item_heights[start - 1] <= viewport_height {
-        start -= 1;
-        used += item_heights[start];
-    }
+    let start = variable_selection_viewport_start(
+        app.todo_list_start,
+        selected_position,
+        &item_heights,
+        viewport_height,
+    );
+    app.todo_list_start = start;
 
     let mut y = inner.y.saturating_add(1);
     for index in visible_indices.iter().copied().skip(start) {
@@ -376,4 +378,3 @@ pub(super) fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactiv
         y = y.saturating_add(layout_height);
     }
 }
-

@@ -204,6 +204,7 @@ pub struct App {
     /// Stable selection retained across file reloads and recent-first reordering.
     pub selected_file: Option<PathBuf>,
     pub file_row: usize,
+    pub file_list_start: usize,
     pub notes_expanded: bool,
     pub archives_expanded: bool,
     pub file_query: String,
@@ -220,10 +221,12 @@ pub struct App {
 
     pub todo_items: Vec<TodoItem>,
     pub todo_index: usize,
+    pub todo_list_start: usize,
 
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
+    pub search_list_start: usize,
     workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
 
@@ -358,6 +361,7 @@ impl App {
             file_index: 0,
             selected_file: first_note,
             file_row,
+            file_list_start: 0,
             notes_expanded: true,
             archives_expanded: false,
             file_query: String::new(),
@@ -370,9 +374,11 @@ impl App {
             pending_file: None,
             todo_items,
             todo_index: 0,
+            todo_list_start: 0,
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
+            search_list_start: 0,
             workspace_index,
             pending_tag_rename: None,
             help_scroll: 0,

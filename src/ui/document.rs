@@ -1,5 +1,7 @@
 use super::*;
 
+const DOCUMENT_TOP_MARGIN: usize = 2;
+
 pub(super) fn draw_document(
     frame: &mut Frame,
     app: &mut App,
@@ -36,16 +38,13 @@ pub(super) fn draw_document(
     let page_style = Style::default().bg(app.theme.surface_panel);
     frame.render_widget(Block::default().style(page_style), page_area);
     let horizontal_padding = (PAGE_PADDING_X as u16).min(page_area.width.saturating_sub(1) / 2);
-    let vertical_padding = 2.min(page_area.height / 2);
     let document_area = Rect::new(
         page_area.x.saturating_add(horizontal_padding),
-        page_area.y.saturating_add(vertical_padding),
+        page_area.y,
         page_area
             .width
             .saturating_sub(horizontal_padding.saturating_mul(2)),
-        page_area
-            .height
-            .saturating_sub(vertical_padding.saturating_mul(2)),
+        page_area.height,
     );
     let unoccluded_document_height = compose
         .y
@@ -59,7 +58,13 @@ pub(super) fn draw_document(
             .unwrap_or_else(|| app.storage.root.clone()),
         crate::app::DocumentKind::Daily(_) => app.storage.daily_dir.clone(),
     };
-    let (rendered_links, rendered_tags, rendered_images, document_scroll) = {
+    let (
+        rendered_links,
+        rendered_tags,
+        rendered_images,
+        document_scroll,
+        visible_top_margin,
+    ) = {
         let document = app.document.as_mut().expect("document checked above");
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -71,13 +76,14 @@ pub(super) fn draw_document(
             header,
         );
         if let Some(target_line) = document.target_line.take() {
-            document.scroll = crate::markdown::rendered_row_for_source_line(
-                &document.source,
-                target_line,
-                document_area.width as usize,
-                app.theme,
-            )
-            .min(u16::MAX as usize) as u16;
+            document.scroll = DOCUMENT_TOP_MARGIN
+                .saturating_add(crate::markdown::rendered_row_for_source_line(
+                    &document.source,
+                    target_line,
+                    document_area.width as usize,
+                    app.theme,
+                ))
+                .min(u16::MAX as usize) as u16;
         }
         document.ensure_rendered(document_area.width as usize, app.theme);
         let rendered = &document
@@ -91,36 +97,49 @@ pub(super) fn draw_document(
         let lines = &rendered.lines;
         let max_scroll = lines
             .len()
+            .saturating_add(DOCUMENT_TOP_MARGIN)
             .saturating_sub(unoccluded_document_height as usize);
         document.scroll = (document.scroll as usize).min(max_scroll) as u16;
         let document_scroll = document.scroll as usize;
-        let visible = visible_line_window(
+        let visible_top_margin = DOCUMENT_TOP_MARGIN
+            .saturating_sub(document_scroll)
+            .min(document_area.height as usize);
+        let content_scroll = document_scroll.saturating_sub(DOCUMENT_TOP_MARGIN);
+        let mut visible = vec![Line::default(); visible_top_margin];
+        visible.extend(visible_line_window(
             lines,
-            document.scroll as usize,
-            document_area.height as usize,
-        );
+            content_scroll,
+            (document_area.height as usize).saturating_sub(visible_top_margin),
+        ));
         frame.render_widget(Paragraph::new(visible).style(page_style), document_area);
         (
             rendered_links,
             rendered_tags,
             rendered_images,
-            document_scroll,
+            content_scroll,
+            visible_top_margin as u16,
         )
     };
+    let content_document_area = Rect::new(
+        document_area.x,
+        document_area.y.saturating_add(visible_top_margin),
+        document_area.width,
+        document_area.height.saturating_sub(visible_top_margin),
+    );
     app.images.render(
         frame,
         &rendered_images,
-        document_area,
+        content_document_area,
         document_scroll,
         &image_base,
         app.theme,
     );
     if interactive {
         let interactive_document_area = Rect::new(
-            document_area.x,
-            document_area.y,
-            document_area.width,
-            unoccluded_document_height,
+            content_document_area.x,
+            content_document_area.y,
+            content_document_area.width,
+            unoccluded_document_height.saturating_sub(visible_top_margin),
         );
         register_link_hitboxes(
             &mut app.link_hitboxes,
@@ -141,4 +160,3 @@ pub(super) fn draw_document(
         draw_compose(frame, app, compose, interactive, cursor_position);
     }
 }
-

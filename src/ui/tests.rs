@@ -1620,6 +1620,45 @@ fn focused_compose_floats_over_the_document_with_an_animated_border() {
 }
 
 #[test]
+fn document_top_margin_scrolls_with_the_text_behind_the_floating_compose() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Document;
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.data_dir.join("Article.md")),
+        title: "Article".to_string(),
+        source: (0..40)
+            .map(|line| format!("paper line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+
+    let terminal = render(&mut app, 120, 30);
+    let center = app.layout.center.expect("center area");
+    let content = inset_horizontal(center_content_axis(center), 2);
+    let paper_y = content.y + 2;
+    let buffer_row = |buffer: &Buffer, y| {
+        (0..buffer.area().width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+    };
+    let buffer = terminal.backend().buffer();
+    assert!(!buffer_row(buffer, paper_y).contains("paper line 0"));
+    assert!(buffer_row(buffer, paper_y + 2).contains("paper line 0"));
+
+    app.document.as_mut().unwrap().scroll = 1;
+    let terminal = render(&mut app, 120, 30);
+    assert!(buffer_row(terminal.backend().buffer(), paper_y + 1).contains("paper line 0"));
+
+    app.document.as_mut().unwrap().scroll = 2;
+    let terminal = render(&mut app, 120, 30);
+    assert!(buffer_row(terminal.backend().buffer(), paper_y).contains("paper line 0"));
+}
+
+#[test]
 fn tiny_terminals_and_requested_widths_do_not_panic() {
     for (width, height) in [
         (1, 1),
@@ -1916,6 +1955,29 @@ fn oversized_card_scroll_can_rest_anywhere_inside_the_card() {
 }
 
 #[test]
+fn selection_viewports_move_the_cursor_before_scrolling_up() {
+    let mut start = 0;
+    for selected in 0..=3 {
+        start = selection_viewport_start(start, selected, 3, 10);
+    }
+    assert_eq!(start, 1, "moving below the viewport should scroll down");
+    assert_eq!(selection_viewport_start(start, 2, 3, 10), 1);
+    assert_eq!(selection_viewport_start(start, 1, 3, 10), 1);
+    assert_eq!(
+        selection_viewport_start(start, 0, 3, 10),
+        0,
+        "scrolling up should begin only after the cursor reaches the top"
+    );
+
+    let heights = [2, 2, 2, 2, 2];
+    let start = variable_selection_viewport_start(0, 3, &heights, 6);
+    assert_eq!(start, 1);
+    assert_eq!(variable_selection_viewport_start(start, 2, &heights, 6), 1);
+    assert_eq!(variable_selection_viewport_start(start, 1, &heights, 6), 1);
+    assert_eq!(variable_selection_viewport_start(start, 0, &heights, 6), 0);
+}
+
+#[test]
 fn manual_scroll_can_cross_an_oversized_selected_card_boundary() {
     let (mut app, _directory) = make_app();
     app.storage
@@ -1979,7 +2041,7 @@ fn single_line_daily_card_spaces_date_body_and_buttons() {
 }
 
 #[test]
-fn document_view_uses_a_padded_page_background_without_an_outer_border() {
+fn document_view_uses_a_scrollable_page_margin_without_an_outer_border() {
     let (mut app, _directory) = make_app();
     app.focus = Focus::Center;
     app.center_view = CenterView::Document;

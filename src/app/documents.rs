@@ -82,6 +82,7 @@ impl App {
     pub fn open_todo(&mut self) {
         self.reload_todos();
         self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
+        self.todo_list_start = 0;
         self.focus = Focus::Todo;
     }
 
@@ -89,6 +90,7 @@ impl App {
         self.search_query.clear();
         self.search_results.clear();
         self.search_index = 0;
+        self.search_list_start = 0;
         self.center_view = CenterView::Search;
         self.focus = Focus::Center;
     }
@@ -97,6 +99,7 @@ impl App {
         self.search_query.clear();
         self.search_results.clear();
         self.search_index = 0;
+        self.search_list_start = 0;
         self.center_view = CenterView::DocumentSearch;
         self.focus = Focus::Center;
     }
@@ -661,6 +664,7 @@ impl App {
         self.close_dialog();
         self.search_query = format!("#{name}");
         self.search_index = 0;
+        self.search_list_start = 0;
         self.center_view = CenterView::Search;
         self.focus = Focus::Center;
         self.recompute_search();

@@ -320,9 +320,15 @@ pub(super) fn draw_command_palette(
             options,
         );
     } else if options.height > 0 {
-        let list_start = dialog
-            .selected
-            .saturating_sub(visible_items.saturating_sub(1));
+        let list_start = selection_viewport_start(
+            dialog.scroll as usize,
+            dialog.selected,
+            visible_items,
+            dialog.options.len(),
+        );
+        if let Some(state) = app.dialog.as_mut() {
+            state.scroll = u16::try_from(list_start).unwrap_or(u16::MAX);
+        }
         let options_end = options.y.saturating_add(options.height);
         let mut y = options.y.saturating_add(1);
         for (index, option) in dialog
@@ -496,10 +502,15 @@ pub(super) fn draw_select_dialog(
         );
     }
     let visible_items = visible_selection_items(options.height, SELECT_OPTION_HEIGHT);
-    let list_start = dialog
-        .selected
-        .saturating_sub(visible_items.saturating_sub(1))
-        .min(option_items.saturating_sub(visible_items));
+    let list_start = selection_viewport_start(
+        dialog.scroll as usize,
+        dialog.selected,
+        visible_items,
+        option_items,
+    );
+    if let Some(state) = app.dialog.as_mut() {
+        state.scroll = u16::try_from(list_start).unwrap_or(u16::MAX);
+    }
     let options_end = options.y.saturating_add(options.height);
     for (index, option) in dialog
         .options
