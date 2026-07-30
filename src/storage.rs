@@ -6,7 +6,7 @@
 //! moved from `data/`; archived daily files retain their `YYYY-MM-DD.md` names.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -28,6 +28,14 @@ const THEMES_DIR: &str = "themes";
 const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
 const ARCHIVES_DIR: &str = "archives";
+
+#[derive(Debug, Clone)]
+pub(crate) struct AppendReceipt {
+    path: PathBuf,
+    original_len: u64,
+    appended: Vec<u8>,
+    created: bool,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -433,18 +441,30 @@ impl Storage {
 
     /// Append content to today's daily note, creating it on first send.
     pub fn append_to_today(&self, body: &str) -> Result<DailyNote> {
+        self.append_to_today_tracked(body).map(|(note, _)| note)
+    }
+
+    pub(crate) fn append_to_today_tracked(&self, body: &str) -> Result<(DailyNote, AppendReceipt)> {
         let date = Local::now().date_naive();
-        self.append_daily_for_date(date, body)?;
-        self.read_daily(date)
+        let receipt = self.append_daily_for_date(date, body)?;
+        Ok((self.read_daily(date)?, receipt))
     }
 
     pub fn append_daily(&self, date: &str, body: &str) -> Result<DailyNote> {
-        let date = parse_daily_date(date)?;
-        self.append_daily_for_date(date, body)?;
-        self.read_daily(date)
+        self.append_daily_tracked(date, body).map(|(note, _)| note)
     }
 
-    fn append_daily_for_date(&self, date: NaiveDate, body: &str) -> Result<()> {
+    pub(crate) fn append_daily_tracked(
+        &self,
+        date: &str,
+        body: &str,
+    ) -> Result<(DailyNote, AppendReceipt)> {
+        let date = parse_daily_date(date)?;
+        let receipt = self.append_daily_for_date(date, body)?;
+        Ok((self.read_daily(date)?, receipt))
+    }
+
+    fn append_daily_for_date(&self, date: NaiveDate, body: &str) -> Result<AppendReceipt> {
         if body.trim().is_empty() {
             bail!("daily content must not be empty");
         }
@@ -455,7 +475,7 @@ impl Storage {
         } else {
             format!("{body}\n")
         };
-        append_text(&path, &content)
+        append_text_tracked(&path, &content)
     }
 
     pub fn read_daily_by_date(&self, date: &str) -> Result<DailyNote> {
@@ -768,6 +788,10 @@ impl Storage {
 
     /// Append to an article in either `data/` or `archives/`.
     pub fn append_document(&self, path: &Path, body: &str) -> Result<()> {
+        self.append_document_tracked(path, body).map(|_| ())
+    }
+
+    pub(crate) fn append_document_tracked(&self, path: &Path, body: &str) -> Result<AppendReceipt> {
         if body.trim().is_empty() {
             bail!("note content must not be empty");
         }
@@ -777,7 +801,43 @@ impl Storage {
         } else {
             format!("{body}\n")
         };
-        append_text(path, &content)
+        append_text_tracked(path, &content)
+    }
+
+    pub(crate) fn undo_append(&self, receipt: &AppendReceipt) -> Result<()> {
+        let current_len = receipt
+            .path
+            .metadata()
+            .with_context(|| format!("reading metadata for {}", receipt.path.display()))?
+            .len();
+        let expected_len = receipt.original_len + receipt.appended.len() as u64;
+        if current_len != expected_len {
+            bail!("file changed after the append");
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&receipt.path)
+            .with_context(|| format!("opening {}", receipt.path.display()))?;
+        file.seek(SeekFrom::Start(receipt.original_len))?;
+        let mut appended = Vec::with_capacity(receipt.appended.len());
+        file.read_to_end(&mut appended)?;
+        if appended != receipt.appended {
+            bail!("file changed after the append");
+        }
+
+        drop(file);
+        if receipt.created {
+            fs::remove_file(&receipt.path)
+                .with_context(|| format!("deleting {}", receipt.path.display()))?;
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .open(&receipt.path)?
+                .set_len(receipt.original_len)?;
+        }
+        Ok(())
     }
 
     /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
@@ -1101,28 +1161,39 @@ fn append_markdown_section(path: &Path, note: &DailyNote) -> Result<String> {
 }
 
 fn append_text(path: &Path, content: &str) -> Result<()> {
+    append_text_tracked(path, content).map(|_| ())
+}
+
+fn append_text_tracked(path: &Path, content: &str) -> Result<AppendReceipt> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
+    let created = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
+    let original_len = file.metadata()?.len();
+    let mut appended = Vec::with_capacity(content.len() + 1);
     // Ensure existing content ends in a newline before appending.
-    if let Ok(meta) = file.metadata() {
-        if meta.len() > 0 {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut f = OpenOptions::new().read(true).open(path)?;
-            let mut tail = [0u8; 1];
-            f.seek(SeekFrom::End(-1))?;
-            if f.read(&mut tail)? == 1 && tail[0] != b'\n' {
-                file.write_all(b"\n")?;
-            }
+    if original_len > 0 {
+        let mut reader = OpenOptions::new().read(true).open(path)?;
+        let mut tail = [0u8; 1];
+        reader.seek(SeekFrom::End(-1))?;
+        if reader.read(&mut tail)? == 1 && tail[0] != b'\n' {
+            file.write_all(b"\n")?;
+            appended.push(b'\n');
         }
     }
     file.write_all(content.as_bytes())?;
-    Ok(())
+    appended.extend_from_slice(content.as_bytes());
+    Ok(AppendReceipt {
+        path: path.to_path_buf(),
+        original_len,
+        appended,
+        created,
+    })
 }
 
 #[cfg(test)]
@@ -1437,6 +1508,27 @@ mod tests {
             .append_document(Path::new("/tmp/outside.md"), "no")
             .is_err());
         assert!(st.append_document(&path, "   ").is_err());
+    }
+
+    #[test]
+    fn tracked_document_append_can_be_undone_exactly() {
+        let (_dir, st) = fresh();
+        let path = st.create_named_file("article").unwrap();
+        fs::write(&path, "original without newline").unwrap();
+
+        let receipt = st
+            .append_document_tracked(&path, "mistaken prompt")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "original without newline\n\nmistaken prompt\n"
+        );
+
+        st.undo_append(&receipt).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "original without newline"
+        );
     }
 
     #[test]

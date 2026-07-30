@@ -113,6 +113,7 @@ restarting Nole.
 | type / paste | edit the compose buffer; multiline paste is preserved |
 | `Enter` | send to Daily, or append to the article currently being viewed |
 | `Ctrl+Enter` | send the buffer directly to Agent without creating a Daily card |
+| `Ctrl+U` | undo the last Compose append and restore it to the buffer |
 | `Shift`/`Alt`+`Enter`, `Ctrl+J` | insert a newline |
 | arrows, `Home`, `End` | move the cursor |
 | `Esc` | focus Daily |

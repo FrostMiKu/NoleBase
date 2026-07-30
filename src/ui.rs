@@ -2108,11 +2108,15 @@ fn draw_compose(
             app.input.lines().count().max(1)
         };
         let count = format!("{lines}l · {}c", app.input.chars().count());
-        let hint = if focused && toolbar.width >= 62 {
+        let hint = if focused && toolbar.width >= 72 {
             match app.center_view {
-                CenterView::Document => "Enter append · Ctrl+Enter Agent · Ctrl+J newline",
-                _ => "Enter send · Ctrl+Enter Agent · Ctrl+J newline",
+                CenterView::Document => {
+                    "Enter append · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline"
+                }
+                _ => "Enter send · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline",
             }
+        } else if focused && toolbar.width >= 42 {
+            "Ctrl+Enter Agent · Ctrl+U recall"
         } else if focused && toolbar.width >= 25 {
             "Ctrl+Enter Agent"
         } else {
@@ -2326,10 +2330,14 @@ fn draw_search(
     let input_style = Style::default().bg(app.theme.surface_panel);
     if input_height >= 3 {
         clear_widget(frame, input_box);
+        let title = match app.center_view {
+            CenterView::DocumentSearch => "Search in Note",
+            _ => "Searcher",
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::horizontal(1))
-            .title(format!(" Searcher · {} ", app.search_results.len()))
+            .title(format!(" {title} · {} ", app.search_results.len()))
             .style(input_style)
             .border_style(focus_border(app.focus == Focus::Center, app.theme));
         let input = block.inner(input_box);
@@ -2689,10 +2697,10 @@ fn footer_hint(app: &App, width: u16) -> &'static str {
     }
     match (app.focus, app.center_view) {
         (Focus::Compose, CenterView::Daily) => {
-            "Enter send · Ctrl+Enter Agent · Ctrl+J newline · Ctrl+P commands"
+            "Enter send · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline · Ctrl+P commands"
         }
         (Focus::Compose, CenterView::Document) => {
-            "Enter append · Ctrl+Enter Agent · Ctrl+J newline · Ctrl+P commands"
+            "Enter append · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline · Ctrl+P commands"
         }
         (Focus::Files, _) => "↑↓ select · Enter open · a/u archive/restore · e edit · / filter",
         (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
@@ -3748,6 +3756,7 @@ fn help_lines(theme: Theme) -> Vec<Line<'static>> {
         heading("Compose / editor"),
         key("Enter", "send / save"),
         key("Ctrl+Enter", "send prompt directly to Agent"),
+        key("Ctrl+U", "recall the last append into Compose"),
         key("Ctrl+J", "insert newline"),
         key("Esc", "leave / cancel"),
         Line::default(),
@@ -4782,6 +4791,10 @@ mod tests {
             terminal.backend().buffer()[(result.x + result.width - 2, result.y)].symbol(),
             " "
         );
+
+        app.center_view = CenterView::DocumentSearch;
+        let terminal = render(&mut app, 80, 18);
+        assert!(buffer_string(&terminal).contains("Search in Note · 1"));
         assert_eq!(
             terminal.backend().buffer()[(result.x + result.width - 1, result.y)].symbol(),
             " "

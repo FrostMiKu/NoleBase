@@ -24,7 +24,7 @@ use crate::model::{
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
-use crate::storage::{LoadedTheme, Storage};
+use crate::storage::{AppendReceipt, LoadedTheme, Storage};
 use crate::workspace_index::{TagRenamePlan, WorkspaceIndex, WorkspaceIndexHandle};
 
 const FORMAT_DAILY_NOTE_PROMPT: &str = "Read this daily note, then edit it in place to improve its Markdown formatting and readability. Preserve every fact, idea, task, link, and the author's meaning. Only improve structure and presentation, such as headings, paragraphs, lists, spacing, and emphasis. Do not add new factual content, and do not merely describe the changes.";
@@ -337,6 +337,10 @@ enum CursorMove {
 
 #[derive(Debug, Clone)]
 enum UndoOp {
+    Append {
+        receipt: AppendReceipt,
+        input: String,
+    },
     Delete(DailyNote),
     Archive(DailyNote),
     Move {
@@ -2285,6 +2289,10 @@ impl App {
             KeyCode::End => self.move_input_cursor(CursorMove::LineEnd),
             KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
                 insert_char(&mut self.input, &mut self.input_cursor, '\n');
+                None
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.recall_last_append();
                 None
             }
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4841,6 +4849,7 @@ impl App {
     }
 
     fn send_message(&mut self) {
+        let original_input = self.input.clone();
         let body = self.input.trim().to_string();
         if body.is_empty() {
             return;
@@ -4851,17 +4860,30 @@ impl App {
             .filter(|_| self.center_view == CenterView::Document)
             .map(|document| document.kind.clone());
         let result = match document_kind {
-            Some(DocumentKind::File(path)) => self.append_to_open_note(&path, &body),
-            Some(DocumentKind::Daily(date)) => self.append_to_open_daily(&date.to_string(), &body),
-            None => self.append_to_today(&body),
+            Some(DocumentKind::File(path)) => {
+                self.append_to_open_note(&path, &body, &original_input)
+            }
+            Some(DocumentKind::Daily(date)) => {
+                self.append_to_open_daily(&date.to_string(), &body, &original_input)
+            }
+            None => self.append_to_today(&body, &original_input),
         };
         if let Err(error) = result {
             self.set_error(format!("Error: {error}"));
         }
     }
 
-    fn append_to_open_note(&mut self, path: &Path, body: &str) -> anyhow::Result<()> {
-        self.storage.append_document(path, body)?;
+    fn append_to_open_note(
+        &mut self,
+        path: &Path,
+        body: &str,
+        original_input: &str,
+    ) -> anyhow::Result<()> {
+        let receipt = self.storage.append_document_tracked(path, body)?;
+        self.record_undo(UndoOp::Append {
+            receipt,
+            input: original_input.to_string(),
+        });
         let source = self.storage.read_document_file(path)?;
         if let Some(document) = self.document.as_mut() {
             document.replace_source(source);
@@ -4875,8 +4897,17 @@ impl App {
         Ok(())
     }
 
-    fn append_to_open_daily(&mut self, date: &str, body: &str) -> anyhow::Result<()> {
-        let note = self.storage.append_daily(date, body)?;
+    fn append_to_open_daily(
+        &mut self,
+        date: &str,
+        body: &str,
+        original_input: &str,
+    ) -> anyhow::Result<()> {
+        let (note, receipt) = self.storage.append_daily_tracked(date, body)?;
+        self.record_undo(UndoOp::Append {
+            receipt,
+            input: original_input.to_string(),
+        });
         if let Some(document) = self.document.as_mut() {
             document.replace_source(note.body);
         }
@@ -4890,8 +4921,12 @@ impl App {
         Ok(())
     }
 
-    fn append_to_today(&mut self, body: &str) -> anyhow::Result<()> {
-        self.storage.append_to_today(body)?;
+    fn append_to_today(&mut self, body: &str, original_input: &str) -> anyhow::Result<()> {
+        let (_, receipt) = self.storage.append_to_today_tracked(body)?;
+        self.record_undo(UndoOp::Append {
+            receipt,
+            input: original_input.to_string(),
+        });
         self.input.clear();
         self.input_cursor = 0;
         self.reload();
@@ -4928,12 +4963,59 @@ impl App {
         self.undo_stack.push(operation);
     }
 
+    fn recall_last_append(&mut self) {
+        let Some(operation) = self.undo_stack.pop() else {
+            self.set_status("Nothing to recall");
+            return;
+        };
+        let UndoOp::Append { receipt, input } = operation else {
+            self.undo_stack.push(operation);
+            self.set_status("Nothing to recall");
+            return;
+        };
+
+        match self.storage.undo_append(&receipt) {
+            Ok(()) => {
+                self.restore_recalled_input(input);
+                self.reload_workspace();
+                self.selected = self.daily_notes.len().saturating_sub(1);
+                self.scroll = u16::MAX;
+                self.set_status("Recalled last append");
+            }
+            Err(error) => {
+                self.undo_stack.push(UndoOp::Append { receipt, input });
+                self.set_error(format!("Recall error: {error}"));
+            }
+        }
+    }
+
+    fn restore_recalled_input(&mut self, recalled: String) {
+        if self.input.is_empty() {
+            self.input = recalled;
+        } else {
+            let current = std::mem::take(&mut self.input);
+            self.input = recalled;
+            if !self.input.ends_with('\n') && !current.starts_with('\n') {
+                self.input.push('\n');
+            }
+            self.input.push_str(&current);
+        }
+        self.input_cursor = self.input.chars().count();
+    }
+
     fn undo(&mut self) {
         let Some(operation) = self.undo_stack.pop() else {
             self.set_status("Nothing to undo");
             return;
         };
         let status = match operation {
+            UndoOp::Append { receipt, input } => match self.storage.undo_append(&receipt) {
+                Ok(()) => {
+                    self.restore_recalled_input(input);
+                    "Recalled last append".to_string()
+                }
+                Err(error) => format!("Undo error: {error}"),
+            },
             UndoOp::Delete(note) => match self.storage.restore_daily(&note) {
                 Ok(()) => "Undid delete".to_string(),
                 Err(error) => format!("Undo error: {error}"),
@@ -6099,6 +6181,62 @@ mod tests {
         );
         assert!(app.notifications.visible().is_none());
         assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn ctrl_u_recalls_an_article_append_into_compose() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Article.md");
+        fs::write(&path, "# Article\n").unwrap();
+        app.open_file_document(&path, DocumentReturn::Daily);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_paste("  mistaken prompt \n");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.input, "  mistaken prompt \n");
+        assert_eq!(app.input_cursor, app.input.chars().count());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Article\n");
+        assert_eq!(app.document.as_ref().unwrap().source, "# Article\n");
+        assert_eq!(app.status, "Recalled last append");
+    }
+
+    #[test]
+    fn ctrl_u_recalls_the_first_daily_append_and_removes_its_file() {
+        let (mut app, _directory) = make_app();
+        app.focus = Focus::Compose;
+        app.handle_paste("send this to Agent");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.daily_notes.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.input, "send this to Agent");
+        assert_eq!(app.input_cursor, app.input.chars().count());
+        assert!(app.daily_notes.is_empty());
+        assert_eq!(app.status, "Recalled last append");
+    }
+
+    #[test]
+    fn ctrl_u_refuses_to_truncate_a_note_changed_after_append() {
+        let (mut app, _directory) = make_app();
+        let path = app.storage.data_dir.join("Article.md");
+        fs::write(&path, "# Article\n").unwrap();
+        app.open_file_document(&path, DocumentReturn::Daily);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_paste("mistaken prompt");
+        app.handle_key(key(KeyCode::Enter));
+        fs::write(&path, "# Article\n\nmistaken prompt\n\nexternal edit\n").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+        assert!(app.input.is_empty());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Article\n\nmistaken prompt\n\nexternal edit\n"
+        );
+        assert!(app.status.starts_with("Recall error:"));
     }
 
     #[test]
