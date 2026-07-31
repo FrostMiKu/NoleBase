@@ -10,13 +10,14 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (Focus::Files, _, FilesContext::NewTarget) => "FILES/NEW",
         (Focus::Files, _, FilesContext::Rename) => "FILES/RENAME",
         (Focus::Files, _, _) => "FILES",
-        (Focus::Todo, _, _) => "TODO",
+        (Focus::Views, _, _) => "VIEWS",
         (Focus::Agent, _, _) => "AGENT",
         (Focus::Compose, _, _) => "COMPOSE",
         (_, CenterView::Document, _) => "DOCUMENT",
         (_, CenterView::Search, _) => "SEARCH",
         (_, CenterView::DocumentSearch, _) => "FIND",
         (_, CenterView::Tags, _) => "TAGS",
+        (_, CenterView::Todo, _) => "TODO",
         _ => "DAILY",
     };
     let surface_segment = format!(" {surface} ");
@@ -109,7 +110,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
             (Focus::Compose, CenterView::Document) => "Esc document",
             (Focus::Compose, _) => "Esc daily",
             (Focus::Files, _) => "Esc back · Enter open",
-            (Focus::Todo, _) => "Esc back · Enter toggle",
+            (Focus::Views, _) => "Esc back · Enter switch",
             (Focus::Agent, _) if app.ai_running => "c cancel · C clear · Esc back",
             (Focus::Agent, _) => "C clear · Esc back",
             (Focus::Center, CenterView::Document)
@@ -124,6 +125,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
                 }
             }
             (Focus::Center, CenterView::Tags) => "type filter · ↑↓ select · Enter search",
+            (Focus::Center, CenterView::Todo) => "↑↓ select · Enter toggle",
             (Focus::Center, _) => "# tags · Ctrl+P commands",
         };
     }
@@ -135,7 +137,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
             "Enter append · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline · Ctrl+P commands"
         }
         (Focus::Files, _) => "↑↓ select · Enter open · a/u archive/restore · e edit · / filter",
-        (Focus::Todo, _) => "↑↓ select · Enter toggle · Esc back",
+        (Focus::Views, _) => "↑↓ select · Enter switch · Esc back",
         (Focus::Agent, _) if app.ai_running => "c cancel · C clear session · ↑↓ scroll · ← center",
         (Focus::Agent, _) => "C clear session · ↑↓ scroll · ← center",
         (_, CenterView::Daily) if width >= 95 => {
@@ -162,11 +164,18 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
         (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
         (_, CenterView::Tags) => "type filter · ↑↓ select · Enter search · Esc back",
+        (_, CenterView::Todo) => "↑↓ select · Enter toggle · ← files · → views · Esc daily",
         _ => "f files · t todo · Ctrl+P commands · ? help",
     }
 }
 
-pub(super) fn draw_left_right_line(frame: &mut Frame, area: Rect, left: &str, right: &str, color: Color) {
+pub(super) fn draw_left_right_line(
+    frame: &mut Frame,
+    area: Rect,
+    left: &str,
+    right: &str,
+    color: Color,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }

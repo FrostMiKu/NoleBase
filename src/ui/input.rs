@@ -135,4 +135,3 @@ pub(super) fn cursor_row_col(input: &str, cursor: usize) -> (usize, usize) {
     }
     (line, column)
 }
-

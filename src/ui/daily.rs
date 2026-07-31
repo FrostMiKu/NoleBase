@@ -513,7 +513,12 @@ pub(super) fn animated_card_border_style(position: usize, tick: u64, theme: Them
         .bg(theme.surface_panel)
 }
 
-pub(super) fn stable_card_scroll(scroll: usize, first: usize, button: usize, view_height: usize) -> usize {
+pub(super) fn stable_card_scroll(
+    scroll: usize,
+    first: usize,
+    button: usize,
+    view_height: usize,
+) -> usize {
     let card_height = button.saturating_sub(first).saturating_add(1);
     if card_height <= view_height {
         if first < scroll {
@@ -599,4 +604,3 @@ pub(super) fn register_buttons_clipped(
         }
     }
 }
-

@@ -64,4 +64,3 @@ pub(super) fn draw_compose(
         draw_left_right_line(frame, toolbar, &count, hint, app.theme.text_muted);
     }
 }
-

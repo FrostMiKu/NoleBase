@@ -80,10 +80,40 @@ impl App {
     }
 
     pub fn open_todo(&mut self) {
-        self.reload_todos();
-        self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
-        self.todo_list_start = 0;
-        self.focus = Focus::Todo;
+        self.activate_workspace_view(CenterView::Todo);
+    }
+
+    pub fn open_workspace_views(&mut self) {
+        if let Some(index) = WorkspaceView::index_of(self.center_view) {
+            self.workspace_view_index = index;
+        }
+        self.focus = Focus::Views;
+    }
+
+    pub(super) fn move_workspace_view_selection(&mut self, delta: i32) {
+        let last = WorkspaceView::ALL.len().saturating_sub(1);
+        self.workspace_view_index = if delta < 0 {
+            self.workspace_view_index
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.workspace_view_index
+                .saturating_add(delta as usize)
+                .min(last)
+        };
+    }
+
+    pub(super) fn activate_workspace_view(&mut self, center_view: CenterView) {
+        let Some(index) = WorkspaceView::index_of(center_view) else {
+            return;
+        };
+        self.workspace_view_index = index;
+        self.center_view = center_view;
+        self.focus = Focus::Center;
+        if center_view == CenterView::Todo {
+            self.reload_todos();
+            self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
+            self.todo_list_start = 0;
+        }
     }
 
     pub fn open_search(&mut self) {
@@ -211,24 +241,10 @@ impl App {
                 None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.center_view == CenterView::Daily {
-                    self.focus = Focus::Center;
-                } else if let Some(group) = self.selected_file_group() {
-                    let expanded = match group {
-                        FileGroup::Notes => &mut self.notes_expanded,
-                        FileGroup::Archives => &mut self.archives_expanded,
-                    };
-                    if *expanded {
-                        if let Some(path) = self.current_note_path() {
-                            self.sync_file_tree_to_note(&path);
-                        }
-                        self.focus = Focus::Center;
-                    } else {
-                        *expanded = true;
-                    }
-                } else {
-                    self.open_selected_file(DocumentReturn::Daily);
+                if let Some(path) = self.current_note_path() {
+                    self.sync_file_tree_to_note(&path);
                 }
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {

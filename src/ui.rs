@@ -3,8 +3,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-#[cfg(test)]
-mod tests;
 mod agent;
 mod compose;
 mod daily;
@@ -18,11 +16,15 @@ mod notification;
 mod search;
 mod tags;
 mod terminal;
+#[cfg(test)]
+mod tests;
+mod todo;
 mod util;
+mod views;
 
 use self::{
-    agent::*, compose::*, daily::*, dialog::*, diff::*, document::*, files::*, footer::*,
-    input::*, notification::*, search::*, tags::*, terminal::*, util::*,
+    agent::*, compose::*, daily::*, dialog::*, diff::*, document::*, files::*, footer::*, input::*,
+    notification::*, search::*, tags::*, terminal::*, todo::*, util::*, views::*,
 };
 
 use chrono::{DateTime, Local, NaiveDate};
@@ -37,12 +39,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::agent::PermissionMode;
 use crate::app::{
     App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus, LayoutSnapshot,
-    Overlay,
+    Overlay, SidebarSelection, WorkspaceView,
 };
 use crate::embedded_terminal::TerminalSnapshot;
 use crate::model::{
     Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
-    LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
+    LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox, WorkspaceViewHitbox,
 };
 use crate::theme::Theme;
 
@@ -59,11 +61,6 @@ pub(in crate::ui) const APPROVAL_UNIFIED_WIDTH: u16 = 110;
 pub(in crate::ui) const APPROVAL_SIDE_BY_SIDE_WIDTH: u16 = 160;
 pub(in crate::ui) const APPROVAL_SIDE_BY_SIDE_MIN_WIDTH: u16 = 140;
 pub(in crate::ui) const SELECT_OPTION_HEIGHT: u16 = 2;
-
-
-
-
-
 
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
 /// position without changing the terminal's hardware cursor.
@@ -119,6 +116,7 @@ fn clear_hitboxes(app: &mut App) {
     app.file_hitboxes.clear();
     app.file_group_hitboxes.clear();
     app.todo_hitboxes.clear();
+    app.workspace_view_hitboxes.clear();
     app.search_hitboxes.clear();
 }
 
@@ -140,11 +138,11 @@ fn draw_wide_workspace(
     cursor_position: &mut Option<Position>,
 ) {
     let files = Rect::new(body.x, body.y, FILES_WIDTH.min(body.width), body.height);
-    let todo_width = RIGHT_SIDEBAR_WIDTH.min(body.width.saturating_sub(files.width));
-    let todo = Rect::new(
-        body.x + body.width.saturating_sub(todo_width),
+    let sidebar_width = RIGHT_SIDEBAR_WIDTH.min(body.width.saturating_sub(files.width));
+    let sidebar = Rect::new(
+        body.x + body.width.saturating_sub(sidebar_width),
         body.y,
-        todo_width,
+        sidebar_width,
         body.height,
     );
     let center_region = Rect::new(
@@ -152,40 +150,35 @@ fn draw_wide_workspace(
         body.y,
         body.width
             .saturating_sub(files.width)
-            .saturating_sub(todo.width),
+            .saturating_sub(sidebar.width),
         body.height,
     );
     app.layout.files = non_empty(files);
     app.layout.center = non_empty(center_region);
     draw_files(frame, app, files, interactive, cursor_position);
     draw_center(frame, app, center_region, interactive, cursor_position);
-    draw_right_sidebar(frame, app, todo, interactive);
+    draw_right_sidebar(frame, app, sidebar, interactive);
 }
 
 fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
-    let todo_height = area.height.div_ceil(3);
-    let todo = Rect::new(area.x, area.y, area.width, todo_height);
+    let views_height = area.height.div_ceil(3);
     let agent = Rect::new(
         area.x,
-        area.y.saturating_add(todo_height),
+        area.y,
         area.width,
-        area.height.saturating_sub(todo_height),
+        area.height.saturating_sub(views_height),
     );
-    app.layout.todo = non_empty(todo);
+    let views = Rect::new(
+        area.x,
+        area.y.saturating_add(agent.height),
+        area.width,
+        views_height,
+    );
     app.layout.agent = non_empty(agent);
-    draw_todo(frame, app, todo, interactive);
+    app.layout.views = non_empty(views);
     draw_agent_output(frame, app, agent);
+    draw_workspace_views(frame, app, views, interactive);
 }
-
-
-
-
-
-
-
-
-
-
 
 fn draw_narrow_workspace(
     frame: &mut Frame,
@@ -197,9 +190,9 @@ fn draw_narrow_workspace(
     if app.focus == Focus::Files || app.files_context != FilesContext::Browse {
         app.layout.files = non_empty(body);
         draw_files(frame, app, body, interactive, cursor_position);
-    } else if app.focus == Focus::Todo {
-        app.layout.todo = non_empty(body);
-        draw_todo(frame, app, body, interactive);
+    } else if app.focus == Focus::Views {
+        app.layout.views = non_empty(body);
+        draw_workspace_views(frame, app, body, interactive);
     } else if app.focus == Focus::Agent {
         app.layout.agent = non_empty(body);
         draw_agent_output(frame, app, body);
@@ -208,27 +201,6 @@ fn draw_narrow_workspace(
         draw_center(frame, app, body, interactive, cursor_position);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn draw_center(
     frame: &mut Frame,
@@ -240,6 +212,7 @@ fn draw_center(
     let content = center_content_axis(area);
     match app.center_view {
         CenterView::Daily => draw_daily(frame, app, area, content, interactive, cursor_position),
+        CenterView::Todo => draw_todo(frame, app, content, interactive),
         CenterView::Document => draw_document(frame, app, content, interactive, cursor_position),
         CenterView::Search | CenterView::DocumentSearch => {
             draw_search(frame, app, content, interactive, cursor_position)
@@ -247,35 +220,6 @@ fn draw_center(
         CenterView::Tags => draw_tags(frame, app, content, interactive, cursor_position),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn draw_overlay(
     frame: &mut Frame,
@@ -289,16 +233,3 @@ fn draw_overlay(
         _ => draw_dialog(frame, app, root, cursor_position),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

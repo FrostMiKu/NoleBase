@@ -57,10 +57,11 @@ impl App {
         match self.focus {
             Focus::Compose => self.handle_compose(key),
             Focus::Files => self.handle_files(key),
-            Focus::Todo => self.handle_todo(key),
+            Focus::Views => self.handle_workspace_views(key),
             Focus::Agent => self.handle_agent(key),
             Focus::Center => match self.center_view {
                 CenterView::Daily => self.handle_daily(key),
+                CenterView::Todo => self.handle_todo(key),
                 CenterView::Document => self.handle_document(key),
                 CenterView::Search | CenterView::DocumentSearch => self.handle_search(key),
                 CenterView::Tags => self.handle_tags(key),
@@ -363,7 +364,7 @@ impl App {
                 None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.open_todo();
+                self.open_workspace_views();
                 None
             }
             KeyCode::Char('g') => {
@@ -407,20 +408,11 @@ impl App {
     pub(super) fn handle_todo(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.focus = Focus::Center;
+                self.activate_workspace_view(CenterView::Daily);
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let visible = self.visible_todo_indices();
-                let at_end = visible.is_empty()
-                    || visible
-                        .last()
-                        .is_some_and(|index| *index == self.todo_index);
-                if at_end && !self.agent_panel.is_empty() {
-                    self.focus = Focus::Agent;
-                } else {
-                    self.move_todo_selection(1);
-                }
+                self.move_todo_selection(1);
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -428,11 +420,46 @@ impl App {
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.focus = Focus::Center;
+                self.open_files();
+                None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.open_workspace_views();
                 None
             }
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
                 self.toggle_todo(self.todo_index);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn handle_workspace_views(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = Focus::Center;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.workspace_view_index == 0 => {
+                self.focus = Focus::Agent;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_workspace_view_selection(-1);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_workspace_view_selection(1);
+                None
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let view = WorkspaceView::ALL
+                    .get(self.workspace_view_index)
+                    .map(|view| view.center_view);
+                if let Some(view) = view {
+                    self.activate_workspace_view(view);
+                }
                 None
             }
             _ => None,
@@ -447,7 +474,7 @@ impl App {
                 None
             }
             KeyCode::Up | KeyCode::Char('k') if self.agent_scroll == 0 => {
-                self.focus = Focus::Todo;
+                self.focus = Focus::Center;
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -648,8 +675,8 @@ impl App {
 
         if in_area(column, row, self.layout.files) {
             self.move_file_selection(delta);
-        } else if in_area(column, row, self.layout.todo) {
-            self.move_todo_selection(delta);
+        } else if in_area(column, row, self.layout.views) {
+            self.move_workspace_view_selection(delta);
         } else if in_area(column, row, self.layout.agent) {
             self.agent_scroll = if delta > 0 {
                 self.agent_scroll.saturating_add(delta as u16)
@@ -667,6 +694,7 @@ impl App {
                         self.scroll.saturating_sub(delta.unsigned_abs() as u16)
                     };
                 }
+                CenterView::Todo => self.move_todo_selection(delta),
                 CenterView::Document => self.scroll_document(delta),
                 CenterView::Search | CenterView::DocumentSearch => {
                     self.move_search_selection(delta)
@@ -761,9 +789,22 @@ impl App {
             .find(|hitbox| point_in_rect(column, row, hitbox.area))
             .map(|hitbox| hitbox.index)
         {
-            self.focus = Focus::Todo;
+            self.center_view = CenterView::Todo;
+            self.focus = Focus::Center;
             self.todo_index = index;
             self.toggle_todo(index);
+            return None;
+        }
+
+        if let Some(index) = self
+            .workspace_view_hitboxes
+            .iter()
+            .find(|hitbox| point_in_rect(column, row, hitbox.area))
+            .map(|hitbox| hitbox.index)
+        {
+            if let Some(center_view) = WorkspaceView::ALL.get(index).map(|view| view.center_view) {
+                self.activate_workspace_view(center_view);
+            }
             return None;
         }
 
@@ -823,8 +864,8 @@ impl App {
             self.focus = Focus::Compose;
         } else if in_area(column, row, self.layout.files) {
             self.focus = Focus::Files;
-        } else if in_area(column, row, self.layout.todo) {
-            self.focus = Focus::Todo;
+        } else if in_area(column, row, self.layout.views) {
+            self.focus = Focus::Views;
         } else if in_area(column, row, self.layout.agent) {
             self.focus = Focus::Agent;
         } else if in_area(column, row, self.layout.center) {
@@ -906,7 +947,11 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn append_to_today(&mut self, body: &str, original_input: &str) -> anyhow::Result<()> {
+    pub(super) fn append_to_today(
+        &mut self,
+        body: &str,
+        original_input: &str,
+    ) -> anyhow::Result<()> {
         let (_, receipt) = self.storage.append_to_today_tracked(body)?;
         self.record_undo(UndoOp::Append {
             receipt,

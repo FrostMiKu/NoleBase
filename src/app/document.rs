@@ -52,7 +52,12 @@ pub(super) struct DocumentRenderLru {
 }
 
 impl DocumentRenderLru {
-    pub(super) fn insert(&mut self, kind: DocumentKind, source: String, render: DocumentRenderCache) {
+    pub(super) fn insert(
+        &mut self,
+        kind: DocumentKind,
+        source: String,
+        render: DocumentRenderCache,
+    ) {
         self.remove(&kind);
         self.entries.push_front(CachedDocumentRender {
             kind,
@@ -66,7 +71,11 @@ impl DocumentRenderLru {
         }
     }
 
-    pub(super) fn take(&mut self, kind: &DocumentKind, source: &str) -> Option<DocumentRenderCache> {
+    pub(super) fn take(
+        &mut self,
+        kind: &DocumentKind,
+        source: &str,
+    ) -> Option<DocumentRenderCache> {
         let index = self.entries.iter().position(|entry| &entry.kind == kind)?;
         let entry = self.entries.remove(index)?;
         (entry.source == source).then_some(entry.render)

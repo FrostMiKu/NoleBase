@@ -100,4 +100,3 @@ pub(super) fn terminal_color(color: vt100::Color, default: Color) -> Color {
         vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
-

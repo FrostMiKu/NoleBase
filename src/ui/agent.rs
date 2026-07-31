@@ -269,7 +269,11 @@ pub(super) fn render_agent_entry(
     (lines, links, images)
 }
 
-pub(super) fn agent_message_line(line: Line<'static>, width: usize, background: Color) -> Line<'static> {
+pub(super) fn agent_message_line(
+    line: Line<'static>,
+    width: usize,
+    background: Color,
+) -> Line<'static> {
     let mut line = line_with_background(line.spans, width, Style::default().bg(background));
     line.style = line.style.bg(background);
     line

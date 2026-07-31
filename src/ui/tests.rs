@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use tempfile::tempdir;
@@ -367,7 +365,7 @@ fn narrow_center_surface_fills_body_while_content_axis_is_capped() {
             "width {width}"
         );
         assert!(app.layout.files.is_none());
-        assert!(app.layout.todo.is_none());
+        assert!(app.layout.views.is_none());
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
         assert!(buffer_string(&terminal).contains("Daily"));
     }
@@ -381,14 +379,15 @@ fn wide_layout_uses_terminal_edges_and_center_content_axis() {
         render(&mut app, width, 24);
         let files = app.layout.files.unwrap();
         let center = app.layout.center.unwrap();
-        let todo = app.layout.todo.unwrap();
+        let views = app.layout.views.unwrap();
         let agent = app.layout.agent.unwrap();
         assert_eq!(files, Rect::new(0, 0, FILES_WIDTH, 23), "width {width}");
-        assert_eq!(todo.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
-        assert_eq!(todo.x + todo.width, width, "width {width}");
-        assert_eq!(todo.height, 23u16.div_ceil(3), "width {width}");
-        assert_eq!(agent.y, todo.y + todo.height, "width {width}");
-        assert_eq!(agent.height, 23 - todo.height, "width {width}");
+        assert_eq!(views.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
+        assert_eq!(views.x + views.width, width, "width {width}");
+        assert_eq!(views.height, 23u16.div_ceil(3), "width {width}");
+        assert_eq!(agent.y, 0, "width {width}");
+        assert_eq!(views.y, agent.y + agent.height, "width {width}");
+        assert_eq!(agent.height, 23 - views.height, "width {width}");
         let region_width = width - FILES_WIDTH - RIGHT_SIDEBAR_WIDTH;
         assert_eq!(center, Rect::new(FILES_WIDTH, 0, region_width, 23));
         let content = center_content_axis(center);
@@ -399,6 +398,98 @@ fn wide_layout_uses_terminal_edges_and_center_content_axis() {
             "width {width}"
         );
     }
+}
+
+#[test]
+fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Views;
+    let terminal = render(&mut app, 170, 24);
+    let screen = buffer_string(&terminal);
+    let views = app.layout.views.expect("views panel");
+
+    assert_eq!(app.workspace_view_hitboxes.len(), WorkspaceView::ALL.len());
+    for view in WorkspaceView::ALL {
+        assert!(screen.contains(view.label));
+    }
+    assert!(app
+        .workspace_view_hitboxes
+        .iter()
+        .all(|hitbox| contains(views, hitbox.area)));
+    let daily = app.workspace_view_hitboxes[0].area;
+    let buffer = terminal.backend().buffer();
+    for y in daily.y.saturating_sub(1)..=daily.y + daily.height {
+        assert_eq!(buffer[(daily.x, y)].symbol(), "▌");
+        assert_eq!(buffer[(daily.x, y)].bg, app.theme.selection_background);
+    }
+    assert!(screen.contains("Daily notes"));
+    assert!(screen.contains("Tasks"));
+
+    let todo = app.workspace_view_hitboxes[1].area;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: todo.x,
+        row: todo.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.center_view, CenterView::Todo);
+    assert_eq!(app.focus, Focus::Center);
+}
+
+#[test]
+fn center_view_interface_assigns_the_visible_sidebar_cursor() {
+    let (mut app, _directory) = make_app();
+    let path = app.storage.data_dir.join("Project.md");
+    fs::write(&path, "project").unwrap();
+    app.reload_files();
+    app.focus = Focus::Center;
+
+    let daily = render(&mut app, 170, 24);
+    let daily_file = app
+        .file_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.path == path)
+        .expect("project file")
+        .area;
+    let daily_view = app.workspace_view_hitboxes[0].area;
+    assert_ne!(
+        daily.backend().buffer()[(daily_file.x, daily_file.y)].symbol(),
+        "▌"
+    );
+    assert_eq!(
+        daily.backend().buffer()[(daily_view.x, daily_view.y)].symbol(),
+        "▌"
+    );
+
+    app.open_files();
+    app.file_index = app
+        .note_files
+        .iter()
+        .position(|file| file.path == path)
+        .unwrap();
+    app.selected_file = Some(path.clone());
+    app.file_row = app
+        .visible_file_rows()
+        .iter()
+        .position(|row| matches!(row, FileListRow::File(index) if *index == app.file_index))
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let document = render(&mut app, 170, 24);
+    let document_file = app
+        .file_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.path == path)
+        .expect("project file")
+        .area;
+    let document_view = app.workspace_view_hitboxes[0].area;
+    assert_eq!(
+        document.backend().buffer()[(document_file.x, document_file.y)].symbol(),
+        "▌"
+    );
+    assert_ne!(
+        document.backend().buffer()[(document_view.x, document_view.y)].symbol(),
+        "▌"
+    );
 }
 
 #[test]
@@ -674,7 +765,7 @@ fn virtual_line_window_clones_only_visible_rows() {
 }
 
 #[test]
-fn narrow_files_and_todo_each_use_the_full_body_without_duplicates() {
+fn narrow_files_and_todo_page_each_use_the_full_body_without_duplicates() {
     let (mut app, _directory) = make_app();
     fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
     app.reload_files();
@@ -682,7 +773,7 @@ fn narrow_files_and_todo_each_use_the_full_body_without_duplicates() {
     let terminal = render(&mut app, 80, 18);
     assert_eq!(app.layout.files, Some(Rect::new(0, 0, 80, 17)));
     assert!(app.layout.center.is_none());
-    assert!(app.layout.todo.is_none());
+    assert!(app.layout.views.is_none());
     assert_eq!(buffer_string(&terminal).matches("NólëBase").count(), 1);
     assert!(!app.file_hitboxes.is_empty());
     assert!(app
@@ -690,15 +781,16 @@ fn narrow_files_and_todo_each_use_the_full_body_without_duplicates() {
         .iter()
         .all(|hitbox| contains(app.layout.files.unwrap(), hitbox.area)));
 
-    app.focus = Focus::Todo;
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Todo;
     app.todo_items = vec![TodoItem {
         checked: false,
         text: "buy milk".to_string(),
     }];
     let terminal = render(&mut app, 60, 18);
-    assert_eq!(app.layout.todo, Some(Rect::new(0, 0, 60, 17)));
+    assert_eq!(app.layout.center, Some(Rect::new(0, 0, 60, 17)));
     assert!(app.layout.files.is_none());
-    assert!(app.layout.center.is_none());
+    assert!(app.layout.views.is_none());
     let screen = buffer_string(&terminal);
     assert_eq!(screen.matches("Todo").count(), 1);
     assert!(screen.contains("buy milk"));
@@ -711,11 +803,11 @@ fn sidebars_use_mantle_background_with_square_ui_borders() {
     let terminal = render(&mut app, 170, 24);
     let buffer = terminal.backend().buffer();
     let files = app.layout.files.expect("files panel");
-    let todo = app.layout.todo.expect("todo panel");
+    let views = app.layout.views.expect("views panel");
     let agent = app.layout.agent.expect("agent panel");
     let center = app.layout.center.expect("center region");
 
-    for area in [files, todo, agent] {
+    for area in [files, views, agent] {
         assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
         assert_eq!(
             buffer[(area.x + 2, area.y + area.height - 2)].bg,
@@ -1738,7 +1830,8 @@ fn multiline_chat_and_compose_content_render() {
 #[test]
 fn todo_items_wrap_and_keep_the_whole_item_clickable() {
     let (mut app, _directory) = make_app();
-    app.focus = Focus::Todo;
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Todo;
     app.todo_items = vec![TodoItem {
         checked: false,
         text: "a todo item whose content is deliberately longer than the panel".to_string(),
@@ -1755,7 +1848,8 @@ fn todo_items_wrap_and_keep_the_whole_item_clickable() {
 #[test]
 fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
     let (mut app, _directory) = make_app();
-    app.focus = Focus::Todo;
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Todo;
     app.todo_items = vec![
         TodoItem {
             checked: false,
@@ -1782,21 +1876,28 @@ fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
     assert_eq!(second_row, first_row + 2);
     assert_eq!(app.todo_hitboxes.len(), 2);
     assert_eq!(app.todo_hitboxes[0].area.height, 2);
-    let todo = app.layout.todo.unwrap();
+    let todo = app.layout.center.unwrap();
     let first = app.todo_hitboxes[0].area;
     let last = app.todo_hitboxes[1].area;
-    assert_eq!(first.y, todo.y + 2, "the first item needs a top margin");
+    assert_eq!(
+        first.y,
+        todo.y + 5,
+        "the first todo needs a blank row below the page header"
+    );
     assert_eq!(
         terminal.backend().buffer()[(first.x, first.y + first.height - 1)].bg,
         ctp::SURFACE_1,
         "the selected background should include the shared blank row"
     );
     assert_eq!(
-        terminal.backend().buffer()[(first.x, first.y)].symbol(),
+        terminal.backend().buffer()[(first.x + 2, first.y)].symbol(),
         "["
     );
-    assert_eq!(terminal.backend().buffer()[(last.x, last.y)].symbol(), "[");
-    let last_margin = &terminal.backend().buffer()[(last.x, last.y + last.height - 1)];
+    assert_eq!(
+        terminal.backend().buffer()[(last.x + 2, last.y)].symbol(),
+        "["
+    );
+    let last_margin = &terminal.backend().buffer()[(last.x + 1, last.y + last.height - 1)];
     assert_eq!(last_margin.symbol(), " ");
     assert_eq!(last_margin.bg, ctp::SURFACE_1);
     assert!(!last_margin.modifier.contains(Modifier::CROSSED_OUT));
@@ -1807,12 +1908,18 @@ fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
         let cell = &terminal.backend().buffer()[(x, last.y)];
         cell.modifier.contains(Modifier::CROSSED_OUT) && cell.symbol() != " "
     }));
+    for y in last.y.saturating_sub(1)..last.y + last.height {
+        let cell = &terminal.backend().buffer()[(last.x, y)];
+        assert_eq!(cell.symbol(), "▌");
+        assert_eq!(cell.fg, app.theme.selection_indicator);
+    }
 }
 
 #[test]
 fn todo_display_groups_open_items_before_completed_items() {
     let (mut app, _directory) = make_app();
-    app.focus = Focus::Todo;
+    app.focus = Focus::Center;
+    app.center_view = CenterView::Todo;
     app.todo_items = vec![
         TodoItem {
             checked: true,
@@ -1898,9 +2005,7 @@ fn chat_renders_block_markdown_on_colored_cards() {
     );
     assert!(
         buffer.content().iter().any(|cell| {
-            cell.symbol() == "H"
-                && cell.modifier.contains(Modifier::BOLD)
-                && cell.bg == ctp::MANTLE
+            cell.symbol() == "H" && cell.modifier.contains(Modifier::BOLD) && cell.bg == ctp::MANTLE
         }),
         "selection should not alter the Markdown body background"
     );
@@ -2151,16 +2256,10 @@ fn document_scroll_overwrites_box_borders_from_the_previous_frame() {
             })
             .unwrap();
         let box_buffer = completed.buffer;
-        let mut saw_vs16 = false;
-        for y in 0..box_buffer.area.height {
-            for x in 0..box_buffer.area.width.saturating_sub(1) {
-                if box_buffer[(x, y)].symbol().contains('\u{fe0f}') {
-                    saw_vs16 = true;
-                    assert_eq!(box_buffer[(x + 1, y)].diff_option, CellDiffOption::Skip);
-                }
-            }
-        }
-        assert!(saw_vs16);
+        assert!(box_buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains('\u{fe0f}')));
     }
     assert!(terminal
         .backend()

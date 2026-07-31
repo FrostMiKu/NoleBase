@@ -150,6 +150,13 @@ pub struct TodoHitbox {
     pub area: Rect,
 }
 
+/// A recorded screen rectangle for a registered workspace view.
+#[derive(Debug, Clone)]
+pub struct WorkspaceViewHitbox {
+    pub index: usize,
+    pub area: Rect,
+}
+
 /// One content-search match.
 #[derive(Debug, Clone)]
 pub enum SearchHit {

@@ -31,4 +31,3 @@ pub(super) fn draw_notification(frame: &mut Frame, root: Rect, message: &str, th
         area,
     );
 }
-

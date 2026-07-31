@@ -451,7 +451,7 @@ fn opening_a_note_keeps_the_file_tree_selection_in_sync() {
 }
 
 #[test]
-fn right_from_the_file_tree_opens_its_selected_note_before_focusing_content() {
+fn right_from_the_file_tree_returns_to_the_open_document_without_opening_selection() {
     let (mut app, _directory) = make_app();
     let first = app.storage.data_dir.join("First.md");
     let second = app.storage.data_dir.join("Second.md");
@@ -463,15 +463,15 @@ fn right_from_the_file_tree_opens_its_selected_note_before_focusing_content() {
     let second_row = app
         .visible_file_rows()
         .iter()
-        .position(|row| {
-            matches!(row, FileListRow::File(index) if app.note_files[*index].path == second)
-        })
+        .position(
+            |row| matches!(row, FileListRow::File(index) if app.note_files[*index].path == second),
+        )
         .unwrap();
     app.select_file_row(second_row);
     assert_eq!(app.selected_file.as_ref(), Some(&second));
     assert_eq!(
         app.document.as_ref().map(|document| &document.kind),
-        Some(&DocumentKind::File(first))
+        Some(&DocumentKind::File(first.clone()))
     );
 
     app.handle_key(key(KeyCode::Right));
@@ -479,9 +479,9 @@ fn right_from_the_file_tree_opens_its_selected_note_before_focusing_content() {
     assert_eq!(app.focus, Focus::Center);
     assert_eq!(
         app.document.as_ref().map(|document| &document.kind),
-        Some(&DocumentKind::File(second.clone()))
+        Some(&DocumentKind::File(first.clone()))
     );
-    assert_eq!(app.selected_file.as_ref(), Some(&second));
+    assert_eq!(app.selected_file.as_ref(), Some(&first));
 }
 
 #[test]
@@ -496,9 +496,9 @@ fn right_from_the_file_tree_returns_to_daily_without_opening_a_note() {
     let note_row = app
         .visible_file_rows()
         .iter()
-        .position(|row| {
-            matches!(row, FileListRow::File(index) if app.note_files[*index].path == note)
-        })
+        .position(
+            |row| matches!(row, FileListRow::File(index) if app.note_files[*index].path == note),
+        )
         .unwrap();
     app.select_file_row(note_row);
 
@@ -1411,15 +1411,37 @@ fn ctrl_enter_buffers_and_clears_compose_while_agent_is_busy() {
 }
 
 #[test]
-fn f_and_t_change_only_focus() {
+fn f_focuses_files_and_t_opens_the_todo_page() {
     let (mut app, _directory) = make_app();
     app.focus = Focus::Center;
     app.handle_key(key(KeyCode::Char('f')));
     assert_eq!(app.focus, Focus::Files);
     assert_eq!(app.center_view, CenterView::Daily);
     app.handle_key(key(KeyCode::Char('t')));
-    assert_eq!(app.focus, Focus::Todo);
-    assert_eq!(app.center_view, CenterView::Daily);
+    assert_eq!(app.focus, Focus::Center);
+    assert_eq!(app.center_view, CenterView::Todo);
+}
+
+#[test]
+fn workspace_view_registry_drives_sidebar_selection() {
+    let (mut app, _directory) = make_app();
+    assert_eq!(
+        WorkspaceView::ALL
+            .iter()
+            .map(|view| (view.label, view.description, view.center_view))
+            .collect::<Vec<_>>(),
+        [
+            ("Daily", "Daily notes", CenterView::Daily),
+            ("TODO", "Tasks", CenterView::Todo),
+        ]
+    );
+
+    app.focus = Focus::Views;
+    app.workspace_view_index = 1;
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.focus, Focus::Center);
+    assert_eq!(app.center_view, CenterView::Todo);
 }
 
 #[test]
@@ -1435,18 +1457,13 @@ fn arrows_move_focus_across_the_workspace() {
     assert_eq!(app.center_view, CenterView::Daily);
 
     app.handle_key(key(KeyCode::Right));
-    assert_eq!(app.focus, Focus::Todo);
+    assert_eq!(app.focus, Focus::Views);
     app.handle_key(key(KeyCode::Left));
     assert_eq!(app.focus, Focus::Center);
 
-    app.todo_items.clear();
-    app.agent_panel.push(AgentPanelEntry::Assistant {
-        text: "final reply".to_string(),
-        streaming: false,
-        final_output: true,
-    });
-    app.focus = Focus::Todo;
-    app.handle_key(key(KeyCode::Down));
+    app.focus = Focus::Views;
+    app.workspace_view_index = 0;
+    app.handle_key(key(KeyCode::Up));
     assert_eq!(app.focus, Focus::Agent);
 }
 
@@ -1498,7 +1515,7 @@ fn file_search_includes_archives_but_move_targets_do_not() {
 }
 
 #[test]
-fn todo_and_agent_form_a_navigable_right_sidebar() {
+fn views_and_agent_form_a_navigable_right_sidebar() {
     let (mut app, _directory) = make_app();
     app.todo_items = vec![TodoItem {
         checked: false,
@@ -1510,14 +1527,11 @@ fn todo_and_agent_form_a_navigable_right_sidebar() {
         streaming: false,
         final_output: true,
     });
-    app.focus = Focus::Todo;
+    app.focus = Focus::Views;
+    app.workspace_view_index = 0;
 
-    app.handle_key(key(KeyCode::Down));
-    assert_eq!(app.focus, Focus::Agent);
     app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.focus, Focus::Todo);
-
-    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.focus, Focus::Agent);
     app.handle_key(key(KeyCode::Left));
     assert_eq!(app.focus, Focus::Center);
 }
@@ -2109,13 +2123,13 @@ fn workspace_reload_refreshes_an_open_daily_note_from_disk() {
 #[test]
 fn help_overlay_restores_underlying_state() {
     let (mut app, _directory) = make_app();
-    app.focus = Focus::Todo;
+    app.focus = Focus::Views;
     app.open_help();
     app.handle_key(key(KeyCode::Down));
     assert_eq!(app.help_scroll, 1);
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.overlay, None);
-    assert_eq!(app.focus, Focus::Todo);
+    assert_eq!(app.focus, Focus::Views);
     assert_eq!(app.center_view, CenterView::Daily);
 }
 
@@ -2132,18 +2146,19 @@ fn wheel_routes_by_layout_coordinates_not_focus() {
             text: "two".to_string(),
         },
     ];
-    app.layout.todo = Some(Rect::new(80, 0, 20, 20));
     app.layout.center = Some(Rect::new(20, 0, 60, 20));
     app.focus = Focus::Center;
+    app.center_view = CenterView::Todo;
     app.scroll = 4;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::ScrollDown,
-        column: 90,
+        column: 30,
         row: 4,
         modifiers: KeyModifiers::NONE,
     });
     assert_eq!(app.todo_index, 1);
     assert_eq!(app.scroll, 4);
+    app.center_view = CenterView::Daily;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 30,

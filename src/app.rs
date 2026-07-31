@@ -19,7 +19,7 @@ use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSna
 use crate::model::{
     Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
     FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
-    TodoItem, WikiLinkCandidate, WikiLinkHitbox,
+    TodoItem, WikiLinkCandidate, WikiLinkHitbox, WorkspaceViewHitbox,
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
@@ -35,13 +35,13 @@ mod document;
 mod documents;
 mod input;
 mod model;
+mod terminal;
 #[cfg(test)]
 mod tests;
-mod terminal;
 mod vlist;
 
-pub use self::{dialog::*, document::*, model::*};
 pub(crate) use self::vlist::*;
+pub use self::{dialog::*, document::*, model::*};
 
 pub(in crate::app) fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
     col >= area.x
@@ -222,6 +222,7 @@ pub struct App {
     pub todo_items: Vec<TodoItem>,
     pub todo_index: usize,
     pub todo_list_start: usize,
+    pub workspace_view_index: usize,
 
     pub search_query: String,
     pub search_results: Vec<SearchHit>,
@@ -248,6 +249,7 @@ pub struct App {
     pub file_hitboxes: Vec<FileHitbox>,
     pub file_group_hitboxes: Vec<FileGroupHitbox>,
     pub todo_hitboxes: Vec<TodoHitbox>,
+    pub workspace_view_hitboxes: Vec<WorkspaceViewHitbox>,
     pub search_hitboxes: Vec<SearchHitbox>,
     pub wiki_link_hitboxes: Vec<WikiLinkHitbox>,
     pub dialog_hitboxes: Vec<DialogOptionHitbox>,
@@ -382,6 +384,7 @@ impl App {
             todo_items,
             todo_index: 0,
             todo_list_start: 0,
+            workspace_view_index: 0,
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
@@ -404,6 +407,7 @@ impl App {
             file_hitboxes: Vec::new(),
             file_group_hitboxes: Vec::new(),
             todo_hitboxes: Vec::new(),
+            workspace_view_hitboxes: Vec::new(),
             search_hitboxes: Vec::new(),
             wiki_link_hitboxes: Vec::new(),
             dialog_hitboxes: Vec::new(),
@@ -592,5 +596,4 @@ impl App {
         self.notifications.notify(error.clone());
         self.status = error;
     }
-
 }

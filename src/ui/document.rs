@@ -58,13 +58,7 @@ pub(super) fn draw_document(
             .unwrap_or_else(|| app.storage.root.clone()),
         crate::app::DocumentKind::Daily(_) => app.storage.daily_dir.clone(),
     };
-    let (
-        rendered_links,
-        rendered_tags,
-        rendered_images,
-        document_scroll,
-        visible_top_margin,
-    ) = {
+    let (rendered_links, rendered_tags, rendered_images, document_scroll, visible_top_margin) = {
         let document = app.document.as_mut().expect("document checked above");
         frame.render_widget(
             Paragraph::new(Span::styled(

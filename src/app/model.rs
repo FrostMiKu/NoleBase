@@ -215,7 +215,7 @@ pub enum Focus {
     Center,
     Compose,
     Files,
-    Todo,
+    Views,
     Agent,
 }
 
@@ -223,10 +223,63 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CenterView {
     Daily,
+    Todo,
     Document,
     Search,
     DocumentSearch,
     Tags,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarSelection {
+    Files,
+    Views,
+}
+
+impl CenterView {
+    /// Sidebar whose selection represents this center view while the center has
+    /// focus. A directly focused sidebar still shows its own selection.
+    pub const fn sidebar_selection(self) -> SidebarSelection {
+        match self {
+            Self::Document => SidebarSelection::Files,
+            Self::Daily | Self::Todo | Self::Search | Self::DocumentSearch | Self::Tags => {
+                SidebarSelection::Views
+            }
+        }
+    }
+}
+
+/// A top-level page exposed by the workspace view switcher.
+///
+/// Adding a page starts here: register it in [`WorkspaceView::ALL`], then add
+/// its center renderer and input handler. The sidebar reads this registry and
+/// never owns its own list of pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceView {
+    pub center_view: CenterView,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
+impl WorkspaceView {
+    pub const ALL: &'static [Self] = &[
+        Self {
+            center_view: CenterView::Daily,
+            label: "Daily",
+            description: "Daily notes",
+        },
+        Self {
+            center_view: CenterView::Todo,
+            label: "TODO",
+            description: "Tasks",
+        },
+    ];
+
+    pub fn index_of(center_view: CenterView) -> Option<usize> {
+        Self::ALL
+            .iter()
+            .position(|view| view.center_view == center_view)
+    }
 }
 
 /// Interaction taking place inside the files pane.
@@ -259,13 +312,13 @@ pub enum Overlay {
 /// Screen geometry recorded by the renderer after each layout pass.
 ///
 /// Mouse wheel events use these rectangles instead of the keyboard focus, so a
-/// wheel over Files/Todo/Center always affects the pane under the pointer.
+/// wheel over Files/Views/Center always affects the pane under the pointer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LayoutSnapshot {
     pub files: Option<Rect>,
     pub center: Option<Rect>,
     pub compose: Option<Rect>,
-    pub todo: Option<Rect>,
+    pub views: Option<Rect>,
     pub agent: Option<Rect>,
     pub overlay: Option<Rect>,
 }

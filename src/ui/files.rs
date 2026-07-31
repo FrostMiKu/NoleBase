@@ -12,6 +12,8 @@ pub(super) fn draw_files(
     }
 
     let focused = app.focus == Focus::Files;
+    let selection_visible =
+        focused || app.center_view.sidebar_selection() == SidebarSelection::Files;
     let title = match app.files_context {
         FilesContext::Browse => " NólëBase ",
         FilesContext::Search => " NólëBase · search ",
@@ -120,7 +122,7 @@ pub(super) fn draw_files(
             break;
         }
         let layout_height = row_height(&row).min(list_area.y + list_area.height - y);
-        let selected = row_index == selected_row;
+        let selected = selection_visible && row_index == selected_row;
         let row_style = if selected {
             Style::default()
                 .fg(app.theme.selection_foreground)
@@ -245,135 +247,6 @@ pub(super) fn draw_files(
                     draw_selection_indicator(frame, selection_area, app.theme);
                 }
             }
-        }
-        y = y.saturating_add(layout_height);
-    }
-}
-
-pub(super) fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let focused = app.focus == Focus::Todo;
-    let done = app.todo_items.iter().filter(|item| item.checked).count();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .padding(Padding::horizontal(PANEL_PADDING))
-        .title(format!(" Todo {done}/{} ", app.todo_items.len()))
-        .style(Style::default().bg(app.theme.surface_panel))
-        .border_style(focus_border(focused, app.theme));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    if app.todo_items.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No todos yet").alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
-
-    let visible_indices = app.visible_todo_indices();
-    let selected = app.todo_index.min(app.todo_items.len().saturating_sub(1));
-    let selected_position = visible_indices
-        .iter()
-        .position(|index| *index == selected)
-        .unwrap_or(0);
-    let text_width = inner.width.saturating_sub(4).max(1) as usize;
-    let item_heights: Vec<usize> = visible_indices
-        .iter()
-        .filter_map(|index| app.todo_items.get(*index))
-        .map(|item| {
-            wrap_spans_to_width(&[Span::raw(item.text.replace('\n', " "))], text_width).len() + 1
-        })
-        .collect();
-    let viewport_height = inner.height.saturating_sub(1) as usize;
-    if viewport_height == 0 {
-        return;
-    }
-    let start = variable_selection_viewport_start(
-        app.todo_list_start,
-        selected_position,
-        &item_heights,
-        viewport_height,
-    );
-    app.todo_list_start = start;
-
-    let mut y = inner.y.saturating_add(1);
-    for index in visible_indices.iter().copied().skip(start) {
-        if y >= inner.y.saturating_add(inner.height) {
-            break;
-        }
-        let Some(item) = app.todo_items.get(index) else {
-            continue;
-        };
-        let checked = if item.checked { "[x]" } else { "[ ]" };
-        let item_selected = focused && index == selected;
-        let marker_style = if item_selected {
-            Style::default()
-                .fg(app.theme.selection_foreground)
-                .add_modifier(Modifier::BOLD)
-        } else if item.checked {
-            Style::default()
-                .fg(app.theme.ui_task_done)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(app.theme.ui_task_open)
-        };
-        let mut text_style = if item.checked {
-            Style::default().add_modifier(Modifier::CROSSED_OUT)
-        } else {
-            Style::default()
-        };
-        if item_selected {
-            text_style = text_style
-                .fg(app.theme.selection_foreground)
-                .bg(app.theme.selection_background);
-        }
-        let wrapped = wrap_spans_to_width(
-            &[Span::styled(item.text.replace('\n', " "), text_style)],
-            text_width,
-        );
-        let content_height = wrapped.len() as u16;
-        let layout_height = content_height
-            .saturating_add(1)
-            .min(inner.y.saturating_add(inner.height).saturating_sub(y));
-        let visible_height = content_height.min(layout_height);
-        if item_selected {
-            frame.render_widget(
-                Block::default().style(
-                    Style::default()
-                        .fg(app.theme.selection_foreground)
-                        .bg(app.theme.selection_background),
-                ),
-                shared_selection_area(inner, y, layout_height),
-            );
-        }
-        for (row, mut spans) in wrapped
-            .into_iter()
-            .take(visible_height as usize)
-            .enumerate()
-        {
-            let mut line = if row == 0 {
-                vec![Span::styled(format!("{checked} "), marker_style)]
-            } else {
-                vec![Span::raw("    ")]
-            };
-            line.append(&mut spans);
-            frame.render_widget(
-                Paragraph::new(Line::from(line)),
-                Rect::new(inner.x, y + row as u16, inner.width, 1),
-            );
-        }
-        let item_area = Rect::new(inner.x, y, inner.width, layout_height);
-        if interactive {
-            app.todo_hitboxes.push(TodoHitbox {
-                index,
-                area: item_area,
-            });
         }
         y = y.saturating_add(layout_height);
     }
