@@ -32,6 +32,7 @@ use crate::workspace_index::WorkspaceIndexHandle;
 
 #[cfg(test)]
 mod test_support;
+mod subagent;
 mod tools;
 
 use tools::*;
@@ -917,17 +918,21 @@ impl Agent {
         agent.register(WebFetch {
             client: client.clone(),
         });
-        agent.register(Explore::new(
-            nole_root,
-            agent.config.clone(),
+        let subagent_runtime = subagent::SubagentRuntime::new(
+            &agent.config,
             agent.provider.clone(),
             agent.system.clone(),
             agent.events.clone(),
+            agent.cancelled.clone(),
+            agent.concurrency.clone(),
+        );
+        agent.register(Explore::new(
+            nole_root,
+            subagent_runtime,
             workspace_index,
             client,
             tavily_api_key,
             &skills,
-            agent.concurrency.clone(),
         )?);
         if let Some(definition) = agent.definitions.last_mut() {
             definition.cache = true;

@@ -395,7 +395,11 @@ conversation; the main Agent session stores only the `explore` call and its
 concise evidence-based report. Targeted reads and lookups can still use the
 corresponding tools directly. Independent `explore` calls run concurrently, as
 do independent read, search, and fetch calls within each subagent, subject to
-the shared limits above.
+the shared limits above. Isolated agents share a reusable task-scoped runtime;
+each profile supplies its own instructions, completion contract, and registered
+tool capabilities. `explore` is the built-in read-only profile rather than a
+special-purpose agent loop, and unregistered mutation, interaction, or
+recursive-agent capabilities are unavailable to it.
 You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
 An in-flight concurrent wave is allowed to finish, while later unstarted calls
