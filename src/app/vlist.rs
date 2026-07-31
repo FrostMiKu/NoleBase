@@ -27,6 +27,13 @@ pub(crate) struct AgentEntryRenderCache {
     pub images: Vec<mbtui::ImagePlacement>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AgentEntryRenderStyle {
+    #[default]
+    Panel,
+    Cards,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DailyVirtualItem {
     pub date: NaiveDate,
@@ -53,6 +60,7 @@ impl Default for DailyVirtualList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentVirtualList {
     pub width: usize,
+    pub style: AgentEntryRenderStyle,
     pub geometry: crate::vlist::VList,
     pub caches: Vec<Option<AgentEntryRenderCache>>,
 }
@@ -61,6 +69,7 @@ impl Default for AgentVirtualList {
     fn default() -> Self {
         Self {
             width: 0,
+            style: AgentEntryRenderStyle::Panel,
             geometry: crate::vlist::VList::new(4),
             caches: Vec::new(),
         }

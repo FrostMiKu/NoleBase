@@ -117,6 +117,9 @@ impl AgentSession {
                 }),
                 AgentPanelEntry::Assistant {
                     text, final_output, ..
+                } if text.trim().is_empty() => None,
+                AgentPanelEntry::Assistant {
+                    text, final_output, ..
                 } => Some(AgentPanelEntry::Assistant {
                     text: text.clone(),
                     streaming: false,
@@ -147,11 +150,21 @@ impl AgentSession {
         u64,
         Duration,
     ) {
+        let panel = self
+            .panel
+            .into_iter()
+            .filter(|entry| {
+                !matches!(
+                    entry,
+                    AgentPanelEntry::Assistant { text, .. } if text.trim().is_empty()
+                )
+            })
+            .collect();
         (
             AgentConversation {
                 messages: self.messages,
             },
-            self.panel,
+            panel,
             self.usage,
             self.timed_output_tokens,
             self.response_duration,
@@ -190,6 +203,11 @@ mod tests {
                     text: "Reading".to_string(),
                     active: true,
                 },
+                AgentPanelEntry::Assistant {
+                    text: String::new(),
+                    streaming: false,
+                    final_output: false,
+                },
             ],
             TokenUsage::default(),
             0,
@@ -205,6 +223,12 @@ mod tests {
                 ..
             }
         ));
+        assert!(panel.iter().all(|entry| {
+            !matches!(
+                entry,
+                AgentPanelEntry::Assistant { text, .. } if text.trim().is_empty()
+            )
+        }));
         assert!(matches!(
             &panel[2],
             AgentPanelEntry::Tool { active: false, .. }

@@ -384,7 +384,8 @@ impl App {
             todo_items,
             todo_index: 0,
             todo_list_start: 0,
-            workspace_view_index: 0,
+            workspace_view_index: WorkspaceView::index_of(CenterView::Daily)
+                .expect("Daily is a registered workspace view"),
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,

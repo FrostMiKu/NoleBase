@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod agent;
+mod chat;
 mod compose;
 mod daily;
 mod dialog;
@@ -23,8 +24,8 @@ mod util;
 mod views;
 
 use self::{
-    agent::*, compose::*, daily::*, dialog::*, diff::*, document::*, files::*, footer::*, input::*,
-    notification::*, search::*, tags::*, terminal::*, todo::*, util::*, views::*,
+    agent::*, chat::*, compose::*, daily::*, dialog::*, diff::*, document::*, files::*, footer::*,
+    input::*, notification::*, search::*, tags::*, terminal::*, todo::*, util::*, views::*,
 };
 
 use chrono::{DateTime, Local, NaiveDate};
@@ -161,7 +162,9 @@ fn draw_wide_workspace(
 }
 
 fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
-    let views_height = area.height.div_ceil(3);
+    let views_height = selection_list_height(WorkspaceView::ALL.len() as u16, 3)
+        .saturating_add(2)
+        .min(area.height);
     let agent = Rect::new(
         area.x,
         area.y,
@@ -176,7 +179,11 @@ fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive:
     );
     app.layout.agent = non_empty(agent);
     app.layout.views = non_empty(views);
-    draw_agent_output(frame, app, agent);
+    if app.center_view == CenterView::Chat {
+        draw_agent_statistics(frame, app, agent);
+    } else {
+        draw_agent_output(frame, app, agent);
+    }
     draw_workspace_views(frame, app, views, interactive);
 }
 
@@ -195,7 +202,11 @@ fn draw_narrow_workspace(
         draw_workspace_views(frame, app, body, interactive);
     } else if app.focus == Focus::Agent {
         app.layout.agent = non_empty(body);
-        draw_agent_output(frame, app, body);
+        if app.center_view == CenterView::Chat {
+            draw_agent_statistics(frame, app, body);
+        } else {
+            draw_agent_output(frame, app, body);
+        }
     } else {
         app.layout.center = non_empty(body);
         draw_center(frame, app, body, interactive, cursor_position);
@@ -212,6 +223,7 @@ fn draw_center(
     let content = center_content_axis(area);
     match app.center_view {
         CenterView::Daily => draw_daily(frame, app, area, content, interactive, cursor_position),
+        CenterView::Chat => draw_chat(frame, app, area, content, interactive, cursor_position),
         CenterView::Todo => draw_todo(frame, app, content, interactive),
         CenterView::Document => draw_document(frame, app, content, interactive, cursor_position),
         CenterView::Search | CenterView::DocumentSearch => {

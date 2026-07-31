@@ -17,6 +17,7 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (_, CenterView::Search, _) => "SEARCH",
         (_, CenterView::DocumentSearch, _) => "FIND",
         (_, CenterView::Tags, _) => "TAGS",
+        (_, CenterView::Chat, _) => "AI CHAT",
         (_, CenterView::Todo, _) => "TODO",
         _ => "DAILY",
     };
@@ -108,6 +109,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
     if width < 55 {
         return match (app.focus, app.center_view) {
             (Focus::Compose, CenterView::Document) => "Esc document",
+            (Focus::Compose, CenterView::Chat) => "Enter send · Esc chat",
             (Focus::Compose, _) => "Esc daily",
             (Focus::Files, _) => "Esc back · Enter open",
             (Focus::Views, _) => "Esc back · Enter switch",
@@ -125,6 +127,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
                 }
             }
             (Focus::Center, CenterView::Tags) => "type filter · ↑↓ select · Enter search",
+            (Focus::Center, CenterView::Chat) => "i message · ↑↓ scroll · C clear",
             (Focus::Center, CenterView::Todo) => "↑↓ select · Enter toggle",
             (Focus::Center, _) => "# tags · Ctrl+P commands",
         };
@@ -135,6 +138,9 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         }
         (Focus::Compose, CenterView::Document) => {
             "Enter append · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline · Ctrl+P commands"
+        }
+        (Focus::Compose, CenterView::Chat) => {
+            "Enter send · Ctrl+J newline · Esc chat · Ctrl+P commands"
         }
         (Focus::Files, _) => "↑↓ select · Enter open · a/u archive/restore · e edit · / filter",
         (Focus::Views, _) => "↑↓ select · Enter switch · Esc back",
@@ -164,6 +170,10 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
         (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
         (_, CenterView::Tags) => "type filter · ↑↓ select · Enter search · Esc back",
+        (_, CenterView::Chat) if app.ai_running => {
+            "i message · ↑↓ scroll · c cancel · C clear · ← files · → views"
+        }
+        (_, CenterView::Chat) => "i message · ↑↓ scroll · C clear session · ← files · → views",
         (_, CenterView::Todo) => "↑↓ select · Enter toggle · ← files · → views · Esc daily",
         _ => "f files · t todo · Ctrl+P commands · ? help",
     }

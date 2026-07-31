@@ -37,6 +37,9 @@ impl App {
             }
             match event {
                 AgentEvent::AssistantDelta(delta) => {
+                    if delta.is_empty() {
+                        continue;
+                    }
                     match self.agent_panel.last_mut() {
                         Some(AgentPanelEntry::Assistant {
                             text, streaming, ..
@@ -50,24 +53,33 @@ impl App {
                     self.agent_scroll = u16::MAX;
                 }
                 AgentEvent::AssistantMessageFinished { text, final_output } => {
-                    let mut replaced = false;
-                    for entry in &mut self.agent_panel {
-                        if let AgentPanelEntry::Assistant {
-                            text: entry_text,
-                            streaming,
-                            final_output: entry_final,
-                            ..
-                        } = entry
-                        {
-                            if *streaming {
-                                *entry_text = text.clone();
-                                *streaming = false;
-                                *entry_final = final_output;
-                                replaced = true;
+                    if text.trim().is_empty() {
+                        self.agent_panel.retain(|entry| {
+                            !matches!(
+                                entry,
+                                AgentPanelEntry::Assistant {
+                                    streaming: true,
+                                    ..
+                                }
+                            )
+                        });
+                    } else if let Some(AgentPanelEntry::Assistant {
+                        text: entry_text,
+                        streaming,
+                        final_output: entry_final,
+                    }) = self.agent_panel.iter_mut().rev().find(|entry| {
+                        matches!(
+                            entry,
+                            AgentPanelEntry::Assistant {
+                                streaming: true,
+                                ..
                             }
-                        }
-                    }
-                    if !replaced && !text.trim().is_empty() {
+                        )
+                    }) {
+                        *entry_text = text;
+                        *streaming = false;
+                        *entry_final = final_output;
+                    } else {
                         self.agent_panel.push(AgentPanelEntry::Assistant {
                             text,
                             streaming: false,
@@ -102,7 +114,13 @@ impl App {
                             matches!(entry, AgentPanelEntry::Tool { active: true, .. })
                         })
                     {
-                        *text = message.clone();
+                        let answer = (message.starts_with("Completed Ask User.")
+                            && text.starts_with("Calling Ask User..."))
+                        .then(|| text.lines().nth(2).map(str::to_string))
+                        .flatten();
+                        *text = answer
+                            .map(|answer| format!("{message}\n{answer}"))
+                            .unwrap_or_else(|| message.clone());
                         *active = false;
                     } else {
                         self.agent_panel.push(AgentPanelEntry::Tool {
@@ -610,6 +628,28 @@ impl App {
         sender
             .send(response.clone())
             .context("sending response to Agent")?;
+        if !round_limit {
+            if let AskUserResponse::Answer(answer) = &response {
+                let answer = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !answer.is_empty() {
+                    if let Some(AgentPanelEntry::Tool { text, active: true }) =
+                        self.agent_panel.iter_mut().rev().find(|entry| {
+                            matches!(
+                                entry,
+                                AgentPanelEntry::Tool { text, active: true }
+                                    if text.starts_with("Calling Ask User...")
+                            )
+                        })
+                    {
+                        if text.lines().count() < 3 {
+                            text.push('\n');
+                            text.push_str(&answer);
+                            self.agent_scroll = u16::MAX;
+                        }
+                    }
+                }
+            }
+        }
         self.set_status(if round_limit {
             match &response {
                 AskUserResponse::Answer(answer) if answer == "Continue" => "Agent continuing",

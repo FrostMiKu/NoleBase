@@ -11,10 +11,11 @@ pub(super) fn draw_compose(
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))
-        .title(if focused {
-            " Compose "
-        } else {
-            " Compose · i "
+        .title(match (focused, app.center_view) {
+            (true, CenterView::Chat) => " Message ",
+            (false, CenterView::Chat) => " Message · i ",
+            (true, _) => " Compose ",
+            (false, _) => " Compose · i ",
         })
         .style(Style::default().bg(app.theme.surface_compose))
         .border_style(focus_border(focused, app.theme));
@@ -49,11 +50,14 @@ pub(super) fn draw_compose(
         let count = format!("{lines}l · {}c", app.input.chars().count());
         let hint = if focused && toolbar.width >= 72 {
             match app.center_view {
+                CenterView::Chat => "Enter send · Ctrl+J newline · Esc chat",
                 CenterView::Document => {
                     "Enter append · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline"
                 }
                 _ => "Enter send · Ctrl+Enter Agent · Ctrl+U recall · Ctrl+J newline",
             }
+        } else if focused && app.center_view == CenterView::Chat && toolbar.width >= 25 {
+            "Enter send · Ctrl+J newline"
         } else if focused && toolbar.width >= 42 {
             "Ctrl+Enter Agent · Ctrl+U recall"
         } else if focused && toolbar.width >= 25 {

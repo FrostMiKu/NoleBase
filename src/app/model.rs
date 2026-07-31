@@ -223,6 +223,7 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CenterView {
     Daily,
+    Chat,
     Todo,
     Document,
     Search,
@@ -242,9 +243,12 @@ impl CenterView {
     pub const fn sidebar_selection(self) -> SidebarSelection {
         match self {
             Self::Document => SidebarSelection::Files,
-            Self::Daily | Self::Todo | Self::Search | Self::DocumentSearch | Self::Tags => {
-                SidebarSelection::Views
-            }
+            Self::Daily
+            | Self::Chat
+            | Self::Todo
+            | Self::Search
+            | Self::DocumentSearch
+            | Self::Tags => SidebarSelection::Views,
         }
     }
 }
@@ -264,14 +268,19 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub const ALL: &'static [Self] = &[
         Self {
-            center_view: CenterView::Daily,
-            label: "Daily",
-            description: "Daily notes",
-        },
-        Self {
             center_view: CenterView::Todo,
             label: "TODO",
             description: "Tasks",
+        },
+        Self {
+            center_view: CenterView::Chat,
+            label: "Agent",
+            description: "AI conversation",
+        },
+        Self {
+            center_view: CenterView::Daily,
+            label: "Daily",
+            description: "Daily notes",
         },
     ];
 

@@ -775,6 +775,10 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     let event_sender = install_agent_observable(&mut app);
     let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
     app.ai_user_sender = Some(answer_sender);
+    app.agent_panel.push(AgentPanelEntry::Tool {
+        text: "Calling Ask User...\nChoose a format".to_string(),
+        active: true,
+    });
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
             kind: AskUserKind::Tool,
@@ -792,6 +796,23 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
         AskUserResponse::Answer("MBDown".to_string())
     );
     assert_eq!(app.overlay, None);
+    assert!(matches!(
+        app.agent_panel.last(),
+        Some(AgentPanelEntry::Tool { text, active: true })
+            if text == "Calling Ask User...\nChoose a format\nMBDown"
+    ));
+
+    event_sender
+        .send(AgentEvent::ToolFinished(
+            "Completed Ask User.\nChoose a format".to_string(),
+        ))
+        .unwrap();
+    app.poll_agent();
+    assert!(matches!(
+        app.agent_panel.last(),
+        Some(AgentPanelEntry::Tool { text, active: false })
+            if text == "Completed Ask User.\nChoose a format\nMBDown"
+    ));
 
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
@@ -1431,13 +1452,14 @@ fn workspace_view_registry_drives_sidebar_selection() {
             .map(|view| (view.label, view.description, view.center_view))
             .collect::<Vec<_>>(),
         [
-            ("Daily", "Daily notes", CenterView::Daily),
             ("TODO", "Tasks", CenterView::Todo),
+            ("Agent", "AI conversation", CenterView::Chat),
+            ("Daily", "Daily notes", CenterView::Daily),
         ]
     );
 
     app.focus = Focus::Views;
-    app.workspace_view_index = 1;
+    app.workspace_view_index = 0;
     app.handle_key(key(KeyCode::Enter));
 
     assert_eq!(app.focus, Focus::Center);

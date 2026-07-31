@@ -1,5 +1,119 @@
 use super::*;
 
+pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(" Agent statistics ")
+        .style(Style::default().bg(app.theme.surface_panel))
+        .border_style(focus_border(app.focus == Focus::Agent, app.theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.ai_running {
+        draw_animated_border(frame, area, app.animation_tick, app.theme);
+    }
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let prompts = app
+        .agent_panel
+        .iter()
+        .filter(|entry| matches!(entry, crate::agent_session::AgentPanelEntry::Prompt { .. }))
+        .count();
+    let replies = app
+        .agent_panel
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                crate::agent_session::AgentPanelEntry::Assistant { .. }
+            )
+        })
+        .count();
+    let tools = app
+        .agent_panel
+        .iter()
+        .filter(|entry| matches!(entry, crate::agent_session::AgentPanelEntry::Tool { .. }))
+        .count();
+    let context_rate = if app.agent_context_capacity == 0 {
+        0.0
+    } else {
+        app.agent_context_window as f64 * 100.0 / app.agent_context_capacity as f64
+    };
+    let cache_rate = if app.agent_usage.total_input() == 0 {
+        0.0
+    } else {
+        app.agent_usage.cache_read_input_tokens as f64 * 100.0
+            / app.agent_usage.total_input() as f64
+    };
+    let tps = if app.agent_response_duration.is_zero() {
+        "--".to_string()
+    } else {
+        format!(
+            "{:.1}",
+            app.agent_timed_output_tokens as f64 / app.agent_response_duration.as_secs_f64()
+        )
+    };
+    let context = if app.agent_context_capacity == 0 {
+        "--".to_string()
+    } else {
+        format!(
+            "{} / {}  {:.0}%",
+            human_token_count(app.agent_context_window),
+            human_token_count(app.agent_context_capacity),
+            context_rate
+        )
+    };
+    let state = if app.ai_running { "Working" } else { "Idle" };
+    let rows = [
+        ("State", state.to_string()),
+        ("Context", context),
+        ("Input", human_token_count(app.agent_usage.total_input())),
+        ("Output", human_token_count(app.agent_usage.output_tokens)),
+        (
+            "Cache",
+            format!(
+                "{}  {:.0}%",
+                human_token_count(app.agent_usage.cache_read_input_tokens),
+                cache_rate
+            ),
+        ),
+        ("Speed", format!("{tps} t/s")),
+        ("Turns", format!("{prompts} user · {replies} agent")),
+        ("Tools", tools.to_string()),
+        (
+            "Round",
+            if app.agent_round_limit == 0 {
+                "--".to_string()
+            } else {
+                format!("{} / {}", app.agent_round, app.agent_round_limit)
+            },
+        ),
+        ("Retries", app.agent_retry_count.to_string()),
+    ];
+    let mut lines = vec![Line::default()];
+    for (label, value) in rows {
+        if lines.len() >= inner.height as usize {
+            break;
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:<8}"),
+                Style::default().fg(app.theme.text_muted),
+            ),
+            Span::styled(value, Style::default().fg(app.theme.text_primary)),
+        ]));
+        if lines.len() < inner.height as usize {
+            lines.push(Line::default());
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -87,8 +201,21 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 pub(super) fn sync_agent_vlist(app: &mut App, width: usize) {
-    if app.agent_vlist.width != width {
+    sync_agent_vlist_with_style(app, width, crate::app::AgentEntryRenderStyle::Panel);
+}
+
+pub(super) fn sync_chat_vlist(app: &mut App, width: usize) {
+    sync_agent_vlist_with_style(app, width, crate::app::AgentEntryRenderStyle::Cards);
+}
+
+fn sync_agent_vlist_with_style(
+    app: &mut App,
+    width: usize,
+    style: crate::app::AgentEntryRenderStyle,
+) {
+    if app.agent_vlist.width != width || app.agent_vlist.style != style {
         app.agent_vlist.width = width;
+        app.agent_vlist.style = style;
         app.agent_vlist.geometry = crate::vlist::VList::new(4);
         app.agent_vlist.caches.clear();
     }
@@ -110,13 +237,18 @@ pub(super) fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
         return;
     }
     let entry = app.agent_panel[index].clone();
-    let (lines, links, images) = render_agent_entry(
-        &entry,
-        app.agent_vlist.width,
-        app.animation_tick,
-        false,
-        app.theme,
-    );
+    let (lines, links, images) = match app.agent_vlist.style {
+        crate::app::AgentEntryRenderStyle::Panel => render_agent_entry(
+            &entry,
+            app.agent_vlist.width,
+            app.animation_tick,
+            false,
+            app.theme,
+        ),
+        crate::app::AgentEntryRenderStyle::Cards => {
+            render_chat_entry(&entry, app.agent_vlist.width, app.theme)
+        }
+    };
     let height = lines.len();
     app.agent_vlist.caches[index] = Some(crate::app::AgentEntryRenderCache {
         width: app.agent_vlist.width,
@@ -223,6 +355,9 @@ pub(super) fn render_agent_entry(
             );
             lines.push(agent_message_line(Line::default(), width, background));
         }
+        crate::agent_session::AgentPanelEntry::Assistant { text, .. } if text.trim().is_empty() => {
+            lines.push(Line::default());
+        }
         crate::agent_session::AgentPanelEntry::Assistant { text, .. } => {
             let background = theme.surface_message_agent;
             lines.push(agent_message_line(Line::default(), width, background));
@@ -325,14 +460,23 @@ pub(super) fn visible_agent_lines(
         let content_from = from;
         let content_to = to.min(cached.lines.len());
         if active {
-            let animated = render_agent_entry(
-                &cached.entry,
-                cached.width,
-                app.animation_tick,
-                true,
-                app.theme,
-            )
-            .0;
+            let animated = if app.agent_vlist.style == crate::app::AgentEntryRenderStyle::Cards {
+                match &cached.entry {
+                    crate::agent_session::AgentPanelEntry::Tool { text, .. } => {
+                        render_chat_tool(text, cached.width, app.animation_tick, true, app.theme)
+                    }
+                    _ => unreachable!("only active tools use animated entry rendering"),
+                }
+            } else {
+                render_agent_entry(
+                    &cached.entry,
+                    cached.width,
+                    app.animation_tick,
+                    true,
+                    app.theme,
+                )
+                .0
+            };
             visible.extend(
                 animated[content_from.min(content_to)..content_to]
                     .iter()
@@ -431,10 +575,10 @@ pub(super) fn animated_activity_lines(
     tick: u64,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    let (status, detail) = activity_parts(text);
+    let (status, details) = activity_parts(text);
     let marker = activity_marker(width, theme);
     let available = width.saturating_sub(marker.width());
-    let characters = compact_activity_line(status, available)
+    let characters = compact_activity_line(&status, available)
         .chars()
         .filter(|character| UnicodeWidthChar::width(*character).unwrap_or(0) > 0)
         .collect::<Vec<_>>();
@@ -454,37 +598,70 @@ pub(super) fn animated_activity_lines(
             .collect::<Vec<_>>(),
     );
     let mut lines = vec![Line::from(spans)];
-    if let Some(detail) = detail {
-        lines.push(activity_detail_line(detail, width, theme));
+    let detail_count = details.len();
+    for (index, detail) in details.into_iter().enumerate() {
+        lines.push(activity_detail_line(
+            &detail,
+            width,
+            theme,
+            index + 1 == detail_count,
+        ));
     }
     lines
 }
 
 pub(super) fn activity_lines(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
-    let (status, detail) = activity_parts(text);
+    let (status, details) = activity_parts(text);
     let marker = activity_marker(width, theme);
     let available = width.saturating_sub(marker.width());
     let spans = vec![
         marker,
         Span::styled(
-            compact_activity_line(status, available),
+            compact_activity_line(&status, available),
             Style::default().fg(theme.text_muted),
         ),
     ];
     let mut lines = vec![Line::from(spans)];
-    if let Some(detail) = detail {
-        lines.push(activity_detail_line(detail, width, theme));
+    let detail_count = details.len();
+    for (index, detail) in details.into_iter().enumerate() {
+        lines.push(activity_detail_line(
+            &detail,
+            width,
+            theme,
+            index + 1 == detail_count,
+        ));
     }
     lines
 }
 
-pub(super) fn activity_parts(text: &str) -> (&str, Option<&str>) {
-    let (status, detail) = text.split_once('\n').unwrap_or((text, ""));
-    (status, (!detail.is_empty()).then_some(detail))
+pub(super) fn activity_parts(text: &str) -> (String, Vec<String>) {
+    let mut parts = text.split('\n');
+    let status = parts.next().unwrap_or_default();
+    let details = parts
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if status.starts_with("Failed ") {
+        if let Some((status, error)) = status.split_once(": ") {
+            let target = details.join(" · ");
+            let detail = if target.is_empty() {
+                error.to_string()
+            } else {
+                format!("{error} · {target}")
+            };
+            return (status.to_string(), vec![detail]);
+        }
+    }
+    (status.to_string(), details)
 }
 
-pub(super) fn activity_detail_line(detail: &str, width: usize, theme: Theme) -> Line<'static> {
-    let marker = activity_detail_marker(width, theme);
+pub(super) fn activity_detail_line(
+    detail: &str,
+    width: usize,
+    theme: Theme,
+    last: bool,
+) -> Line<'static> {
+    let marker = activity_detail_marker(width, theme, last);
     let available = width.saturating_sub(marker.width());
     Line::from(vec![
         marker,
@@ -536,14 +713,15 @@ pub(super) fn activity_marker(width: usize, theme: Theme) -> Span<'static> {
     )
 }
 
-pub(super) fn activity_detail_marker(width: usize, theme: Theme) -> Span<'static> {
+pub(super) fn activity_detail_marker(width: usize, theme: Theme, last: bool) -> Span<'static> {
+    let branch = if last { '└' } else { '├' };
     let marker = match width {
-        0 => "",
-        1 => "└",
-        2 => "└─",
-        3 => "└─ ",
-        4 => " └─",
-        _ => "   └─ ",
+        0 => String::new(),
+        1 => branch.to_string(),
+        2 => format!("{branch}─"),
+        3 => format!("{branch}─ "),
+        4 => format!(" {branch}─"),
+        _ => format!("   {branch}─ "),
     };
     Span::styled(marker, Style::default().fg(theme.ui_border_subtle))
 }

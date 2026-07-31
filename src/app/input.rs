@@ -61,6 +61,7 @@ impl App {
             Focus::Agent => self.handle_agent(key),
             Focus::Center => match self.center_view {
                 CenterView::Daily => self.handle_daily(key),
+                CenterView::Chat => self.handle_chat(key),
                 CenterView::Todo => self.handle_todo(key),
                 CenterView::Document => self.handle_document(key),
                 CenterView::Search | CenterView::DocumentSearch => self.handle_search(key),
@@ -112,7 +113,7 @@ impl App {
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match (self.focus, self.center_view, self.files_context) {
-            (Focus::Compose, CenterView::Daily | CenterView::Document, _) => {
+            (Focus::Compose, CenterView::Daily | CenterView::Chat | CenterView::Document, _) => {
                 paste_into(&mut self.input, &mut self.input_cursor, &text)
             }
             (Focus::Center, CenterView::Search | CenterView::DocumentSearch, _) => {
@@ -204,7 +205,11 @@ impl App {
                 None
             }
             KeyCode::Enter => {
-                self.send_message();
+                if self.center_view == CenterView::Chat {
+                    self.submit_compose_to_agent();
+                } else {
+                    self.send_message();
+                }
                 None
             }
             KeyCode::Tab | KeyCode::Esc => {
@@ -430,6 +435,48 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
                 self.toggle_todo(self.todo_index);
                 None
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn handle_chat(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.activate_workspace_view(CenterView::Daily);
+                None
+            }
+            KeyCode::Tab | KeyCode::Char('i') | KeyCode::Enter => {
+                self.focus = Focus::Compose;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.agent_scroll = self.agent_scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.agent_scroll = self.agent_scroll.saturating_add(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.agent_scroll = self.agent_scroll.saturating_sub(8);
+                None
+            }
+            KeyCode::PageDown => {
+                self.agent_scroll = self.agent_scroll.saturating_add(8);
+                None
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.open_files();
+                None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.open_workspace_views();
+                None
+            }
+            KeyCode::Char('C') => self.execute_app_command(AppCommand::ClearAgentSession),
+            KeyCode::Char('c') if self.ai_running => {
+                self.execute_app_command(AppCommand::InterruptAgent)
             }
             _ => None,
         }
@@ -694,6 +741,14 @@ impl App {
                         self.scroll.saturating_sub(delta.unsigned_abs() as u16)
                     };
                 }
+                CenterView::Chat => {
+                    self.agent_scroll = if delta > 0 {
+                        self.agent_scroll.saturating_add(delta as u16)
+                    } else {
+                        self.agent_scroll
+                            .saturating_sub(delta.unsigned_abs() as u16)
+                    };
+                }
                 CenterView::Todo => self.move_todo_selection(delta),
                 CenterView::Document => self.scroll_document(delta),
                 CenterView::Search | CenterView::DocumentSearch => {
@@ -859,7 +914,10 @@ impl App {
         }
 
         if in_area(column, row, self.layout.compose)
-            && matches!(self.center_view, CenterView::Daily | CenterView::Document)
+            && matches!(
+                self.center_view,
+                CenterView::Daily | CenterView::Chat | CenterView::Document
+            )
         {
             self.focus = Focus::Compose;
         } else if in_area(column, row, self.layout.files) {

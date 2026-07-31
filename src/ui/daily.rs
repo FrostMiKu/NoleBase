@@ -446,6 +446,28 @@ pub(super) fn draw_selected_card_border(
     tick: u64,
     theme: Theme,
 ) {
+    draw_animated_card_border(
+        frame,
+        area,
+        scroll,
+        first,
+        last,
+        tick,
+        theme,
+        theme.surface_panel,
+    );
+}
+
+pub(super) fn draw_animated_card_border(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    first: usize,
+    last: usize,
+    tick: u64,
+    theme: Theme,
+    background: Color,
+) {
     if area.width < 2 || first > last {
         return;
     }
@@ -471,9 +493,9 @@ pub(super) fn draw_selected_card_border(
                     "─"
                 };
                 let position = (x - left) as usize;
-                frame.buffer_mut()[(x, y)]
-                    .set_symbol(symbol)
-                    .set_style(animated_card_border_style(position, tick, theme));
+                frame.buffer_mut()[(x, y)].set_symbol(symbol).set_style(
+                    animated_card_border_style(position, tick, theme, background),
+                );
             }
         } else if row == last {
             for x in left..=right {
@@ -487,9 +509,9 @@ pub(super) fn draw_selected_card_border(
                 let position = width
                     .saturating_add(height.saturating_sub(1))
                     .saturating_add((right - x) as usize);
-                frame.buffer_mut()[(x, y)]
-                    .set_symbol(symbol)
-                    .set_style(animated_card_border_style(position, tick, theme));
+                frame.buffer_mut()[(x, y)].set_symbol(symbol).set_style(
+                    animated_card_border_style(position, tick, theme, background),
+                );
             }
         } else {
             let right_position = width.saturating_add(row.saturating_sub(first + 1));
@@ -499,18 +521,33 @@ pub(super) fn draw_selected_card_border(
                 .saturating_add(last.saturating_sub(row + 1));
             frame.buffer_mut()[(left, y)]
                 .set_symbol("│")
-                .set_style(animated_card_border_style(left_position, tick, theme));
+                .set_style(animated_card_border_style(
+                    left_position,
+                    tick,
+                    theme,
+                    background,
+                ));
             frame.buffer_mut()[(right, y)]
                 .set_symbol("│")
-                .set_style(animated_card_border_style(right_position, tick, theme));
+                .set_style(animated_card_border_style(
+                    right_position,
+                    tick,
+                    theme,
+                    background,
+                ));
         }
     }
 }
 
-pub(super) fn animated_card_border_style(position: usize, tick: u64, theme: Theme) -> Style {
+pub(super) fn animated_card_border_style(
+    position: usize,
+    tick: u64,
+    theme: Theme,
+    background: Color,
+) -> Style {
     Style::default()
         .fg(animated_color(position, tick, theme))
-        .bg(theme.surface_panel)
+        .bg(background)
 }
 
 pub(super) fn stable_card_scroll(

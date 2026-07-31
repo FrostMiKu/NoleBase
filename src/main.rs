@@ -105,7 +105,12 @@ fn run_editor(path: &std::path::Path, editor: &str, terminal: &mut Tui) -> Resul
     }
 }
 
-fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Result<bool> {
+fn handle_command(
+    cmd: Option<Command>,
+    app: &mut App,
+    terminal: &mut Tui,
+    cursor_visible: &mut bool,
+) -> Result<bool> {
     match cmd {
         Some(Command::Quit) => Ok(true),
         Some(Command::Edit(path)) => {
@@ -119,6 +124,7 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
                 }
                 Err(error) => app.set_error(format!("Editor settings error: {error}")),
             }
+            *cursor_visible = true;
             if let Err(error) = set_mouse_capture(terminal.backend_mut(), app.mouse_captured) {
                 app.mouse_captured = true;
                 app.set_error(format!("Mouse support error: {error}"));
@@ -229,14 +235,30 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::pat
     indexed_paths
 }
 
-fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(), B::Error> {
-    terminal
-        .draw(|frame| {
-            if let Some(position) = ui::draw(frame, app) {
-                frame.set_cursor_position(position);
-            }
-        })
-        .map(|_| ())
+fn draw_frame<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    cursor_visible: &mut bool,
+) -> Result<(), B::Error> {
+    terminal.autoresize()?;
+    let cursor_position = {
+        let mut frame = terminal.get_frame();
+        ui::draw(&mut frame, app)
+    };
+    terminal.flush()?;
+    terminal.swap_buffers();
+    if let Some(position) = cursor_position {
+        terminal.set_cursor_position(position)?;
+        if !*cursor_visible {
+            terminal.show_cursor()?;
+            *cursor_visible = true;
+        }
+    } else if *cursor_visible {
+        terminal.hide_cursor()?;
+        *cursor_visible = false;
+    }
+    terminal.backend_mut().flush()?;
+    Ok(())
 }
 
 fn run(
@@ -245,6 +267,7 @@ fn run(
     workspace_events: &WatchEvents,
     workspace_indexer: &WorkspaceIndexer,
 ) -> Result<()> {
+    let mut cursor_visible = true;
     loop {
         let indexed_paths = process_workspace_events(workspace_events, app);
         workspace_indexer.paths_changed(indexed_paths);
@@ -262,7 +285,7 @@ fn run(
             output.flush()?;
         }
         app.advance_animation();
-        draw_frame(terminal, app)?;
+        draw_frame(terminal, app, &mut cursor_visible)?;
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
@@ -287,7 +310,7 @@ fn run(
                     continue;
                 }
                 flush_wheel(&mut pending_wheel, app);
-                if handle_command(app.handle_mouse(mouse), app, terminal)? {
+                if handle_command(app.handle_mouse(mouse), app, terminal, &mut cursor_visible)? {
                     quit = true;
                     break;
                 }
@@ -300,7 +323,7 @@ fn run(
                         || (key.kind == KeyEventKind::Repeat
                             && app.overlay == Some(app::Overlay::Terminal)) =>
                 {
-                    if handle_command(app.handle_key(key), app, terminal)? {
+                    if handle_command(app.handle_key(key), app, terminal, &mut cursor_visible)? {
                         quit = true;
                         break;
                     }
@@ -383,28 +406,40 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn draw_frame_tracks_input_cursor_while_animation_advances() {
+    fn draw_frame_tracks_chat_cursor_while_agent_animation_advances() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         let mut app = App::new(storage).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut cursor_visible = true;
 
-        draw_frame(&mut terminal, &mut app).unwrap();
+        draw_frame(&mut terminal, &mut app, &mut cursor_visible).unwrap();
+        assert!(!cursor_visible);
         assert!(!terminal.backend().cursor_visible());
 
+        app.center_view = CenterView::Chat;
         app.focus = app::Focus::Compose;
-        draw_frame(&mut terminal, &mut app).unwrap();
+        app.agent_panel
+            .push(crate::agent_session::AgentPanelEntry::Assistant {
+                text: "Streaming response".to_string(),
+                streaming: true,
+                final_output: false,
+            });
+        app.ai_running = true;
+        draw_frame(&mut terminal, &mut app, &mut cursor_visible).unwrap();
 
         let compose = app.layout.compose.expect("compose layout");
         let cursor = terminal.get_cursor_position().unwrap();
+        assert!(cursor_visible);
         assert!(terminal.backend().cursor_visible());
         assert!(cursor.x > compose.x && cursor.x < compose.right() - 1);
         assert!(cursor.y > compose.y && cursor.y < compose.bottom() - 1);
 
         app.advance_animation();
         assert_eq!(app.animation_tick, 1);
-        draw_frame(&mut terminal, &mut app).unwrap();
+        draw_frame(&mut terminal, &mut app, &mut cursor_visible).unwrap();
+        assert!(cursor_visible);
         assert!(terminal.backend().cursor_visible());
         assert_eq!(terminal.get_cursor_position().unwrap(), cursor);
     }

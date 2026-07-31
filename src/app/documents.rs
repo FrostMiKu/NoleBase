@@ -109,10 +109,14 @@ impl App {
         self.workspace_view_index = index;
         self.center_view = center_view;
         self.focus = Focus::Center;
-        if center_view == CenterView::Todo {
-            self.reload_todos();
-            self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
-            self.todo_list_start = 0;
+        match center_view {
+            CenterView::Chat => self.agent_scroll = u16::MAX,
+            CenterView::Todo => {
+                self.reload_todos();
+                self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
+                self.todo_list_start = 0;
+            }
+            _ => {}
         }
     }
 

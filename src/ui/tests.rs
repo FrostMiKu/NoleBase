@@ -384,7 +384,7 @@ fn wide_layout_uses_terminal_edges_and_center_content_axis() {
         assert_eq!(files, Rect::new(0, 0, FILES_WIDTH, 23), "width {width}");
         assert_eq!(views.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
         assert_eq!(views.x + views.width, width, "width {width}");
-        assert_eq!(views.height, 23u16.div_ceil(3), "width {width}");
+        assert_eq!(views.height, 12, "width {width}");
         assert_eq!(agent.y, 0, "width {width}");
         assert_eq!(views.y, agent.y + agent.height, "width {width}");
         assert_eq!(agent.height, 23 - views.height, "width {width}");
@@ -416,16 +416,17 @@ fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
         .workspace_view_hitboxes
         .iter()
         .all(|hitbox| contains(views, hitbox.area)));
-    let daily = app.workspace_view_hitboxes[0].area;
+    let daily = app.workspace_view_hitboxes[2].area;
     let buffer = terminal.backend().buffer();
     for y in daily.y.saturating_sub(1)..=daily.y + daily.height {
         assert_eq!(buffer[(daily.x, y)].symbol(), "▌");
         assert_eq!(buffer[(daily.x, y)].bg, app.theme.selection_background);
     }
     assert!(screen.contains("Daily notes"));
+    assert!(screen.contains("AI conversation"));
     assert!(screen.contains("Tasks"));
 
-    let todo = app.workspace_view_hitboxes[1].area;
+    let todo = app.workspace_view_hitboxes[0].area;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: todo.x,
@@ -451,7 +452,7 @@ fn center_view_interface_assigns_the_visible_sidebar_cursor() {
         .find(|hitbox| hitbox.path == path)
         .expect("project file")
         .area;
-    let daily_view = app.workspace_view_hitboxes[0].area;
+    let daily_view = app.workspace_view_hitboxes[2].area;
     assert_ne!(
         daily.backend().buffer()[(daily_file.x, daily_file.y)].symbol(),
         "▌"
@@ -481,7 +482,7 @@ fn center_view_interface_assigns_the_visible_sidebar_cursor() {
         .find(|hitbox| hitbox.path == path)
         .expect("project file")
         .area;
-    let document_view = app.workspace_view_hitboxes[0].area;
+    let document_view = app.workspace_view_hitboxes[2].area;
     assert_eq!(
         document.backend().buffer()[(document_file.x, document_file.y)].symbol(),
         "▌"
@@ -809,10 +810,7 @@ fn sidebars_use_mantle_background_with_square_ui_borders() {
 
     for area in [files, views, agent] {
         assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
-        assert_eq!(
-            buffer[(area.x + 2, area.y + area.height - 2)].bg,
-            ctp::MANTLE
-        );
+        assert_eq!(buffer[(area.x + 2, area.y + 1)].bg, ctp::MANTLE);
     }
     assert_eq!(buffer[(center.x, center.y)].bg, Color::Reset);
 }
