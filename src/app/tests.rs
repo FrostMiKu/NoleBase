@@ -1452,8 +1452,10 @@ fn workspace_view_registry_drives_sidebar_selection() {
             .map(|view| (view.label, view.description, view.center_view))
             .collect::<Vec<_>>(),
         [
-            ("TODO", "Tasks", CenterView::Todo),
             ("Agent", "AI conversation", CenterView::Chat),
+            ("TODO", "Tasks", CenterView::Todo),
+            ("Tag", "Browse tags", CenterView::Tags),
+            ("Search", "Find notes", CenterView::Search),
             ("Daily", "Daily notes", CenterView::Daily),
         ]
     );
@@ -1463,7 +1465,7 @@ fn workspace_view_registry_drives_sidebar_selection() {
     app.handle_key(key(KeyCode::Enter));
 
     assert_eq!(app.focus, Focus::Center);
-    assert_eq!(app.center_view, CenterView::Todo);
+    assert_eq!(app.center_view, CenterView::Chat);
 }
 
 #[test]

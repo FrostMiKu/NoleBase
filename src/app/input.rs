@@ -551,11 +551,12 @@ impl App {
         let document_search = self.center_view == CenterView::DocumentSearch;
         match key.code {
             KeyCode::Esc => {
-                self.center_view = if document_search && self.document.is_some() {
-                    CenterView::Document
+                if document_search && self.document.is_some() {
+                    self.center_view = CenterView::Document;
+                    self.focus = Focus::Center;
                 } else {
-                    CenterView::Daily
-                };
+                    self.activate_workspace_view(CenterView::Daily);
+                }
                 None
             }
             KeyCode::Down => {
@@ -587,7 +588,12 @@ impl App {
     pub(super) fn handle_tags(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc => {
-                self.center_view = self.tags_return_view;
+                if WorkspaceView::index_of(self.tags_return_view).is_some() {
+                    self.activate_workspace_view(self.tags_return_view);
+                } else {
+                    self.center_view = self.tags_return_view;
+                    self.focus = Focus::Center;
+                }
                 None
             }
             KeyCode::Down => {
@@ -844,8 +850,7 @@ impl App {
             .find(|hitbox| point_in_rect(column, row, hitbox.area))
             .map(|hitbox| hitbox.index)
         {
-            self.center_view = CenterView::Todo;
-            self.focus = Focus::Center;
+            self.activate_workspace_view(CenterView::Todo);
             self.todo_index = index;
             self.toggle_todo(index);
             return None;

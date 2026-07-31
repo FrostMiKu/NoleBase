@@ -1,6 +1,21 @@
 use super::*;
 
 const DOCUMENT_TOP_MARGIN: usize = 2;
+const DOCUMENT_BOTTOM_MARGIN: usize = 2;
+// A terminal cell is roughly twice as tall as it is wide, so A4's physical
+// sqrt(2) height-to-width ratio maps to about 0.7 rows per column.
+const A4_CELL_HEIGHT_NUMERATOR: usize = 7;
+const A4_CELL_HEIGHT_DENOMINATOR: usize = 10;
+
+fn document_paper_height(width: usize, content_height: usize) -> usize {
+    let minimum_a4_height = width
+        .saturating_mul(A4_CELL_HEIGHT_NUMERATOR)
+        .div_ceil(A4_CELL_HEIGHT_DENOMINATOR);
+    DOCUMENT_TOP_MARGIN
+        .saturating_add(content_height)
+        .saturating_add(DOCUMENT_BOTTOM_MARGIN)
+        .max(minimum_a4_height)
+}
 
 pub(super) fn draw_document(
     frame: &mut Frame,
@@ -23,20 +38,11 @@ pub(super) fn draw_document(
     if content.width == 0 || content.height == 0 {
         return;
     }
-    let compose = compose_rect(content);
-    app.layout.compose = non_empty(compose);
+    let compose_layout = floating_compose_layout(content);
+    app.layout.compose = non_empty(compose_layout.compose);
     let header = Rect::new(content.x, content.y, content.width, 1);
-    let page_area = Rect::new(
-        content.x,
-        content.y.saturating_add(2),
-        content.width,
-        content
-            .y
-            .saturating_add(content.height)
-            .saturating_sub(content.y.saturating_add(2)),
-    );
+    let page_area = compose_layout.body;
     let page_style = Style::default().bg(app.theme.surface_panel);
-    frame.render_widget(Block::default().style(page_style), page_area);
     let horizontal_padding = (PAGE_PADDING_X as u16).min(page_area.width.saturating_sub(1) / 2);
     let document_area = Rect::new(
         page_area.x.saturating_add(horizontal_padding),
@@ -46,11 +52,7 @@ pub(super) fn draw_document(
             .saturating_sub(horizontal_padding.saturating_mul(2)),
         page_area.height,
     );
-    let unoccluded_document_height = compose
-        .y
-        .saturating_sub(1)
-        .saturating_sub(document_area.y)
-        .min(document_area.height);
+    let unoccluded_document_height = compose_layout.visible_body.height.min(document_area.height);
     let image_base = match &app.document.as_ref().expect("document checked above").kind {
         crate::app::DocumentKind::File(path) => path
             .parent()
@@ -70,14 +72,19 @@ pub(super) fn draw_document(
             header,
         );
         if let Some(target_line) = document.target_line.take() {
-            document.scroll = DOCUMENT_TOP_MARGIN
+            let target_scroll = DOCUMENT_TOP_MARGIN
                 .saturating_add(crate::markdown::rendered_row_for_source_line(
                     &document.source,
                     target_line,
                     document_area.width as usize,
                     app.theme,
                 ))
-                .min(u16::MAX as usize) as u16;
+                .min(u16::MAX as usize);
+            let current_scroll = document.scroll as usize;
+            let viewport_end = current_scroll.saturating_add(unoccluded_document_height as usize);
+            if target_scroll < current_scroll || target_scroll >= viewport_end {
+                document.scroll = target_scroll as u16;
+            }
         }
         document.ensure_rendered(document_area.width as usize, app.theme);
         let rendered = &document
@@ -89,12 +96,22 @@ pub(super) fn draw_document(
         let rendered_tags = rendered.tags.clone();
         let rendered_images = rendered.images.clone();
         let lines = &rendered.lines;
-        let max_scroll = lines
-            .len()
-            .saturating_add(DOCUMENT_TOP_MARGIN)
-            .saturating_sub(unoccluded_document_height as usize);
+        let paper_height = document_paper_height(page_area.width as usize, lines.len());
+        let max_scroll = paper_height.saturating_sub(unoccluded_document_height as usize);
         document.scroll = (document.scroll as usize).min(max_scroll) as u16;
         let document_scroll = document.scroll as usize;
+        let visible_paper_height = paper_height
+            .saturating_sub(document_scroll)
+            .min(page_area.height as usize) as u16;
+        frame.render_widget(
+            Block::default().style(page_style),
+            Rect::new(
+                page_area.x,
+                page_area.y,
+                page_area.width,
+                visible_paper_height,
+            ),
+        );
         let visible_top_margin = DOCUMENT_TOP_MARGIN
             .saturating_sub(document_scroll)
             .min(document_area.height as usize);
@@ -105,7 +122,7 @@ pub(super) fn draw_document(
             content_scroll,
             (document_area.height as usize).saturating_sub(visible_top_margin),
         ));
-        frame.render_widget(Paragraph::new(visible).style(page_style), document_area);
+        frame.render_widget(Paragraph::new(visible), document_area);
         (
             rendered_links,
             rendered_tags,
@@ -149,8 +166,19 @@ pub(super) fn draw_document(
             document_scroll,
         );
     }
-    if compose.width > 0 && compose.height > 0 {
-        clear_widget(frame, compose);
-        draw_compose(frame, app, compose, interactive, cursor_position);
+    draw_floating_compose(frame, app, compose_layout, interactive, cursor_position);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paper_uses_a4_minimum_height_and_keeps_vertical_padding() {
+        assert_eq!(document_paper_height(100, 1), 70);
+        assert_eq!(
+            document_paper_height(100, 100),
+            DOCUMENT_TOP_MARGIN + 100 + DOCUMENT_BOTTOM_MARGIN
+        );
     }
 }

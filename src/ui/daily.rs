@@ -25,30 +25,16 @@ pub(super) fn draw_daily(
         Rect::new(content.x, content.y, content.width, 1),
     );
 
-    let compose = compose_rect(content);
-    app.layout.compose = non_empty(compose);
-
-    let daily_top = content.y.saturating_add(2).min(content.y + content.height);
-    let daily_view = Rect::new(
-        content.x,
-        daily_top,
-        content.width,
-        content
-            .y
-            .saturating_add(content.height)
-            .saturating_sub(daily_top),
+    let compose_layout = floating_compose_layout(content);
+    app.layout.compose = non_empty(compose_layout.compose);
+    draw_daily_notes(
+        frame,
+        app,
+        compose_layout.body,
+        compose_layout.visible_body.height,
+        interactive,
     );
-    let unoccluded_height = compose
-        .y
-        .saturating_sub(1)
-        .saturating_sub(daily_view.y)
-        .min(daily_view.height);
-    draw_daily_notes(frame, app, daily_view, unoccluded_height, interactive);
-
-    if compose.width > 0 && compose.height > 0 {
-        clear_widget(frame, compose);
-        draw_compose(frame, app, compose, interactive, cursor_position);
-    }
+    draw_floating_compose(frame, app, compose_layout, interactive, cursor_position);
 }
 
 pub(super) fn draw_daily_notes(

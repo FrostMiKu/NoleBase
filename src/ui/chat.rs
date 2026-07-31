@@ -25,25 +25,25 @@ pub(super) fn draw_chat(
         Rect::new(content.x, content.y, content.width, 1),
     );
 
-    let compose = compose_rect(content);
-    app.layout.compose = non_empty(compose);
-    let messages_y = content.y.saturating_add(2);
-    let messages_bottom = compose.y.saturating_sub(1);
-    let messages = Rect::new(
-        content.x,
-        messages_y,
-        content.width,
-        messages_bottom.saturating_sub(messages_y),
+    let compose_layout = floating_compose_layout(content);
+    app.layout.compose = non_empty(compose_layout.compose);
+    draw_chat_messages(
+        frame,
+        app,
+        compose_layout.body,
+        compose_layout.visible_body,
+        interactive,
     );
-    draw_chat_messages(frame, app, messages, interactive);
-
-    if compose.width > 0 && compose.height > 0 {
-        clear_widget(frame, compose);
-        draw_compose(frame, app, compose, interactive, cursor_position);
-    }
+    draw_floating_compose(frame, app, compose_layout, interactive, cursor_position);
 }
 
-fn draw_chat_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+fn draw_chat_messages(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    visible_area: Rect,
+    interactive: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -62,14 +62,16 @@ fn draw_chat_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive:
     }
 
     let width = area.width as usize;
-    let view_height = area.height as usize;
+    let render_height = area.height as usize;
+    let view_height = visible_area.height.min(area.height) as usize;
     sync_chat_vlist(app, width);
     let tail_pinned = app.agent_scroll == u16::MAX;
     let mut scroll =
         (app.agent_scroll as usize).min(app.agent_vlist.geometry.max_scroll(view_height));
     scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
     app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
-    let (visible, rendered_links, rendered_images) = visible_agent_lines(app, scroll, view_height);
+    let (visible, rendered_links, rendered_images) =
+        visible_agent_lines(app, scroll, render_height);
 
     fill_agent_message_rows(frame, area, &visible);
     frame.render_widget(Paragraph::new(visible), area);
@@ -86,7 +88,7 @@ fn draw_chat_messages(frame: &mut Frame, app: &mut App, area: Rect, interactive:
         register_link_hitboxes(
             &mut app.link_hitboxes,
             &rendered_links,
-            area,
+            visible_area,
             scroll,
             &image_base,
         );
@@ -507,7 +509,7 @@ mod tests {
         app.agent_timed_output_tokens = 200;
         app.agent_response_duration = Duration::from_secs(10);
 
-        let terminal = render(&mut app, 180, 30);
+        let terminal = render(&mut app, 180, 40);
         let statistics_area = app.layout.agent.expect("statistics panel");
         let statistics = area_text(&terminal, statistics_area);
         let (_, state_y) = find_text(&terminal, "State");

@@ -384,7 +384,11 @@ fn wide_layout_uses_terminal_edges_and_center_content_axis() {
         assert_eq!(files, Rect::new(0, 0, FILES_WIDTH, 23), "width {width}");
         assert_eq!(views.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
         assert_eq!(views.x + views.width, width, "width {width}");
-        assert_eq!(views.height, 12, "width {width}");
+        assert_eq!(
+            views.height,
+            selection_list_height(WorkspaceView::ALL.len() as u16, 3) + 2,
+            "width {width}"
+        );
         assert_eq!(agent.y, 0, "width {width}");
         assert_eq!(views.y, agent.y + agent.height, "width {width}");
         assert_eq!(agent.height, 23 - views.height, "width {width}");
@@ -416,7 +420,8 @@ fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
         .workspace_view_hitboxes
         .iter()
         .all(|hitbox| contains(views, hitbox.area)));
-    let daily = app.workspace_view_hitboxes[2].area;
+    let daily_index = WorkspaceView::index_of(CenterView::Daily).unwrap();
+    let daily = app.workspace_view_hitboxes[daily_index].area;
     let buffer = terminal.backend().buffer();
     for y in daily.y.saturating_sub(1)..=daily.y + daily.height {
         assert_eq!(buffer[(daily.x, y)].symbol(), "▌");
@@ -425,8 +430,11 @@ fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
     assert!(screen.contains("Daily notes"));
     assert!(screen.contains("AI conversation"));
     assert!(screen.contains("Tasks"));
+    assert!(screen.contains("Browse tags"));
+    assert!(screen.contains("Find notes"));
 
-    let todo = app.workspace_view_hitboxes[0].area;
+    let todo_index = WorkspaceView::index_of(CenterView::Todo).unwrap();
+    let todo = app.workspace_view_hitboxes[todo_index].area;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: todo.x,
@@ -452,7 +460,8 @@ fn center_view_interface_assigns_the_visible_sidebar_cursor() {
         .find(|hitbox| hitbox.path == path)
         .expect("project file")
         .area;
-    let daily_view = app.workspace_view_hitboxes[2].area;
+    let daily_index = WorkspaceView::index_of(CenterView::Daily).unwrap();
+    let daily_view = app.workspace_view_hitboxes[daily_index].area;
     assert_ne!(
         daily.backend().buffer()[(daily_file.x, daily_file.y)].symbol(),
         "▌"
@@ -1600,7 +1609,7 @@ fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
     ];
     app.focus = Focus::Agent;
 
-    let terminal = render(&mut app, 170, 24);
+    let terminal = render(&mut app, 170, 40);
     let screen = buffer_string(&terminal);
     let prompt = screen.find("Explain the selected note").unwrap();
     let response = screen.find("Here is the explanation").unwrap();
@@ -1702,7 +1711,7 @@ fn document_keeps_compose_visible_and_notification_uses_top_right() {
 }
 
 #[test]
-fn focused_compose_floats_over_the_document_with_an_animated_border() {
+fn focused_compose_sits_below_the_document_with_an_animated_border() {
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Document;
     app.focus = Focus::Compose;
@@ -1736,7 +1745,10 @@ fn focused_compose_floats_over_the_document_with_an_animated_border() {
     let center = app.layout.center.expect("center area");
     let content = inset_horizontal(center_content_axis(center), 2);
     assert!(compose.x > content.x);
-    assert_eq!(buffer[(content.x, compose.y + 1)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(content.x, compose.y - 3)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(content.x, compose.y - 2)].bg, Color::Reset);
+    assert_eq!(buffer[(content.x, compose.y - 1)].bg, Color::Reset);
+    assert_eq!(buffer[(content.x, compose.y + 1)].bg, Color::Reset);
     assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::SURFACE_0);
     let last_paragraph_y = (0..buffer.area().height)
         .find(|y| {
@@ -1750,7 +1762,7 @@ fn focused_compose_floats_over_the_document_with_an_animated_border() {
 }
 
 #[test]
-fn document_top_margin_scrolls_with_the_text_behind_the_floating_compose() {
+fn document_paper_scrolls_behind_the_compose_while_content_remains() {
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Document;
     app.document = Some(Document {
@@ -1769,6 +1781,7 @@ fn document_top_margin_scrolls_with_the_text_behind_the_floating_compose() {
     let terminal = render(&mut app, 120, 30);
     let center = app.layout.center.expect("center area");
     let content = inset_horizontal(center_content_axis(center), 2);
+    let compose = app.layout.compose.expect("document compose");
     let paper_y = content.y + 2;
     let buffer_row = |buffer: &Buffer, y| {
         (0..buffer.area().width)
@@ -1776,6 +1789,8 @@ fn document_top_margin_scrolls_with_the_text_behind_the_floating_compose() {
             .collect::<String>()
     };
     let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(content.x, compose.y + 1)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::SURFACE_0);
     assert!(!buffer_row(buffer, paper_y).contains("paper line 0"));
     assert!(buffer_row(buffer, paper_y + 2).contains("paper line 0"));
 

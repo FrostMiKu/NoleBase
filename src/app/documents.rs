@@ -106,6 +106,7 @@ impl App {
         let Some(index) = WorkspaceView::index_of(center_view) else {
             return;
         };
+        let previous_view = self.center_view;
         self.workspace_view_index = index;
         self.center_view = center_view;
         self.focus = Focus::Center;
@@ -116,32 +117,34 @@ impl App {
                 self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
                 self.todo_list_start = 0;
             }
+            CenterView::Search => {
+                self.search_query.clear();
+                self.search_results.clear();
+                self.search_index = 0;
+                self.search_list_start = 0;
+            }
+            CenterView::Tags => {
+                self.tags_return_view = if previous_view == CenterView::Document {
+                    CenterView::Document
+                } else {
+                    CenterView::Daily
+                };
+                self.tag_query.clear();
+                self.tag_index = 0;
+                self.tag_list_start = 0;
+                self.recompute_tags();
+            }
             _ => {}
         }
     }
 
     pub fn open_search(&mut self) {
-        self.search_query.clear();
-        self.search_results.clear();
-        self.search_index = 0;
-        self.search_list_start = 0;
-        self.center_view = CenterView::Search;
-        self.focus = Focus::Center;
+        self.activate_workspace_view(CenterView::Search);
     }
 
     pub fn open_tags(&mut self) {
         self.close_dialog();
-        self.tags_return_view = if self.center_view == CenterView::Document {
-            CenterView::Document
-        } else {
-            CenterView::Daily
-        };
-        self.tag_query.clear();
-        self.tag_index = 0;
-        self.tag_list_start = 0;
-        self.center_view = CenterView::Tags;
-        self.focus = Focus::Center;
-        self.recompute_tags();
+        self.activate_workspace_view(CenterView::Tags);
     }
 
     pub(super) fn open_document_search(&mut self) {
@@ -720,6 +723,8 @@ impl App {
 
     pub(super) fn open_tag_search(&mut self, name: &str) {
         self.close_dialog();
+        self.workspace_view_index = WorkspaceView::index_of(CenterView::Search)
+            .expect("Search is registered as a workspace view");
         self.search_query = format!("#{name}");
         self.search_index = 0;
         self.search_list_start = 0;

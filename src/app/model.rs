@@ -268,14 +268,24 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub const ALL: &'static [Self] = &[
         Self {
+            center_view: CenterView::Chat,
+            label: "Agent",
+            description: "AI conversation",
+        },
+        Self {
             center_view: CenterView::Todo,
             label: "TODO",
             description: "Tasks",
         },
         Self {
-            center_view: CenterView::Chat,
-            label: "Agent",
-            description: "AI conversation",
+            center_view: CenterView::Tags,
+            label: "Tag",
+            description: "Browse tags",
+        },
+        Self {
+            center_view: CenterView::Search,
+            label: "Search",
+            description: "Find notes",
         },
         Self {
             center_view: CenterView::Daily,
