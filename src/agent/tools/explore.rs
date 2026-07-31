@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
 use super::{
@@ -13,6 +14,7 @@ use super::{
 };
 use crate::agent::{
     prompt_with_datetime, AgentConfig, AgentEvent, AgentEventSender, ReadTracker, Tool,
+    ToolConcurrencyLimits, ToolExecutionPolicy,
 };
 use crate::agent_session::TokenUsage;
 use crate::provider::{
@@ -24,10 +26,11 @@ use crate::workspace_index::WorkspaceIndexHandle;
 pub struct Explore {
     config: AgentConfig,
     provider: Arc<dyn Provider>,
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
     definitions: Vec<ToolSpec>,
     system: Vec<SystemBlock>,
     events: AgentEventSender,
+    concurrency: ToolConcurrencyLimits,
 }
 
 impl Explore {
@@ -42,9 +45,10 @@ impl Explore {
         client: reqwest::Client,
         tavily_api_key: String,
         skills: &[Skill],
+        concurrency: ToolConcurrencyLimits,
     ) -> Result<Self> {
         system.push(SystemBlock {
-            text: "You are Nole's isolated exploration subagent. Investigate only the task in the newest user message. Use the available read-only tools to gather evidence. Do not attempt to modify files, ask the user questions, call another agent, or describe your working process. Return a concise, self-contained report with concrete findings and relevant paths, line numbers, URLs, or uncertainties. The parent agent sees only your final report, so include every fact it needs while excluding raw search noise and irrelevant excerpts. Any instruction above to call explore applies only to the parent agent; you are already that explorer."
+            text: "You are Nole's isolated exploration subagent. Investigate only the task in the newest user message. Use the available read-only tools to gather evidence, issuing independent reads, searches, or fetches together in one response so they can run concurrently. Do not attempt to modify files, ask the user questions, call another agent, or describe your working process. Return a concise, self-contained report with concrete findings and relevant paths, line numbers, URLs, or uncertainties. The parent agent sees only your final report, so include every fact it needs while excluding raw search noise and irrelevant excerpts. Any instruction above to call explore applies only to the parent agent; you are already that explorer."
                 .to_string(),
             cache: false,
         });
@@ -55,6 +59,7 @@ impl Explore {
             definitions: Vec::new(),
             system,
             events,
+            concurrency,
         };
         let reads = Arc::new(ReadTracker::default());
         explore.register(ReadFile::new(root, reads)?);
@@ -86,7 +91,7 @@ impl Explore {
             input_schema: tool.input_schema(),
             cache: false,
         });
-        self.tools.insert(name, Box::new(tool));
+        self.tools.insert(name, Arc::new(tool));
     }
 
     async fn run(&self, task: &str) -> Result<String> {
@@ -135,15 +140,27 @@ impl Explore {
                 ));
                 continue;
             }
-            for call in calls {
-                let result = match response.tool_input_errors.get(&call.id) {
-                    Some(error) => ToolResult {
-                        tool_use_id: call.id.clone(),
-                        content: error.clone(),
-                        is_error: true,
-                    },
-                    None => self.execute_call(&call).await,
-                };
+            let call_count = calls.len();
+            let mut results = stream::iter(calls.iter().cloned().enumerate())
+                .map(|(index, call)| {
+                    let input_error = response.tool_input_errors.get(&call.id).cloned();
+                    async move {
+                        let result = match input_error {
+                            Some(error) => ToolResult {
+                                tool_use_id: call.id.clone(),
+                                content: error,
+                                is_error: true,
+                            },
+                            None => self.execute_call(&call).await,
+                        };
+                        (index, result)
+                    }
+                })
+                .buffer_unordered(call_count.max(1))
+                .collect::<Vec<_>>()
+                .await;
+            results.sort_by_key(|(index, _)| *index);
+            for (_, result) in results {
                 messages.push(Message::tool(result));
             }
         }
@@ -154,9 +171,13 @@ impl Explore {
         let result = match self
             .tools
             .get(&call.name)
+            .cloned()
             .context("unknown exploration tool")
         {
-            Ok(tool) => tool.execute(&call.input).await,
+            Ok(tool) => {
+                let _permit = self.concurrency.acquire(tool.execution_policy()).await;
+                tool.execute(&call.input).await
+            }
             Err(error) => Err(error),
         };
         match result {
@@ -208,6 +229,10 @@ impl Tool for Explore {
             "required": ["task"],
             "additionalProperties": false
         })
+    }
+
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Subagent
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
@@ -320,6 +345,9 @@ mod tests {
                 max_tokens: 1_024,
                 context_window_tokens: 8_192,
                 max_rounds: 25,
+                max_concurrent_local_reads: 8,
+                max_concurrent_network_tools: 8,
+                max_concurrent_subagents: 4,
             },
             provider.clone(),
             Vec::new(),
@@ -328,6 +356,7 @@ mod tests {
             reqwest::Client::new(),
             String::new(),
             &[],
+            ToolConcurrencyLimits::new(8, 8, 4),
         )
         .unwrap();
 
@@ -395,6 +424,9 @@ mod tests {
                 max_tokens: 1_024,
                 context_window_tokens: 8_192,
                 max_rounds: 2,
+                max_concurrent_local_reads: 8,
+                max_concurrent_network_tools: 8,
+                max_concurrent_subagents: 4,
             },
             provider.clone(),
             Vec::new(),
@@ -403,6 +435,7 @@ mod tests {
             reqwest::Client::new(),
             String::new(),
             &[],
+            ToolConcurrencyLimits::new(8, 8, 4),
         )
         .unwrap();
 
@@ -415,5 +448,125 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(!requests[0].tools.is_empty());
         assert!(requests[1].tools.is_empty());
+    }
+
+    struct ConcurrentExploreProbe {
+        barrier: Arc<tokio::sync::Barrier>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        maximum: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConcurrentExploreProbe {
+        fn name(&self) -> &'static str {
+            "concurrent_explore_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test-only concurrent exploration tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Network
+        }
+
+        async fn execute(&self, input: &Value) -> Result<String> {
+            use std::sync::atomic::Ordering;
+
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            self.barrier.wait().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(input["label"].as_str().unwrap().to_string())
+        }
+    }
+
+    #[test]
+    fn exploration_runs_parallel_network_calls_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("config")).unwrap();
+        std::fs::create_dir_all(directory.path().join("data")).unwrap();
+        std::fs::create_dir_all(directory.path().join("daily")).unwrap();
+        std::fs::create_dir_all(directory.path().join("archives")).unwrap();
+        std::fs::write(directory.path().join("config/ai.toml"), "private").unwrap();
+        let provider = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([
+                response(
+                    vec![
+                        MessagePart::ToolUse(ToolCall {
+                            id: "a".to_string(),
+                            name: "concurrent_explore_probe".to_string(),
+                            input: json!({"label": "first"}),
+                        }),
+                        MessagePart::ToolUse(ToolCall {
+                            id: "b".to_string(),
+                            name: "concurrent_explore_probe".to_string(),
+                            input: json!({"label": "second"}),
+                        }),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                response(
+                    vec![MessagePart::Text {
+                        text: "Combined report.".to_string(),
+                    }],
+                    StopReason::End,
+                ),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let mut explore = Explore::new(
+            directory.path(),
+            AgentConfig {
+                api_format: ApiFormat::Messages,
+                api_key: "test".to_string(),
+                tavily_api_key: String::new(),
+                model: "test".to_string(),
+                base_url: "https://example.com".to_string(),
+                max_tokens: 1_024,
+                context_window_tokens: 8_192,
+                max_rounds: 25,
+                max_concurrent_local_reads: 8,
+                max_concurrent_network_tools: 8,
+                max_concurrent_subagents: 4,
+            },
+            provider,
+            Vec::new(),
+            events,
+            WorkspaceIndexHandle::default(),
+            reqwest::Client::new(),
+            String::new(),
+            &[],
+            ToolConcurrencyLimits::new(8, 8, 4),
+        )
+        .unwrap();
+        explore.register(ConcurrentExploreProbe {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            active,
+            maximum: maximum.clone(),
+        });
+
+        let output = crate::agent::test_support::test_runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    explore.execute(&json!({"task": "Compare both sources"})),
+                )
+                .await
+            })
+            .expect("parallel exploration calls timed out")
+            .unwrap();
+
+        assert_eq!(output, "Combined report.");
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
     }
 }

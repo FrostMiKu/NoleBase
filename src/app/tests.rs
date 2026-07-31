@@ -803,9 +803,10 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     ));
 
     event_sender
-        .send(AgentEvent::ToolFinished(
-            "Completed Ask User.\nChoose a format".to_string(),
-        ))
+        .send(AgentEvent::ToolFinished {
+            id: "ask-user".to_string(),
+            message: "Completed Ask User.\nChoose a format".to_string(),
+        })
         .unwrap();
     app.poll_agent();
     assert!(matches!(
@@ -887,7 +888,10 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
         .send(AgentEvent::AssistantDelta("the source first.".to_string()))
         .unwrap();
     sender
-        .send(AgentEvent::ToolStarted("Calling Read File...".to_string()))
+        .send(AgentEvent::ToolStarted {
+            id: "read".to_string(),
+            message: "Calling Read File...".to_string(),
+        })
         .unwrap();
     sender
         .send(AgentEvent::Round {
@@ -943,7 +947,10 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     ));
 
     sender
-        .send(AgentEvent::ToolFinished("Completed Read File.".to_string()))
+        .send(AgentEvent::ToolFinished {
+            id: "read".to_string(),
+            message: "Completed Read File.".to_string(),
+        })
         .unwrap();
     app.poll_agent();
     assert!(matches!(
@@ -982,6 +989,42 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
         Some("Agent finished")
     );
     assert_eq!(app.notifications.take_bells(), 1);
+}
+
+#[test]
+fn concurrent_tool_events_finish_the_matching_timeline_entries() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "a".to_string(),
+            message: "Fetching Web...\nhttps://a.example".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "b".to_string(),
+            message: "Fetching Web...\nhttps://b.example".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "a".to_string(),
+            message: "Completed Web Fetch.\nhttps://a.example".to_string(),
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert!(matches!(
+        &app.agent_panel[0],
+        AgentPanelEntry::Tool { text, active: false }
+            if text.contains("https://a.example")
+    ));
+    assert!(matches!(
+        &app.agent_panel[1],
+        AgentPanelEntry::Tool { text, active: true }
+            if text.contains("https://b.example")
+    ));
 }
 
 #[test]
@@ -1056,12 +1099,16 @@ fn application_errors_notify_but_agent_tool_failures_do_not() {
 
     let sender = install_agent_observable(&mut app);
     sender
-        .send(AgentEvent::ToolStarted("Calling Read File...".to_string()))
+        .send(AgentEvent::ToolStarted {
+            id: "failed-read".to_string(),
+            message: "Calling Read File...".to_string(),
+        })
         .unwrap();
     sender
-        .send(AgentEvent::ToolFinished(
-            "Failed Read File: file not found".to_string(),
-        ))
+        .send(AgentEvent::ToolFinished {
+            id: "failed-read".to_string(),
+            message: "Failed Read File: file not found".to_string(),
+        })
         .unwrap();
     app.poll_agent();
 
@@ -1850,6 +1897,38 @@ fn document_search_reuses_search_view_and_jumps_to_source_line() {
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.center_view, CenterView::Document);
     assert_eq!(app.document.as_ref().unwrap().target_line, Some(4));
+}
+
+#[test]
+fn single_line_search_inputs_edit_at_the_shared_character_cursor() {
+    let (mut app, _directory) = make_app();
+
+    app.open_search();
+    app.handle_paste("文档ab");
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Backspace));
+    app.handle_key(key(KeyCode::Char('新')));
+    app.handle_key(key(KeyCode::Delete));
+    assert_eq!(app.search_query, "文档新");
+    assert_eq!(app.search_cursor, 3);
+
+    app.focus = Focus::Files;
+    app.files_context = FilesContext::Search;
+    app.handle_paste("文档ab");
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Right));
+    app.handle_key(key(KeyCode::Char('新')));
+    assert_eq!(app.file_query, "文新档ab");
+    assert_eq!(app.file_query_cursor, 2);
+
+    app.open_command_palette();
+    app.handle_paste("文档ab");
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Right));
+    app.handle_key(key(KeyCode::Char('新')));
+    let dialog = app.dialog.as_ref().unwrap();
+    assert_eq!(dialog.input, "文新档ab");
+    assert_eq!(dialog.cursor, 2);
 }
 
 #[test]

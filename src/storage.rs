@@ -9,13 +9,15 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_session::AgentSession;
-use crate::model::{DailyNote, NoteFile, SearchHit, TodoItem};
+use crate::model::{DailyNote, NoteFile, TodoItem};
 use crate::theme::Theme;
+
+mod theme;
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
@@ -182,6 +184,9 @@ impl Storage {
             "max_tokens = 8192\n",
             "context_window_tokens = 200000\n",
             "max_rounds = 25\n",
+            "max_concurrent_local_reads = 8\n",
+            "max_concurrent_network_tools = 8\n",
+            "max_concurrent_subagents = 4\n",
         );
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -256,7 +261,7 @@ impl Storage {
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("reading {}", self.settings_path.display()))
+                    .with_context(|| format!("reading {}", self.settings_path.display()));
             }
         };
         toml::from_str(&source).with_context(|| format!("parsing {}", self.settings_path.display()))
@@ -268,7 +273,7 @@ impl Storage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("opening {}", self.agent_session_path.display()))
+                    .with_context(|| format!("opening {}", self.agent_session_path.display()));
             }
         };
         serde_json::from_reader(file)
@@ -324,115 +329,6 @@ impl Storage {
             Err(error) => Err(error)
                 .with_context(|| format!("removing {}", self.agent_session_path.display())),
         }
-    }
-
-    pub fn select_theme(&self, selection: &str) -> Result<LoadedTheme> {
-        let loaded = self.resolve_theme(selection, None)?;
-        self.write_theme_selection(selection)?;
-        Ok(loaded)
-    }
-
-    pub fn list_theme_names(&self) -> Result<Vec<String>> {
-        Ok(self
-            .theme_files()?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect())
-    }
-
-    fn resolve_theme(
-        &self,
-        requested: &str,
-        previous_random_source: Option<&Path>,
-    ) -> Result<LoadedTheme> {
-        if requested == "default" {
-            return self.load_default_theme(requested);
-        }
-
-        let files = self.theme_files()?;
-        if requested == "random" {
-            if let Some(previous) = previous_random_source {
-                if let Some((name, path)) = files.iter().find(|(_, path)| path == previous) {
-                    return self.load_theme_file(requested, name, path);
-                }
-            }
-
-            let mut valid = Vec::new();
-            for (name, path) in &files {
-                if let Ok(theme) = self.parse_theme_file(path) {
-                    valid.push((name, path, theme));
-                }
-            }
-            if valid.is_empty() {
-                return self.load_default_theme(requested);
-            }
-            let (name, path, theme) = valid.swap_remove(fastrand::usize(..valid.len()));
-            return Ok(LoadedTheme {
-                requested: requested.to_string(),
-                active: name.clone(),
-                source: Some(path.clone()),
-                theme,
-            });
-        }
-
-        match files.into_iter().find(|(name, _)| name == requested) {
-            Some((name, path)) => self.load_theme_file(requested, &name, &path),
-            None => self.load_default_theme(requested),
-        }
-    }
-
-    fn load_default_theme(&self, requested: &str) -> Result<LoadedTheme> {
-        let path = self.themes_dir.join("default.toml");
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                self.load_theme_file(requested, "default", &path)
-            }
-            Ok(_) => Ok(LoadedTheme::built_in_default_for(requested)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(LoadedTheme::built_in_default_for(requested))
-            }
-            Err(error) => Err(error).with_context(|| format!("reading theme {}", path.display())),
-        }
-    }
-
-    fn load_theme_file(&self, requested: &str, name: &str, path: &Path) -> Result<LoadedTheme> {
-        Ok(LoadedTheme {
-            requested: requested.to_string(),
-            active: name.to_string(),
-            source: Some(path.to_path_buf()),
-            theme: self.parse_theme_file(path)?,
-        })
-    }
-
-    fn parse_theme_file(&self, path: &Path) -> Result<Theme> {
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("reading theme {}", path.display()))?;
-        Theme::from_toml(&source).with_context(|| format!("loading theme {}", path.display()))
-    }
-
-    fn theme_files(&self) -> Result<Vec<(String, PathBuf)>> {
-        let mut themes = Vec::new();
-        for entry in fs::read_dir(&self.themes_dir)
-            .with_context(|| format!("reading {}", self.themes_dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let is_toml = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"));
-            let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if is_toml && !name.is_empty() && name != "default" && name != "random" {
-                themes.push((name.to_string(), path));
-            }
-        }
-        themes.sort_by(|(left, _), (right, _)| left.cmp(right));
-        Ok(themes)
     }
 
     /// Load one card per daily file, oldest first.
@@ -568,30 +464,6 @@ impl Storage {
             }
         }
         Ok(false)
-    }
-
-    /// Perform an explicit content scan for Agent tools and other non-interactive callers.
-    pub fn search_file_lines(&self, query: &str) -> Vec<SearchHit> {
-        let query = query.to_lowercase();
-        if query.is_empty() {
-            return Vec::new();
-        }
-        const CAP: usize = 200;
-        let mut hits = Vec::new();
-        let daily = self
-            .list_note_files_in(&self.daily_dir, false)
-            .unwrap_or_default();
-        let notes = self.list_note_files().unwrap_or_default();
-        let archives = self.list_archived_note_files().unwrap_or_default();
-        for file in daily.into_iter().chain(notes).chain(archives) {
-            let Ok(source) = fs::read_to_string(&file.path) else {
-                continue;
-            };
-            if append_search_hits(&mut hits, &file.path, &source, &query, CAP) {
-                break;
-            }
-        }
-        hits
     }
 
     /// Append a DailyNote to a managed note, then remove its daily file.
@@ -1013,29 +885,6 @@ fn create_empty_file(path: &Path) -> Result<()> {
     }
 }
 
-fn append_search_hits(
-    hits: &mut Vec<SearchHit>,
-    path: &Path,
-    source: &str,
-    query: &str,
-    cap: usize,
-) -> bool {
-    for (index, line) in source.lines().enumerate() {
-        let text = line.trim();
-        if !text.is_empty() && line.to_lowercase().contains(query) {
-            hits.push(SearchHit::FileLine {
-                path: path.to_path_buf(),
-                line_no: index + 1,
-                text: text.to_string(),
-            });
-            if hits.len() >= cap {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn parse_daily_date(value: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .with_context(|| format!("invalid daily date {value}; expected YYYY-MM-DD"))
@@ -1403,9 +1252,10 @@ mod tests {
             st.validate_embedded_file(&file).unwrap(),
             fs::canonicalize(&file).unwrap()
         );
-        assert!(st
-            .validate_embedded_file(&st.root.join("missing.pdf"))
-            .is_err());
+        assert!(
+            st.validate_embedded_file(&st.root.join("missing.pdf"))
+                .is_err()
+        );
 
         let outside = tempdir().unwrap();
         let outside_file = outside.path().join("outside.pdf");
@@ -1522,9 +1372,10 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "# Article\n\nnew paragraph\n"
         );
-        assert!(st
-            .append_document_tracked(Path::new("/tmp/outside.md"), "no")
-            .is_err());
+        assert!(
+            st.append_document_tracked(Path::new("/tmp/outside.md"), "no")
+                .is_err()
+        );
         assert!(st.append_document_tracked(&path, "   ").is_err());
     }
 
@@ -1674,11 +1525,12 @@ mod tests {
         assert!(st.rename_file(&link, "renamed.md").is_err());
         assert!(st.delete_file(&link).is_err());
         assert!(link.exists());
-        assert!(!st
-            .list_note_files()
-            .unwrap()
-            .iter()
-            .any(|file| file.path == link));
+        assert!(
+            !st.list_note_files()
+                .unwrap()
+                .iter()
+                .any(|file| file.path == link)
+        );
     }
 
     #[test]
@@ -1719,6 +1571,9 @@ mod tests {
         assert!(config.contains("max_tokens = 8192"));
         assert!(config.contains("context_window_tokens = 200000"));
         assert!(config.contains("max_rounds = 25"));
+        assert!(config.contains("max_concurrent_local_reads = 8"));
+        assert!(config.contains("max_concurrent_network_tools = 8"));
+        assert!(config.contains("max_concurrent_subagents = 4"));
         assert_eq!(
             fs::read_to_string(&st.settings_path).unwrap(),
             "theme = \"default\"\n"
@@ -1868,9 +1723,11 @@ mod tests {
     fn initial_settings_capture_editor_and_theme_changes_preserve_it() {
         let with_editor = initial_settings(Some("code -w".to_string()));
         assert_eq!(with_editor.editor.as_deref(), Some("code -w"));
-        assert!(serialize_settings(&with_editor)
-            .unwrap()
-            .contains("editor = \"code -w\""));
+        assert!(
+            serialize_settings(&with_editor)
+                .unwrap()
+                .contains("editor = \"code -w\"")
+        );
         assert_eq!(initial_settings(Some(" ".to_string())).editor, None);
 
         let (_directory, storage) = fresh();
@@ -1909,18 +1766,29 @@ mod tests {
             crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
         let path = storage.themes_dir.join("only.toml");
         fs::write(&path, custom).unwrap();
-        let random = storage.select_theme("random").unwrap();
-        assert_eq!(random.requested, "random");
-        assert_eq!(random.active, "only");
-        assert_eq!(random.source.as_deref(), Some(path.as_path()));
+        assert_eq!(storage.list_theme_names().unwrap(), vec!["only"]);
+        storage.write_theme_selection("random").unwrap();
+
+        let default_random = storage.load_theme(Some(&default_path)).unwrap();
+        assert_eq!(default_random.requested, "random");
+        assert_eq!(default_random.active, "default");
         assert_eq!(
-            random.theme.surface_panel,
-            ratatui::style::Color::Rgb(1, 2, 3)
+            default_random.source.as_deref(),
+            Some(default_path.as_path())
+        );
+        assert_eq!(
+            default_random.theme.surface_panel,
+            ratatui::style::Color::Rgb(9, 8, 7)
         );
 
-        let reloaded = storage.load_theme(random.source.as_deref()).unwrap();
-        assert_eq!(reloaded.active, "only");
-        assert_eq!(reloaded.source, random.source);
+        let custom_random = storage.load_theme(Some(&path)).unwrap();
+        assert_eq!(custom_random.requested, "random");
+        assert_eq!(custom_random.active, "only");
+        assert_eq!(custom_random.source.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            custom_random.theme.surface_panel,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
 
         fs::remove_file(default_path).unwrap();
         storage.write_theme_selection("missing").unwrap();

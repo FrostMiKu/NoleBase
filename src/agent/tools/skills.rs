@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::agent::Tool;
+use crate::agent::{Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
 
 pub struct LoadSkill {
@@ -27,6 +27,9 @@ impl LoadSkill {
 impl Tool for LoadSkill {
     fn name(&self) -> &'static str {
         "load_skill"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
 
     fn description(&self) -> &'static str {

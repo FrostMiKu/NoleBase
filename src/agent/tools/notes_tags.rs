@@ -11,7 +11,7 @@ use super::util::{
     required_string, truncate_chars,
 };
 use super::write_policy::{WriteSource, validate_write};
-use crate::agent::{ApprovalGate, ApprovalRequest, Tool, canonical_root};
+use crate::agent::{ApprovalGate, ApprovalRequest, Tool, ToolExecutionPolicy, canonical_root};
 use crate::model::SearchHit;
 use crate::storage::Storage;
 use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};
@@ -30,6 +30,9 @@ impl ListTags {
 impl Tool for ListTags {
     fn name(&self) -> &'static str {
         "list_tags"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
 
     fn description(&self) -> &'static str {
@@ -148,6 +151,9 @@ impl SearchTag {
 impl Tool for SearchTag {
     fn name(&self) -> &'static str {
         "search_tag"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
 
     fn description(&self) -> &'static str {

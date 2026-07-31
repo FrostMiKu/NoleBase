@@ -277,6 +277,9 @@ base_url = "https://api.anthropic.com"
 max_tokens = 8192
 context_window_tokens = 200000
 max_rounds = 25
+max_concurrent_local_reads = 8
+max_concurrent_network_tools = 8
+max_concurrent_subagents = 4
 ```
 
 Set `api_format` to `messages` for the Anthropic Messages protocol, or to
@@ -303,6 +306,8 @@ keeps the completed conversation and tool history, so a later prompt can continu
 exhausted, uses provider token counting when available and replaces a safe prefix
 of older completed turns with a dense summary. The system prompt, current turn,
 recent history, and complete `tool_use`/`tool_result` pairs are retained.
+The three `max_concurrent_*` settings bound local read/search calls, web
+search/fetch calls, and isolated subagents across the complete Agent tree.
 Compatible endpoints without token counting fall back to a conservative local
 estimate.
 Provider requests retry connection failures and HTTP 408, 425, 429, and 5xx
@@ -342,6 +347,16 @@ observed output throughput in `t/s`, and cache-read tokens with their share of
 total input tokens. Token and throughput statistics reset when the Agent session
 is cleared; the retry count covers the current application run. Multiple tool
 calls returned in one model response still count as one round.
+Consecutive read-only calls in one response execute as a concurrent wave. This
+includes local reads and searches, web search/fetch, and multiple `explore`
+subagents. Mutation, approval, and TUI interaction tools are exclusive barriers:
+Nole finishes the preceding wave before running one, then starts a new wave.
+Filesystem-backed Agent reads use Tokio's asynchronous filesystem APIs rather
+than blocking the Agent runtime thread.
+By default, concurrency is bounded across the complete Agent tree to eight
+local reads, eight network tools, and four subagents; the `max_concurrent_*`
+settings above adjust these limits. Tool results are returned to the model in
+its original call order even when completion order differs.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
 task, clear its saved session, create or manage notes, or open `template.mb`,
@@ -378,13 +393,15 @@ web lookup tools, but no mutation, interaction, or recursive-agent tools. Its
 search calls, source excerpts, and intermediate reasoning stay in a private
 conversation; the main Agent session stores only the `explore` call and its
 concise evidence-based report. Targeted reads and lookups can still use the
-corresponding tools directly.
+corresponding tools directly. Independent `explore` calls run concurrently, as
+do independent read, search, and fetch calls within each subagent, subject to
+the shared limits above.
 You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
-An in-flight tool is allowed to finish, while later unstarted calls from the
-old plan are deferred so the Agent can reconsider them with the new input and a
-fresh `max_rounds` budget. A follow-up appears at the end of the timeline in
-muted text while queued, then
+An in-flight concurrent wave is allowed to finish, while later unstarted calls
+from the old plan are deferred so the Agent can reconsider them with the new
+input and a fresh `max_rounds` budget. A follow-up appears at the end of the
+timeline in muted text while queued, then
 uses normal MBDown colors once the Agent consumes it. Final responses and later
 prompts append to the same virtual-scrolling timeline. Only clearing the Agent
 session removes panel history.

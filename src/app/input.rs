@@ -117,15 +117,27 @@ impl App {
                 paste_into(&mut self.input, &mut self.input_cursor, &text)
             }
             (Focus::Center, CenterView::Search | CenterView::DocumentSearch, _) => {
-                self.search_query.push_str(&text);
+                paste_into(
+                    &mut self.search_query,
+                    &mut self.search_cursor,
+                    &text.replace('\n', ""),
+                );
                 self.recompute_search();
             }
             (Focus::Center, CenterView::Tags, _) => {
-                self.tag_query.push_str(&text.replace('\n', ""));
+                paste_into(
+                    &mut self.tag_query,
+                    &mut self.tag_cursor,
+                    &text.replace('\n', ""),
+                );
                 self.recompute_tags();
             }
             (Focus::Files, _, FilesContext::Search) => {
-                self.file_query.push_str(&text.replace('\n', ""));
+                paste_into(
+                    &mut self.file_query,
+                    &mut self.file_query_cursor,
+                    &text.replace('\n', ""),
+                );
                 self.ensure_visible_file_selection();
             }
             (Focus::Files, _, FilesContext::NewTarget) => {
@@ -571,17 +583,13 @@ impl App {
                 self.jump_to_search_result(self.search_index);
                 None
             }
-            KeyCode::Backspace => {
-                self.search_query.pop();
-                self.recompute_search();
+            _ => {
+                let edit = edit_single_line(&mut self.search_query, &mut self.search_cursor, key);
+                if edit.changed() {
+                    self.recompute_search();
+                }
                 None
             }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search_query.push(character);
-                self.recompute_search();
-                None
-            }
-            _ => None,
         }
     }
 
@@ -614,17 +622,13 @@ impl App {
                 }
                 None
             }
-            KeyCode::Backspace => {
-                self.tag_query.pop();
-                self.recompute_tags();
+            _ => {
+                let edit = edit_single_line(&mut self.tag_query, &mut self.tag_cursor, key);
+                if edit.changed() {
+                    self.recompute_tags();
+                }
                 None
             }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.tag_query.push(character);
-                self.recompute_tags();
-                None
-            }
-            _ => None,
         }
     }
 

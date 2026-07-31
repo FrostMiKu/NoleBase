@@ -119,6 +119,7 @@ impl App {
             }
             CenterView::Search => {
                 self.search_query.clear();
+                self.search_cursor = 0;
                 self.search_results.clear();
                 self.search_index = 0;
                 self.search_list_start = 0;
@@ -130,6 +131,7 @@ impl App {
                     CenterView::Daily
                 };
                 self.tag_query.clear();
+                self.tag_cursor = 0;
                 self.tag_index = 0;
                 self.tag_list_start = 0;
                 self.recompute_tags();
@@ -149,6 +151,7 @@ impl App {
 
     pub(super) fn open_document_search(&mut self) {
         self.search_query.clear();
+        self.search_cursor = 0;
         self.search_results.clear();
         self.search_index = 0;
         self.search_list_start = 0;
@@ -287,6 +290,7 @@ impl App {
             KeyCode::Char('e') => self.selected_file.clone().map(Command::Edit),
             KeyCode::Char('/') => {
                 self.file_query.clear();
+                self.file_query_cursor = 0;
                 self.files_context = FilesContext::Search;
                 self.ensure_visible_file_selection();
                 None
@@ -328,6 +332,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.file_query.clear();
+                self.file_query_cursor = 0;
                 self.files_context = FilesContext::Browse;
                 self.ensure_visible_file_selection();
                 None
@@ -344,17 +349,13 @@ impl App {
                 self.open_selected_file(DocumentReturn::Daily);
                 None
             }
-            KeyCode::Backspace => {
-                self.file_query.pop();
-                self.ensure_visible_file_selection();
+            _ => {
+                let edit = edit_single_line(&mut self.file_query, &mut self.file_query_cursor, key);
+                if edit.changed() {
+                    self.ensure_visible_file_selection();
+                }
                 None
             }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.file_query.push(character);
-                self.ensure_visible_file_selection();
-                None
-            }
-            _ => None,
         }
     }
 
@@ -738,6 +739,7 @@ impl App {
         self.workspace_view_index = WorkspaceView::index_of(CenterView::Search)
             .expect("Search is registered as a workspace view");
         self.search_query = format!("#{name}");
+        self.search_cursor = self.search_query.chars().count();
         self.search_index = 0;
         self.search_list_start = 0;
         self.center_view = CenterView::Search;
@@ -980,6 +982,7 @@ impl App {
             Action::Move => {
                 self.pending_daily_date = Some(date);
                 self.file_query.clear();
+                self.file_query_cursor = 0;
                 self.reload_files();
                 self.files_context = FilesContext::MoveTarget;
                 self.ensure_visible_file_selection();

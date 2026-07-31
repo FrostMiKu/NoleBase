@@ -1,5 +1,6 @@
 //! Application state and event handling.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,8 +42,10 @@ mod skill_tests;
 mod terminal;
 #[cfg(test)]
 mod tests;
+mod text_input;
 mod vlist;
 
+pub(in crate::app) use self::text_input::{edit_single_line, TextInputEdit};
 pub(crate) use self::vlist::*;
 pub use self::{dialog::*, document::*, model::*};
 
@@ -211,6 +214,7 @@ pub struct App {
     pub notes_expanded: bool,
     pub archives_expanded: bool,
     pub file_query: String,
+    pub file_query_cursor: usize,
     pub rename_input: String,
     pub rename_cursor: usize,
     pub new_file_input: String,
@@ -228,10 +232,12 @@ pub struct App {
     pub workspace_view_index: usize,
 
     pub search_query: String,
+    pub search_cursor: usize,
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
     pub search_list_start: usize,
     pub tag_query: String,
+    pub tag_cursor: usize,
     pub tag_results: Vec<TagSummary>,
     pub tag_index: usize,
     pub tag_list_start: usize,
@@ -279,6 +285,7 @@ pub struct App {
     pub permission_mode: PermissionMode,
     permission_bypass: Arc<AtomicBool>,
     pub agent_panel: Vec<AgentPanelEntry>,
+    active_agent_tools: HashMap<String, usize>,
     pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
     pub agent_usage: TokenUsage,
@@ -387,6 +394,7 @@ impl App {
             notes_expanded: true,
             archives_expanded: false,
             file_query: String::new(),
+            file_query_cursor: 0,
             rename_input: String::new(),
             rename_cursor: 0,
             new_file_input: String::new(),
@@ -400,10 +408,12 @@ impl App {
             workspace_view_index: WorkspaceView::index_of(CenterView::Daily)
                 .expect("Daily is a registered workspace view"),
             search_query: String::new(),
+            search_cursor: 0,
             search_results: Vec::new(),
             search_index: 0,
             search_list_start: 0,
             tag_query: String::new(),
+            tag_cursor: 0,
             tag_results: Vec::new(),
             tag_index: 0,
             tag_list_start: 0,
@@ -443,6 +453,7 @@ impl App {
             permission_mode: PermissionMode::Approve,
             permission_bypass,
             agent_panel,
+            active_agent_tools: HashMap::new(),
             agent_vlist: AgentVirtualList::default(),
             agent_scroll,
             agent_usage,

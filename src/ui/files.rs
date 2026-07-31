@@ -53,7 +53,7 @@ pub(super) fn draw_files(
             input_area,
             prompt,
             value,
-            value.chars().count(),
+            app.file_query_cursor,
             focused && interactive,
             app.theme,
         ) {

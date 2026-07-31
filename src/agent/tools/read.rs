@@ -1,22 +1,19 @@
 //! Read-only filesystem and note search tools.
 
-use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use serde_json::{json, Value};
+use tokio::fs as async_fs;
 
 use super::util::{
-    MAX_FILE_BYTES, DEFAULT_SEARCH_RESULTS, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
-    MAX_SEARCH_SNIPPET_CHARS, display_path, fuzzy_match, optional_usize, required_string,
-    truncate_chars,
+    display_path, fuzzy_match, optional_usize, required_string, truncate_chars,
+    DEFAULT_SEARCH_RESULTS, MAX_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
+    MAX_SEARCH_SNIPPET_CHARS,
 };
-use crate::agent::{ReadTracker, Tool, canonical_root};
-use crate::model::SearchHit;
-use crate::storage::Storage;
+use crate::agent::{canonical_root, ReadTracker, Tool, ToolExecutionPolicy};
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
@@ -34,8 +31,7 @@ pub struct ReadFile {
 impl ReadFile {
     pub fn new(root: &Path, reads: Arc<ReadTracker>) -> Result<Self> {
         let root = canonical_root(root)?;
-        let private_config = fs::canonicalize(root.join("config/ai.toml"))
-            .unwrap_or_else(|_| root.join("config/ai.toml"));
+        let private_config = root.join("config/ai.toml");
         Ok(Self {
             private_config,
             reads,
@@ -48,6 +44,9 @@ impl ReadFile {
 impl Tool for ReadFile {
     fn name(&self) -> &'static str {
         "read_file"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
     fn description(&self) -> &'static str {
         "Read a paginated range from any UTF-8 text file by absolute path, or by a path relative to the Nole root (maximum 1 MB). offset is a zero-based line number. The response includes every returned line's absolute zero-based line number and text without its line ending."
@@ -72,18 +71,21 @@ impl Tool for ReadFile {
         } else {
             self.root.join(path)
         };
-        let path =
-            fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?;
+        let path = async_fs::canonicalize(&path)
+            .await
+            .with_context(|| format!("resolving {}", path.display()))?;
         if path == self.private_config {
             bail!("AI configuration is private");
         }
-        let metadata =
-            fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+        let metadata = async_fs::metadata(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
             bail!("file must be a regular UTF-8 file no larger than 1 MB");
         }
-        let content =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let content = async_fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
         let offset = optional_usize(input, "offset", 0, usize::MAX)?;
         let limit = optional_usize(input, "limit", DEFAULT_READ_LINES, MAX_READ_LINES)?;
         let lines: Vec<&str> = source_lines(&content);
@@ -138,6 +140,9 @@ impl Tool for ListDirectory {
     fn name(&self) -> &'static str {
         "list_directory"
     }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
+    }
 
     fn description(&self) -> &'static str {
         "List files and subdirectories in any directory with type, nesting depth, extension, byte size, line count, creation time, and modification time. depth=1 lists direct children; larger values recurse without following symlinks. Supports metadata sorting and pagination."
@@ -176,9 +181,11 @@ impl Tool for ListDirectory {
         } else {
             self.root.join(requested_path)
         };
-        let directory = fs::canonicalize(&directory)
+        let directory = async_fs::canonicalize(&directory)
+            .await
             .with_context(|| format!("resolving directory {}", directory.display()))?;
-        if !fs::metadata(&directory)
+        if !async_fs::metadata(&directory)
+            .await
             .with_context(|| format!("reading metadata for {}", directory.display()))?
             .is_dir()
         {
@@ -203,7 +210,7 @@ impl Tool for ListDirectory {
         };
         let offset = optional_usize(input, "offset", 0, usize::MAX)?;
         let limit = optional_usize(input, "limit", 200, MAX_DIRECTORY_RESULTS)?;
-        let (mut entries, truncated) = directory_entries(&directory, depth)?;
+        let (mut entries, truncated) = directory_entries(&directory, depth).await?;
         entries.sort_by(|a, b| {
             let ordering = match sort_by {
                 "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -257,18 +264,25 @@ impl Tool for ListDirectory {
     }
 }
 
-fn directory_entries(root: &Path, max_depth: usize) -> Result<(Vec<DirectoryEntryMetadata>, bool)> {
+async fn directory_entries(
+    root: &Path,
+    max_depth: usize,
+) -> Result<(Vec<DirectoryEntryMetadata>, bool)> {
     let mut entries = Vec::new();
     let mut directories = vec![(root.to_path_buf(), 1usize)];
     let mut truncated = false;
     while let Some((directory, depth)) = directories.pop() {
-        let children = fs::read_dir(&directory)
+        let mut children = async_fs::read_dir(&directory)
+            .await
             .with_context(|| format!("listing directory {}", directory.display()))?;
-        for child in children {
-            let child =
-                child.with_context(|| format!("listing directory {}", directory.display()))?;
+        while let Some(child) = children
+            .next_entry()
+            .await
+            .with_context(|| format!("listing directory {}", directory.display()))?
+        {
             let path = child.path();
-            let metadata = fs::symlink_metadata(&path)
+            let metadata = async_fs::symlink_metadata(&path)
+                .await
                 .with_context(|| format!("reading metadata for {}", path.display()))?;
             let file_type = metadata.file_type();
             let kind = if file_type.is_dir() {
@@ -281,7 +295,7 @@ fn directory_entries(root: &Path, max_depth: usize) -> Result<(Vec<DirectoryEntr
                 "other"
             };
             let line_count = if file_type.is_file() && metadata.len() <= MAX_FILE_BYTES {
-                count_file_lines(&path).ok()
+                count_file_lines(&path).await.ok()
             } else {
                 None
             };
@@ -313,15 +327,10 @@ fn directory_entries(root: &Path, max_depth: usize) -> Result<(Vec<DirectoryEntr
     Ok((entries, truncated))
 }
 
-fn count_file_lines(path: &Path) -> Result<u64> {
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    let mut buffer = Vec::new();
-    let mut line_count = 0u64;
-    while reader.read_until(b'\n', &mut buffer)? != 0 {
-        line_count += 1;
-        buffer.clear();
-    }
-    Ok(line_count)
+async fn count_file_lines(path: &Path) -> Result<u64> {
+    let content = async_fs::read(path).await?;
+    let newlines = content.iter().filter(|byte| **byte == b'\n').count() as u64;
+    Ok(newlines + u64::from(!content.is_empty() && !content.ends_with(b"\n")))
 }
 
 fn listed_path(root: &Path, path: &Path) -> String {
@@ -341,15 +350,16 @@ struct NoteMetadata {
 }
 
 pub struct ListNotes {
-    storage: Storage,
+    data_dir: PathBuf,
     root: PathBuf,
 }
 
 impl ListNotes {
     pub fn new(root: &Path) -> Result<Self> {
+        let root = canonical_root(root)?;
         Ok(Self {
-            storage: Storage::new(root)?,
-            root: canonical_root(root)?,
+            data_dir: root.join("data"),
+            root,
         })
     }
 }
@@ -358,6 +368,9 @@ impl ListNotes {
 impl Tool for ListNotes {
     fn name(&self) -> &'static str {
         "list_notes"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
 
     fn description(&self) -> &'static str {
@@ -402,12 +415,11 @@ impl Tool for ListNotes {
         }
         let offset = optional_usize(input, "offset", 0, usize::MAX)?;
         let limit = optional_usize(input, "limit", 200, MAX_NOTE_RESULTS)?;
-        let mut notes = self
-            .storage
-            .list_note_files()?
-            .into_iter()
-            .map(|note| note_metadata(note.path))
-            .collect::<Result<Vec<_>>>()?;
+        let listed = list_note_files_in(&self.data_dir).await?;
+        let mut notes = Vec::with_capacity(listed.len());
+        for note in listed {
+            notes.push(note_metadata(note.path).await?);
+        }
         notes.sort_by(|a, b| {
             let ordering = match sort_by {
                 "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -451,10 +463,11 @@ impl Tool for ListNotes {
     }
 }
 
-fn note_metadata(path: PathBuf) -> Result<NoteMetadata> {
-    let metadata =
-        fs::metadata(&path).with_context(|| format!("reading metadata for {}", path.display()))?;
-    let line_count = count_file_lines(&path)?;
+async fn note_metadata(path: PathBuf) -> Result<NoteMetadata> {
+    let metadata = async_fs::metadata(&path)
+        .await
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    let line_count = count_file_lines(&path).await?;
     Ok(NoteMetadata {
         name: path
             .file_name()
@@ -470,15 +483,16 @@ fn note_metadata(path: PathBuf) -> Result<NoteMetadata> {
 }
 
 pub struct SearchContent {
-    storage: Storage,
+    directories: [PathBuf; 3],
     root: PathBuf,
 }
 
 impl SearchContent {
     pub fn new(root: &Path) -> Result<Self> {
+        let root = canonical_root(root)?;
         Ok(Self {
-            storage: Storage::new(root)?,
-            root: canonical_root(root)?,
+            directories: [root.join("daily"), root.join("data"), root.join("archives")],
+            root,
         })
     }
 }
@@ -487,6 +501,9 @@ impl SearchContent {
 impl Tool for SearchContent {
     fn name(&self) -> &'static str {
         "search_content"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
 
     fn description(&self) -> &'static str {
@@ -505,18 +522,25 @@ impl Tool for SearchContent {
         let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
         let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
         let mut matches = Vec::new();
-        for hit in self.storage.search_file_lines(query) {
-            if let SearchHit::FileLine {
-                path,
-                line_no,
-                text,
-            } = hit
-            {
-                matches.push(json!({
-                    "path": display_path(&self.root, &path),
-                    "line": line_no.saturating_sub(1),
-                    "snippet": truncate_chars(&text, MAX_SEARCH_SNIPPET_CHARS),
-                }));
+        let lowercase_query = query.to_lowercase();
+        'directories: for directory in &self.directories {
+            for file in list_note_files_in(directory).await? {
+                let Ok(source) = async_fs::read_to_string(&file.path).await else {
+                    continue;
+                };
+                for (line, text) in source.lines().enumerate() {
+                    let snippet = text.trim();
+                    if !snippet.is_empty() && text.to_lowercase().contains(&lowercase_query) {
+                        matches.push(json!({
+                            "path": display_path(&self.root, &file.path),
+                            "line": line,
+                            "snippet": truncate_chars(snippet, MAX_SEARCH_SNIPPET_CHARS),
+                        }));
+                        if matches.len() >= 200 {
+                            break 'directories;
+                        }
+                    }
+                }
             }
         }
         paginated_search_result(query, offset, limit, matches)
@@ -524,15 +548,16 @@ impl Tool for SearchContent {
 }
 
 pub struct SearchFiles {
-    storage: Storage,
+    directories: [PathBuf; 2],
     root: PathBuf,
 }
 
 impl SearchFiles {
     pub fn new(root: &Path) -> Result<Self> {
+        let root = canonical_root(root)?;
         Ok(Self {
-            storage: Storage::new(root)?,
-            root: canonical_root(root)?,
+            directories: [root.join("data"), root.join("archives")],
+            root,
         })
     }
 }
@@ -541,6 +566,9 @@ impl SearchFiles {
 impl Tool for SearchFiles {
     fn name(&self) -> &'static str {
         "search_files"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::LocalRead
     }
 
     fn description(&self) -> &'static str {
@@ -558,11 +586,12 @@ impl Tool for SearchFiles {
         }
         let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
         let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
-        let matches = self
-            .storage
-            .list_note_files()?
+        let mut listed = Vec::new();
+        for directory in &self.directories {
+            listed.extend(list_note_files_in(directory).await?);
+        }
+        let matches = listed
             .into_iter()
-            .chain(self.storage.list_archived_note_files()?)
             .filter(|file| {
                 file.path
                     .file_stem()
@@ -578,6 +607,59 @@ impl Tool for SearchFiles {
             .collect();
         paginated_search_result(query, offset, limit, matches)
     }
+}
+
+struct ListedNote {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+}
+
+async fn list_note_files_in(directory: &Path) -> Result<Vec<ListedNote>> {
+    async_fs::create_dir_all(directory)
+        .await
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let mut entries = async_fs::read_dir(directory)
+        .await
+        .with_context(|| format!("listing {}", directory.display()))?;
+    let mut files = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("listing {}", directory.display()))?
+    {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_note_path(&path) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        files.push(ListedNote { path, modified });
+    }
+    files.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.path.file_name().cmp(&right.path.file_name()))
+    });
+    Ok(files)
+}
+
+fn is_note_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
+        })
 }
 
 fn source_lines(content: &str) -> Vec<&str> {

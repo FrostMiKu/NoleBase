@@ -100,20 +100,24 @@ impl App {
                         *followup = false;
                     }
                 }
-                AgentEvent::ToolStarted(message) => {
+                AgentEvent::ToolStarted { id, message } => {
+                    let index = self.agent_panel.len();
                     self.agent_panel.push(AgentPanelEntry::Tool {
                         text: message.clone(),
                         active: true,
                     });
+                    self.active_agent_tools.insert(id, index);
                     self.agent_scroll = u16::MAX;
                     self.set_status(message);
                 }
-                AgentEvent::ToolFinished(message) => {
-                    if let Some(AgentPanelEntry::Tool { text, active }) =
-                        self.agent_panel.iter_mut().rev().find(|entry| {
+                AgentEvent::ToolFinished { id, message } => {
+                    let index = self.active_agent_tools.remove(&id).or_else(|| {
+                        self.agent_panel.iter().rposition(|entry| {
                             matches!(entry, AgentPanelEntry::Tool { active: true, .. })
                         })
-                    {
+                    });
+                    let entry = index.and_then(|index| self.agent_panel.get_mut(index));
+                    if let Some(AgentPanelEntry::Tool { text, active }) = entry {
                         let answer = (message.starts_with("Completed Ask User.")
                             && text.starts_with("Calling Ask User..."))
                         .then(|| text.lines().nth(2).map(str::to_string))
@@ -199,6 +203,7 @@ impl App {
                 }
                 AgentEvent::Stopped(reason) => {
                     self.active_agent = None;
+                    self.deactivate_agent_tools();
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
                         self.ai_cancel = None;
@@ -236,6 +241,7 @@ impl App {
                 }
                 AgentEvent::Finished(result) => {
                     self.active_agent = None;
+                    self.deactivate_agent_tools();
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
                         self.ai_cancel = None;
@@ -561,18 +567,21 @@ impl App {
                 *streaming = false;
             }
         }
-        for entry in self.agent_panel.iter_mut().rev() {
-            if let AgentPanelEntry::Tool { active, .. } = entry {
-                if *active {
-                    *active = false;
-                }
-            }
-        }
+        self.deactivate_agent_tools();
         self.agent_panel
             .push(AgentPanelEntry::Error("Cancelled".to_string()));
         self.agent_scroll = u16::MAX;
         self.notifications.notify("Agent task cancelled");
         self.set_status("Agent task cancelled");
+    }
+
+    fn deactivate_agent_tools(&mut self) {
+        self.active_agent_tools.clear();
+        for entry in &mut self.agent_panel {
+            if let AgentPanelEntry::Tool { active, .. } = entry {
+                *active = false;
+            }
+        }
     }
 
     pub(super) fn clear_agent_session(&mut self) {
@@ -593,6 +602,7 @@ impl App {
         }
         let had_panel_content = !self.agent_panel.is_empty();
         self.agent_panel.clear();
+        self.active_agent_tools.clear();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }

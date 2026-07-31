@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
+use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,6 +44,9 @@ const CONTEXT_ESTIMATE_OVERHEAD: u64 = 1_024;
 const MAX_CONTEXT_COMPACTIONS_PER_ROUND: usize = 3;
 const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
 const MAX_TRUNCATION_RETRIES: usize = 3;
+const DEFAULT_MAX_CONCURRENT_LOCAL_READS: usize = 8;
+const DEFAULT_MAX_CONCURRENT_NETWORK_TOOLS: usize = 8;
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionMode {
@@ -86,8 +90,14 @@ pub enum AgentEvent {
         final_output: bool,
     },
     BufferedInputConsumed(usize),
-    ToolStarted(String),
-    ToolFinished(String),
+    ToolStarted {
+        id: String,
+        message: String,
+    },
+    ToolFinished {
+        id: String,
+        message: String,
+    },
     Usage(TokenUsage),
     ContextWindow {
         tokens: u64,
@@ -197,6 +207,63 @@ enum ToolBatchExecution {
         turn_boundary: bool,
     },
     Denied(Vec<Message>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionPolicy {
+    Exclusive,
+    LocalRead,
+    Network,
+    Subagent,
+}
+
+impl ToolExecutionPolicy {
+    fn is_concurrent(self) -> bool {
+        self != Self::Exclusive
+    }
+}
+
+#[derive(Clone)]
+struct ToolConcurrencyLimits {
+    local_reads: Arc<tokio::sync::Semaphore>,
+    network: Arc<tokio::sync::Semaphore>,
+    subagents: Arc<tokio::sync::Semaphore>,
+}
+
+impl ToolConcurrencyLimits {
+    fn from_config(config: &AgentConfig) -> Self {
+        Self::new(
+            config.max_concurrent_local_reads,
+            config.max_concurrent_network_tools,
+            config.max_concurrent_subagents,
+        )
+    }
+
+    fn new(local_reads: usize, network: usize, subagents: usize) -> Self {
+        Self {
+            local_reads: Arc::new(tokio::sync::Semaphore::new(local_reads)),
+            network: Arc::new(tokio::sync::Semaphore::new(network)),
+            subagents: Arc::new(tokio::sync::Semaphore::new(subagents)),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        policy: ToolExecutionPolicy,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let semaphore = match policy {
+            ToolExecutionPolicy::Exclusive => return None,
+            ToolExecutionPolicy::LocalRead => self.local_reads.clone(),
+            ToolExecutionPolicy::Network => self.network.clone(),
+            ToolExecutionPolicy::Subagent => self.subagents.clone(),
+        };
+        Some(
+            semaphore
+                .acquire_owned()
+                .await
+                .expect("tool concurrency semaphore closed"),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -415,6 +482,12 @@ pub struct AgentConfig {
     pub context_window_tokens: u64,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
+    #[serde(default = "default_max_concurrent_local_reads")]
+    pub max_concurrent_local_reads: usize,
+    #[serde(default = "default_max_concurrent_network_tools")]
+    pub max_concurrent_network_tools: usize,
+    #[serde(default = "default_max_concurrent_subagents")]
+    pub max_concurrent_subagents: usize,
 }
 
 const fn default_max_tokens() -> u32 {
@@ -427,6 +500,18 @@ const fn default_context_window_tokens() -> u64 {
 
 const fn default_max_rounds() -> u32 {
     DEFAULT_MAX_ROUNDS
+}
+
+const fn default_max_concurrent_local_reads() -> usize {
+    DEFAULT_MAX_CONCURRENT_LOCAL_READS
+}
+
+const fn default_max_concurrent_network_tools() -> usize {
+    DEFAULT_MAX_CONCURRENT_NETWORK_TOOLS
+}
+
+const fn default_max_concurrent_subagents() -> usize {
+    DEFAULT_MAX_CONCURRENT_SUBAGENTS
 }
 
 impl AgentConfig {
@@ -455,6 +540,15 @@ impl AgentConfig {
         }
         if config.max_rounds == 0 {
             bail!("max_rounds must be greater than zero");
+        }
+        if config.max_concurrent_local_reads == 0 {
+            bail!("max_concurrent_local_reads must be greater than zero");
+        }
+        if config.max_concurrent_network_tools == 0 {
+            bail!("max_concurrent_network_tools must be greater than zero");
+        }
+        if config.max_concurrent_subagents == 0 {
+            bail!("max_concurrent_subagents must be greater than zero");
         }
         Ok(config)
     }
@@ -502,19 +596,23 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn input_schema(&self) -> Value;
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Exclusive
+    }
     async fn execute(&self, input: &Value) -> Result<String>;
 }
 
 pub struct Agent {
     config: AgentConfig,
     provider: Arc<dyn Provider>,
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
     definitions: Vec<ToolSpec>,
     system: Vec<SystemBlock>,
     events: AgentEventSender,
     user_responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>>>,
     input_buffer: Arc<Mutex<Vec<String>>>,
     cancelled: Arc<AtomicBool>,
+    concurrency: ToolConcurrencyLimits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -755,6 +853,7 @@ impl Agent {
                 config.base_url.clone(),
             )?),
         };
+        let concurrency = ToolConcurrencyLimits::from_config(&config);
         let mut agent = Self {
             config,
             provider,
@@ -765,6 +864,7 @@ impl Agent {
             user_responses: user_responses.clone(),
             input_buffer,
             cancelled: cancelled.clone(),
+            concurrency,
         };
         let gate = ApprovalGate {
             bypass,
@@ -827,6 +927,7 @@ impl Agent {
             client,
             tavily_api_key,
             &skills,
+            agent.concurrency.clone(),
         )?);
         if let Some(definition) = agent.definitions.last_mut() {
             definition.cache = true;
@@ -851,7 +952,7 @@ impl Agent {
         } else {
             self.definitions.push(definition);
         }
-        self.tools.insert(name, Box::new(tool));
+        self.tools.insert(name, Arc::new(tool));
     }
 
     async fn run(
@@ -1242,7 +1343,8 @@ impl Agent {
     ) -> Result<ToolBatchExecution> {
         let mut results = Vec::with_capacity(tool_uses.len() + 1);
         let mut buffered = Vec::new();
-        for (index, call) in tool_uses.iter().enumerate() {
+        let mut index = 0usize;
+        while index < tool_uses.len() {
             let pending = self.take_buffered_prompts()?;
             if !pending.is_empty() {
                 buffered.extend(pending);
@@ -1253,41 +1355,49 @@ impl Agent {
                 );
                 break;
             }
-            let _ = self
-                .events
-                .send(AgentEvent::ToolStarted(tool_start_activity(
-                    &tool_call_value(call),
-                )));
-            let input_error = call.id.as_str();
-            let input_error = tool_input_errors.get(input_error);
-            let execution = match input_error {
-                Some(error) => ToolCallExecution::Completed(failed_tool_result(call, error)),
-                None => self.execute_tool_call(call).await,
-            };
-            let (result, denied) = match execution {
-                ToolCallExecution::Completed(result) => (result, false),
-                ToolCallExecution::Denied(result) => (result, true),
-            };
-            let error = if result.is_error {
-                Some(result.content.as_str())
+
+            let policy = self.tool_execution_policy(&tool_uses[index]);
+            let end = if policy.is_concurrent() {
+                tool_uses[index..]
+                    .iter()
+                    .position(|call| !self.tool_execution_policy(call).is_concurrent())
+                    .map_or(tool_uses.len(), |offset| index + offset)
             } else {
-                None
+                index + 1
             };
-            let _ = self
-                .events
-                .send(AgentEvent::ToolFinished(tool_finish_activity(
-                    &tool_call_value(call),
-                    error,
-                )));
-            results.push(Message::tool(result));
+
+            let wave = &tool_uses[index..end];
+            let mut executions = stream::iter(wave.iter().enumerate())
+                .map(|(offset, call)| async move {
+                    let execution = self
+                        .execute_scheduled_tool_call(call, tool_input_errors.get(&call.id))
+                        .await;
+                    (offset, execution)
+                })
+                .buffer_unordered(wave.len().max(1))
+                .collect::<Vec<_>>()
+                .await;
+            executions.sort_by_key(|(offset, _)| *offset);
+            let denied = executions
+                .iter()
+                .any(|(_, execution)| matches!(execution, ToolCallExecution::Denied(_)));
+            results.extend(executions.into_iter().map(|(_, execution)| {
+                let result = match execution {
+                    ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => {
+                        result
+                    }
+                };
+                Message::tool(result)
+            }));
             if denied {
                 results.extend(
-                    tool_uses[index + 1..]
+                    tool_uses[end..]
                         .iter()
                         .map(|call| Message::tool(skipped_after_denial_tool_result(call))),
                 );
                 return Ok(ToolBatchExecution::Denied(results));
             }
+            index = end;
         }
         buffered.extend(self.take_buffered_prompts()?);
         let turn_boundary = !buffered.is_empty();
@@ -1303,6 +1413,42 @@ impl Agent {
         })
     }
 
+    fn tool_execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
+        self.tools
+            .get(&call.name)
+            .map_or(ToolExecutionPolicy::Exclusive, |tool| {
+                tool.execution_policy()
+            })
+    }
+
+    async fn execute_scheduled_tool_call(
+        &self,
+        call: &ToolCall,
+        input_error: Option<&String>,
+    ) -> ToolCallExecution {
+        let _permit = self
+            .concurrency
+            .acquire(self.tool_execution_policy(call))
+            .await;
+        let _ = self.events.send(AgentEvent::ToolStarted {
+            id: call.id.clone(),
+            message: tool_start_activity(&tool_call_value(call)),
+        });
+        let execution = match input_error {
+            Some(error) => ToolCallExecution::Completed(failed_tool_result(call, error)),
+            None => self.execute_tool_call(call).await,
+        };
+        let result = match &execution {
+            ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => result,
+        };
+        let error = result.is_error.then_some(result.content.as_str());
+        let _ = self.events.send(AgentEvent::ToolFinished {
+            id: call.id.clone(),
+            message: tool_finish_activity(&tool_call_value(call), error),
+        });
+        execution
+    }
+
     async fn execute_tool_call(&self, call: &ToolCall) -> ToolCallExecution {
         let id = call.id.as_str();
         let name = call.name.as_str();
@@ -1314,7 +1460,7 @@ impl Agent {
                 is_error: true,
             });
         }
-        let result = self.tools.get(name).context("unknown tool");
+        let result = self.tools.get(name).cloned().context("unknown tool");
         let result = match result {
             Ok(tool) => tool.execute(input).await,
             Err(error) => Err(error),
@@ -1626,7 +1772,7 @@ Root: {root} (the user's `.nole` workspace)
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
-- Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
+- Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. When several investigations are independent, call explore multiple times in the same response so they can run concurrently. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
 - Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
 - Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
 - Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches, rename_file for file renames, and rename_tag for exact workspace-wide tag renames.

@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 
 use super::util::{optional_usize, required_string};
-use crate::agent::Tool;
+use crate::agent::{Tool, ToolExecutionPolicy};
 
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_WEB_SEARCH_RESULTS: usize = 10;
@@ -22,6 +22,9 @@ pub struct WebSearch {
 impl Tool for WebSearch {
     fn name(&self) -> &'static str {
         "web_search"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Network
     }
 
     fn description(&self) -> &'static str {
@@ -233,6 +236,9 @@ pub struct WebFetch {
 impl Tool for WebFetch {
     fn name(&self) -> &'static str {
         "web_fetch"
+    }
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Network
     }
     fn description(&self) -> &'static str {
         "Fetch an HTTP or HTTPS URL (maximum 1 MB). HTML responses are converted to Markdown; other UTF-8 text is returned unchanged."

@@ -47,7 +47,7 @@ pub(super) fn draw_search(
             input,
             "/ ",
             &app.search_query,
-            app.search_query.chars().count(),
+            app.search_cursor,
             app.focus == Focus::Center && interactive,
             app.theme,
         ) {
@@ -59,7 +59,7 @@ pub(super) fn draw_search(
             input_box,
             "/ ",
             &app.search_query,
-            app.search_query.chars().count(),
+            app.search_cursor,
             app.focus == Focus::Center && interactive,
             app.theme,
         ) {

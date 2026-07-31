@@ -1089,6 +1089,24 @@ fn narrow_center_renders_each_center_view_in_place() {
 }
 
 #[test]
+fn search_input_renders_the_shared_cursor_position() {
+    let (mut app, _directory) = make_app();
+    app.open_search();
+    app.handle_paste("abc");
+    let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+
+    let mut end = None;
+    terminal.draw(|frame| end = draw(frame, &mut app)).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    let mut moved = None;
+    terminal
+        .draw(|frame| moved = draw(frame, &mut app))
+        .unwrap();
+
+    assert_eq!(moved.unwrap().x + 1, end.unwrap().x);
+}
+
+#[test]
 fn chat_compose_and_button_hitboxes_stay_inside_visible_center_viewport() {
     for width in [60, 80, 120, 169, 170, 171, 220] {
         let (mut app, _directory) = make_app();

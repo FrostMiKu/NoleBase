@@ -23,7 +23,7 @@ impl App {
         };
         let mut options = vec![
             DialogOption::with_hint("default", "themes/default.toml"),
-            DialogOption::with_hint("random", "Choose a custom theme at random"),
+            DialogOption::with_hint("random", "Choose a theme at random"),
         ];
         options.extend(names.into_iter().map(|name| {
             let hint = if name == self.active_theme {
@@ -268,7 +268,7 @@ impl App {
             AppCommand::ArchiveCurrentNote => self.manage_current_note(false),
             AppCommand::RestoreCurrentNote => self.manage_current_note(true),
             AppCommand::EditAiConfig => {
-                return Some(Command::Edit(self.storage.ai_config_path.clone()))
+                return Some(Command::Edit(self.storage.ai_config_path.clone()));
             }
             AppCommand::SwitchTheme => self.open_theme_picker(),
             AppCommand::BrowseTags => self.open_tags(),
@@ -812,23 +812,11 @@ impl App {
             KeyCode::Up => self.move_dialog_selection(-1),
             KeyCode::Down => self.move_dialog_selection(1),
             KeyCode::Enter => return self.execute_selected_palette_command(),
-            KeyCode::Backspace => {
-                self.delete_dialog_backward();
-                self.refresh_command_palette();
+            _ => {
+                if self.edit_dialog_single_line(key).changed() {
+                    self.refresh_command_palette();
+                }
             }
-            KeyCode::Delete => {
-                self.delete_dialog_forward();
-                self.refresh_command_palette();
-            }
-            KeyCode::Left => self.move_dialog_cursor(CursorMove::Left),
-            KeyCode::Right => self.move_dialog_cursor(CursorMove::Right),
-            KeyCode::Home => self.move_dialog_cursor(CursorMove::LineStart),
-            KeyCode::End => self.move_dialog_cursor(CursorMove::LineEnd),
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_dialog_char(character);
-                self.refresh_command_palette();
-            }
-            _ => {}
         }
         None
     }
@@ -1134,6 +1122,9 @@ impl App {
                 }
                 self.close_dialog();
             }
+            _ if single_line => {
+                self.edit_dialog_single_line(key);
+            }
             KeyCode::Backspace => self.delete_dialog_backward(),
             KeyCode::Delete => self.delete_dialog_forward(),
             KeyCode::Left => self.move_dialog_cursor(CursorMove::Left),
@@ -1151,6 +1142,17 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    pub(super) fn edit_dialog_single_line(&mut self, key: KeyEvent) -> TextInputEdit {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return TextInputEdit::Ignored;
+        };
+        let edit = edit_single_line(&mut dialog.input, &mut dialog.cursor, key);
+        if edit.handled() {
+            self.sync_dialog_owner_state();
+        }
+        edit
     }
 
     pub(super) fn insert_dialog_char(&mut self, character: char) {

@@ -10,15 +10,44 @@
         assert_eq!(config.max_rounds, 25);
         assert_eq!(config.max_tokens, 8192);
         assert_eq!(config.context_window_tokens, 200_000);
+        assert_eq!(config.max_concurrent_local_reads, 8);
+        assert_eq!(config.max_concurrent_network_tools, 8);
+        assert_eq!(config.max_concurrent_subagents, 4);
 
-        fs::write(&path, format!("{TEST_MESSAGES_CONFIG}max_rounds = 40\n")).unwrap();
-        assert_eq!(AgentConfig::load(&path).unwrap().max_rounds, 40);
+        fs::write(
+            &path,
+            format!(
+                "{TEST_MESSAGES_CONFIG}max_rounds = 40\nmax_concurrent_local_reads = 3\nmax_concurrent_network_tools = 5\nmax_concurrent_subagents = 2\n"
+            ),
+        )
+        .unwrap();
+        let configured = AgentConfig::load(&path).unwrap();
+        assert_eq!(configured.max_rounds, 40);
+        let concurrency = ToolConcurrencyLimits::from_config(&configured);
+        assert_eq!(concurrency.local_reads.available_permits(), 3);
+        assert_eq!(concurrency.network.available_permits(), 5);
+        assert_eq!(concurrency.subagents.available_permits(), 2);
 
         fs::write(&path, format!("{TEST_MESSAGES_CONFIG}max_rounds = 0\n")).unwrap();
         assert!(AgentConfig::load(&path)
             .unwrap_err()
             .to_string()
             .contains("max_rounds must be greater than zero"));
+
+        for field in [
+            "max_concurrent_local_reads",
+            "max_concurrent_network_tools",
+            "max_concurrent_subagents",
+        ] {
+            fs::write(&path, format!("{TEST_MESSAGES_CONFIG}{field} = 0\n")).unwrap();
+            assert!(
+                AgentConfig::load(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("{field} must be greater than zero")),
+                "missing validation for {field}"
+            );
+        }
 
         fs::write(
             &path,
@@ -705,8 +734,8 @@
         let activities = drain_events(&mut event_receiver)
             .into_iter()
             .filter_map(|event| match event {
-                AgentEvent::ToolStarted(text) => Some((true, text)),
-                AgentEvent::ToolFinished(text) => Some((false, text)),
+                AgentEvent::ToolStarted { message, .. } => Some((true, message)),
+                AgentEvent::ToolFinished { message, .. } => Some((false, message)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -719,6 +748,186 @@
                 (false, "Completed Notify.\nSecond".to_string()),
             ]
         );
+    }
+
+    struct ConcurrentProbe {
+        barrier: Arc<tokio::sync::Barrier>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        maximum: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConcurrentProbe {
+        fn name(&self) -> &'static str {
+            "concurrent_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test-only concurrent tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Subagent
+        }
+
+        async fn execute(&self, input: &Value) -> Result<String> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            self.barrier.wait().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(input["label"].as_str().unwrap().to_string())
+        }
+    }
+
+    struct ExclusiveProbe {
+        concurrent_active: Arc<std::sync::atomic::AtomicUsize>,
+        executed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ExclusiveProbe {
+        fn name(&self) -> &'static str {
+            "exclusive_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test-only exclusive tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, _input: &Value) -> Result<String> {
+            assert_eq!(self.concurrent_active.load(Ordering::SeqCst), 0);
+            self.executed.store(true, Ordering::SeqCst);
+            Ok("exclusive".to_string())
+        }
+    }
+
+    #[test]
+    fn tool_batch_runs_safe_calls_concurrently_and_keeps_exclusive_barriers() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(&storage.ai_config_path, TEST_MESSAGES_CONFIG).unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exclusive_executed = Arc::new(AtomicBool::new(false));
+        agent.register(ConcurrentProbe {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            active: active.clone(),
+            maximum: maximum.clone(),
+        });
+        agent.register(ExclusiveProbe {
+            concurrent_active: active,
+            executed: exclusive_executed.clone(),
+        });
+        let calls = [
+            ToolCall {
+                id: "parallel-a".to_string(),
+                name: "concurrent_probe".to_string(),
+                input: json!({"label": "first"}),
+            },
+            ToolCall {
+                id: "parallel-b".to_string(),
+                name: "concurrent_probe".to_string(),
+                input: json!({"label": "second"}),
+            },
+            ToolCall {
+                id: "exclusive".to_string(),
+                name: "exclusive_probe".to_string(),
+                input: json!({}),
+            },
+        ];
+
+        let execution = test_runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    agent.execute_tool_batch(&calls, &HashMap::new()),
+                )
+                .await
+            })
+            .expect("concurrent wave timed out")
+            .unwrap();
+        let results = completed_tool_results(execution);
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert!(exclusive_executed.load(Ordering::SeqCst));
+        let contents = results
+            .iter()
+            .map(|message| match &message.parts[0] {
+                MessagePart::ToolResult(result) => result.content.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["first", "second", "exclusive"]);
+    }
+
+    #[test]
+    fn tool_concurrency_limits_bound_the_complete_agent_tree() {
+        test_runtime().block_on(async {
+            for (policy, limit) in [
+                (
+                    ToolExecutionPolicy::Network,
+                    DEFAULT_MAX_CONCURRENT_NETWORK_TOOLS,
+                ),
+                (
+                    ToolExecutionPolicy::Subagent,
+                    DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+                ),
+            ] {
+                let concurrency = ToolConcurrencyLimits::new(
+                    DEFAULT_MAX_CONCURRENT_LOCAL_READS,
+                    DEFAULT_MAX_CONCURRENT_NETWORK_TOOLS,
+                    DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+                );
+                let mut permits = Vec::new();
+                for _ in 0..limit {
+                    permits.push(concurrency.acquire(policy).await.unwrap());
+                }
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(10),
+                        concurrency.acquire(policy)
+                    )
+                    .await
+                    .is_err(),
+                    "{policy:?} exceeded its configured limit"
+                );
+                permits.pop();
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        concurrency.acquire(policy)
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+                );
+            }
+        });
     }
 
     #[test]
@@ -968,7 +1177,7 @@
             .into_iter()
             .any(|event| matches!(
                 event,
-                AgentEvent::ToolFinished(message) if message.contains("invalid JSON")
+                AgentEvent::ToolFinished { message, .. } if message.contains("invalid JSON")
             )));
     }
 
@@ -1249,7 +1458,7 @@
         assert!(results[1].content.contains("not executed"));
         let activities = drain_events(&mut event_receiver)
             .into_iter()
-            .filter(|event| matches!(event, AgentEvent::ToolStarted(_)))
+            .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
             .count();
         assert_eq!(activities, 1);
     }

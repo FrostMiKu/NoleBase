@@ -43,7 +43,7 @@ pub(super) fn draw_tags(
             input,
             "# ",
             &app.tag_query,
-            app.tag_query.chars().count(),
+            app.tag_cursor,
             app.focus == Focus::Center && interactive,
             app.theme,
         ) {
@@ -54,7 +54,7 @@ pub(super) fn draw_tags(
         input_box,
         "# ",
         &app.tag_query,
-        app.tag_query.chars().count(),
+        app.tag_cursor,
         app.focus == Focus::Center && interactive,
         app.theme,
     ) {
