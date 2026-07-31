@@ -5,10 +5,11 @@
 //! hidden inside their theme module, and only [`util`] is shared between themes.
 
 mod file_ops;
+mod explore;
 mod interactive;
 mod notes_tags;
 mod read;
 mod util;
 mod web;
 
-pub use self::{file_ops::*, interactive::*, notes_tags::*, read::*, web::*};
+pub use self::{explore::*, file_ops::*, interactive::*, notes_tags::*, read::*, web::*};

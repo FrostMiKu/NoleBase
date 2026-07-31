@@ -863,6 +863,12 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
         }))
         .unwrap();
     sender
+        .send(AgentEvent::ContextWindow {
+            tokens: 1_700,
+            capacity: 200_000,
+        })
+        .unwrap();
+    sender
         .send(AgentEvent::ResponseTiming {
             output_tokens: 200,
             elapsed: Duration::from_secs(2),
@@ -882,6 +888,8 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     assert_eq!(app.agent_round, 2);
     assert_eq!(app.agent_round_limit, 25);
     assert_eq!(app.agent_usage.total_input(), 2_000);
+    assert_eq!(app.agent_context_window, 1_700);
+    assert_eq!(app.agent_context_capacity, 200_000);
     assert_eq!(app.agent_timed_output_tokens, 200);
     assert_eq!(app.agent_response_duration, Duration::from_secs(2));
     assert!(matches!(

@@ -74,7 +74,7 @@ pub(crate) fn run_agent(
 
 pub(crate) fn completed_tool_results(execution: ToolBatchExecution) -> Vec<Message> {
     match execution {
-        ToolBatchExecution::Completed(results) => results,
+        ToolBatchExecution::Completed { messages, .. } => messages,
         ToolBatchExecution::Denied(_) => panic!("expected completed tool batch"),
     }
 }

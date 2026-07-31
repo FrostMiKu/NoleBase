@@ -239,12 +239,15 @@ fn agent_header_shows_rounds_session_usage_tps_and_cache() {
         cache_creation_input_tokens: 1_000,
         cache_read_input_tokens: 2_000,
     };
+    app.agent_context_window = 6_789;
+    app.agent_context_capacity = 200_000;
     app.agent_timed_output_tokens = 1_234;
     app.agent_response_duration = std::time::Duration::from_secs(2);
     app.agent_retry_count = 2;
     let terminal = render(&mut app, 220, 24);
     let screen = buffer_string(&terminal);
     assert!(screen.contains("Agent · ↻3/25"));
+    assert!(screen.contains("Ctx 6.8k/200k"));
     assert!(screen.contains("↑3.5k ↓1.2k"));
     assert!(screen.contains("617.0t/s"));
     assert!(screen.contains("C2k 57%"));

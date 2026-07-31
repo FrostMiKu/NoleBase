@@ -4,10 +4,22 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let title = if app.agent_round_limit == 0 {
-        " Agent ".to_string()
+    let context = if app.agent_context_window == 0 || app.agent_context_capacity == 0 {
+        "Ctx --".to_string()
     } else {
-        format!(" Agent · ↻{}/{} ", app.agent_round, app.agent_round_limit,)
+        format!(
+            "Ctx {}/{}",
+            human_token_count(app.agent_context_window),
+            human_token_count(app.agent_context_capacity)
+        )
+    };
+    let title = if app.agent_round_limit == 0 {
+        format!(" Agent · {context} ")
+    } else {
+        format!(
+            " Agent · ↻{}/{} · {context} ",
+            app.agent_round, app.agent_round_limit,
+        )
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -531,4 +543,3 @@ pub(super) fn activity_detail_marker(width: usize, theme: Theme) -> Span<'static
     };
     Span::styled(marker, Style::default().fg(theme.ui_border_subtle))
 }
-

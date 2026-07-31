@@ -114,6 +114,10 @@ impl App {
                     self.set_status(message);
                 }
                 AgentEvent::Usage(usage) => self.agent_usage.add(usage),
+                AgentEvent::ContextWindow { tokens, capacity } => {
+                    self.agent_context_window = tokens;
+                    self.agent_context_capacity = capacity;
+                }
                 AgentEvent::ResponseTiming {
                     output_tokens,
                     elapsed,
@@ -567,6 +571,8 @@ impl App {
         }
         self.agent_scroll = 0;
         self.agent_usage = TokenUsage::default();
+        self.agent_context_window = 0;
+        self.agent_context_capacity = 0;
         self.agent_timed_output_tokens = 0;
         self.agent_response_duration = Duration::ZERO;
         self.agent_retry_count = 0;

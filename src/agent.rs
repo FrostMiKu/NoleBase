@@ -88,6 +88,10 @@ pub enum AgentEvent {
     ToolStarted(String),
     ToolFinished(String),
     Usage(TokenUsage),
+    ContextWindow {
+        tokens: u64,
+        capacity: u64,
+    },
     ResponseTiming {
         output_tokens: u64,
         elapsed: Duration,
@@ -126,6 +130,7 @@ fn report_provider_metrics(
     reported_duration: &mut Duration,
     usage: TokenUsage,
     generation_duration: Duration,
+    context_window_capacity: u64,
 ) {
     let usage_delta = usage.saturating_sub(*reported_usage);
     let output_delta = usage_delta.output_tokens;
@@ -133,6 +138,12 @@ fn report_provider_metrics(
 
     if !usage_delta.is_empty() {
         let _ = events.send(AgentEvent::Usage(usage_delta));
+    }
+    if usage.total_input() > 0 {
+        let _ = events.send(AgentEvent::ContextWindow {
+            tokens: usage.total_input(),
+            capacity: context_window_capacity,
+        });
     }
     if usage.output_tokens > 0 && (output_delta > 0 || !duration_delta.is_zero()) {
         let _ = events.send(AgentEvent::ResponseTiming {
@@ -180,7 +191,10 @@ enum ToolCallExecution {
 }
 
 enum ToolBatchExecution {
-    Completed(Vec<Message>),
+    Completed {
+        messages: Vec<Message>,
+        turn_boundary: bool,
+    },
     Denied(Vec<Message>),
 }
 
@@ -755,7 +769,11 @@ impl Agent {
         agent.register(SearchFiles::new(nole_root)?);
         agent.register(ListTags::new(workspace_index.clone()));
         agent.register(SearchTag::new(nole_root, workspace_index.clone())?);
-        agent.register(RenameTag::new(nole_root, workspace_index, gate.clone())?);
+        agent.register(RenameTag::new(
+            nole_root,
+            workspace_index.clone(),
+            gate.clone(),
+        )?);
         agent.register(CreateFile::new(nole_root)?);
         agent.register(CopyFile::new(nole_root)?);
         let file_events = agent.events.clone();
@@ -777,10 +795,22 @@ impl Agent {
         if has_web_search {
             agent.register(WebSearch {
                 client: client.clone(),
-                api_key: tavily_api_key,
+                api_key: tavily_api_key.clone(),
             });
         }
-        agent.register(WebFetch { client });
+        agent.register(WebFetch {
+            client: client.clone(),
+        });
+        agent.register(Explore::new(
+            nole_root,
+            agent.config.clone(),
+            agent.provider.clone(),
+            agent.system.clone(),
+            agent.events.clone(),
+            workspace_index,
+            client,
+            tavily_api_key,
+        )?);
         if let Some(definition) = agent.definitions.last_mut() {
             definition.cache = true;
         }
@@ -822,121 +852,6 @@ impl Agent {
         let mut round_limit = self.config.max_rounds;
 
         loop {
-            for _ in 0..self.config.max_rounds {
-                round = round.saturating_add(1);
-                self.ensure_active()?;
-                let buffered = self.take_buffered_prompts()?;
-                if !buffered.is_empty() {
-                    append_user_text(
-                        &mut conversation.messages,
-                        format_buffered_prompts(buffered),
-                    );
-                    self.checkpoint_conversation(conversation);
-                }
-                let _ = self.events.send(AgentEvent::Round {
-                    current: round,
-                    limit: round_limit,
-                });
-                if self
-                    .compact_context_if_needed(&mut conversation.messages, definitions)
-                    .await?
-                {
-                    self.checkpoint_conversation(conversation);
-                }
-                let response = self
-                    .request_message(&conversation.messages, definitions)
-                    .await?;
-                let content = response.message.parts.clone();
-                let stop_reason = response.stop_reason.clone();
-                let tool_uses = response.message.tool_calls().cloned().collect::<Vec<_>>();
-                let response_text = response.text();
-                if tool_uses.is_empty() {
-                    let output = response_text;
-                    conversation.messages.push(response.message);
-                    self.checkpoint_conversation(conversation);
-                    let buffered = self.take_buffered_prompts()?;
-                    if !buffered.is_empty() {
-                        if !output.trim().is_empty() {
-                            let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                                text: output.clone(),
-                                final_output: false,
-                            });
-                        }
-                        append_user_text(
-                            &mut conversation.messages,
-                            format_buffered_prompts(buffered),
-                        );
-                        self.checkpoint_conversation(conversation);
-                        empty_response_retries = 0;
-                        truncation_retries = 0;
-                        continue;
-                    }
-                    if stop_reason == StopReason::Length {
-                        if !output.trim().is_empty() {
-                            let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                                text: output.clone(),
-                                final_output: false,
-                            });
-                        }
-                        if truncation_retries >= MAX_TRUNCATION_RETRIES {
-                            bail!("{}", empty_response_diagnostic(&stop_reason, &content));
-                        }
-                        truncation_retries += 1;
-                        append_user_text(
-                        &mut conversation.messages,
-                        "Continue from the previous response and provide the complete answer. Do not repeat completed work.".to_string(),
-                    );
-                        self.checkpoint_conversation(conversation);
-                        continue;
-                    }
-                    if output.trim().is_empty() {
-                        if stop_reason == StopReason::Refusal
-                            || empty_response_retries >= MAX_EMPTY_RESPONSE_RETRIES
-                        {
-                            bail!("{}", empty_response_diagnostic(&stop_reason, &content));
-                        }
-                        empty_response_retries += 1;
-                        append_user_text(
-                        &mut conversation.messages,
-                        "Provide a non-empty final answer to the user's request. If required information is missing, use ask_user.".to_string(),
-                    );
-                        self.checkpoint_conversation(conversation);
-                        continue;
-                    }
-                    let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                        text: output.clone(),
-                        final_output: true,
-                    });
-                    return Ok(AgentRunCompletion::Finished(output));
-                }
-
-                empty_response_retries = 0;
-                truncation_retries = 0;
-
-                let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                    text: response_text,
-                    final_output: false,
-                });
-
-                conversation.messages.push(response.message);
-                self.ensure_active()?;
-                let results = self
-                    .execute_tool_batch(&tool_uses, &response.tool_input_errors)
-                    .await?;
-                match results {
-                    ToolBatchExecution::Completed(results) => {
-                        conversation.messages.extend(results);
-                        self.checkpoint_conversation(conversation);
-                    }
-                    ToolBatchExecution::Denied(results) => {
-                        conversation.messages.extend(results);
-                        self.checkpoint_conversation(conversation);
-                        return Ok(AgentRunCompletion::Stopped(
-                            AgentStopReason::ToolApprovalDenied,
-                        ));
-                    }
-                }
-            }
             let buffered = self.take_buffered_prompts()?;
             if !buffered.is_empty() {
                 append_user_text(
@@ -944,15 +859,131 @@ impl Agent {
                     format_buffered_prompts(buffered),
                 );
                 self.checkpoint_conversation(conversation);
+                round = 0;
+                round_limit = self.config.max_rounds;
+            }
+            if round >= round_limit {
+                if !self.request_round_limit_decision(round).await? {
+                    return Ok(AgentRunCompletion::Stopped(
+                        AgentStopReason::RequestRoundLimit,
+                    ));
+                }
                 round_limit = round_limit.saturating_add(self.config.max_rounds);
-                continue;
             }
-            if !self.request_round_limit_decision(round).await? {
-                return Ok(AgentRunCompletion::Stopped(
-                    AgentStopReason::RequestRoundLimit,
-                ));
+            round = round.saturating_add(1);
+            self.ensure_active()?;
+            let _ = self.events.send(AgentEvent::Round {
+                current: round,
+                limit: round_limit,
+            });
+            if self
+                .compact_context_if_needed(&mut conversation.messages, definitions)
+                .await?
+            {
+                self.checkpoint_conversation(conversation);
             }
-            round_limit = round_limit.saturating_add(self.config.max_rounds);
+            let response = self
+                .request_message(&conversation.messages, definitions)
+                .await?;
+            let content = response.message.parts.clone();
+            let stop_reason = response.stop_reason.clone();
+            let tool_uses = response.message.tool_calls().cloned().collect::<Vec<_>>();
+            let response_text = response.text();
+            if tool_uses.is_empty() {
+                let output = response_text;
+                conversation.messages.push(response.message);
+                self.checkpoint_conversation(conversation);
+                let buffered = self.take_buffered_prompts()?;
+                if !buffered.is_empty() {
+                    if !output.trim().is_empty() {
+                        let _ = self.events.send(AgentEvent::AssistantMessageFinished {
+                            text: output.clone(),
+                            final_output: false,
+                        });
+                    }
+                    append_user_text(
+                        &mut conversation.messages,
+                        format_buffered_prompts(buffered),
+                    );
+                    self.checkpoint_conversation(conversation);
+                    round = 0;
+                    round_limit = self.config.max_rounds;
+                    empty_response_retries = 0;
+                    truncation_retries = 0;
+                    continue;
+                }
+                if stop_reason == StopReason::Length {
+                    if !output.trim().is_empty() {
+                        let _ = self.events.send(AgentEvent::AssistantMessageFinished {
+                            text: output.clone(),
+                            final_output: false,
+                        });
+                    }
+                    if truncation_retries >= MAX_TRUNCATION_RETRIES {
+                        bail!("{}", empty_response_diagnostic(&stop_reason, &content));
+                    }
+                    truncation_retries += 1;
+                    append_user_text(
+                        &mut conversation.messages,
+                        "Continue from the previous response and provide the complete answer. Do not repeat completed work.".to_string(),
+                    );
+                    self.checkpoint_conversation(conversation);
+                    continue;
+                }
+                if output.trim().is_empty() {
+                    if stop_reason == StopReason::Refusal
+                        || empty_response_retries >= MAX_EMPTY_RESPONSE_RETRIES
+                    {
+                        bail!("{}", empty_response_diagnostic(&stop_reason, &content));
+                    }
+                    empty_response_retries += 1;
+                    append_user_text(
+                        &mut conversation.messages,
+                        "Provide a non-empty final answer to the user's request. If required information is missing, use ask_user.".to_string(),
+                    );
+                    self.checkpoint_conversation(conversation);
+                    continue;
+                }
+                let _ = self.events.send(AgentEvent::AssistantMessageFinished {
+                    text: output.clone(),
+                    final_output: true,
+                });
+                return Ok(AgentRunCompletion::Finished(output));
+            }
+
+            empty_response_retries = 0;
+            truncation_retries = 0;
+
+            let _ = self.events.send(AgentEvent::AssistantMessageFinished {
+                text: response_text,
+                final_output: false,
+            });
+
+            conversation.messages.push(response.message);
+            self.ensure_active()?;
+            let results = self
+                .execute_tool_batch(&tool_uses, &response.tool_input_errors)
+                .await?;
+            match results {
+                ToolBatchExecution::Completed {
+                    messages,
+                    turn_boundary,
+                } => {
+                    conversation.messages.extend(messages);
+                    self.checkpoint_conversation(conversation);
+                    if turn_boundary {
+                        round = 0;
+                        round_limit = self.config.max_rounds;
+                    }
+                }
+                ToolBatchExecution::Denied(results) => {
+                    conversation.messages.extend(results);
+                    self.checkpoint_conversation(conversation);
+                    return Ok(AgentRunCompletion::Stopped(
+                        AgentStopReason::ToolApprovalDenied,
+                    ));
+                }
+            }
         }
     }
 
@@ -1016,6 +1047,7 @@ impl Agent {
                                 &mut reported_duration,
                                 usage,
                                 generation_duration,
+                                self.config.context_window_tokens,
                             );
                         }
                         Ok(ProviderEvent::Retry) => {
@@ -1040,6 +1072,7 @@ impl Agent {
                                     &mut reported_duration,
                                     usage,
                                     generation_duration,
+                                    self.config.context_window_tokens,
                                 );
                             }
                             ProviderEvent::Retry => {
@@ -1054,6 +1087,7 @@ impl Agent {
                             &mut reported_duration,
                             answer.token_usage,
                             answer.generation_duration,
+                            self.config.context_window_tokens,
                         );
                     }
                     return result;
@@ -1239,13 +1273,17 @@ impl Agent {
             }
         }
         buffered.extend(self.take_buffered_prompts()?);
-        if !buffered.is_empty() {
+        let turn_boundary = !buffered.is_empty();
+        if turn_boundary {
             results.push(Message::user(format!(
                 "Additional user input received while you were working:\n\n{}",
                 format_buffered_prompts(buffered)
             )));
         }
-        Ok(ToolBatchExecution::Completed(results))
+        Ok(ToolBatchExecution::Completed {
+            messages: results,
+            turn_boundary,
+        })
     }
 
     async fn execute_tool_call(&self, call: &ToolCall) -> ToolCallExecution {
@@ -1436,6 +1474,7 @@ fn tool_activity_target(call: &Value) -> Option<String> {
             .filter(|value| !value.is_empty())
     };
     match name {
+        "explore" => text("task"),
         "web_fetch" => text("url").map(|url| web_base_url(&url)),
         "web_search" | "search_content" | "search_files" | "list_tags" => text("query"),
         "search_tag" => text("tag"),
@@ -1552,6 +1591,7 @@ Root: {root} (the user's `.nole` workspace)
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
+- Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
 - Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
 - Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
 - Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches, rename_file for file renames, and rename_tag for exact workspace-wide tag renames.
@@ -2236,6 +2276,15 @@ mod tests {
         );
         assert_eq!(tool_display_name("add_daily_entry"), "Add Daily Entry");
 
+        let explore = json!({
+            "name": "explore",
+            "input": {"task": "Find every note about context compaction"}
+        });
+        assert_eq!(
+            tool_start_activity(&explore),
+            "Calling Explore...\nFind every note about context compaction"
+        );
+
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
             "Failed Read File: file not found\ndata/project notes.md"
@@ -2382,6 +2431,9 @@ mod tests {
         assert!(events[..first_text]
             .iter()
             .any(|event| matches!(event, AgentEvent::Usage(usage) if usage.input_tokens == 7)));
+        assert!(events[..first_text]
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextWindow { tokens: 7, capacity: 200_000 })));
         assert!(events
             .iter()
             .any(|event| matches!(event, AgentEvent::AssistantDelta(delta) if delta == "world")));
@@ -3199,6 +3251,129 @@ mod tests {
     }
 
     #[test]
+    fn buffered_prompt_starts_a_fresh_round_budget() {
+        struct BufferFollowup(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl Tool for BufferFollowup {
+            fn name(&self) -> &'static str {
+                "buffer_followup"
+            }
+
+            fn description(&self) -> &'static str {
+                "Test tool"
+            }
+
+            fn input_schema(&self) -> Value {
+                json!({"type": "object", "additionalProperties": false})
+            }
+
+            async fn execute(&self, _input: &Value) -> Result<String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push("New user turn".to_string());
+                Ok("buffered".to_string())
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = [
+            json!({
+                "content": [{
+                    "type": "tool_use", "id": "notify", "name": "notify",
+                    "input": {"message": "round one"}
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            }),
+            json!({
+                "content": [{
+                    "type": "tool_use", "id": "buffer", "name": "buffer_followup",
+                    "input": {}
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 12, "output_tokens": 2}
+            }),
+            json!({
+                "content": [{"type": "text", "text": "Handled the new turn"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 14, "output_tokens": 3}
+            }),
+        ];
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
+                let body = serde_json::to_vec(&response).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                reader.get_mut().write_all(&body).unwrap();
+                reader.get_mut().flush().unwrap();
+            }
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!(
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 2\n"
+            ),
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, mut event_receiver) = event_channel();
+        let input_buffer = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                input_buffer.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        agent.register(BufferFollowup(input_buffer));
+
+        let output = run_agent(&agent, "Original turn", &mut AgentConversation::default()).unwrap();
+        server.join().unwrap();
+        assert_eq!(output, "Handled the new turn");
+        let rounds = drain_events(&mut event_receiver)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Round { current, limit } => Some((current, limit)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rounds, vec![(1, 2), (2, 2), (1, 2)]);
+    }
+
+    #[test]
     fn system_prompt_describes_ask_user_without_runtime_protocol_details() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("Use ask_user"));
@@ -3242,6 +3417,9 @@ mod tests {
         assert!(!prompt.contains("bypass"));
         assert!(!prompt.contains("prevalidated"));
         assert!(prompt.contains("Use web_fetch when you already have a URL"));
+        assert!(prompt.contains("Delegate broad, multi-step exploration"));
+        assert!(prompt.contains("internal work stays out of this conversation"));
+        assert!(prompt.contains("Use direct read/search tools only for narrow lookups"));
         assert!(prompt.contains("Use open_file"));
         assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
     }
@@ -3320,6 +3498,7 @@ mod tests {
         assert!(without_key.tools.contains_key("create_file"));
         assert!(without_key.tools.contains_key("edit_file"));
         assert!(without_key.tools.contains_key("add_daily_entry"));
+        assert!(without_key.tools.contains_key("explore"));
         for removed in ["update_file", "read_daily", "update_daily", "append_daily"] {
             assert!(!without_key.tools.contains_key(removed));
         }
