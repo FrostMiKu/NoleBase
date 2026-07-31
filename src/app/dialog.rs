@@ -31,6 +31,7 @@ pub enum DialogPurpose {
     ThemePicker,
     TagRenameSource,
     TagRenameTarget,
+    SkillBrowser,
     Custom,
 }
 

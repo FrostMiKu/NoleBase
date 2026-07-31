@@ -23,6 +23,7 @@ use crate::model::{
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
+use crate::skill::Skill;
 use crate::storage::{LoadedTheme, Storage};
 use crate::workspace_index::{TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle};
 
@@ -35,6 +36,8 @@ mod document;
 mod documents;
 mod input;
 mod model;
+#[cfg(test)]
+mod skill_tests;
 mod terminal;
 #[cfg(test)]
 mod tests;
@@ -235,6 +238,9 @@ pub struct App {
     tags_return_view: CenterView,
     workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
+    pub skill_entries: Vec<Skill>,
+    pub skill_index: usize,
+    skill_browser_return: Option<SkillBrowserReturn>,
 
     pub help_scroll: u16,
     pub status: String,
@@ -302,6 +308,13 @@ pub struct App {
     ai_cancelling: bool,
 
     undo_stack: Vec<UndoOp>,
+}
+
+#[derive(Clone)]
+struct SkillBrowserReturn {
+    center_view: CenterView,
+    focus: Focus,
+    document: Option<Document>,
 }
 
 impl App {
@@ -397,6 +410,9 @@ impl App {
             tags_return_view: CenterView::Daily,
             workspace_index,
             pending_tag_rename: None,
+            skill_entries: Vec::new(),
+            skill_index: 0,
+            skill_browser_return: None,
             help_scroll: 0,
             status: String::new(),
             animation_tick: 0,
@@ -583,6 +599,21 @@ impl App {
                     }
                 }
             }
+            Some(DocumentKind::Skill(path)) => match self.storage.read_skill(&path) {
+                Ok(updated) => {
+                    if let Some(document) = self.document.as_mut() {
+                        document.title = updated.id;
+                        document.replace_source(updated.body);
+                    }
+                }
+                Err(error) => {
+                    self.document_render_lru
+                        .remove(&DocumentKind::Skill(path.clone()));
+                    self.document = None;
+                    self.return_to_skill_browser();
+                    self.set_error(format!("Skill reload error: {error}"));
+                }
+            },
             None => {}
         }
     }

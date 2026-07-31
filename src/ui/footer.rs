@@ -117,6 +117,13 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
             (Focus::Agent, _) => "C clear · Esc back",
             (Focus::Center, CenterView::Document)
                 if app.document.as_ref().is_some_and(|document| {
+                    matches!(document.kind, crate::app::DocumentKind::Skill(_))
+                }) =>
+            {
+                "e edit · r rename · d delete"
+            }
+            (Focus::Center, CenterView::Document)
+                if app.document.as_ref().is_some_and(|document| {
                     matches!(document.kind, crate::app::DocumentKind::File(_))
                 }) =>
             {
@@ -148,6 +155,13 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         (Focus::Agent, _) => "C clear session · ↑↓ scroll · ← center",
         (_, CenterView::Daily) if width >= 95 => {
             "i compose · f files · t todo · / search · # tags · Ctrl+P commands · ? help"
+        }
+        (_, CenterView::Document)
+            if app.document.as_ref().is_some_and(|document| {
+                matches!(document.kind, crate::app::DocumentKind::Skill(_))
+            }) =>
+        {
+            "↑↓ scroll · e edit · r rename · d delete · / find · Esc skills"
         }
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {

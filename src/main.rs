@@ -10,6 +10,7 @@ mod model;
 mod notification;
 mod observable;
 mod provider;
+mod skill;
 mod storage;
 mod theme;
 mod ui;

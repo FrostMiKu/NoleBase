@@ -38,6 +38,7 @@ pub(super) enum AppCommand {
     RenameTag,
     EditAgentInstructions,
     EditAgentMemory,
+    BrowseSkills,
 }
 
 pub(super) struct AppCommandDefinition {
@@ -137,6 +138,12 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Config: Edit Agent memory",
         description: "Open MEMORY.md in your editor",
         keywords: "config configuration agent memory md editor",
+    },
+    AppCommandDefinition {
+        id: AppCommand::BrowseSkills,
+        label: "Skill: Browse",
+        description: "Browse and preview Agent skills",
+        keywords: "skill skills agent browse workflow instructions",
     },
     AppCommandDefinition {
         id: AppCommand::SwitchTheme,

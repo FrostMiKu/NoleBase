@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 use super::util::{
     DEFAULT_SEARCH_RESULTS, MAX_DIFF_BYTES, MAX_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
     MAX_SEARCH_SNIPPET_CHARS, display_path, fuzzy_match, limited_diff, optional_usize,
-    required_string, truncate_chars, validate_mbdown,
+    required_string, truncate_chars,
 };
+use super::write_policy::{WriteSource, validate_write};
 use crate::agent::{ApprovalGate, ApprovalRequest, Tool, canonical_root};
 use crate::model::SearchHit;
 use crate::storage::Storage;
@@ -371,7 +372,7 @@ impl Tool for AddDailyEntry {
         }
         candidate.push_str(content);
         candidate.push('\n');
-        validate_mbdown(&path, &candidate)?;
+        validate_write(&self.storage.root, &path, WriteSource::Text(&candidate))?;
         let note = match requested_date {
             Some(date) => self.storage.append_daily(&date, content)?,
             None => self.storage.append_to_today(content)?,

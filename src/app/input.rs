@@ -663,7 +663,9 @@ impl App {
                 None
             }
             KeyCode::Char('e') => match self.document.as_ref().map(|doc| &doc.kind) {
-                Some(DocumentKind::File(path)) => Some(Command::Edit(path.clone())),
+                Some(DocumentKind::File(path)) | Some(DocumentKind::Skill(path)) => {
+                    Some(Command::Edit(path.clone()))
+                }
                 Some(DocumentKind::Daily(date)) => self.daily_edit_command(*date),
                 None => None,
             },
@@ -676,19 +678,23 @@ impl App {
                 None
             }
             KeyCode::Char('d')
-                if self
-                    .document
-                    .as_ref()
-                    .is_some_and(|document| matches!(document.kind, DocumentKind::File(_))) =>
+                if self.document.as_ref().is_some_and(|document| {
+                    matches!(
+                        document.kind,
+                        DocumentKind::File(_) | DocumentKind::Skill(_)
+                    )
+                }) =>
             {
                 self.delete_current_note();
                 None
             }
             KeyCode::Char('r')
-                if self
-                    .document
-                    .as_ref()
-                    .is_some_and(|document| matches!(document.kind, DocumentKind::File(_))) =>
+                if self.document.as_ref().is_some_and(|document| {
+                    matches!(
+                        document.kind,
+                        DocumentKind::File(_) | DocumentKind::Skill(_)
+                    )
+                }) =>
             {
                 self.rename_current_note();
                 None
@@ -955,6 +961,9 @@ impl App {
             Some(DocumentKind::Daily(date)) => {
                 self.append_to_open_daily(&date.to_string(), &body, &original_input)
             }
+            Some(DocumentKind::Skill(path)) => {
+                self.append_to_open_skill(&path, &body, &original_input)
+            }
             None => self.append_to_today(&body, &original_input),
         };
         if let Err(error) = result {
@@ -983,6 +992,29 @@ impl App {
         self.input_cursor = 0;
         self.reload_files();
         self.status.clear();
+        Ok(())
+    }
+
+    pub(super) fn append_to_open_skill(
+        &mut self,
+        path: &Path,
+        body: &str,
+        original_input: &str,
+    ) -> anyhow::Result<()> {
+        let receipt = self.storage.append_document_tracked(path, body)?;
+        self.record_undo(UndoOp::Append {
+            receipt,
+            input: original_input.to_string(),
+        });
+        let skill = self.storage.read_skill(path)?;
+        if let Some(document) = self.document.as_mut() {
+            document.replace_source(skill.body);
+            document.scroll = u16::MAX;
+            document.target_line = None;
+        }
+        self.input.clear();
+        self.input_cursor = 0;
+        self.set_status("Appended to skill");
         Ok(())
     }
 

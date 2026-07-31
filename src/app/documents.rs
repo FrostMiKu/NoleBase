@@ -166,7 +166,7 @@ impl App {
             .as_ref()
             .filter(|_| self.center_view == CenterView::Document)
             .and_then(|document| match &document.kind {
-                DocumentKind::File(path) => Some(path.clone()),
+                DocumentKind::File(path) | DocumentKind::Skill(path) => Some(path.clone()),
                 DocumentKind::Daily(_) => None,
             })
     }
@@ -476,12 +476,20 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(from) = self.pending_file.clone() {
+                    let skill = self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| {
+                            matches!(&document.kind, DocumentKind::Skill(path) if path == &from)
+                        });
                     let archived = self
                         .note_files
                         .iter()
                         .find(|file| file.path == from)
                         .is_some_and(|file| file.archived);
-                    let result = if archived {
+                    let result = if skill {
+                        self.storage.rename_skill(&from, &self.rename_input)
+                    } else if archived {
                         self.storage.rename_archived_file(&from, &self.rename_input)
                     } else {
                         self.storage.rename_file(&from, &self.rename_input)
@@ -490,9 +498,13 @@ impl App {
                         Ok(to) => {
                             self.pending_file = None;
                             self.retarget_open_document(&from, &to);
-                            self.selected_file = Some(to);
-                            self.set_status("Renamed");
-                            self.reload_files();
+                            if skill {
+                                self.set_status("Skill renamed");
+                            } else {
+                                self.selected_file = Some(to);
+                                self.set_status("Renamed");
+                                self.reload_files();
+                            }
                             self.files_context = FilesContext::Browse;
                         }
                         Err(error) => self.set_error(format!("Error: {error}")),
@@ -950,6 +962,7 @@ impl App {
                 self.center_view = CenterView::Daily;
                 self.focus = Focus::Center;
             }
+            DocumentReturn::Skills => self.return_to_skill_browser(),
         }
     }
 

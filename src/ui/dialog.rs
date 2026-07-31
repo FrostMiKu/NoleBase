@@ -456,9 +456,14 @@ pub(super) fn draw_select_dialog(
         .saturating_sub(input_height);
     let option_capacity = available.saturating_sub(message_height);
     let option_items = dialog.options.len() + usize::from(has_input);
+    let option_item_height = if dialog.purpose == DialogPurpose::SkillBrowser {
+        3
+    } else {
+        SELECT_OPTION_HEIGHT
+    };
     let option_height = selection_list_height(
         u16::try_from(option_items).unwrap_or(u16::MAX),
-        SELECT_OPTION_HEIGHT,
+        option_item_height,
     )
     .min(option_capacity);
     let message = Rect::new(inner.x, inner.y, inner.width, message_height);
@@ -488,7 +493,7 @@ pub(super) fn draw_select_dialog(
             message,
         );
     }
-    let visible_items = visible_selection_items(options.height, SELECT_OPTION_HEIGHT);
+    let visible_items = visible_selection_items(options.height, option_item_height);
     let list_start = selection_viewport_start(
         dialog.scroll as usize,
         dialog.selected,
@@ -507,11 +512,11 @@ pub(super) fn draw_select_dialog(
         .take(visible_items)
     {
         let row = index - list_start;
-        let y = selection_item_y(options, row, SELECT_OPTION_HEIGHT);
+        let y = selection_item_y(options, row, option_item_height);
         if y >= options_end {
             break;
         }
-        let item_height = SELECT_OPTION_HEIGHT.min(options_end.saturating_sub(y));
+        let item_height = option_item_height.min(options_end.saturating_sub(y));
         let item_area = Rect::new(options.x, y, options.width, item_height);
         let selected = dialog.selected == index;
         let style = if selected {
@@ -531,17 +536,6 @@ pub(super) fn draw_select_dialog(
         } else {
             option.label.clone()
         };
-        let mut spans = vec![Span::styled(label, style)];
-        if let Some(hint) = &option.hint {
-            spans.push(Span::styled(
-                format!("  {hint}"),
-                if selected {
-                    style.add_modifier(Modifier::DIM)
-                } else {
-                    Style::default().fg(app.theme.text_muted)
-                },
-            ));
-        }
         let selection_area = selected.then(|| shared_selection_area(options, y, item_height));
         if let Some(selection_area) = selection_area {
             frame.render_widget(
@@ -553,15 +547,44 @@ pub(super) fn draw_select_dialog(
                 selection_area,
             );
         }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(
-                item_area.x.saturating_add(2),
-                item_area.y,
-                item_area.width.saturating_sub(2),
-                1,
-            ),
+        let text_area = Rect::new(
+            item_area.x.saturating_add(2),
+            item_area.y,
+            item_area.width.saturating_sub(2),
+            1,
         );
+        if dialog.purpose == DialogPurpose::SkillBrowser {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(label, style))),
+                text_area,
+            );
+            if item_height > 1 {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        option.hint.clone().unwrap_or_default(),
+                        if selected {
+                            style.add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default().fg(app.theme.text_muted)
+                        },
+                    ))),
+                    Rect::new(text_area.x, text_area.y + 1, text_area.width, 1),
+                );
+            }
+        } else {
+            let mut spans = vec![Span::styled(label, style)];
+            if let Some(hint) = &option.hint {
+                spans.push(Span::styled(
+                    format!("  {hint}"),
+                    if selected {
+                        style.add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(app.theme.text_muted)
+                    },
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), text_area);
+        }
         if let Some(selection_area) = selection_area {
             draw_selection_indicator(frame, selection_area, app.theme);
         }
@@ -645,6 +668,9 @@ pub(super) fn draw_select_dialog(
         DialogMode::SelectOrInput => "↑↓ choose · Enter submit · type custom · Esc cancel",
         DialogMode::SingleSelect if dialog.purpose == DialogPurpose::AskUser => {
             "↑↓ choose · Enter submit · Esc stop"
+        }
+        DialogMode::SingleSelect if dialog.purpose == DialogPurpose::SkillBrowser => {
+            "↑↓ choose · Enter preview · Esc close"
         }
         _ => "↑↓ choose · Enter open · Esc cancel",
     };

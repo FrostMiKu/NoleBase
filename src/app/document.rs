@@ -12,12 +12,14 @@ pub(crate) const DOCUMENT_CACHE_MAX_CELLS: usize = 4_000_000;
 pub enum DocumentKind {
     File(PathBuf),
     Daily(NaiveDate),
+    Skill(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentReturn {
     Daily,
     Search,
+    Skills,
 }
 
 /// A regular or daily note rendered as Markdown in the center pane.
@@ -89,6 +91,8 @@ impl DocumentRenderLru {
         for entry in &mut self.entries {
             if matches!(&entry.kind, DocumentKind::File(path) if path == from) {
                 entry.kind = DocumentKind::File(to.to_path_buf());
+            } else if matches!(&entry.kind, DocumentKind::Skill(path) if path == from) {
+                entry.kind = DocumentKind::Skill(to.to_path_buf());
             }
         }
     }

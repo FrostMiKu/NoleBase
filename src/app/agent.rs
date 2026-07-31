@@ -336,14 +336,20 @@ impl App {
         let Some(document) = self.document.as_mut() else {
             return false;
         };
-        if !matches!(&document.kind, DocumentKind::File(path) if path == from) {
-            return false;
-        }
-        document.kind = DocumentKind::File(to.to_path_buf());
-        document.title = to
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Document".to_string());
+        document.kind = match &document.kind {
+            DocumentKind::File(path) if path == from => DocumentKind::File(to.to_path_buf()),
+            DocumentKind::Skill(path) if path == from => DocumentKind::Skill(to.to_path_buf()),
+            _ => return false,
+        };
+        document.title = if matches!(document.kind, DocumentKind::Skill(_)) {
+            to.file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Skill".to_string())
+        } else {
+            to.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Document".to_string())
+        };
         true
     }
 
@@ -447,20 +453,21 @@ impl App {
         if content.is_empty() {
             return None;
         }
-        let note = self
+        let document = self
             .document
             .as_ref()
             .filter(|_| self.center_view == CenterView::Document)
             .and_then(|document| match &document.kind {
-                DocumentKind::File(path) => Some(path),
+                DocumentKind::File(path) => Some(("note", path)),
+                DocumentKind::Skill(path) => Some(("skill", path)),
                 DocumentKind::Daily(_) => None,
             });
-        Some(if let Some(path) = note {
+        Some(if let Some((kind, path)) = document {
             let display = path
                 .strip_prefix(&self.storage.root)
                 .unwrap_or(path)
                 .to_string_lossy();
-            format!("The user is currently viewing note: {display}\n\n{content}")
+            format!("The user is currently viewing {kind}: {display}\n\n{content}")
         } else {
             content.to_string()
         })

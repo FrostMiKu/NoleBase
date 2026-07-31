@@ -28,6 +28,7 @@ const THEMES_DIR: &str = "themes";
 const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
 const ARCHIVES_DIR: &str = "archives";
+const SKILLS_DIR: &str = "skills";
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppendReceipt {
@@ -100,6 +101,7 @@ pub struct Storage {
     pub data_dir: PathBuf,
     pub daily_dir: PathBuf,
     pub archives_dir: PathBuf,
+    pub skills_dir: PathBuf,
     pub ai_config_path: PathBuf,
     pub settings_path: PathBuf,
     pub agent_session_path: PathBuf,
@@ -125,6 +127,7 @@ impl Storage {
             data_dir: root.join(DATA_DIR),
             daily_dir: root.join(DAILY_DIR),
             archives_dir: root.join(ARCHIVES_DIR),
+            skills_dir: root.join(SKILLS_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
             settings_path: root.join(CONFIG_DIR).join(SETTINGS_FILE),
             agent_session_path: root.join(CONFIG_DIR).join(AGENT_SESSION_FILE),
@@ -148,6 +151,7 @@ impl Storage {
             .with_context(|| format!("creating {}", self.daily_dir.display()))?;
         fs::create_dir_all(&self.archives_dir)
             .with_context(|| format!("creating {}", self.archives_dir.display()))?;
+        crate::skill::ensure_skills_directory(&self.skills_dir)?;
         fs::create_dir_all(&self.themes_dir)
             .with_context(|| format!("creating {}", self.themes_dir.display()))?;
         let default_theme_path = self.themes_dir.join("default.toml");
@@ -777,6 +781,23 @@ impl Storage {
         let path = self.validate_archived_target(path)?;
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
         Ok(())
+    }
+
+    pub fn load_skills(&self) -> Result<crate::skill::SkillCatalog> {
+        crate::skill::load_skill_catalog(&self.skills_dir)
+    }
+
+    pub fn read_skill(&self, path: &Path) -> Result<crate::skill::Skill> {
+        let path = crate::skill::validate_skill_path(&self.skills_dir, path)?;
+        crate::skill::load_skill(&path)
+    }
+
+    pub fn rename_skill(&self, from: &Path, new_id: &str) -> Result<PathBuf> {
+        crate::skill::rename_skill(&self.skills_dir, from, new_id)
+    }
+
+    pub fn delete_skill(&self, path: &Path) -> Result<()> {
+        crate::skill::delete_skill(&self.skills_dir, path)
     }
 
     /// Read a managed note after applying the same path checks used by

@@ -75,6 +75,115 @@ impl App {
         ));
     }
 
+    pub(super) fn open_skill_browser(&mut self) {
+        if self.skill_browser_return.is_none() {
+            self.skill_browser_return = Some(SkillBrowserReturn {
+                center_view: self.center_view,
+                focus: self.focus,
+                document: self.document.clone(),
+            });
+        }
+        self.reopen_skill_browser();
+    }
+
+    pub(super) fn reopen_skill_browser(&mut self) {
+        let selected_id = self
+            .skill_entries
+            .get(self.skill_index)
+            .map(|skill| skill.id.clone());
+        let catalog = match self.storage.load_skills() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.set_error(format!("Skill list error: {error}"));
+                return;
+            }
+        };
+        if let Some(warning) = catalog.warnings.first() {
+            self.set_status(format!("Skill warning: {warning}"));
+        }
+        self.skill_entries = catalog.skills;
+        self.skill_index = selected_id
+            .as_deref()
+            .and_then(|id| self.skill_entries.iter().position(|skill| skill.id == id))
+            .unwrap_or_else(|| {
+                self.skill_index
+                    .min(self.skill_entries.len().saturating_sub(1))
+            });
+        let options = self
+            .skill_entries
+            .iter()
+            .map(|skill| DialogOption::with_hint(&skill.id, &skill.description))
+            .collect();
+        let mut dialog = DialogState::new(
+            "Skills · Enter preview",
+            String::new(),
+            DialogMode::SingleSelect,
+            DialogPurpose::SkillBrowser,
+            options,
+        );
+        dialog.selected = self.skill_index;
+        self.open_dialog(dialog);
+    }
+
+    pub(super) fn finish_skill_browser(&mut self) {
+        self.close_dialog();
+        if let Some(return_to) = self.skill_browser_return.take() {
+            self.center_view = return_to.center_view;
+            self.focus = return_to.focus;
+            self.document = return_to.document;
+        }
+    }
+
+    pub(super) fn return_to_skill_browser(&mut self) {
+        if let Some(return_to) = self.skill_browser_return.as_ref() {
+            self.center_view = return_to.center_view;
+            self.focus = return_to.focus;
+            self.document = return_to.document.clone();
+        }
+        self.reopen_skill_browser();
+    }
+
+    pub(super) fn handle_skill_browser(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.finish_skill_browser(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_dialog_selection(-1);
+                self.skill_index = self.dialog_selected();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_dialog_selection(1);
+                self.skill_index = self.dialog_selected();
+            }
+            KeyCode::Enter => {
+                self.skill_index = self.dialog_selected();
+                let Some(path) = self
+                    .skill_entries
+                    .get(self.skill_index)
+                    .map(|skill| skill.path.clone())
+                else {
+                    self.set_status("No skills found");
+                    return None;
+                };
+                match self.storage.read_skill(&path) {
+                    Ok(skill) => {
+                        self.close_dialog();
+                        self.show_document(
+                            DocumentKind::Skill(skill.path),
+                            skill.id,
+                            skill.body,
+                            DocumentReturn::Skills,
+                        );
+                        self.center_view = CenterView::Document;
+                        self.focus = Focus::Center;
+                    }
+                    Err(error) => self.set_error(format!("Skill preview error: {error}")),
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     pub(super) fn refresh_command_palette(&mut self) {
         let query = self
             .dialog
@@ -170,6 +279,7 @@ impl App {
             AppCommand::EditAgentMemory => {
                 return Some(Command::Edit(self.storage.memory_path.clone()));
             }
+            AppCommand::BrowseSkills => self.open_skill_browser(),
         }
         None
     }
@@ -193,7 +303,8 @@ impl App {
             | AppCommand::BrowseTags
             | AppCommand::RenameTag
             | AppCommand::EditAgentInstructions
-            | AppCommand::EditAgentMemory => true,
+            | AppCommand::EditAgentMemory
+            | AppCommand::BrowseSkills => true,
         }
     }
 
@@ -528,6 +639,7 @@ impl App {
                 }
                 return None;
             }
+            DialogPurpose::SkillBrowser => return self.handle_skill_browser(key),
             DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
@@ -1153,26 +1265,39 @@ impl App {
     pub(super) fn handle_delete_file_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let mut deleted_skill = false;
                 if let Some(path) = self.pending_file.take() {
+                    let skill = self.document.as_ref().is_some_and(|document| {
+                        matches!(&document.kind, DocumentKind::Skill(open) if open == &path)
+                    });
                     let archived = self
                         .note_files
                         .iter()
                         .find(|file| file.path == path)
                         .is_some_and(|file| file.archived);
-                    let result = if archived {
+                    let result = if skill {
+                        self.storage.delete_skill(&path)
+                    } else if archived {
                         self.storage.delete_archived_file(&path)
                     } else {
                         self.storage.delete_file(&path)
                     };
                     match result {
                         Ok(()) => {
-                            self.document_render_lru
-                                .remove(&DocumentKind::File(path.clone()));
+                            let kind = if skill {
+                                DocumentKind::Skill(path.clone())
+                            } else {
+                                DocumentKind::File(path.clone())
+                            };
+                            self.document_render_lru.remove(&kind);
                             self.set_status(format!(
                                 "Deleted {}",
                                 path.file_name().unwrap_or_default().to_string_lossy()
                             ));
-                            if self
+                            if skill {
+                                self.document = None;
+                                deleted_skill = true;
+                            } else if self
                                 .document
                                 .as_ref()
                                 .is_some_and(|document| document.kind == DocumentKind::File(path))
@@ -1180,13 +1305,18 @@ impl App {
                                 self.document = None;
                                 self.center_view = CenterView::Daily;
                             }
-                            self.reload_files();
+                            if !skill {
+                                self.reload_files();
+                            }
                         }
                         Err(error) => self.set_error(format!("Error: {error}")),
                     }
                 }
                 self.overlay = None;
                 self.dialog = None;
+                if deleted_skill {
+                    self.return_to_skill_browser();
+                }
                 None
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {

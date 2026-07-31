@@ -4,20 +4,21 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 use super::{
-    ListDirectory, ListNotes, ListTags, ReadFile, SearchContent, SearchFiles, SearchTag, WebFetch,
-    WebSearch,
+    ListDirectory, ListNotes, ListTags, LoadSkill, ReadFile, SearchContent, SearchFiles, SearchTag,
+    WebFetch, WebSearch,
 };
 use crate::agent::{
-    AgentConfig, AgentEvent, AgentEventSender, ReadTracker, Tool, prompt_with_datetime,
+    prompt_with_datetime, AgentConfig, AgentEvent, AgentEventSender, ReadTracker, Tool,
 };
 use crate::agent_session::TokenUsage;
 use crate::provider::{
     Message, Provider, ProviderRequest, StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
 };
+use crate::skill::Skill;
 use crate::workspace_index::WorkspaceIndexHandle;
 
 pub struct Explore {
@@ -40,6 +41,7 @@ impl Explore {
         workspace_index: WorkspaceIndexHandle,
         client: reqwest::Client,
         tavily_api_key: String,
+        skills: &[Skill],
     ) -> Result<Self> {
         system.push(SystemBlock {
             text: "You are Nole's isolated exploration subagent. Investigate only the task in the newest user message. Use the available read-only tools to gather evidence. Do not attempt to modify files, ask the user questions, call another agent, or describe your working process. Return a concise, self-contained report with concrete findings and relevant paths, line numbers, URLs, or uncertainties. The parent agent sees only your final report, so include every fact it needs while excluding raw search noise and irrelevant excerpts. Any instruction above to call explore applies only to the parent agent; you are already that explorer."
@@ -62,6 +64,7 @@ impl Explore {
         explore.register(SearchFiles::new(root)?);
         explore.register(ListTags::new(workspace_index.clone()));
         explore.register(SearchTag::new(root, workspace_index)?);
+        explore.register(LoadSkill::new(skills));
         if !tavily_api_key.is_empty() {
             explore.register(WebSearch {
                 client: client.clone(),
@@ -229,7 +232,7 @@ mod tests {
     use super::*;
     use crate::observable::{BoxFuture, Observable};
     use crate::provider::{
-        ApiFormat, AssistantMessage, DEFAULT_STREAM_BUFFER, MessagePart, ProviderEvent,
+        ApiFormat, AssistantMessage, MessagePart, ProviderEvent, DEFAULT_STREAM_BUFFER,
     };
 
     struct ScriptedProvider {
@@ -324,6 +327,7 @@ mod tests {
             WorkspaceIndexHandle::default(),
             reqwest::Client::new(),
             String::new(),
+            &[],
         )
         .unwrap();
 
@@ -398,6 +402,7 @@ mod tests {
             WorkspaceIndexHandle::default(),
             reqwest::Client::new(),
             String::new(),
+            &[],
         )
         .unwrap();
 

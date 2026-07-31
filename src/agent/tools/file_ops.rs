@@ -8,7 +8,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::util::{MAX_FILE_BYTES, display_path, limited_diff, required_string, validate_mbdown};
+use super::util::{MAX_FILE_BYTES, display_path, limited_diff, required_string};
+use super::write_policy::{WriteSource, validate_write};
 use crate::agent::{
     AgentEvent, AgentEventSender, ApprovalGate, ApprovalRequest, ReadTracker, Tool, canonical_root,
 };
@@ -145,7 +146,7 @@ impl Tool for EditFile {
         if old == content {
             return Ok(format!("no changes needed for {relative}"));
         }
-        validate_mbdown(&path, &content)?;
+        validate_write(&self.root, &path, WriteSource::Text(&content))?;
         self.gate
             .request(ApprovalRequest {
                 title: format!("Edit {relative}"),
@@ -415,6 +416,7 @@ impl Tool for CopyFile {
         let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
+        validate_write(&self.root, &destination, WriteSource::File(&source))?;
         let bytes = copy_to_new_file(&source, &destination)?;
         Ok(format!("copied {bytes} bytes to {destination_text}"))
     }
@@ -452,6 +454,7 @@ impl Tool for MoveFile {
         let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
+        validate_write(&self.root, &destination, WriteSource::File(&source))?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!("moved {bytes} bytes to {destination_text}"))
@@ -533,6 +536,7 @@ impl Tool for MoveFiles {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("checking batch destination"),
             }
+            validate_write(&self.root, &destination, WriteSource::File(&source))?;
             transfers.push((source, destination));
         }
 
@@ -673,6 +677,7 @@ impl Tool for RenameFile {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("checking rename destination"),
         }
+        validate_write(&self.root, &destination, WriteSource::File(&source))?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!(
@@ -826,7 +831,7 @@ impl Tool for CreateFile {
         if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
             bail!("generic file tools cannot operate on this special file");
         }
-        validate_mbdown(&path, content)?;
+        validate_write(&self.root, &path, WriteSource::Text(content))?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

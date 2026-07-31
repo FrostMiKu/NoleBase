@@ -15,6 +15,8 @@ mod footer;
 mod input;
 mod notification;
 mod search;
+#[cfg(test)]
+mod skill_tests;
 mod tags;
 mod terminal;
 #[cfg(test)]
