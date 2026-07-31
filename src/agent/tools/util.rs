@@ -84,7 +84,7 @@ pub(super) fn validate_mbdown(path: &Path, content: &str) -> Result<()> {
     if !is_mbdown {
         return Ok(());
     }
-    if let Err(error) = mbdown::parse(content) {
+    if let Err(error) = mbdown::validate(content) {
         bail!("MBDown validation failed for {}: {error}", path.display());
     }
     Ok(())

@@ -226,6 +226,7 @@ pub enum CenterView {
     Document,
     Search,
     DocumentSearch,
+    Tags,
 }
 
 /// Interaction taking place inside the files pane.

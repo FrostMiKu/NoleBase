@@ -50,14 +50,7 @@ pub(super) fn draw_dialog(
     let option_count = dialog.options.len() as u16;
     let desired_height = match dialog.mode {
         DialogMode::Confirm => 5,
-        DialogMode::FreeText
-            if matches!(
-                dialog.purpose,
-                DialogPurpose::NewFile | DialogPurpose::RenameFile
-            ) =>
-        {
-            5
-        }
+        DialogMode::SingleLine => 5,
         DialogMode::FreeText => 11,
         DialogMode::SelectOrInput => message_rows
             .min(8)
@@ -107,17 +100,14 @@ pub(super) fn draw_dialog(
     let border = match dialog.mode {
         _ if destructive => app.theme.ui_error,
         DialogMode::Approval => app.theme.ui_warning,
-        DialogMode::FreeText => app.theme.ui_dialog_input,
+        DialogMode::SingleLine | DialogMode::FreeText => app.theme.ui_dialog_input,
         DialogMode::SelectOrInput
         | DialogMode::SingleSelect
         | DialogMode::MultiSelect
         | DialogMode::CommandPalette => app.theme.ui_dialog_choice,
         _ => app.theme.text_disabled,
     };
-    let modal_background = if matches!(
-        dialog.purpose,
-        DialogPurpose::NewFile | DialogPurpose::RenameFile
-    ) {
+    let modal_background = if dialog.mode == DialogMode::SingleLine {
         app.theme.surface_panel
     } else {
         app.theme.surface_overlay
@@ -183,44 +173,41 @@ pub(super) fn draw_dialog(
                 draw_dialog_footer(frame, inner, "Enter/Y confirm · N/Esc cancel", app.theme);
             }
         }
+        DialogMode::SingleLine => {
+            let (input, footer) = split_last_row(inner);
+            let single = Rect::new(input.x, input.y, input.width, 1);
+            if let Some(position) = draw_single_line_input(
+                frame,
+                single,
+                &dialog.message,
+                &dialog.input,
+                dialog.cursor,
+                true,
+                app.theme,
+            ) {
+                *cursor_position = Some(position);
+            }
+            draw_dialog_footer(frame, footer, "Enter save · Esc cancel", app.theme);
+        }
         DialogMode::FreeText => {
             let (input, footer) = split_last_row(inner);
-            if matches!(
-                dialog.purpose,
-                DialogPurpose::NewFile | DialogPurpose::RenameFile
+            if let Some(position) = draw_multiline_input(
+                frame,
+                input,
+                &dialog.input,
+                dialog.cursor,
+                "Optional prompt; empty formats this daily note",
+                true,
+                app.theme,
             ) {
-                let single = Rect::new(input.x, input.y, input.width, 1);
-                if let Some(position) = draw_single_line_input(
-                    frame,
-                    single,
-                    &dialog.message,
-                    &dialog.input,
-                    dialog.cursor,
-                    true,
-                    app.theme,
-                ) {
-                    *cursor_position = Some(position);
-                }
-                draw_dialog_footer(frame, footer, "Enter save · Esc cancel", app.theme);
-            } else {
-                if let Some(position) = draw_multiline_input(
-                    frame,
-                    input,
-                    &dialog.input,
-                    dialog.cursor,
-                    "Optional prompt; empty formats this daily note",
-                    true,
-                    app.theme,
-                ) {
-                    *cursor_position = Some(position);
-                }
-                draw_dialog_footer(
-                    frame,
-                    footer,
-                    "Enter submit · Shift/Ctrl/Alt+Enter newline · Esc cancel",
-                    app.theme,
-                );
+                *cursor_position = Some(position);
             }
+            draw_dialog_footer(
+                frame,
+                footer,
+                "Enter submit · Shift/Ctrl/Alt+Enter newline · Esc cancel",
+                app.theme,
+            );
         }
         DialogMode::Approval => {
             let (content, footer) = split_last_row(inner);
@@ -690,6 +677,7 @@ pub(super) fn help_lines(theme: Theme) -> Vec<Line<'static>> {
         key("← → / ↑ ↓", "move focus between panes"),
         key("Tab", "toggle approve / bypass mode"),
         key("Ctrl+P", "open command palette"),
+        key("#", "browse workspace tags"),
         key("Ctrl+`", "toggle workspace terminal"),
         key("Esc", "return / cancel"),
         key("?", "open this help"),

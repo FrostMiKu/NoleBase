@@ -556,7 +556,7 @@ fn command_palette_switches_theme_and_persists_the_selection() {
 }
 
 #[test]
-fn command_palette_browses_tags_with_counts_and_opens_exact_search() {
+fn command_palette_and_hash_shortcut_open_centered_tag_browser() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "daily #rust and #rust\nnot #rustlang");
     fs::write(app.storage.data_dir.join("Project.md"), "note #rust\n").unwrap();
@@ -565,19 +565,15 @@ fn command_palette_browses_tags_with_counts_and_opens_exact_search() {
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_paste("tags browse");
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        app.dialog.as_ref().map(|dialog| dialog.purpose),
-        Some(DialogPurpose::TagPicker)
-    );
+    assert_eq!(app.overlay, None);
+    assert_eq!(app.center_view, CenterView::Tags);
+    assert_eq!(app.focus, Focus::Center);
     let rust = app
-        .dialog
-        .as_ref()
-        .unwrap()
-        .options
+        .tag_results
         .iter()
-        .find(|option| option.label == "#rust")
+        .find(|tag| tag.name == "rust")
         .unwrap();
-    assert_eq!(rust.hint.as_deref(), Some("2 documents · 3 mentions"));
+    assert_eq!((rust.documents, rust.mentions), (2, 3));
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.center_view, CenterView::Search);
@@ -588,6 +584,21 @@ fn command_palette_browses_tags_with_counts_and_opens_exact_search() {
             !text.contains("#rustlang")
         }
     }));
+
+    app.center_view = CenterView::Daily;
+    app.handle_key(key(KeyCode::Char('#')));
+    assert_eq!(app.center_view, CenterView::Tags);
+    app.handle_paste("lang");
+    assert_eq!(app.tag_query, "lang");
+    assert_eq!(app.tag_results.len(), 1);
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.center_view, CenterView::Daily);
+
+    app.center_view = CenterView::Document;
+    app.handle_key(key(KeyCode::Char('#')));
+    assert_eq!(app.center_view, CenterView::Tags);
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.center_view, CenterView::Document);
 }
 
 #[test]
@@ -611,7 +622,16 @@ fn command_palette_renames_an_exact_tag_across_the_workspace() {
         app.dialog.as_ref().map(|dialog| dialog.purpose),
         Some(DialogPurpose::TagRenameTarget)
     );
-    app.handle_paste("new/tag");
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.mode),
+        Some(DialogMode::SingleLine)
+    );
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.message.as_str()),
+        Some("New tag  #")
+    );
+    app.handle_paste("new/\ntag");
+    assert_eq!(app.dialog.as_ref().unwrap().input, "new/tag");
     app.handle_key(key(KeyCode::Enter));
 
     assert_eq!(app.overlay, None);

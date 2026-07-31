@@ -46,6 +46,10 @@ impl App {
                     self.open_todo();
                     return None;
                 }
+                KeyCode::Char('#') => {
+                    self.open_tags();
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -59,6 +63,7 @@ impl App {
                 CenterView::Daily => self.handle_daily(key),
                 CenterView::Document => self.handle_document(key),
                 CenterView::Search | CenterView::DocumentSearch => self.handle_search(key),
+                CenterView::Tags => self.handle_tags(key),
             },
         }
     }
@@ -71,6 +76,7 @@ impl App {
         }
         if self.overlay.is_some() {
             let purpose = self.dialog.as_ref().map(|dialog| dialog.purpose);
+            let mode = self.dialog.as_ref().map(|dialog| dialog.mode);
             if matches!(
                 purpose,
                 Some(
@@ -87,7 +93,9 @@ impl App {
                     self.select_custom_dialog_option();
                 }
                 if let Some(dialog) = self.dialog.as_mut() {
-                    let text = if purpose == Some(DialogPurpose::CommandPalette) {
+                    let text = if mode == Some(DialogMode::SingleLine)
+                        || purpose == Some(DialogPurpose::CommandPalette)
+                    {
                         text.replace('\n', "")
                     } else {
                         text
@@ -109,6 +117,10 @@ impl App {
             (Focus::Center, CenterView::Search | CenterView::DocumentSearch, _) => {
                 self.search_query.push_str(&text);
                 self.recompute_search();
+            }
+            (Focus::Center, CenterView::Tags, _) => {
+                self.tag_query.push_str(&text.replace('\n', ""));
+                self.recompute_tags();
             }
             (Focus::Files, _, FilesContext::Search) => {
                 self.file_query.push_str(&text.replace('\n', ""));
@@ -170,7 +182,7 @@ impl App {
             || (self.focus == Focus::Center
                 && matches!(
                     self.center_view,
-                    CenterView::Search | CenterView::DocumentSearch
+                    CenterView::Search | CenterView::DocumentSearch | CenterView::Tags
                 ))
             || (self.focus == Focus::Files
                 && matches!(
@@ -498,6 +510,44 @@ impl App {
         }
     }
 
+    pub(super) fn handle_tags(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.center_view = self.tags_return_view;
+                None
+            }
+            KeyCode::Down => {
+                self.move_tag_selection(1);
+                None
+            }
+            KeyCode::Up => {
+                self.move_tag_selection(-1);
+                None
+            }
+            KeyCode::Enter => {
+                if let Some(name) = self
+                    .tag_results
+                    .get(self.tag_index)
+                    .map(|tag| tag.name.clone())
+                {
+                    self.open_tag_search(&name);
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                self.tag_query.pop();
+                self.recompute_tags();
+                None
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.tag_query.push(character);
+                self.recompute_tags();
+                None
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn handle_document(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -621,6 +671,7 @@ impl App {
                 CenterView::Search | CenterView::DocumentSearch => {
                     self.move_search_selection(delta)
                 }
+                CenterView::Tags => self.move_tag_selection(delta),
             }
         }
     }

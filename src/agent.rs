@@ -3718,6 +3718,18 @@ mod tests {
             .to_string();
         assert!(error.contains("box border must be single or none"));
         assert!(!storage.data_dir.join("invalid.md").exists());
+
+        let mermaid_error = create
+            .execute(&json!({
+                "path": "data/invalid-mermaid.md",
+                "content": "# Diagram\n\n```mermaid\nclassDiagram\nclass Agent~T~ {}\n```\n"
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(mermaid_error.contains("Mermaid validation failed at line 3"));
+        assert!(mermaid_error.contains("generics not yet supported"));
+        assert!(!storage.data_dir.join("invalid-mermaid.md").exists());
+
         create
             .execute(&json!({"path": "data/plain.txt", "content": invalid}))
             .unwrap();
@@ -3757,7 +3769,24 @@ mod tests {
             .to_string();
         assert!(error.contains("box border must be single or none"));
         assert!(event_receiver.try_recv().is_err());
-        assert_eq!(fs::read_to_string(path).unwrap(), "valid\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
+
+        let error = test_runtime()
+            .block_on(edit.execute(&json!({
+                "path": "data/note.md",
+                "edits": [{
+                    "operation": "replace",
+                    "start_line": 0,
+                    "end_line": 0,
+                    "lines": ["```mermaid", "classDiagram", "class Agent~T~ {}", "```"]
+                }]
+            })))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Mermaid validation failed at line 1"));
+        assert!(error.contains("generics not yet supported"));
+        assert!(event_receiver.try_recv().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
     }
 
     #[test]

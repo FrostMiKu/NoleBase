@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogMode {
     Confirm,
+    SingleLine,
     SingleSelect,
     MultiSelect,
     SelectOrInput,
@@ -28,7 +29,6 @@ pub enum DialogPurpose {
     RenameFile,
     CommandPalette,
     ThemePicker,
-    TagPicker,
     TagRenameSource,
     TagRenameTarget,
     Custom,

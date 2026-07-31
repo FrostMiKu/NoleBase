@@ -95,6 +95,21 @@ impl App {
         self.focus = Focus::Center;
     }
 
+    pub fn open_tags(&mut self) {
+        self.close_dialog();
+        self.tags_return_view = if self.center_view == CenterView::Document {
+            CenterView::Document
+        } else {
+            CenterView::Daily
+        };
+        self.tag_query.clear();
+        self.tag_index = 0;
+        self.tag_list_start = 0;
+        self.center_view = CenterView::Tags;
+        self.focus = Focus::Center;
+        self.recompute_tags();
+    }
+
     pub(super) fn open_document_search(&mut self) {
         self.search_query.clear();
         self.search_results.clear();
@@ -606,6 +621,14 @@ impl App {
         }
     }
 
+    pub(super) fn move_tag_selection(&mut self, delta: i32) {
+        if !self.tag_results.is_empty() {
+            self.tag_index = (self.tag_index as i32 + delta)
+                .clamp(0, self.tag_results.len().saturating_sub(1) as i32)
+                as usize;
+        }
+    }
+
     pub(super) fn scroll_document(&mut self, delta: i32) {
         if let Some(document) = self.document.as_mut() {
             document.scroll = if delta > 0 {
@@ -658,6 +681,21 @@ impl App {
         self.search_index = self
             .search_index
             .min(self.search_results.len().saturating_sub(1));
+    }
+
+    pub(super) fn recompute_tags(&mut self) {
+        let query = self.tag_query.trim().trim_start_matches('#').to_lowercase();
+        let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
+            self.tag_results.clear();
+            self.tag_index = 0;
+            self.set_status("Workspace index is still building");
+            return;
+        };
+        self.tag_results = tags
+            .into_iter()
+            .filter(|tag| query.is_empty() || tag.name.to_lowercase().contains(&query))
+            .collect();
+        self.tag_index = self.tag_index.min(self.tag_results.len().saturating_sub(1));
     }
 
     pub(super) fn open_tag_search(&mut self, name: &str) {
@@ -994,5 +1032,4 @@ impl App {
             Err(error) => self.set_error(format!("Error: {error}")),
         }
     }
-
 }

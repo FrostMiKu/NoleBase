@@ -24,7 +24,7 @@ use crate::model::{
 use crate::notification::NotificationService;
 use crate::observable::Observable;
 use crate::storage::{LoadedTheme, Storage};
-use crate::workspace_index::{TagRenamePlan, WorkspaceIndex, WorkspaceIndexHandle};
+use crate::workspace_index::{TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle};
 
 pub(in crate::app) const FORMAT_DAILY_NOTE_PROMPT: &str = "Read this daily note, then edit it in place to improve its Markdown formatting and readability. Preserve every fact, idea, task, link, and the author's meaning. Only improve structure and presentation, such as headings, paragraphs, lists, spacing, and emphasis. Do not add new factual content, and do not merely describe the changes.";
 
@@ -227,6 +227,11 @@ pub struct App {
     pub search_results: Vec<SearchHit>,
     pub search_index: usize,
     pub search_list_start: usize,
+    pub tag_query: String,
+    pub tag_results: Vec<TagSummary>,
+    pub tag_index: usize,
+    pub tag_list_start: usize,
+    tags_return_view: CenterView,
     workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
 
@@ -381,6 +386,11 @@ impl App {
             search_results: Vec::new(),
             search_index: 0,
             search_list_start: 0,
+            tag_query: String::new(),
+            tag_results: Vec::new(),
+            tag_index: 0,
+            tag_list_start: 0,
+            tags_return_view: CenterView::Daily,
             workspace_index,
             pending_tag_rename: None,
             help_scroll: 0,
@@ -527,6 +537,8 @@ impl App {
             CenterView::Search | CenterView::DocumentSearch
         ) {
             self.recompute_search();
+        } else if self.center_view == CenterView::Tags {
+            self.recompute_tags();
         }
         let document_kind = self.document.as_ref().map(|document| document.kind.clone());
         match document_kind {

@@ -282,6 +282,8 @@ impl App {
         }
         if self.center_view == CenterView::Search && !self.search_query.trim().is_empty() {
             self.recompute_search();
+        } else if self.center_view == CenterView::Tags {
+            self.recompute_tags();
         }
     }
 

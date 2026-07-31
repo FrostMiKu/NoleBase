@@ -48,33 +48,6 @@ impl App {
         self.open_dialog(dialog);
     }
 
-    pub(super) fn open_tag_picker(&mut self) {
-        let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
-            self.set_status("Tag index is still building");
-            return;
-        };
-        let options = tags
-            .into_iter()
-            .map(|tag| {
-                DialogOption::with_hint(
-                    format!("#{}", tag.name),
-                    format!("{} documents · {} mentions", tag.documents, tag.mentions),
-                )
-            })
-            .collect::<Vec<_>>();
-        if options.is_empty() {
-            self.set_status("No tags found");
-            return;
-        }
-        self.open_dialog(DialogState::new(
-            "Tags · Enter search",
-            String::new(),
-            DialogMode::SingleSelect,
-            DialogPurpose::TagPicker,
-            options,
-        ));
-    }
-
     pub(super) fn open_tag_rename_picker(&mut self) {
         let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
             self.set_status("Tag index is still building");
@@ -189,7 +162,7 @@ impl App {
                 return Some(Command::Edit(self.storage.ai_config_path.clone()))
             }
             AppCommand::SwitchTheme => self.open_theme_picker(),
-            AppCommand::BrowseTags => self.open_tag_picker(),
+            AppCommand::BrowseTags => self.open_tags(),
             AppCommand::RenameTag => self.open_tag_rename_picker(),
             AppCommand::EditAgentInstructions => {
                 return Some(Command::Edit(self.storage.agents_path.clone()));
@@ -265,7 +238,7 @@ impl App {
             _ => return,
         };
         let mut dialog =
-            DialogState::new(title, "Name  ", DialogMode::FreeText, purpose, Vec::new());
+            DialogState::new(title, "Name  ", DialogMode::SingleLine, purpose, Vec::new());
         dialog.input = input;
         dialog.cursor = cursor;
         self.open_dialog(dialog);
@@ -449,7 +422,7 @@ impl App {
                     let mut dialog = DialogState::new(
                         "New file · Enter create",
                         "Name  ",
-                        DialogMode::FreeText,
+                        DialogMode::SingleLine,
                         DialogPurpose::NewFile,
                         Vec::new(),
                     );
@@ -461,7 +434,7 @@ impl App {
                     let mut dialog = DialogState::new(
                         "Rename file · Enter save",
                         "Name  ",
-                        DialogMode::FreeText,
+                        DialogMode::SingleLine,
                         DialogPurpose::RenameFile,
                         Vec::new(),
                     );
@@ -558,7 +531,6 @@ impl App {
             DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
-            DialogPurpose::TagPicker => return self.handle_tag_picker(key),
             DialogPurpose::TagRenameSource => return self.handle_tag_rename_source(key),
             DialogPurpose::AgentPrompt
             | DialogPurpose::NewFile
@@ -616,7 +588,7 @@ impl App {
                 _ => {}
             },
             DialogMode::SelectOrInput => return self.handle_custom_select_or_input(key),
-            DialogMode::FreeText => return self.handle_text_dialog(key),
+            DialogMode::SingleLine | DialogMode::FreeText => return self.handle_text_dialog(key),
             DialogMode::CommandPalette => return self.handle_command_palette(key),
             DialogMode::Approval | DialogMode::Informational => {}
         }
@@ -654,29 +626,6 @@ impl App {
         None
     }
 
-    pub(super) fn handle_tag_picker(&mut self, key: KeyEvent) -> Option<Command> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.close_dialog(),
-            KeyCode::Up | KeyCode::Char('k') => self.move_dialog_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_dialog_selection(1),
-            KeyCode::Enter => {
-                let tag = self
-                    .dialog
-                    .as_ref()
-                    .and_then(DialogState::selected_option)
-                    .map(|option| option.label.clone())?;
-                self.close_dialog();
-                self.search_query = tag;
-                self.search_index = 0;
-                self.center_view = CenterView::Search;
-                self.focus = Focus::Center;
-                self.recompute_search();
-            }
-            _ => {}
-        }
-        None
-    }
-
     pub(super) fn handle_tag_rename_source(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.close_dialog(),
@@ -691,8 +640,8 @@ impl App {
                 self.pending_tag_rename = Some(source.clone());
                 self.open_dialog(DialogState::new(
                     format!("Rename #{source}"),
-                    "Enter the new tag name",
-                    DialogMode::FreeText,
+                    "New tag  #",
+                    DialogMode::SingleLine,
                     DialogPurpose::TagRenameTarget,
                     Vec::new(),
                 ));
@@ -1014,11 +963,16 @@ impl App {
 
     pub(super) fn handle_text_dialog(&mut self, key: KeyEvent) -> Option<Command> {
         let modifiers = key.modifiers;
+        let single_line = self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.mode == DialogMode::SingleLine);
         match key.code {
             KeyCode::Enter
-                if modifiers.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-                ) =>
+                if !single_line
+                    && modifiers.intersects(
+                        KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    ) =>
             {
                 self.insert_dialog_char('\n');
             }
@@ -1076,7 +1030,7 @@ impl App {
             KeyCode::Down => self.move_dialog_cursor(CursorMove::Down),
             KeyCode::Home => self.move_dialog_cursor(CursorMove::LineStart),
             KeyCode::End => self.move_dialog_cursor(CursorMove::LineEnd),
-            KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('j') if !single_line && modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_dialog_char('\n')
             }
             KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {

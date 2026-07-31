@@ -16,6 +16,7 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (_, CenterView::Document, _) => "DOCUMENT",
         (_, CenterView::Search, _) => "SEARCH",
         (_, CenterView::DocumentSearch, _) => "FIND",
+        (_, CenterView::Tags, _) => "TAGS",
         _ => "DAILY",
     };
     let surface_segment = format!(" {surface} ");
@@ -122,7 +123,8 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
                     "e edit · a archive · r rename · d delete"
                 }
             }
-            (Focus::Center, _) => "Ctrl+P commands",
+            (Focus::Center, CenterView::Tags) => "type filter · ↑↓ select · Enter search",
+            (Focus::Center, _) => "# tags · Ctrl+P commands",
         };
     }
     match (app.focus, app.center_view) {
@@ -137,7 +139,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         (Focus::Agent, _) if app.ai_running => "c cancel · C clear session · ↑↓ scroll · ← center",
         (Focus::Agent, _) => "C clear session · ↑↓ scroll · ← center",
         (_, CenterView::Daily) if width >= 95 => {
-            "i compose · f files · t todo · / search · Ctrl+P commands · ? help"
+            "i compose · f files · t todo · / search · # tags · Ctrl+P commands · ? help"
         }
         (_, CenterView::Document)
             if app.document.as_ref().is_some_and(|document| {
@@ -159,6 +161,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         (_, CenterView::Document) => "↑↓ scroll · e edit DailyNote · / find · Esc back",
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
         (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
+        (_, CenterView::Tags) => "type filter · ↑↓ select · Enter search · Esc back",
         _ => "f files · t todo · Ctrl+P commands · ? help",
     }
 }
@@ -180,4 +183,3 @@ pub(super) fn draw_left_right_line(frame: &mut Frame, area: Rect, left: &str, ri
         );
     }
 }
-

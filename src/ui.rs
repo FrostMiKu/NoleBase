@@ -16,12 +16,13 @@ mod footer;
 mod input;
 mod notification;
 mod search;
+mod tags;
 mod terminal;
 mod util;
 
 use self::{
     agent::*, compose::*, daily::*, dialog::*, diff::*, document::*, files::*, footer::*,
-    input::*, notification::*, search::*, terminal::*, util::*,
+    input::*, notification::*, search::*, tags::*, terminal::*, util::*,
 };
 
 use chrono::{DateTime, Local, NaiveDate};
@@ -243,6 +244,7 @@ fn draw_center(
         CenterView::Search | CenterView::DocumentSearch => {
             draw_search(frame, app, content, interactive, cursor_position)
         }
+        CenterView::Tags => draw_tags(frame, app, content, interactive, cursor_position),
     }
 }
 
@@ -287,9 +289,6 @@ fn draw_overlay(
         _ => draw_dialog(frame, app, root, cursor_position),
     }
 }
-
-
-
 
 
 

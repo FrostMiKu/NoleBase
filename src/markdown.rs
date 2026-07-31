@@ -423,6 +423,24 @@ mod tests {
     }
 
     #[test]
+    fn renders_nested_lists_with_hierarchical_indent() {
+        let output = text(&to_lines_at_width("- AAA\n  - BBB\n- CCC", WIDTH));
+        assert_eq!(output, " • AAA\n    • BBB\n • CCC");
+    }
+
+    #[test]
+    fn mermaid_fallback_shows_a_concise_error_status() {
+        let output = text(&to_lines_at_width(
+            "```mermaid\nclassDiagram\nclass Agent~T~ {}\n```",
+            80,
+        ));
+        let label = output.lines().find(|line| line.contains("mermaid")).unwrap();
+        assert!(label.trim_end().ends_with("unsupported"));
+        assert!(!output.contains("generics not yet supported"));
+        assert!(output.contains("class Agent~T~ {}"));
+    }
+
+    #[test]
     fn renders_mermaid_fences_as_unicode_diagrams() {
         let lines = to_lines_at_width(
             "```mermaid\nsequenceDiagram\n    Alice->>Bob: Hello\n```",

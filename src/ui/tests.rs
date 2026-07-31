@@ -886,6 +886,22 @@ fn file_name_inputs_render_as_modals_while_search_stays_inline() {
     assert_eq!(underline.symbol(), "─");
     assert_eq!(underline.fg, ctp::OVERLAY_0);
     assert!(app.layout.overlay.is_none());
+
+    app.open_dialog(DialogState::new(
+        "Rename #old",
+        "New tag  #",
+        DialogMode::SingleLine,
+        DialogPurpose::TagRenameTarget,
+        Vec::new(),
+    ));
+    app.dialog.as_mut().unwrap().input = "new/tag".to_string();
+    app.dialog.as_mut().unwrap().cursor = 7;
+    let terminal = render(&mut app, 80, 16);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Rename #old"));
+    assert!(screen.contains("New tag  #new/tag"));
+    assert!(!screen.contains("Optional prompt"));
+    assert_eq!(app.layout.overlay.unwrap().height, 5);
 }
 
 #[test]
@@ -950,6 +966,27 @@ fn narrow_center_renders_each_center_view_in_place() {
         terminal.backend().buffer()[(result.x + result.width - 1, result.y)].symbol(),
         " "
     );
+
+    app.center_view = CenterView::Tags;
+    app.tag_results = vec![
+        crate::workspace_index::TagSummary {
+            name: "rust".to_string(),
+            documents: 2,
+            mentions: 3,
+        },
+        crate::workspace_index::TagSummary {
+            name: "design/system".to_string(),
+            documents: 1,
+            mentions: 4,
+        },
+    ];
+    let terminal = render(&mut app, 80, 18);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Tags · 2"));
+    assert!(screen.contains("#rust"));
+    assert!(screen.contains("2 documents · 3 mentions"));
+    assert_eq!(app.tag_hitboxes.len(), 2);
+    assert_eq!(app.tag_hitboxes[0].area.height, SELECT_OPTION_HEIGHT);
 }
 
 #[test]
