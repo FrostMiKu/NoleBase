@@ -1453,6 +1453,8 @@ dependencies = [
 [[package]]
 name = "mbdown"
 version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e883f507beb5fdac360d4589aa401926194caa0d75cf5fcbba962b927673091"
 dependencies = [
  "ascii-dag",
  "chrono",
@@ -1463,6 +1465,8 @@ dependencies = [
 [[package]]
 name = "mbtui"
 version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4612c1cbd1cb8b7bef34cd1ebaf1e20734c2701092dabc7bbff4bfdbbdd79be"
 dependencies = [
  "mbdown",
  "ratatui",
