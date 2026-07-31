@@ -441,6 +441,76 @@ mod tests {
     }
 
     #[test]
+    fn renders_cjk_mermaid_without_wide_cell_placeholders() {
+        for (source, labels) in [
+            (
+                "```mermaid\nflowchart LR\n    A[开始] --> B{是否满意?}\n    B -->|否| C[继续改进]\n```",
+                &["开始", "是否满意?", "继续改进"][..],
+            ),
+            (
+                "```mermaid\nsequenceDiagram\n    participant U as 用户\n    participant N as Nole\n    U->>N: 输入指令\n    N-->>U: 展示响应\n```",
+                &["用户", "输入指令", "展示响应"][..],
+            ),
+            (
+                "```mermaid\ngantt\n    dateFormat YYYY-MM-DD\n    section 核心功能\n    Markdown 支持: 2026-01-01, 30d\n    AI 集成: 2026-01-15, 30d\n```",
+                &["核心功能", "Markdown 支持", "AI 集成"][..],
+            ),
+        ] {
+            let lines = to_lines_at_width(source, 80);
+            let output = text(&lines);
+
+            for label in labels {
+                assert!(output.contains(label), "missing {label:?}:\n{output}");
+            }
+            assert!(!output.contains("开 始"));
+            assert!(!output.contains("输 入"));
+            assert!(!output.contains("支 持"));
+            assert!(!output.contains("mermaid"));
+            assert!(output
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= 80));
+        }
+    }
+
+    #[test]
+    fn renders_exact_mermaid_bad_cases_at_supported_widths() {
+        let fixtures = [
+            (
+                "graph LR\n    A[开始] --> B{条件判断}\n    B -->|是| C(执行操作 A)\n    B -->|否| D(执行操作 B)\n    C --> E[结束]\n    D --> E\n    C --> F((检查点))\n    F --> B\n",
+                &["开始", "条件判断", "执行操作 A", "执行操作 B", "结束", "检查点"][..],
+            ),
+            (
+                "stateDiagram-v2\n    [*] --> Idle\n    Idle --> Processing: 接收任务\n    Processing --> Running: 开始执行\n    Running --> Success: 完成\n    Running --> Error: 失败\n    Success --> [*]\n    Error --> Retry: 重试\n    Retry --> Processing\n    Error --> [*]: 放弃\n",
+                &["Idle", "Processing", "Running", "Success", "Error", "Retry", "接收任务", "开始执行", "完成", "失败", "重试", "放弃"][..],
+            ),
+            (
+                "mindmap\n  root((Nole))\n    核心\n      编辑器\n        MBDown 渲染\n        Mermaid 图表\n        BBCode 样式\n      文件管理\n        data 笔记\n        daily 日志\n        archives 归档\n    AI Agent\n      工具\n        文件读写\n        搜索\n        网络请求\n      记忆\n        MEMORY.md\n        每日笔记\n    主题\n      TOML 配置\n      自定义颜色\n",
+                &["Nole", "核心", "编辑器", "MBDown 渲染", "文件管理", "AI Agent", "MEMORY.md", "主题", "自定义颜色"][..],
+            ),
+        ];
+
+        for width in [60, 80, 120] {
+            for (source, labels) in fixtures {
+                let fenced = format!("```mermaid\n{source}```");
+                let output = text(&to_lines_at_width(&fenced, width));
+
+                let fell_back = output.contains("mermaid");
+                assert!(
+                    !fell_back || width == 60,
+                    "renderer unexpectedly fell back at width {width}:\n{output}"
+                );
+                for label in labels {
+                    assert!(output.contains(label), "missing {label:?} at width {width}:\n{output}");
+                }
+                assert!(
+                    output.lines().all(|line| UnicodeWidthStr::width(line) <= width),
+                    "diagram or fallback exceeded width {width}:\n{output}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn renders_bbcode_foreground_and_background_colors() {
         let lines = to_lines_at_width(
             "[color=#12abef]foreground[/color] [bg=196]background[/bg]",
