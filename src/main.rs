@@ -347,7 +347,22 @@ fn resolve_storage() -> Result<storage::Storage> {
     }
 }
 
+/// True when the first CLI argument is a version request. `nole --version` must
+/// print the version and exit without touching the workspace or terminal, so
+/// this runs before any storage or TUI setup.
+fn wants_version<I>(mut args: I) -> bool
+where
+    I: Iterator<Item = String>,
+{
+    args.next(); // program name
+    matches!(args.next().as_deref(), Some("--version" | "-V"))
+}
+
 fn main() -> Result<()> {
+    if wants_version(std::env::args()) {
+        println!("nole {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let storage = resolve_storage()?;
     storage.ensure_files()?;
     let (_watcher, workspace_events) = watch_workspace(&storage.root)?;
@@ -382,6 +397,21 @@ mod tests {
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
     use notify::event::ModifyKind;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn version_flag_is_detected() {
+        let args = |flags: &[&str]| {
+            std::iter::once("nole")
+                .chain(flags.iter().copied())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(wants_version(args(&["--version"]).into_iter()));
+        assert!(wants_version(args(&["-V"]).into_iter()));
+        assert!(!wants_version(args(&[]).into_iter()));
+        assert!(!wants_version(args(&["--verbose"]).into_iter()));
+        assert!(!wants_version(args(&["-vv"]).into_iter()));
+    }
 
     #[test]
     fn draw_frame_tracks_chat_cursor_while_agent_animation_advances() {
