@@ -323,7 +323,7 @@ pub struct App {
     pub ai_running: bool,
     pub permission_mode: PermissionMode,
     permission_bypass: Arc<AtomicBool>,
-    pub agent_panel: Vec<AgentPanelEntry>,
+    pub agent_panel: Vec<Arc<AgentPanelEntry>>,
     active_agent_tools: HashMap<String, usize>,
     pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
@@ -377,6 +377,7 @@ impl App {
             .unwrap_or_default()
             .into_parts();
         let agent_scroll = if agent_panel.is_empty() { 0 } else { u16::MAX };
+        let agent_panel = agent_panel.into_iter().map(Arc::new).collect();
         let daily_notes = storage.load_daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
         let mut note_files = storage.list_note_files()?;

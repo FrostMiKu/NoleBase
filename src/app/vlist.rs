@@ -1,5 +1,7 @@
 //! Virtual-list and per-card render caches for the daily and agent panels.
 
+use std::sync::Arc;
+
 use chrono::NaiveDate;
 
 use crate::agent_session::AgentPanelEntry;
@@ -21,7 +23,9 @@ pub(crate) struct DailyCardRenderCache {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentEntryRenderCache {
     pub width: usize,
-    pub entry: AgentPanelEntry,
+    /// Shared with `App::agent_panel` so the sync pass can compare by `Arc::ptr_eq`
+    /// instead of deep-comparing the entry text every frame.
+    pub entry: Arc<AgentPanelEntry>,
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::markdown::RenderedLink>,
     pub images: Vec<mbtui::ImagePlacement>,

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 use std::fs;
 
@@ -161,10 +163,10 @@ fn command_palette_names_mouse_support_action_for_the_next_state() {
 fn command_palette_filters_and_clears_the_agent_session() {
     let (mut app, _directory) = make_app();
     app.agent_conversation = AgentConversation::seeded_for_test();
-    app.agent_panel.push(AgentPanelEntry::Prompt {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
         text: "Previous prompt".to_string(),
         muted: false,
-    });
+    }));
     app.persist_agent_session().unwrap();
     assert!(app.storage.agent_session_path.exists());
 
@@ -209,15 +211,15 @@ fn app_restores_the_single_agent_session() {
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
     let conversation = AgentConversation::seeded_for_test();
-    let panel = vec![AgentPanelEntry::Assistant {
+    let panel = vec![Arc::new(AgentPanelEntry::Assistant {
         text: "Persisted answer".to_string(),
         streaming: false,
         final_output: true,
-    }];
+    })];
     storage
         .write_agent_session(&AgentSession::from_parts(
             &conversation,
-            &panel,
+            &panel.iter().map(|entry| entry.as_ref().clone()).collect::<Vec<_>>(),
             TokenUsage {
                 input_tokens: 10,
                 output_tokens: 4,
@@ -242,11 +244,11 @@ fn app_restores_the_single_agent_session() {
 #[test]
 fn conversation_update_overwrites_the_saved_agent_session() {
     let (mut app, _directory) = make_app();
-    app.agent_panel.push(AgentPanelEntry::Assistant {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
         text: "Completed answer".to_string(),
         streaming: false,
         final_output: true,
-    });
+    }));
     let sender = install_agent_observable(&mut app);
 
     sender
@@ -263,7 +265,13 @@ fn conversation_update_overwrites_the_saved_agent_session() {
         .unwrap()
         .into_parts();
     assert!(conversation.clear());
-    assert_eq!(panel, app.agent_panel);
+    assert_eq!(
+        panel,
+        app.agent_panel
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -369,11 +377,11 @@ fn command_palette_adds_contextual_note_and_agent_output_commands() {
     app.reload_files();
     app.open_file_document(&current, DocumentReturn::Daily);
     app.selected_file = Some(other);
-    app.agent_panel.push(AgentPanelEntry::Assistant {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
         text: "Final response".to_string(),
         streaming: false,
         final_output: true,
-    });
+    }));
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
 
@@ -719,7 +727,7 @@ fn daily_ai_custom_prompt_includes_the_daily_file_path() {
     assert!(prompts[0].contains("Extract the action items"));
     assert!(!prompts[0].contains("card body that should not become the prompt"));
     assert!(matches!(
-        app.agent_panel.last(),
+        app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Prompt { text, muted: true })
             if text == "Extract the action items"
     ));
@@ -747,7 +755,7 @@ fn empty_daily_ai_prompt_requests_in_place_markdown_formatting() {
     assert!(prompts[0].contains(FORMAT_DAILY_NOTE_PROMPT));
     assert!(!prompts[0].contains("unformatted card body"));
     assert!(matches!(
-        app.agent_panel.last(),
+        app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Prompt { text, muted: true })
             if text == &format!("Format {display_path}")
     ));
@@ -776,10 +784,10 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     let event_sender = install_agent_observable(&mut app);
     let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
     app.ai_user_sender = Some(answer_sender);
-    app.agent_panel.push(AgentPanelEntry::Tool {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Calling Ask User...\nChoose a format".to_string(),
         active: true,
-    });
+    }));
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
             kind: AskUserKind::Tool,
@@ -798,7 +806,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     );
     assert_eq!(app.overlay, None);
     assert!(matches!(
-        app.agent_panel.last(),
+        app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Tool { text, active: true })
             if text == "Calling Ask User...\nChoose a format\nMBDown"
     ));
@@ -811,7 +819,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
         .unwrap();
     app.poll_agent();
     assert!(matches!(
-        app.agent_panel.last(),
+        app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Tool { text, active: false })
             if text == "Completed Ask User.\nChoose a format\nMBDown"
     ));
@@ -872,14 +880,14 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
     app.agent_panel = vec![
-        AgentPanelEntry::Prompt {
+        Arc::new(AgentPanelEntry::Prompt {
             text: "First follow-up".to_string(),
             muted: true,
-        },
-        AgentPanelEntry::Prompt {
+        }),
+        Arc::new(AgentPanelEntry::Prompt {
             text: "Second follow-up".to_string(),
             muted: true,
-        },
+        }),
     ];
     sender.send(AgentEvent::BufferedInputConsumed(1)).unwrap();
     sender
@@ -923,12 +931,12 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     app.poll_agent();
     assert_eq!(app.status, "Calling Read File...");
     assert!(matches!(
-        &app.agent_panel[2],
+        app.agent_panel[2].as_ref(),
         AgentPanelEntry::Assistant { text, streaming: true, .. }
             if text == "I need to inspect the source first."
     ));
     assert!(matches!(
-        &app.agent_panel[3],
+        app.agent_panel[3].as_ref(),
         AgentPanelEntry::Tool { text, active: true } if text == "Calling Read File..."
     ));
     assert_eq!(app.agent_round, 2);
@@ -939,11 +947,11 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     assert_eq!(app.agent_timed_output_tokens, 200);
     assert_eq!(app.agent_response_duration, Duration::from_secs(2));
     assert!(matches!(
-        &app.agent_panel[0],
+        app.agent_panel[0].as_ref(),
         AgentPanelEntry::Prompt { muted: false, .. }
     ));
     assert!(matches!(
-        &app.agent_panel[1],
+        app.agent_panel[1].as_ref(),
         AgentPanelEntry::Prompt { muted: true, .. }
     ));
 
@@ -955,7 +963,7 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
         .unwrap();
     app.poll_agent();
     assert!(matches!(
-        &app.agent_panel[3],
+        app.agent_panel[3].as_ref(),
         AgentPanelEntry::Tool { text, active: false } if text == "Completed Read File."
     ));
 
@@ -980,7 +988,7 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     app.poll_agent();
     assert_eq!(app.agent_panel.len(), 5);
     assert!(matches!(
-        app.agent_panel.last(),
+        app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Assistant { text, streaming: false, final_output: true })
             if text == "final reply"
     ));
@@ -1017,12 +1025,12 @@ fn concurrent_tool_events_finish_the_matching_timeline_entries() {
     app.poll_agent();
 
     assert!(matches!(
-        &app.agent_panel[0],
+        app.agent_panel[0].as_ref(),
         AgentPanelEntry::Tool { text, active: false }
             if text.contains("https://a.example")
     ));
     assert!(matches!(
-        &app.agent_panel[1],
+        app.agent_panel[1].as_ref(),
         AgentPanelEntry::Tool { text, active: true }
             if text.contains("https://b.example")
     ));
@@ -1154,10 +1162,10 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
     let cancelled = Arc::new(AtomicBool::new(false));
     app.ai_cancel = Some(cancelled.clone());
     app.ai_running = true;
-    app.agent_panel.push(AgentPanelEntry::Tool {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
         active: true,
-    });
+    }));
     app.focus = Focus::Center;
 
     app.handle_key(key(KeyCode::Char('c')));
@@ -1171,10 +1179,10 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
     assert!(cancelled.load(Ordering::Relaxed));
     assert!(observable_cancel.is_cancelled());
     assert!(
-        matches!(app.agent_panel.last(), Some(AgentPanelEntry::Error(text)) if text == "Cancelled")
+        matches!(app.agent_panel.last().map(|entry| entry.as_ref()), Some(AgentPanelEntry::Error(text)) if text == "Cancelled")
     );
     assert!(matches!(
-        &app.agent_panel[0],
+        app.agent_panel[0].as_ref(),
         AgentPanelEntry::Tool { active: false, .. }
     ));
     assert!(app.ai_approval_sender.is_some());
@@ -1194,19 +1202,19 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
     app.ai_cancel = Some(cancelled.clone());
     app.ai_running = true;
     app.agent_panel = vec![
-        AgentPanelEntry::Prompt {
+        Arc::new(AgentPanelEntry::Prompt {
             text: "Current prompt".to_string(),
             muted: false,
-        },
-        AgentPanelEntry::Tool {
+        }),
+        Arc::new(AgentPanelEntry::Tool {
             text: "Searching Web...".to_string(),
             active: true,
-        },
-        AgentPanelEntry::Assistant {
+        }),
+        Arc::new(AgentPanelEntry::Assistant {
             text: "Looking for sources.".to_string(),
             streaming: true,
             final_output: false,
-        },
+        }),
     ];
     app.agent_conversation = AgentConversation::seeded_for_test();
     app.focus = Focus::Agent;
@@ -1435,7 +1443,7 @@ fn ctrl_enter_sends_compose_to_agent_without_creating_a_chat_card() {
 
     assert!(app.ai_running);
     assert!(matches!(
-        app.agent_panel.last(),
+        app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Prompt { text, muted: false }) if text == "Direct Agent prompt"
     ));
     assert!(app.input.is_empty());
@@ -1451,10 +1459,10 @@ fn ctrl_enter_buffers_and_clears_compose_while_agent_is_busy() {
     let (mut app, _directory) = make_app();
     app.focus = Focus::Compose;
     app.ai_running = true;
-    app.agent_panel.push(AgentPanelEntry::Prompt {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
         text: "Initial prompt".to_string(),
         muted: false,
-    });
+    }));
     app.input = "Additional prompt".to_string();
     app.input_cursor = app.input.chars().count();
 
@@ -1467,8 +1475,11 @@ fn ctrl_enter_buffers_and_clears_compose_while_agent_is_busy() {
     assert!(app.input.is_empty());
     assert_eq!(app.input_cursor, 0);
     assert_eq!(
-        app.agent_panel,
-        [
+        app.agent_panel
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect::<Vec<_>>(),
+        vec![
             AgentPanelEntry::Prompt {
                 text: "Initial prompt".to_string(),
                 muted: false,
@@ -1646,11 +1657,11 @@ fn views_and_agent_form_a_navigable_right_sidebar() {
         text: "only task".to_string(),
     }];
     app.todo_index = 0;
-    app.agent_panel.push(AgentPanelEntry::Assistant {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
         text: "final reply".to_string(),
         streaming: false,
         final_output: true,
-    });
+    }));
     app.focus = Focus::Views;
     app.workspace_view_index = 0;
 
@@ -1665,15 +1676,15 @@ fn enter_on_agent_panel_does_not_move_output_to_daily() {
     let (mut app, _directory) = make_app();
     let original_count = app.daily_notes.len();
     app.agent_panel = vec![
-        AgentPanelEntry::Prompt {
+        Arc::new(AgentPanelEntry::Prompt {
             text: "User prompt".to_string(),
             muted: false,
-        },
-        AgentPanelEntry::Assistant {
+        }),
+        Arc::new(AgentPanelEntry::Assistant {
             text: "Agent final reply".to_string(),
             streaming: false,
             final_output: true,
-        },
+        }),
     ];
     app.focus = Focus::Agent;
 

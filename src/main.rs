@@ -394,6 +394,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use super::*;
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
@@ -428,11 +429,11 @@ mod tests {
         app.center_view = CenterView::Chat;
         app.focus = app::Focus::Compose;
         app.agent_panel
-            .push(crate::agent_session::AgentPanelEntry::Assistant {
+            .push(Arc::new(crate::agent_session::AgentPanelEntry::Assistant {
                 text: "Streaming response".to_string(),
                 streaming: true,
                 final_output: false,
-            });
+            }));
         app.ai_running = true;
         draw_frame(&mut terminal, &mut app).unwrap();
 
@@ -442,12 +443,14 @@ mod tests {
         assert!(cursor.x > compose.x && cursor.x < compose.right() - 1);
         assert!(cursor.y > compose.y && cursor.y < compose.bottom() - 1);
 
-        let Some(crate::agent_session::AgentPanelEntry::Assistant { text, .. }) =
-            app.agent_panel.last_mut()
-        else {
+        let Some(entry) = app.agent_panel.last_mut() else {
             panic!("streaming assistant entry");
         };
-        text.push_str(" with another streamed chunk");
+        if let crate::agent_session::AgentPanelEntry::Assistant { text, .. } =
+            Arc::make_mut(entry)
+        {
+            text.push_str(" with another streamed chunk");
+        }
         app.advance_animation();
         assert_eq!(app.animation_tick, 1);
         draw_frame(&mut terminal, &mut app).unwrap();

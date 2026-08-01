@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -554,31 +556,31 @@ fn running_agent_animates_its_border_and_current_activity_only() {
     let (mut app, _directory) = make_app();
     app.ai_running = true;
     app.agent_panel = vec![
-        AgentPanelEntry::Prompt {
+        Arc::new(AgentPanelEntry::Prompt {
             text: "Analyze this".to_string(),
             muted: false,
-        },
-        AgentPanelEntry::Tool {
+        }),
+        Arc::new(AgentPanelEntry::Tool {
             text: "Completed Read File.".to_string(),
             active: false,
-        },
-        AgentPanelEntry::Tool {
+        }),
+        Arc::new(AgentPanelEntry::Tool {
             text: "Fetching Web...".to_string(),
             active: true,
-        },
-        AgentPanelEntry::Assistant {
+        }),
+        Arc::new(AgentPanelEntry::Assistant {
             text: "I will compare **multiple sources**.".to_string(),
             streaming: false,
             final_output: false,
-        },
-        AgentPanelEntry::Prompt {
+        }),
+        Arc::new(AgentPanelEntry::Prompt {
             text: "Consumed follow-up".to_string(),
             muted: false,
-        },
-        AgentPanelEntry::Prompt {
+        }),
+        Arc::new(AgentPanelEntry::Prompt {
             text: "Queued follow-up".to_string(),
             muted: true,
-        },
+        }),
     ];
     app.status = "AI is working".to_string();
     app.animation_tick = 0;
@@ -653,11 +655,11 @@ fn running_agent_animates_its_border_and_current_activity_only() {
     assert_ne!(first_activity_colors, second_activity_colors);
 
     app.ai_running = false;
-    app.agent_panel.push(AgentPanelEntry::Assistant {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
         text: "Final response".to_string(),
         streaming: false,
         final_output: true,
-    });
+    }));
     app.agent_scroll = u16::MAX;
     let final_frame = render(&mut app, 170, 40);
     let final_screen = buffer_string(&final_frame);
@@ -1233,11 +1235,11 @@ fn links_are_clickable_in_daily_documents_and_agent_output() {
         .iter()
         .any(|hitbox| { hitbox.target == LinkTarget::WikiLink("Project".to_string()) }));
 
-    app.agent_panel = vec![AgentPanelEntry::Assistant {
+    app.agent_panel = vec![Arc::new(AgentPanelEntry::Assistant {
         text: "[result](https://agent.example)".to_string(),
         streaming: false,
         final_output: true,
-    }];
+    })];
     render(&mut app, 170, 24);
     assert!(app.link_hitboxes.iter().any(|hitbox| {
         hitbox.target == LinkTarget::External("https://agent.example".to_string())
@@ -1274,11 +1276,11 @@ fn file_embed_hitboxes_resolve_against_each_content_base() {
             == LinkTarget::EmbeddedFile(app.storage.data_dir.join("article-attachment.pdf"))
     }));
 
-    app.agent_panel = vec![AgentPanelEntry::Assistant {
+    app.agent_panel = vec![Arc::new(AgentPanelEntry::Assistant {
         text: "Open ![[agent-attachment.pdf]]".to_string(),
         streaming: false,
         final_output: true,
-    }];
+    })];
     render(&mut app, 170, 24);
     assert!(app.link_hitboxes.iter().any(|hitbox| {
         hitbox.target == LinkTarget::EmbeddedFile(app.storage.root.join("agent-attachment.pdf"))
@@ -1715,15 +1717,15 @@ fn round_limit_dialog_only_offers_continue_or_stop() {
 fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
     let (mut app, _directory) = make_app();
     app.agent_panel = vec![
-        AgentPanelEntry::Prompt {
+        Arc::new(AgentPanelEntry::Prompt {
             text: "Explain the selected note".to_string(),
             muted: false,
-        },
-        AgentPanelEntry::Assistant {
+        }),
+        Arc::new(AgentPanelEntry::Assistant {
             text: "Here is the explanation".to_string(),
             streaming: false,
             final_output: true,
-        },
+        }),
     ];
     app.focus = Focus::Agent;
 
@@ -2493,15 +2495,15 @@ fn daily_vlist_only_renders_visible_cards_and_invalidates_changed_content() {
 #[test]
 fn agent_vlist_only_renders_visible_entries_and_keeps_animation_out_of_cache() {
     let (mut app, _directory) = make_app();
-    app.agent_panel.push(AgentPanelEntry::Tool {
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
         active: true,
-    });
+    }));
     app.agent_panel
-        .extend((1..40).map(|index| AgentPanelEntry::Prompt {
+        .extend((1..40).map(|index| Arc::new(AgentPanelEntry::Prompt {
             text: format!("Prompt {index}"),
             muted: false,
-        }));
+        })));
 
     sync_agent_vlist(&mut app, 40);
     assert!(app.agent_vlist.caches.iter().all(Option::is_none));
@@ -2523,7 +2525,7 @@ fn agent_vlist_only_renders_visible_entries_and_keeps_animation_out_of_cache() {
     sync_agent_vlist(&mut app, 40);
     assert_eq!(app.agent_vlist.caches[0], original);
 
-    if let AgentPanelEntry::Tool { text, .. } = &mut app.agent_panel[0] {
+    if let AgentPanelEntry::Tool { text, .. } = Arc::make_mut(&mut app.agent_panel[0]) {
         text.push_str(" now");
     }
     sync_agent_vlist(&mut app, 40);

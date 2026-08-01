@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 
 pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
@@ -22,14 +24,14 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let prompts = app
         .agent_panel
         .iter()
-        .filter(|entry| matches!(entry, crate::agent_session::AgentPanelEntry::Prompt { .. }))
+        .filter(|entry| matches!(entry.as_ref(), crate::agent_session::AgentPanelEntry::Prompt { .. }))
         .count();
     let replies = app
         .agent_panel
         .iter()
         .filter(|entry| {
             matches!(
-                entry,
+                entry.as_ref(),
                 crate::agent_session::AgentPanelEntry::Assistant { .. }
             )
         })
@@ -37,7 +39,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let tools = app
         .agent_panel
         .iter()
-        .filter(|entry| matches!(entry, crate::agent_session::AgentPanelEntry::Tool { .. }))
+        .filter(|entry| matches!(entry.as_ref(), crate::agent_session::AgentPanelEntry::Tool { .. }))
         .count();
     let context_rate = if app.agent_context_capacity == 0 {
         0.0
@@ -172,6 +174,7 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut scroll =
         (app.agent_scroll as usize).min(app.agent_vlist.geometry.max_scroll(view_height));
     scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
+    evict_agent_caches(app, scroll, view_height);
     app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
     let (visible, rendered_links, rendered_images) = visible_agent_lines(app, scroll, view_height);
     let message_rows = Rect::new(
@@ -221,14 +224,46 @@ fn sync_agent_vlist_with_style(
     }
     app.agent_vlist.caches.resize(app.agent_panel.len(), None);
     app.agent_vlist.geometry.resize(app.agent_panel.len());
+    for (index, entry) in app.agent_panel.iter().enumerate() {
+        app.agent_vlist
+            .geometry
+            .set_estimate(index, estimated_agent_entry_height(entry, width));
+    }
     for (index, cache) in app.agent_vlist.caches.iter_mut().enumerate() {
-        if cache
-            .as_ref()
-            .is_some_and(|cached| cached.entry != app.agent_panel[index])
-        {
+        let entry = &app.agent_panel[index];
+        let volatile = is_volatile_agent_entry(entry);
+        if volatile || cache.as_ref().is_some_and(|cached| !Arc::ptr_eq(&cached.entry, entry)) {
             *cache = None;
             app.agent_vlist.geometry.invalidate(index);
         }
+    }
+}
+
+/// Entries whose rendered output changes every frame (streaming text, running tool
+/// spinners) are kept out of the render cache: caching them would pin an `Arc`
+/// reference on the panel entry, forcing `Arc::make_mut` to deep-copy the whole
+/// text on every streamed delta.
+fn is_volatile_agent_entry(entry: &Arc<crate::agent_session::AgentPanelEntry>) -> bool {
+    matches!(
+        entry.as_ref(),
+        crate::agent_session::AgentPanelEntry::Assistant {
+            streaming: true,
+            ..
+        } | crate::agent_session::AgentPanelEntry::Tool { active: true, .. }
+    )
+}
+
+/// Rough per-type height estimate used before an entry is measured. Keeps the
+/// visible-range window tight so few out-of-view entries are rendered speculatively.
+fn estimated_agent_entry_height(entry: &crate::agent_session::AgentPanelEntry, width: usize) -> usize {
+    let width = width.max(1);
+    match entry {
+        crate::agent_session::AgentPanelEntry::Prompt { text, .. }
+        | crate::agent_session::AgentPanelEntry::Assistant { text, .. } => {
+            4 + text.len().div_ceil(width)
+        }
+        crate::agent_session::AgentPanelEntry::Tool { text, .. } => text.lines().count() + 1,
+        crate::agent_session::AgentPanelEntry::Error(_) => 1,
     }
 }
 
@@ -236,7 +271,7 @@ pub(super) fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
     if app.agent_vlist.caches[index].is_some() {
         return;
     }
-    let entry = app.agent_panel[index].clone();
+    let entry = Arc::clone(&app.agent_panel[index]);
     let (lines, links, images) = match app.agent_vlist.style {
         crate::app::AgentEntryRenderStyle::Panel => render_agent_entry(
             &entry,
@@ -250,15 +285,22 @@ pub(super) fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
         }
     };
     let height = lines.len();
-    app.agent_vlist.caches[index] = Some(crate::app::AgentEntryRenderCache {
-        width: app.agent_vlist.width,
-        entry,
-        lines,
-        links,
-        images,
-    });
+    if !is_volatile_agent_entry(&entry) {
+        app.agent_vlist.caches[index] = Some(crate::app::AgentEntryRenderCache {
+            width: app.agent_vlist.width,
+            entry,
+            lines,
+            links,
+            images,
+        });
+    }
     app.agent_vlist.geometry.set_height(index, height);
 }
+
+/// Maximum entries rendered in one frame. Keeps a full-screen scroll (PageDown or
+/// wheel burst) from stalling the frame on markdown rendering; the remainder is
+/// measured on the following frames while the viewport shows estimated heights.
+const MEASURE_BUDGET: usize = 16;
 
 pub(super) fn measure_visible_agent_entries(
     app: &mut App,
@@ -273,7 +315,7 @@ pub(super) fn measure_visible_agent_entries(
         }
         let anchor = range.start;
         let anchor_offset = scroll.saturating_sub(app.agent_vlist.geometry.item_top(anchor));
-        let missing = range
+        let mut missing = range
             .clone()
             .filter(|index| !app.agent_vlist.geometry.is_measured(*index))
             .collect::<Vec<_>>();
@@ -285,8 +327,22 @@ pub(super) fn measure_visible_agent_entries(
                 scroll.min(maximum)
             };
         }
-        for index in missing {
-            ensure_agent_entry_rendered(app, index);
+        // Measure toward the anchor first: it pins the scroll position, so getting
+        // it right early keeps the viewport stable while the rest fills in.
+        missing.sort_by_key(|index| index.abs_diff(anchor));
+        let budget = missing.len().min(MEASURE_BUDGET);
+        for index in &missing[..budget] {
+            ensure_agent_entry_rendered(app, *index);
+        }
+        if missing.len() > budget {
+            // Budget exhausted: leave the remaining entries unmeasured for now and
+            // return the current (clamped) scroll; the next frame continues.
+            let maximum = app.agent_vlist.geometry.max_scroll(view_height);
+            return if tail_pinned {
+                maximum
+            } else {
+                scroll.min(maximum)
+            };
         }
         scroll = if tail_pinned {
             app.agent_vlist.geometry.max_scroll(view_height)
@@ -295,6 +351,28 @@ pub(super) fn measure_visible_agent_entries(
             app.agent_vlist.geometry.item_top(anchor) + anchor_offset.min(height.saturating_sub(1))
         };
         scroll = scroll.min(app.agent_vlist.geometry.max_scroll(view_height));
+    }
+}
+
+/// Drop render caches (and their measurements) for entries far outside the viewport
+/// window so long agent sessions do not accumulate rendered text for the whole panel.
+/// The margin keeps a small scroll-back buffer so quick wheel bursts do not thrash.
+const CACHE_KEEP_MARGIN: usize = 50;
+
+pub(super) fn evict_agent_caches(app: &mut App, scroll: usize, view_height: usize) {
+    let len = app.agent_panel.len();
+    if len == 0 {
+        return;
+    }
+    let range = app.agent_vlist.geometry.visible_range(scroll, view_height);
+    let keep_start = range.start.saturating_sub(CACHE_KEEP_MARGIN);
+    let keep_end = range.end.saturating_add(CACHE_KEEP_MARGIN).min(len);
+    for index in 0..len {
+        if (index < keep_start || index >= keep_end)
+            && app.agent_vlist.caches[index].take().is_some()
+        {
+            app.agent_vlist.geometry.invalidate(index);
+        }
     }
 }
 
@@ -448,63 +526,89 @@ pub(super) fn visible_agent_lines(
     for index in range {
         let item_top = app.agent_vlist.geometry.item_top(index);
         let height = app.agent_vlist.geometry.height(index);
-        let cached = app.agent_vlist.caches[index]
-            .as_ref()
-            .expect("visible Agent entries are measured before rendering");
-        let active = matches!(
-            cached.entry,
-            crate::agent_session::AgentPanelEntry::Tool { active: true, .. }
-        );
         let from = scroll.saturating_sub(item_top);
         let to = height.min(end.saturating_sub(item_top));
         let content_from = from;
-        let content_to = to.min(cached.lines.len());
-        if active {
-            let animated = if app.agent_vlist.style == crate::app::AgentEntryRenderStyle::Cards {
-                match &cached.entry {
-                    crate::agent_session::AgentPanelEntry::Tool { text, .. } => {
-                        render_chat_tool(text, cached.width, app.animation_tick, true, app.theme)
-                    }
-                    _ => unreachable!("only active tools use animated entry rendering"),
-                }
-            } else {
-                render_agent_entry(
-                    &cached.entry,
-                    cached.width,
-                    app.animation_tick,
-                    true,
-                    app.theme,
-                )
-                .0
-            };
-            visible.extend(
-                animated[content_from.min(content_to)..content_to]
-                    .iter()
-                    .cloned(),
-            );
-        } else {
+        if let Some(cached) = app.agent_vlist.caches[index].as_ref() {
+            // Stable entry: reuse the cached render.
+            let content_to = to.min(cached.lines.len());
             visible.extend(
                 cached.lines[content_from.min(content_to)..content_to]
                     .iter()
                     .cloned(),
             );
+            links.extend(cached.links.iter().filter_map(|link| {
+                let global_row = item_top + link.row;
+                (global_row >= scroll && global_row < end).then(|| {
+                    let mut link = link.clone();
+                    link.row = global_row;
+                    link
+                })
+            }));
+            images.extend(cached.images.iter().filter_map(|image| {
+                let mut image = image.clone();
+                image.row += item_top;
+                let image_end = image.row.saturating_add(image.height);
+                (image_end > scroll && image.row < end).then_some(image)
+            }));
+        } else {
+            // Volatile entry (streaming assistant or running tool): the sync pass
+            // keeps it out of the cache, so render it fresh with the current tick.
+            let (rendered_lines, rendered_links, rendered_images) =
+                render_agent_entry_current(app, index);
+            let content_to = to.min(rendered_lines.len());
+            visible.extend(
+                rendered_lines[content_from.min(content_to)..content_to]
+                    .iter()
+                    .cloned(),
+            );
+            links.extend(rendered_links.into_iter().filter_map(|link| {
+                let global_row = item_top + link.row;
+                (global_row >= scroll && global_row < end).then(|| {
+                    let mut link = link;
+                    link.row = global_row;
+                    link
+                })
+            }));
+            images.extend(rendered_images.into_iter().filter_map(|image| {
+                let mut image = image;
+                image.row += item_top;
+                let image_end = image.row.saturating_add(image.height);
+                (image_end > scroll && image.row < end).then_some(image)
+            }));
         }
-        links.extend(cached.links.iter().filter_map(|link| {
-            let global_row = item_top + link.row;
-            (global_row >= scroll && global_row < end).then(|| {
-                let mut link = link.clone();
-                link.row = global_row;
-                link
-            })
-        }));
-        images.extend(cached.images.iter().filter_map(|image| {
-            let mut image = image.clone();
-            image.row += item_top;
-            let image_end = image.row.saturating_add(image.height);
-            (image_end > scroll && image.row < end).then_some(image)
-        }));
     }
     (visible, links, images)
+}
+
+/// Fresh render of a not-cached (volatile) agent entry, with animation enabled for
+/// running tools so the spinner advances with `animation_tick`.
+fn render_agent_entry_current(
+    app: &App,
+    index: usize,
+) -> (
+    Vec<Line<'static>>,
+    Vec<crate::markdown::RenderedLink>,
+    Vec<mbtui::ImagePlacement>,
+) {
+    let entry = app.agent_panel[index].as_ref();
+    match app.agent_vlist.style {
+        crate::app::AgentEntryRenderStyle::Panel => render_agent_entry(
+            entry,
+            app.agent_vlist.width,
+            app.animation_tick,
+            true,
+            app.theme,
+        ),
+        crate::app::AgentEntryRenderStyle::Cards => match entry {
+            crate::agent_session::AgentPanelEntry::Tool { text, active: true, .. } => (
+                render_chat_tool(text, app.agent_vlist.width, app.animation_tick, true, app.theme),
+                Vec::new(),
+                Vec::new(),
+            ),
+            _ => render_chat_entry(entry, app.agent_vlist.width, app.theme),
+        },
+    }
 }
 
 pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {

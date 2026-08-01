@@ -69,6 +69,7 @@ fn draw_chat_messages(
     let mut scroll =
         (app.agent_scroll as usize).min(app.agent_vlist.geometry.max_scroll(view_height));
     scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
+    evict_agent_caches(app, scroll, view_height);
     app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
     let (visible, rendered_links, rendered_images) =
         visible_agent_lines(app, scroll, render_height);
@@ -96,12 +97,7 @@ fn draw_chat_messages(
     if let Some(index) = active_chat_card(app) {
         let first = app.agent_vlist.geometry.item_top(index);
         let last = first
-            + app.agent_vlist.caches[index]
-                .as_ref()
-                .expect("active chat card is rendered")
-                .lines
-                .len()
-                .saturating_sub(2);
+            + app.agent_vlist.geometry.height(index).saturating_sub(2);
         draw_animated_card_border(
             frame,
             CardBorderGeometry {
@@ -121,14 +117,14 @@ fn active_chat_card(app: &App) -> Option<usize> {
     app.ai_running.then(|| {
         app.agent_panel.iter().rposition(|entry| {
             matches!(
-                entry,
+                entry.as_ref(),
                 crate::agent_session::AgentPanelEntry::Assistant {
                     text,
                     streaming: true,
                     ..
                 } if !text.trim().is_empty()
             ) || matches!(
-                entry,
+                entry.as_ref(),
                 crate::agent_session::AgentPanelEntry::Assistant {
                     text,
                     final_output: false,
@@ -300,6 +296,7 @@ fn render_chat_card(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -372,19 +369,19 @@ mod tests {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
         app.agent_panel = vec![
-            AgentPanelEntry::Prompt {
+            Arc::new(AgentPanelEntry::Prompt {
                 text: "hello user".to_string(),
                 muted: false,
-            },
-            AgentPanelEntry::Tool {
+            }),
+            Arc::new(AgentPanelEntry::Tool {
                 text: "Reading\ndata/Note.md".to_string(),
                 active: false,
-            },
-            AgentPanelEntry::Assistant {
+            }),
+            Arc::new(AgentPanelEntry::Assistant {
                 text: "hello agent".to_string(),
                 streaming: true,
                 final_output: false,
-            },
+            }),
         ];
         app.ai_running = true;
         app.agent_scroll = 0;
@@ -511,19 +508,19 @@ mod tests {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
         app.agent_panel = vec![
-            AgentPanelEntry::Prompt {
+            Arc::new(AgentPanelEntry::Prompt {
                 text: "private prompt text".to_string(),
                 muted: false,
-            },
-            AgentPanelEntry::Assistant {
+            }),
+            Arc::new(AgentPanelEntry::Assistant {
                 text: "private reply text".to_string(),
                 streaming: false,
                 final_output: true,
-            },
-            AgentPanelEntry::Tool {
+            }),
+            Arc::new(AgentPanelEntry::Tool {
                 text: "Read data/Note.md".to_string(),
                 active: false,
-            },
+            }),
         ];
         app.agent_usage = TokenUsage {
             input_tokens: 800,
@@ -566,7 +563,7 @@ mod tests {
 
         assert!(app.input.is_empty());
         assert!(matches!(
-            app.agent_panel.last(),
+            app.agent_panel.last().map(|entry| entry.as_ref()),
             Some(AgentPanelEntry::Prompt { text, muted: true }) if text == "answer this"
         ));
     }

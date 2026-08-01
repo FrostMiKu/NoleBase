@@ -1,6 +1,8 @@
 //! Agent coordination: the event loop, prompt dispatch, session lifecycle,
 //! and approval / ask-user / permission handling.
 
+use std::sync::Arc;
+
 use super::*;
 
 impl App {
@@ -41,14 +43,26 @@ impl App {
                         continue;
                     }
                     match self.agent_panel.last_mut() {
-                        Some(AgentPanelEntry::Assistant {
-                            text, streaming, ..
-                        }) if *streaming => text.push_str(&delta),
-                        _ => self.agent_panel.push(AgentPanelEntry::Assistant {
+                        Some(entry)
+                            if matches!(
+                                entry.as_ref(),
+                                AgentPanelEntry::Assistant {
+                                    streaming: true,
+                                    ..
+                                }
+                            ) =>
+                        {
+                            if let AgentPanelEntry::Assistant { text, .. } =
+                                Arc::make_mut(entry)
+                            {
+                                text.push_str(&delta);
+                            }
+                        }
+                        _ => self.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
                             text: delta,
                             streaming: true,
                             final_output: false,
-                        }),
+                        })),
                     }
                     self.agent_scroll = u16::MAX;
                 }
@@ -56,56 +70,61 @@ impl App {
                     if text.trim().is_empty() {
                         self.agent_panel.retain(|entry| {
                             !matches!(
-                                entry,
+                                entry.as_ref(),
                                 AgentPanelEntry::Assistant {
                                     streaming: true,
                                     ..
                                 }
                             )
                         });
-                    } else if let Some(AgentPanelEntry::Assistant {
-                        text: entry_text,
-                        streaming,
-                        final_output: entry_final,
-                    }) = self.agent_panel.iter_mut().rev().find(|entry| {
+                    } else if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
                         matches!(
-                            entry,
+                            entry.as_ref(),
                             AgentPanelEntry::Assistant {
                                 streaming: true,
                                 ..
                             }
                         )
                     }) {
-                        *entry_text = text;
-                        *streaming = false;
-                        *entry_final = final_output;
+                        if let AgentPanelEntry::Assistant {
+                            text: entry_text,
+                            streaming,
+                            final_output: entry_final,
+                        } = Arc::make_mut(entry)
+                        {
+                            *entry_text = text;
+                            *streaming = false;
+                            *entry_final = final_output;
+                        }
                     } else {
-                        self.agent_panel.push(AgentPanelEntry::Assistant {
+                        self.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
                             text,
                             streaming: false,
                             final_output,
-                        });
+                        }));
                     }
                 }
                 AgentEvent::BufferedInputConsumed(count) => {
                     for followup in self
                         .agent_panel
                         .iter_mut()
-                        .filter_map(|entry| match entry {
-                            AgentPanelEntry::Prompt { muted, .. } if *muted => Some(muted),
+                        .filter_map(|entry| match entry.as_ref() {
+                            AgentPanelEntry::Prompt { muted: true, .. } => Some(entry),
                             _ => None,
                         })
                         .take(count)
                     {
-                        *followup = false;
+                        if let AgentPanelEntry::Prompt { muted, .. } = Arc::make_mut(followup) {
+                            *muted = false;
+                        }
                     }
                 }
                 AgentEvent::ToolStarted { id, message } => {
                     let index = self.agent_panel.len();
-                    self.agent_panel.push(AgentPanelEntry::Tool {
+                    self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
                         text: message.clone(),
                         active: true,
-                    });
+                    }));
                     self.active_agent_tools.insert(id, index);
                     self.agent_scroll = u16::MAX;
                     self.set_status(message);
@@ -113,24 +132,26 @@ impl App {
                 AgentEvent::ToolFinished { id, message } => {
                     let index = self.active_agent_tools.remove(&id).or_else(|| {
                         self.agent_panel.iter().rposition(|entry| {
-                            matches!(entry, AgentPanelEntry::Tool { active: true, .. })
+                            matches!(entry.as_ref(), AgentPanelEntry::Tool { active: true, .. })
                         })
                     });
                     let entry = index.and_then(|index| self.agent_panel.get_mut(index));
-                    if let Some(AgentPanelEntry::Tool { text, active }) = entry {
-                        let answer = (message.starts_with("Completed Ask User.")
-                            && text.starts_with("Calling Ask User..."))
-                        .then(|| text.lines().nth(2).map(str::to_string))
-                        .flatten();
-                        *text = answer
-                            .map(|answer| format!("{message}\n{answer}"))
-                            .unwrap_or_else(|| message.clone());
-                        *active = false;
+                    if let Some(entry) = entry {
+                        if let AgentPanelEntry::Tool { text, active } = Arc::make_mut(entry) {
+                            let answer = (message.starts_with("Completed Ask User.")
+                                && text.starts_with("Calling Ask User..."))
+                            .then(|| text.lines().nth(2).map(str::to_string))
+                            .flatten();
+                            *text = answer
+                                .map(|answer| format!("{message}\n{answer}"))
+                                .unwrap_or_else(|| message.clone());
+                            *active = false;
+                        }
                     } else {
-                        self.agent_panel.push(AgentPanelEntry::Tool {
+                        self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
                             text: message.clone(),
                             active: false,
-                        });
+                        }));
                     }
                     self.agent_scroll = u16::MAX;
                     self.set_status(message);
@@ -258,12 +279,15 @@ impl App {
                         }
                         Err(error) => {
                             for entry in &mut self.agent_panel {
-                                if let AgentPanelEntry::Assistant { streaming, .. } = entry {
+                                if let AgentPanelEntry::Assistant { streaming, .. } =
+                                    Arc::make_mut(entry)
+                                {
                                     *streaming = false;
                                 }
                             }
-                            self.agent_panel
-                                .push(AgentPanelEntry::Error(format!("Agent failed: {error}")));
+                            self.agent_panel.push(Arc::new(AgentPanelEntry::Error(format!(
+                                "Agent failed: {error}"
+                            ))));
                             self.agent_scroll = u16::MAX;
                             self.set_error(format!("AI error: {error}"));
                         }
@@ -290,9 +314,9 @@ impl App {
         if disconnected && self.ai_running {
             self.ai_running = false;
             self.ai_cancel = None;
-            self.agent_panel.push(AgentPanelEntry::Error(
+            self.agent_panel.push(Arc::new(AgentPanelEntry::Error(
                 "Agent worker stopped unexpectedly".to_string(),
-            ));
+            )));
             self.agent_scroll = u16::MAX;
             self.clear_ask_user();
             self.set_error("AI error: worker stopped unexpectedly");
@@ -445,10 +469,10 @@ impl App {
             self.set_error("Agent input buffer is unavailable");
             return false;
         }
-        self.agent_panel.push(AgentPanelEntry::Prompt {
+        self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
             text: display_prompt,
             muted: true,
-        });
+        }));
         self.agent_scroll = u16::MAX;
         self.set_status("Prompt buffered for Agent");
         true
@@ -500,10 +524,10 @@ impl App {
             self.set_status("AI is already working");
             return false;
         }
-        self.agent_panel.push(AgentPanelEntry::Prompt {
+        self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
             text: display_prompt,
             muted: false,
-        });
+        }));
         self.agent_scroll = u16::MAX;
         self.start_agent_worker(prompt)
     }
@@ -544,16 +568,18 @@ impl App {
     }
 
     pub(super) fn mark_buffered_prompts_consumed(&mut self, count: usize) {
-        for muted in self
+        for entry in self
             .agent_panel
             .iter_mut()
-            .filter_map(|entry| match entry {
-                AgentPanelEntry::Prompt { muted, .. } if *muted => Some(muted),
+            .filter_map(|entry| match entry.as_ref() {
+                AgentPanelEntry::Prompt { muted: true, .. } => Some(entry),
                 _ => None,
             })
             .take(count)
         {
-            *muted = false;
+            if let AgentPanelEntry::Prompt { muted, .. } = Arc::make_mut(entry) {
+                *muted = false;
+            }
         }
     }
 
@@ -579,13 +605,13 @@ impl App {
             self.overlay = None;
         }
         for entry in &mut self.agent_panel {
-            if let AgentPanelEntry::Assistant { streaming, .. } = entry {
+            if let AgentPanelEntry::Assistant { streaming, .. } = Arc::make_mut(entry) {
                 *streaming = false;
             }
         }
         self.deactivate_agent_tools();
         self.agent_panel
-            .push(AgentPanelEntry::Error("Cancelled".to_string()));
+            .push(Arc::new(AgentPanelEntry::Error("Cancelled".to_string())));
         self.agent_scroll = u16::MAX;
         self.notifications.notify("Agent task cancelled");
         self.set_status("Agent task cancelled");
@@ -594,7 +620,7 @@ impl App {
     fn deactivate_agent_tools(&mut self) {
         self.active_agent_tools.clear();
         for entry in &mut self.agent_panel {
-            if let AgentPanelEntry::Tool { active, .. } = entry {
+            if let AgentPanelEntry::Tool { active, .. } = Arc::make_mut(entry) {
                 *active = false;
             }
         }
@@ -641,7 +667,11 @@ impl App {
     pub(super) fn persist_agent_session(&self) -> anyhow::Result<()> {
         let session = AgentSession::from_parts(
             &self.agent_conversation,
-            &self.agent_panel,
+            &self
+                .agent_panel
+                .iter()
+                .map(|entry| entry.as_ref().clone())
+                .collect::<Vec<_>>(),
             self.agent_usage,
             self.agent_timed_output_tokens,
             self.agent_response_duration,
@@ -665,19 +695,19 @@ impl App {
             if let AskUserResponse::Answer(answer) = &response {
                 let answer = answer.split_whitespace().collect::<Vec<_>>().join(" ");
                 if !answer.is_empty() {
-                    if let Some(AgentPanelEntry::Tool { text, active: true }) =
-                        self.agent_panel.iter_mut().rev().find(|entry| {
-                            matches!(
-                                entry,
-                                AgentPanelEntry::Tool { text, active: true }
-                                    if text.starts_with("Calling Ask User...")
-                            )
-                        })
-                    {
-                        if text.lines().count() < 3 {
-                            text.push('\n');
-                            text.push_str(&answer);
-                            self.agent_scroll = u16::MAX;
+                    if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
+                        matches!(
+                            entry.as_ref(),
+                            AgentPanelEntry::Tool { text, active: true }
+                                if text.starts_with("Calling Ask User...")
+                        )
+                    }) {
+                        if let AgentPanelEntry::Tool { text, .. } = Arc::make_mut(entry) {
+                            if text.lines().count() < 3 {
+                                text.push('\n');
+                                text.push_str(&answer);
+                                self.agent_scroll = u16::MAX;
+                            }
                         }
                     }
                 }

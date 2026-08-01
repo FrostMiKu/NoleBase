@@ -5,6 +5,8 @@ use std::ops::Range;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VList {
     estimated_height: usize,
+    /// Per-index estimate; defaults to [`Self::estimated_height`] on resize.
+    estimates: Vec<usize>,
     measured: Vec<Option<usize>>,
     prefix: Vec<usize>,
     dirty: bool,
@@ -14,6 +16,7 @@ impl VList {
     pub fn new(estimated_height: usize) -> Self {
         Self {
             estimated_height: estimated_height.max(1),
+            estimates: Vec::new(),
             measured: Vec::new(),
             prefix: vec![0],
             dirty: false,
@@ -23,6 +26,20 @@ impl VList {
     pub fn resize(&mut self, len: usize) {
         if self.measured.len() != len {
             self.measured.resize(len, None);
+            self.estimates.resize(len, self.estimated_height);
+            self.dirty = true;
+        }
+    }
+
+    /// Sets the estimated height for an unmeasured item. Marks the prefix dirty only
+    /// when the estimate actually changes, so the per-frame sync pass stays cheap.
+    pub fn set_estimate(&mut self, index: usize, height: usize) {
+        let height = height.max(1);
+        let Some(estimate) = self.estimates.get_mut(index) else {
+            return;
+        };
+        if *estimate != height {
+            *estimate = height;
             self.dirty = true;
         }
     }
@@ -52,6 +69,7 @@ impl VList {
         self.measured
             .get(index)
             .and_then(|height| *height)
+            .or_else(|| self.estimates.get(index).copied())
             .unwrap_or(self.estimated_height)
     }
 
@@ -98,8 +116,13 @@ impl VList {
         self.prefix.reserve(self.measured.len() + 1);
         self.prefix.push(0);
         let mut total = 0usize;
-        for height in &self.measured {
-            total = total.saturating_add(height.unwrap_or(self.estimated_height));
+        for (index, height) in self.measured.iter().enumerate() {
+            let height = height
+                .as_ref()
+                .copied()
+                .or_else(|| self.estimates.get(index).copied())
+                .unwrap_or(self.estimated_height);
+            total = total.saturating_add(height);
             self.prefix.push(total);
         }
         self.dirty = false;
