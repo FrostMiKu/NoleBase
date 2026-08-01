@@ -76,7 +76,9 @@ recognizes `#tag` and `[[wikilink]]` references in ordinary text:
 
 Columns stack when the center pane is too narrow. Widths are Unicode terminal
 columns, and background colors fill the complete Box or column rectangle. The
-full syntax rules are documented in the standalone [`mbdown` crate](https://crates.io/crates/mbdown).
+full syntax rules are documented in the standalone
+[`mbdown`](https://crates.io/crates/mbdown) parser crate, and its native
+Ratatui renderer is published as [`mbtui`](https://crates.io/crates/mbtui).
 
 Fenced `mermaid` blocks render directly as width-aware Unicode character
 diagrams. Rendering is local and does not require a browser, an image-capable
@@ -529,6 +531,34 @@ applies. Adding a new card never requires approval. Note listings return at
 most 2,000 entries per call; file and web responses are capped at 1 MB.
 Filesystem mutation tools reject symlink targets. The API configuration itself
 is not exposed to tools.
+
+## Libraries
+
+Every Markdown and MBDown card in NólëBase is parsed and rendered by two
+standalone crates that are also available to any Rust TUI project:
+
+- [`mbdown`](https://crates.io/crates/mbdown) — parser and canonical formatter
+  for the MBDown markup language. It produces a backend-neutral syntax tree
+  covering CommonMark plus hashtags, wikilinks, file embeds, restricted inline
+  BBCode, inline and display math, and structural containers such as boxes and
+  responsive columns. YAML/TOML front matter stays available as source text.
+- [`mbtui`](https://crates.io/crates/mbtui) — native Ratatui renderer for
+  `mbdown` documents. It handles Unicode-aware layout for tables,
+  syntax-highlighted code blocks, boxes, and columns; applies semantic styles;
+  and reports hashtag, wikilink, and embed regions with terminal-cell
+  coordinates so applications can add interaction without reparsing. Images
+  come back as cell rectangles with reserved blank rows for any image backend.
+
+Render MBDown directly in your own application:
+
+```rust
+use mbtui::Renderer;
+
+let rendered = Renderer::new(80).render(&mbdown::parse("# Hello")?);
+for line in &rendered.text {
+    // native Ratatui lines, ready for a Paragraph widget
+}
+```
 
 ## Build and check
 
