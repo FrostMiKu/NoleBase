@@ -1757,8 +1757,22 @@ mod tests {
             "theme = \"default\"\neditor = \"  \"\nshell = \"  \"\n",
         )
         .unwrap();
+        // The storage-level fallback reads the ambient environment, so pin it
+        // down to keep this test hermetic.
+        let old_editor = std::env::var("EDITOR").ok();
+        let old_visual = std::env::var("VISUAL").ok();
+        std::env::set_var("EDITOR", "");
+        std::env::set_var("VISUAL", "");
         assert_eq!(storage.editor_command().unwrap(), "vi");
         assert_eq!(storage.terminal_shell().unwrap(), None);
+        match old_editor {
+            Some(value) => std::env::set_var("EDITOR", value),
+            None => std::env::remove_var("EDITOR"),
+        }
+        match old_visual {
+            Some(value) => std::env::set_var("VISUAL", value),
+            None => std::env::remove_var("VISUAL"),
+        }
     }
 
     #[test]
