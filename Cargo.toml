@@ -5,6 +5,7 @@ edition = "2021"
 description = "An Agent-driven terminal knowledge management system"
 license = "MIT"
 repository = "https://github.com/FrostMiKu/NoleBase"
+homepage = "https://github.com/FrostMiKu/NoleBase"
 readme = "README.md"
 exclude = [".github/**", "AGENTS.md"]
 
@@ -48,3 +49,8 @@ tempfile = "3"
 [profile.release]
 opt-level = "z"
 lto = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

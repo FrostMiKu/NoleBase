@@ -20,17 +20,14 @@ jobs:
           - name: Ubuntu x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            builder: cargo
             test: true
           - name: Ubuntu ARM64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            builder: cargo
             test: true
           - name: macOS ARM64
             os: macos-14
             target: aarch64-apple-darwin
-            builder: cargo
             test: true
 
     steps:
@@ -50,6 +47,3 @@ jobs:
       - name: Run tests
         if: matrix.test
         run: cargo test --locked --target ${{ matrix.target }}
-
-      - name: Build release binary
-        run: ${{ matrix.builder }} build --locked --release --target ${{ matrix.target }}
