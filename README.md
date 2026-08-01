@@ -15,6 +15,8 @@ cargo install nole
 nole
 ```
 
+`nole --version` (or `-V`) prints the current version and exits.
+
 ## Workspace
 
 The UI is one responsive workspace rather than a collection of duplicated
@@ -74,7 +76,7 @@ recognizes `#tag` and `[[wikilink]]` references in ordinary text:
 
 Columns stack when the center pane is too narrow. Widths are Unicode terminal
 columns, and background colors fill the complete Box or column rectangle. The
-full syntax rules live in the sibling MBDown workspace.
+full syntax rules are documented in the standalone [`mbdown` crate](https://crates.io/crates/mbdown).
 
 Fenced `mermaid` blocks render directly as width-aware Unicode character
 diagrams. Rendering is local and does not require a browser, an image-capable
@@ -530,14 +532,9 @@ is not exposed to tools.
 
 ## Build and check
 
-The workspace expects `nole` and the MBDown workspace to be
-sibling directories:
-
-```text
-Codes/
-  mbdown/
-  nole/
-```
+MBDown and its terminal widgets (`mbdown`, `mbtui`) are published as
+standalone crates on crates.io and pulled in as ordinary dependencies, so no
+separate workspace checkout is needed.
 
 ```bash
 cargo run -q
