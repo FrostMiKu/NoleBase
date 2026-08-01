@@ -28,10 +28,22 @@ impl PermissionMode {
     }
 }
 
+/// How an approval request is presented to the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// Show the request as a scrollable unified/side-by-side diff panel.
+    Diff,
+    /// Show the request as a confirmation dialog with the message in its body.
+    Confirm,
+}
+
 #[derive(Clone, Debug)]
 pub struct ApprovalRequest {
     pub title: String,
-    pub diff: String,
+    /// Diff text for [`ApprovalKind::Diff`], or the confirmation body for
+    /// [`ApprovalKind::Confirm`].
+    pub message: String,
+    pub kind: ApprovalKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

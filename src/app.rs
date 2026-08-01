@@ -12,8 +12,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::agent::{
-    AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision, ApprovalRequest,
-    AskUserKind, AskUserRequest, AskUserResponse, PermissionMode, AGENT_STREAM_BUFFER,
+    AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision, ApprovalKind,
+    ApprovalRequest, AskUserKind, AskUserRequest, AskUserResponse, PermissionMode,
+    AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};

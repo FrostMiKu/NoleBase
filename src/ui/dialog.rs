@@ -16,6 +16,20 @@ fn approval_diff_lines(message: &str, content_width: u16, theme: Theme) -> Vec<L
     }
 }
 
+/// Body lines for an approval dialog. An empty diff (for example when the
+/// agent deletes an empty file) must still render content so the panel never
+/// degrades to a bare frame with no body or footer.
+fn approval_content_lines(message: &str, content_width: u16, theme: Theme) -> Vec<Line<'static>> {
+    let lines = approval_diff_lines(message, content_width, theme);
+    if !lines.is_empty() {
+        return lines;
+    }
+    vec![Line::from(Span::styled(
+        "No changes to display",
+        Style::default().fg(theme.text_muted),
+    ))]
+}
+
 /// Render every modal interaction through one fixed-width, bounded-height
 /// command surface. The body changes by mode, but title, scrolling, option
 /// selection, input and footer geometry remain identical.
@@ -37,7 +51,7 @@ pub(super) fn draw_dialog(
     .min(root.width.saturating_sub(4).max(root.width.min(1)));
     let text_width = width.saturating_sub(4).max(1) as usize;
     let approval_rows = (dialog.mode == DialogMode::Approval).then(|| {
-        u16::try_from(approval_diff_lines(&dialog.message, text_width as u16, app.theme).len())
+        u16::try_from(approval_content_lines(&dialog.message, text_width as u16, app.theme).len())
             .unwrap_or(u16::MAX)
     });
     let message_rows = if dialog.purpose == DialogPurpose::Help {
@@ -96,7 +110,8 @@ pub(super) fn draw_dialog(
     let destructive = matches!(
         dialog.purpose,
         DialogPurpose::DeleteDaily | DialogPurpose::DeleteFile
-    );
+    ) || (dialog.mode == DialogMode::Confirm
+        && dialog.purpose == DialogPurpose::AgentApproval);
     let border = match dialog.mode {
         _ if destructive => app.theme.ui_error,
         DialogMode::Approval => app.theme.ui_warning,
@@ -211,7 +226,7 @@ pub(super) fn draw_dialog(
         }
         DialogMode::Approval => {
             let (content, footer) = split_last_row(inner);
-            let lines = approval_diff_lines(&dialog.message, content.width, app.theme);
+            let lines = approval_content_lines(&dialog.message, content.width, app.theme);
             let maximum = lines.len().saturating_sub(content.height as usize);
             let scroll = dialog.scroll.min(maximum as u16);
             if let Some(state) = app.dialog.as_mut() {

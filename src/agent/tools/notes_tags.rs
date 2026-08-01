@@ -11,7 +11,9 @@ use super::util::{
     MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::write_policy::{validate_write, WriteSource};
-use crate::agent::{canonical_root, ApprovalGate, ApprovalRequest, Tool, ToolExecutionPolicy};
+use crate::agent::{
+    canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy,
+};
 use crate::model::SearchHit;
 use crate::storage::Storage;
 use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};
@@ -295,7 +297,8 @@ impl Tool for RenameTag {
         self.gate
             .request(ApprovalRequest {
                 title: format!("Rename #{} to #{}", plan.from, plan.to),
-                diff,
+                message: diff,
+                kind: ApprovalKind::Diff,
             })
             .await?;
         let outcome = plan.apply()?;

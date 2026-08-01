@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use super::util::{display_path, limited_diff, required_string, MAX_FILE_BYTES};
 use super::write_policy::{validate_write, WriteSource};
 use crate::agent::{
-    canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalRequest, ReadTracker, Tool,
+    canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
+    ReadTracker, Tool,
 };
 
 pub struct EditFile {
@@ -150,7 +151,8 @@ impl Tool for EditFile {
         self.gate
             .request(ApprovalRequest {
                 title: format!("Edit {relative}"),
-                diff: limited_diff(&old, &content, relative, relative),
+                message: limited_diff(&old, &content, relative, relative),
+                kind: ApprovalKind::Diff,
             })
             .await?;
         let current =
@@ -756,18 +758,11 @@ impl Tool for DeleteFile {
             bail!("delete_file cannot operate inside config/");
         }
         let modified = metadata.modified().ok();
-        let preview = if metadata.len() <= MAX_FILE_BYTES {
-            fs::read_to_string(&path)
-                .ok()
-                .map(|content| limited_diff(&content, "", relative, "/dev/null"))
-        } else {
-            None
-        }
-        .unwrap_or_else(|| format!("Delete {relative}\nSize: {} bytes\n", metadata.len()));
         self.gate
             .request(ApprovalRequest {
-                title: format!("Delete {relative}"),
-                diff: preview,
+                title: "Delete file".to_string(),
+                message: format!("Delete {relative}?"),
+                kind: ApprovalKind::Confirm,
             })
             .await?;
 
@@ -839,5 +834,49 @@ impl Tool for CreateFile {
             .with_context(|| format!("creating new file {}", path.display()))?;
         file.write_all(content.as_bytes())?;
         Ok(format!("wrote {} bytes to {relative}", content.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::agent::test_support::{drain_events, event_channel, test_runtime};
+    use crate::agent::ApprovalDecision;
+
+    #[test]
+    fn delete_file_requests_a_confirm_approval_naming_the_target() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Old.md"), "content").unwrap();
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender,
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let tool = DeleteFile::new(&root, gate).unwrap();
+        let input = json!({"path": "Old.md"});
+        decision_sender.send(ApprovalDecision::Approve).unwrap();
+        let output = test_runtime().block_on(tool.execute(&input)).unwrap();
+        assert!(output.contains("deleted Old.md"));
+        assert!(!root.join("Old.md").exists());
+        let events = drain_events(&mut event_receiver);
+        let request = events
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::Approval(request) => Some(request),
+                _ => None,
+            })
+            .expect("delete_file must request approval");
+        assert_eq!(request.kind, ApprovalKind::Confirm);
+        assert_eq!(request.title, "Delete file");
+        assert_eq!(request.message, "Delete Old.md?");
     }
 }

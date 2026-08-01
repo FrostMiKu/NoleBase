@@ -146,8 +146,8 @@ fn render_daily_note(
 fn animated_color(position: usize, tick: u64) -> Color {
     super::animated_color(position, tick, Theme::default())
 }
-use crate::agent::ApprovalRequest;
 use crate::agent::AskUserKind;
+use crate::agent::{ApprovalKind, ApprovalRequest};
 use crate::agent_session::AgentPanelEntry;
 use crate::app::{Document, DocumentKind, DocumentReturn};
 use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate};
@@ -1348,6 +1348,30 @@ fn wikilink_choice_marks_archive_and_file_format_as_muted_metadata() {
 }
 
 #[test]
+fn approval_panel_with_empty_diff_keeps_body_and_footer() {
+    let (mut app, _directory) = make_app();
+    app.approval_request = Some(ApprovalRequest {
+        title: "Delete data/Empty.md".to_string(),
+        message: String::new(),
+        kind: ApprovalKind::Diff,
+    });
+    app.set_overlay(Overlay::Approval);
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Delete data/Empty.md"));
+    assert!(screen.contains("No changes to display"));
+    assert!(screen.contains("Enter/Y approve"));
+    let overlay = app.layout.overlay.expect("approval overlay");
+    assert!(
+        overlay.height >= 4,
+        "approval panel must keep room for the footer row"
+    );
+
+    let wide = render(&mut app, 180, 24);
+    assert!(buffer_string(&wide).contains("No changes to display"));
+}
+
+#[test]
 fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
     let (mut app, _directory) = make_app();
     app.ai_prompt_input = "summarize this".to_string();
@@ -1360,7 +1384,8 @@ fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
 
     app.approval_request = Some(ApprovalRequest {
         title: "Update data/note.md".to_string(),
-        diff: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        message: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        kind: ApprovalKind::Diff,
     });
     app.set_overlay(Overlay::Approval);
     let terminal = render(&mut app, 100, 24);
@@ -1372,11 +1397,39 @@ fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
 }
 
 #[test]
+fn confirm_approval_renders_as_a_destructive_confirmation_dialog() {
+    let (mut app, _directory) = make_app();
+    app.approval_request = Some(ApprovalRequest {
+        title: "Delete file".to_string(),
+        message: "Delete data/Empty.md?".to_string(),
+        kind: ApprovalKind::Confirm,
+    });
+    app.set_overlay(Overlay::Approval);
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Delete file"));
+    assert!(screen.contains("Delete data/Empty.md?"));
+    assert!(screen.contains("Enter/Y confirm · N/Esc cancel"));
+    assert!(
+        !screen.contains("Tab bypass"),
+        "confirm approvals must not use the diff panel"
+    );
+    let overlay = app.layout.overlay.expect("confirm overlay");
+    assert_eq!(overlay.height, 5);
+    let corner_fg = terminal.backend().buffer()[(overlay.x, overlay.y)].fg;
+    assert_eq!(
+        corner_fg, app.theme.ui_error,
+        "delete confirmation should use the destructive border"
+    );
+}
+
+#[test]
 fn agent_diff_approval_switches_layout_with_terminal_width() {
     let (mut app, _directory) = make_app();
     app.approval_request = Some(ApprovalRequest {
         title: "Update data/note.md".to_string(),
-        diff: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        message: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        kind: ApprovalKind::Diff,
     });
     app.set_overlay(Overlay::Approval);
 
@@ -1448,7 +1501,8 @@ fn long_approval_diff_keeps_the_bounded_height() {
     let (mut app, _directory) = make_app();
     app.approval_request = Some(ApprovalRequest {
         title: "Update data/note.md".to_string(),
-        diff: (0..50).map(|line| format!("+line {line}\n")).collect(),
+        message: (0..50).map(|line| format!("+line {line}\n")).collect(),
+        kind: ApprovalKind::Diff,
     });
     app.set_overlay(Overlay::Approval);
 

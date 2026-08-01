@@ -760,7 +760,8 @@ fn approval_overlay_sends_the_user_decision() {
     app.ai_approval_sender = Some(sender);
     app.approval_request = Some(ApprovalRequest {
         title: "Update note".to_string(),
-        diff: "--- old\n+++ new\n-old\n+new\n".to_string(),
+        message: "--- old\n+++ new\n-old\n+new\n".to_string(),
+        kind: ApprovalKind::Diff,
     });
     app.set_overlay(Overlay::Approval);
     app.handle_key(key(KeyCode::Char('y')));

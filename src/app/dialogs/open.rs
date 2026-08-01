@@ -237,17 +237,30 @@ impl App {
             }
             Overlay::Approval => {
                 let request = self.approval_request.as_ref();
-                let mut dialog = DialogState::new(
-                    request
-                        .map(|request| request.title.clone())
-                        .unwrap_or_else(|| "Approve change".to_string()),
-                    request
-                        .map(|request| request.diff.clone())
-                        .unwrap_or_default(),
-                    DialogMode::Approval,
-                    DialogPurpose::AgentApproval,
-                    Vec::new(),
-                );
+                let mut dialog = match request.map(|request| request.kind) {
+                    Some(ApprovalKind::Confirm) => DialogState::new(
+                        request
+                            .map(|request| request.title.clone())
+                            .unwrap_or_else(|| "Confirm change".to_string()),
+                        request
+                            .map(|request| request.message.clone())
+                            .unwrap_or_default(),
+                        DialogMode::Confirm,
+                        DialogPurpose::AgentApproval,
+                        Vec::new(),
+                    ),
+                    _ => DialogState::new(
+                        request
+                            .map(|request| request.title.clone())
+                            .unwrap_or_else(|| "Approve change".to_string()),
+                        request
+                            .map(|request| request.message.clone())
+                            .unwrap_or_default(),
+                        DialogMode::Approval,
+                        DialogPurpose::AgentApproval,
+                        Vec::new(),
+                    ),
+                };
                 dialog.scroll = self.approval_scroll;
                 dialog
             }

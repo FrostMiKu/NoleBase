@@ -1293,8 +1293,8 @@
         let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
             panic!("expected approval request");
         };
-        assert!(request.diff.contains("-old"));
-        assert!(request.diff.contains("+new"));
+        assert!(request.message.contains("-old"));
+        assert!(request.message.contains("+new"));
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         worker.join().unwrap().unwrap();
         assert_eq!(
@@ -1433,8 +1433,8 @@
         let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
             panic!("expected approval request");
         };
-        assert!(request.diff.contains("-#old"));
-        assert!(request.diff.contains("+#new"));
+        assert!(request.message.contains("-#old"));
+        assert!(request.message.contains("+#new"));
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         let result: Value = serde_json::from_str(&worker.join().unwrap().unwrap()).unwrap();
         assert_eq!(result["documents"], 1);
