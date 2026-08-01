@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "nole"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
