@@ -3,6 +3,7 @@
 mod agent;
 mod agent_session;
 mod app;
+mod backend;
 mod embedded_terminal;
 mod markdown;
 mod media;
@@ -34,14 +35,15 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use app::{App, Command};
+use backend::FrameBackend;
 use workspace_index::WorkspaceIndexer;
 
-type Tui = Terminal<CrosstermBackend<Stdout>>;
+type Tui = Terminal<FrameBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -375,7 +377,7 @@ fn main() -> Result<()> {
         ratatui_image::picker::Picker::from_query_stdio()
             .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
     );
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = FrameBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
@@ -440,6 +442,12 @@ mod tests {
         assert!(cursor.x > compose.x && cursor.x < compose.right() - 1);
         assert!(cursor.y > compose.y && cursor.y < compose.bottom() - 1);
 
+        let Some(crate::agent_session::AgentPanelEntry::Assistant { text, .. }) =
+            app.agent_panel.last_mut()
+        else {
+            panic!("streaming assistant entry");
+        };
+        text.push_str(" with another streamed chunk");
         app.advance_animation();
         assert_eq!(app.animation_tick, 1);
         draw_frame(&mut terminal, &mut app).unwrap();
