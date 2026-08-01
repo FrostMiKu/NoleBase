@@ -15,64 +15,16 @@ pub(super) fn draw_tags(
         return;
     }
 
-    let input_width = if content.width > 4 {
-        content.width.saturating_sub(4).min(72)
-    } else {
-        content.width
-    };
-    let input_height = 3.min(content.height);
-    let input_box = Rect::new(
-        content.x + content.width.saturating_sub(input_width) / 2,
-        content.y,
-        input_width,
-        input_height,
-    );
-    let input_style = Style::default().bg(app.theme.surface_panel);
-    if input_height >= 3 {
-        clear_widget(frame, input_box);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .padding(Padding::horizontal(1))
-            .title(format!(" Tags · {} ", app.tag_results.len()))
-            .style(input_style)
-            .border_style(focus_border(app.focus == Focus::Center, app.theme));
-        let input = block.inner(input_box);
-        frame.render_widget(block, input_box);
-        if let Some(position) = draw_single_line_input(
-            frame,
-            input,
-            "# ",
-            &app.tag_query,
-            app.tag_cursor,
-            app.focus == Focus::Center && interactive,
-            app.theme,
-        ) {
-            *cursor_position = Some(position);
-        }
-    } else if let Some(position) = draw_single_line_input(
+    let results = draw_filter_header(
         frame,
-        input_box,
+        content,
+        app,
+        format!(" Tags · {} ", app.tag_results.len()),
         "# ",
         &app.tag_query,
         app.tag_cursor,
-        app.focus == Focus::Center && interactive,
-        app.theme,
-    ) {
-        *cursor_position = Some(position);
-    }
-
-    let results_y = input_box
-        .y
-        .saturating_add(input_box.height)
-        .saturating_add(1);
-    let results = Rect::new(
-        content.x,
-        results_y,
-        content.width,
-        content
-            .y
-            .saturating_add(content.height)
-            .saturating_sub(results_y),
+        interactive,
+        cursor_position,
     );
     if results.height == 0 {
         return;

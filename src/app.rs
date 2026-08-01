@@ -49,6 +49,42 @@ pub(in crate::app) use self::text_input::{edit_single_line, TextInputEdit};
 pub(crate) use self::vlist::*;
 pub use self::{dialog::*, document::*, model::*};
 
+pub(in crate::app) const DAILY_PAGE_STEP: u16 = 5;
+pub(in crate::app) const AGENT_PAGE_STEP: u16 = 8;
+pub(in crate::app) const DOCUMENT_PAGE_STEP: u16 = 10;
+pub(in crate::app) const DIALOG_PAGE_STEP: i32 = 8;
+
+/// Move a selection index by `delta` within `[0, len)`.
+/// Clamps on both ends; an empty list keeps the index at zero.
+pub(in crate::app) fn move_index(current: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let current = current.min(len - 1);
+    (current as i32 + delta).clamp(0, len as i32 - 1) as usize
+}
+
+pub(in crate::app) fn is_up_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Up | KeyCode::Char('k'))
+}
+
+pub(in crate::app) fn is_down_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Down | KeyCode::Char('j'))
+}
+
+pub(in crate::app) fn is_left_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Left | KeyCode::Char('h'))
+}
+
+pub(in crate::app) fn is_right_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Right | KeyCode::Char('l'))
+}
+
+/// `Esc` or `q` — the two keys that leave the current context.
+pub(in crate::app) fn is_cancel_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+}
+
 pub(in crate::app) fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
     col >= area.x
         && col < area.x.saturating_add(area.width)

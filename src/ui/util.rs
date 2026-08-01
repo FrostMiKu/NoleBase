@@ -1,5 +1,75 @@
 use super::*;
 
+/// Draw the shared filter header used by the search and tags views: a bordered
+/// single-line input centered at the top of `content`, followed by the list
+/// area below it. Returns the list area.
+#[allow(clippy::too_many_arguments)] // mirrors the existing view renderer signature (frame, app, area, interactive, cursor)
+pub(super) fn draw_filter_header(
+    frame: &mut Frame,
+    content: Rect,
+    app: &App,
+    title: String,
+    prefix: &str,
+    query: &str,
+    cursor: usize,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) -> Rect {
+    let input_width = if content.width > 4 {
+        content.width.saturating_sub(4).min(72)
+    } else {
+        content.width
+    };
+    let input_height = 3.min(content.height);
+    let input_box = Rect::new(
+        content.x + content.width.saturating_sub(input_width) / 2,
+        content.y,
+        input_width,
+        input_height,
+    );
+    let input_style = Style::default().bg(app.theme.surface_panel);
+    let show_cursor = app.focus == Focus::Center && interactive;
+    if input_height >= 3 {
+        clear_widget(frame, input_box);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .title(title)
+            .style(input_style)
+            .border_style(focus_border(app.focus == Focus::Center, app.theme));
+        let input = block.inner(input_box);
+        frame.render_widget(block, input_box);
+        if let Some(position) =
+            draw_single_line_input(frame, input, prefix, query, cursor, show_cursor, app.theme)
+        {
+            *cursor_position = Some(position);
+        }
+    } else if let Some(position) = draw_single_line_input(
+        frame,
+        input_box,
+        prefix,
+        query,
+        cursor,
+        show_cursor,
+        app.theme,
+    ) {
+        *cursor_position = Some(position);
+    }
+    let list_y = input_box
+        .y
+        .saturating_add(input_box.height)
+        .saturating_add(1);
+    Rect::new(
+        content.x,
+        list_y,
+        content.width,
+        content
+            .y
+            .saturating_add(content.height)
+            .saturating_sub(list_y),
+    )
+}
+
 /// Clear a widget's rectangle without leaving a wide-character continuation
 /// cell from the content underneath it. Ratatui's diff buffer can otherwise
 /// miss the cell next to a one-column border when a CJK glyph straddles that
