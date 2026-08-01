@@ -5,13 +5,13 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
-use super::util::{MAX_FILE_BYTES, display_path, limited_diff, required_string};
-use super::write_policy::{WriteSource, validate_write};
+use super::util::{display_path, limited_diff, required_string, MAX_FILE_BYTES};
+use super::write_policy::{validate_write, WriteSource};
 use crate::agent::{
-    AgentEvent, AgentEventSender, ApprovalGate, ApprovalRequest, ReadTracker, Tool, canonical_root,
+    canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalRequest, ReadTracker, Tool,
 };
 
 pub struct EditFile {

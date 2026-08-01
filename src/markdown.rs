@@ -434,7 +434,10 @@ mod tests {
             "```mermaid\nclassDiagram\nclass Agent~T~ {}\n```",
             80,
         ));
-        let label = output.lines().find(|line| line.contains("mermaid")).unwrap();
+        let label = output
+            .lines()
+            .find(|line| line.contains("mermaid"))
+            .unwrap();
         assert!(label.trim_end().ends_with("unsupported"));
         assert!(!output.contains("generics not yet supported"));
         assert!(output.contains("class Agent~T~ {}"));
@@ -518,10 +521,15 @@ mod tests {
                     "renderer unexpectedly fell back at width {width}:\n{output}"
                 );
                 for label in labels {
-                    assert!(output.contains(label), "missing {label:?} at width {width}:\n{output}");
+                    assert!(
+                        output.contains(label),
+                        "missing {label:?} at width {width}:\n{output}"
+                    );
                 }
                 assert!(
-                    output.lines().all(|line| UnicodeWidthStr::width(line) <= width),
+                    output
+                        .lines()
+                        .all(|line| UnicodeWidthStr::width(line) <= width),
                     "diagram or fallback exceeded width {width}:\n{output}"
                 );
             }

@@ -2,16 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 use super::util::{
+    display_path, fuzzy_match, limited_diff, optional_usize, required_string, truncate_chars,
     DEFAULT_SEARCH_RESULTS, MAX_DIFF_BYTES, MAX_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
-    MAX_SEARCH_SNIPPET_CHARS, display_path, fuzzy_match, limited_diff, optional_usize,
-    required_string, truncate_chars,
+    MAX_SEARCH_SNIPPET_CHARS,
 };
-use super::write_policy::{WriteSource, validate_write};
-use crate::agent::{ApprovalGate, ApprovalRequest, Tool, ToolExecutionPolicy, canonical_root};
+use super::write_policy::{validate_write, WriteSource};
+use crate::agent::{canonical_root, ApprovalGate, ApprovalRequest, Tool, ToolExecutionPolicy};
 use crate::model::SearchHit;
 use crate::storage::Storage;
 use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};

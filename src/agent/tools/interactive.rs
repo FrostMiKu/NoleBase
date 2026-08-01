@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 use super::util::required_string;
 use crate::agent::{
-    AgentEvent, AgentEventSender, AskUserKind, AskUserRequest, AskUserResponse, Tool,
-    canonical_root, recv_while_active,
+    canonical_root, recv_while_active, AgentEvent, AgentEventSender, AskUserKind, AskUserRequest,
+    AskUserResponse, Tool,
 };
 use crate::storage::Storage;
 

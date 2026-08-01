@@ -30,9 +30,9 @@ use crate::skill::{load_skill_catalog, Skill, SkillCatalog};
 use crate::storage::Storage;
 use crate::workspace_index::WorkspaceIndexHandle;
 
+mod subagent;
 #[cfg(test)]
 mod test_support;
-mod subagent;
 mod tools;
 
 use tools::*;

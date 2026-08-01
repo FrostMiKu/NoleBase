@@ -45,7 +45,10 @@ pub(crate) fn test_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-pub(crate) fn event_channel() -> (AgentEventSender, tokio::sync::broadcast::Receiver<AgentEvent>) {
+pub(crate) fn event_channel() -> (
+    AgentEventSender,
+    tokio::sync::broadcast::Receiver<AgentEvent>,
+) {
     tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER)
 }
 

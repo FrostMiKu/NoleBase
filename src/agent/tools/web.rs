@@ -1,9 +1,9 @@
 //! Web tools: Tavily search and HTTP fetch.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::util::{optional_usize, required_string};
 use crate::agent::{Tool, ToolExecutionPolicy};

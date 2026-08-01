@@ -53,7 +53,12 @@ pub(super) fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-pub(super) fn optional_usize(input: &Value, key: &str, default: usize, maximum: usize) -> Result<usize> {
+pub(super) fn optional_usize(
+    input: &Value,
+    key: &str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize> {
     let Some(value) = input.get(key) else {
         return Ok(default);
     };
