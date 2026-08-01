@@ -123,7 +123,8 @@ in-memory snapshot and never rescans files on the UI thread. Search results
 remain grouped as Daily, Notes, then Archives.
 
 Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
-opens that file in the configured editor (then `$EDITOR`, `$VISUAL`, and `vi`). Search and message
+opens that file in the configured editor (then `$EDITOR`, `$VISUAL`, and `vi`).
+Search and message
 editing also use Center instead of covering the workspace with a popup. External
 changes to `.md` and `.mb` files under the note directory are detected
 automatically; Daily, ToDo, Files, Search, and an open document refresh without
@@ -196,7 +197,7 @@ Errors leave the active input/context in place so they can be corrected.
   `Esc` returns to Daily. Closing a search result first returns to Search.
 
 Message card edits suspend the TUI and open a temporary `.md` file in the
-configured editor (then `$EDITOR`, `$VISUAL`, and `vi`). When the editor exits successfully, Nole
+configured editor. When the editor exits successfully, Nole
 writes the content back to the original daily date and removes the temporary
 file. Editing from a message preview keeps that preview open and refreshes it.
 
@@ -213,7 +214,7 @@ under `~/.nole`:
 ```text
 config/         # private application configuration
   ai.toml       # LLM provider and optional Tavily configuration
-  settings.toml # selected theme and external editor
+  settings.toml # selected theme, external editor, and terminal shell
   agent-session.json # current Agent conversation; absent when empty
   AGENTS.md      # user-authored Agent instructions
 themes/         # Agent-editable application and MBDown themes
@@ -242,15 +243,19 @@ overwriting an existing file.
 
 ### Theme
 
-On first start Nole creates `themes/default.toml` with its current colors and
-writes `theme = "default"` to `config/settings.toml`. If `$EDITOR` is nonempty,
-its current value is captured as `editor` for subsequent launches. When the
-setting is absent or blank, Nole falls back to `$EDITOR`, then `$VISUAL`, then
-`vi`:
+On first start Nole creates `themes/default.toml` with its current colors and a
+documented `config/settings.toml`. The `editor` and `shell` settings are optional
+and commented out by default. Set either one to override its documented
+fallback:
 
 ```toml
 theme = "default"
-editor = "code -w"
+
+# Command used to edit notes. Defaults to $EDITOR, then $VISUAL, then vi.
+# editor = "code -w"
+
+# Executable used by the floating terminal. Defaults to the system login shell.
+# shell = "fish"
 ```
 
 Each direct
@@ -270,7 +275,7 @@ and `surface.status_bar`. Animation gradient entries must remain `#RRGGBB`.
 
 Use `Theme: Switch` from the command palette to choose `default`, `random`, or
 any custom theme. The selection is saved to `config/settings.toml` without
-overwriting `editor`. Changes to
+overwriting the editor or terminal settings. Changes to
 that file or to a direct TOML file under `themes/` are loaded automatically.
 Because `themes/` is outside `config/`, the Agent can create and edit custom
 themes without gaining access to private configuration.
@@ -376,6 +381,8 @@ Press `Ctrl+\`` or run `Terminal: Open` from the command palette to open a
 PTY-backed floating terminal. Its shell starts in the active Nole directory
 (`~/.nole` by default, or `NOLE_DIR` when configured). Hiding the terminal
 retains its single shell session; exiting the shell closes and discards it.
+Set `shell` in `config/settings.toml` to an executable name or path; when it is
+absent or blank, Nole uses the system login shell.
 The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
 Agent conversations and their visible panel history persist in the single
 `config/agent-session.json` file across prompts and application restarts. Each

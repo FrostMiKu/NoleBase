@@ -193,10 +193,12 @@ pub(super) fn draw_daily_notes(
         let last = first + cached.lines.len().saturating_sub(2);
         draw_selected_card_border(
             frame,
-            area,
-            scroll,
-            first,
-            last,
+            CardBorderGeometry {
+                area,
+                scroll,
+                first,
+                last,
+            },
             app.animation_tick,
             app.theme,
         );
@@ -425,35 +427,33 @@ pub(super) fn daily_button_line(
 
 pub(super) fn draw_selected_card_border(
     frame: &mut Frame,
-    area: Rect,
-    scroll: usize,
-    first: usize,
-    last: usize,
+    geometry: CardBorderGeometry,
     tick: u64,
     theme: Theme,
 ) {
-    draw_animated_card_border(
-        frame,
-        area,
-        scroll,
-        first,
-        last,
-        tick,
-        theme,
-        theme.surface_panel,
-    );
+    draw_animated_card_border(frame, geometry, tick, theme, theme.surface_panel);
+}
+
+pub(super) struct CardBorderGeometry {
+    pub(super) area: Rect,
+    pub(super) scroll: usize,
+    pub(super) first: usize,
+    pub(super) last: usize,
 }
 
 pub(super) fn draw_animated_card_border(
     frame: &mut Frame,
-    area: Rect,
-    scroll: usize,
-    first: usize,
-    last: usize,
+    geometry: CardBorderGeometry,
     tick: u64,
     theme: Theme,
     background: Color,
 ) {
+    let CardBorderGeometry {
+        area,
+        scroll,
+        first,
+        last,
+    } = geometry;
     if area.width < 2 || first > last {
         return;
     }

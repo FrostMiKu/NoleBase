@@ -9,7 +9,14 @@ impl App {
             return;
         }
         if self.terminal.is_none() {
-            match EmbeddedTerminal::spawn(&self.storage.root) {
+            let shell = match self.storage.terminal_shell() {
+                Ok(shell) => shell,
+                Err(error) => {
+                    self.set_error(format!("Terminal settings error: {error}"));
+                    return;
+                }
+            };
+            match EmbeddedTerminal::spawn(&self.storage.root, shell.as_deref()) {
                 Ok(terminal) => self.terminal = Some(terminal),
                 Err(error) => {
                     self.set_error(format!("Terminal error: {error}"));

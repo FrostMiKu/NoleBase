@@ -63,14 +63,17 @@ pub(super) fn draw_terminal_snapshot(
             if cell.is_wide_continuation() {
                 continue;
             }
-            let mut foreground = terminal_color(cell.fgcolor(), theme.text_primary);
-            let mut background = terminal_color(cell.bgcolor(), theme.surface_overlay);
+            let mut foreground = terminal_color(cell.foreground(), theme.text_primary);
+            let mut background = terminal_color(cell.background(), theme.surface_overlay);
             if cell.inverse() {
                 std::mem::swap(&mut foreground, &mut background);
             }
             let mut style = Style::default().fg(foreground).bg(background);
             if cell.bold() {
                 style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.dim() {
+                style = style.add_modifier(Modifier::DIM);
             }
             if cell.italic() {
                 style = style.add_modifier(Modifier::ITALIC);
@@ -80,7 +83,7 @@ pub(super) fn draw_terminal_snapshot(
             }
             let contents = cell.contents();
             buffer[(area.x + col, area.y + row)]
-                .set_symbol(if contents.is_empty() { " " } else { &contents })
+                .set_symbol(if contents.is_empty() { " " } else { contents })
                 .set_style(style);
         }
     }
@@ -93,10 +96,10 @@ pub(super) fn draw_terminal_snapshot(
     }
 }
 
-pub(super) fn terminal_color(color: vt100::Color, default: Color) -> Color {
+pub(super) fn terminal_color(color: TerminalColor, default: Color) -> Color {
     match color {
-        vt100::Color::Default => default,
-        vt100::Color::Idx(index) => Color::Indexed(index),
-        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+        TerminalColor::Default => default,
+        TerminalColor::Indexed(index) => Color::Indexed(index),
+        TerminalColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }

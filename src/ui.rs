@@ -44,7 +44,7 @@ use crate::app::{
     App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus, LayoutSnapshot,
     Overlay, SidebarSelection, WorkspaceView,
 };
-use crate::embedded_terminal::TerminalSnapshot;
+use crate::embedded_terminal::{TerminalColor, TerminalSnapshot};
 use crate::model::{
     Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
     LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox, WorkspaceViewHitbox,

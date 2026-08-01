@@ -5,6 +5,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(test)]
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{self, Color, CursorShape, NamedColor};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -14,30 +21,187 @@ const INITIAL_COLS: u16 = 80;
 const SCROLLBACK_ROWS: usize = 10_000;
 const WHEEL_SCROLL_ROWS: usize = 3;
 
+type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+type TerminalCore = Term<PtyEventListener>;
+
+#[derive(Clone)]
+struct PtyEventListener {
+    writer: PtyWriter,
+}
+
+impl EventListener for PtyEventListener {
+    fn send_event(&self, event: Event) {
+        let Event::PtyWrite(text) = event else {
+            return;
+        };
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = writer.write_all(text.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalSize {
+    rows: usize,
+    cols: usize,
+}
+
+impl TerminalSize {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            rows: rows as usize,
+            cols: cols as usize,
+        }
+    }
+}
+
+impl Dimensions for TerminalSize {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalColor {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TerminalCell {
+    contents: String,
+    foreground: TerminalColor,
+    background: TerminalColor,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+    wide_continuation: bool,
+}
+
+impl TerminalCell {
+    fn from_cell(cell: &Cell) -> Self {
+        let mut contents = if cell.flags.contains(Flags::HIDDEN) {
+            " ".to_string()
+        } else {
+            cell.c.to_string()
+        };
+        if let Some(zerowidth) = cell.zerowidth() {
+            contents.extend(zerowidth);
+        }
+        Self {
+            contents,
+            foreground: terminal_color(cell.fg),
+            background: terminal_color(cell.bg),
+            bold: cell.flags.contains(Flags::BOLD),
+            dim: cell.flags.contains(Flags::DIM),
+            italic: cell.flags.contains(Flags::ITALIC),
+            underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+            inverse: cell.flags.contains(Flags::INVERSE),
+            wide_continuation: cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+        }
+    }
+
+    pub fn contents(&self) -> &str {
+        &self.contents
+    }
+
+    pub fn foreground(&self) -> TerminalColor {
+        self.foreground
+    }
+
+    pub fn background(&self) -> TerminalColor {
+        self.background
+    }
+
+    pub fn bold(&self) -> bool {
+        self.bold
+    }
+
+    pub fn dim(&self) -> bool {
+        self.dim
+    }
+
+    pub fn italic(&self) -> bool {
+        self.italic
+    }
+
+    pub fn underline(&self) -> bool {
+        self.underline
+    }
+
+    pub fn inverse(&self) -> bool {
+        self.inverse
+    }
+
+    pub fn is_wide_continuation(&self) -> bool {
+        self.wide_continuation
+    }
+}
+
+fn terminal_color(color: Color) -> TerminalColor {
+    match color {
+        Color::Spec(color) => TerminalColor::Rgb(color.r, color.g, color.b),
+        Color::Indexed(index) => TerminalColor::Indexed(index),
+        Color::Named(named) if named <= NamedColor::BrightWhite => {
+            TerminalColor::Indexed(named as u8)
+        }
+        Color::Named(named) if (NamedColor::DimBlack..=NamedColor::DimWhite).contains(&named) => {
+            let index = usize::from(named as u16) - usize::from(NamedColor::DimBlack as u16);
+            TerminalColor::Indexed(u8::try_from(index).expect("dim ANSI color index fits in u8"))
+        }
+        Color::Named(_) => TerminalColor::Default,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TerminalSnapshot {
     rows: u16,
     cols: u16,
-    cells: Vec<vt100::Cell>,
+    cells: Vec<TerminalCell>,
     cursor: (u16, u16),
     hide_cursor: bool,
 }
 
 impl TerminalSnapshot {
-    fn from_screen(screen: &vt100::Screen) -> Self {
-        let (rows, cols) = screen.size();
+    fn from_terminal<T: EventListener>(terminal: &Term<T>) -> Self {
+        let rows = terminal.screen_lines() as u16;
+        let cols = terminal.columns() as u16;
+        let content = terminal.renderable_content();
+        let display_offset = content.display_offset;
+        let cursor_row = content.cursor.point.line.0 + display_offset as i32;
+        let cursor_col = content.cursor.point.column.0;
         let mut cells = Vec::with_capacity(rows as usize * cols as usize);
-        for row in 0..rows {
-            for col in 0..cols {
-                cells.push(screen.cell(row, col).cloned().unwrap_or_default());
-            }
-        }
+        cells.extend(
+            content
+                .display_iter
+                .map(|cell| TerminalCell::from_cell(&cell)),
+        );
         Self {
             rows,
             cols,
             cells,
-            cursor: screen.cursor_position(),
-            hide_cursor: screen.hide_cursor() || screen.scrollback() > 0,
+            cursor: (
+                cursor_row.clamp(0, i32::from(rows.saturating_sub(1))) as u16,
+                cursor_col.min(cols.saturating_sub(1) as usize) as u16,
+            ),
+            hide_cursor: content.cursor.shape == CursorShape::Hidden || display_offset > 0,
         }
     }
 
@@ -45,7 +209,7 @@ impl TerminalSnapshot {
         (self.rows, self.cols)
     }
 
-    pub fn cell(&self, row: u16, col: u16) -> Option<&vt100::Cell> {
+    pub fn cell(&self, row: u16, col: u16) -> Option<&TerminalCell> {
         if row >= self.rows || col >= self.cols {
             return None;
         }
@@ -63,9 +227,11 @@ impl TerminalSnapshot {
 
     #[cfg(test)]
     pub(crate) fn from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> Self {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(bytes);
-        Self::from_screen(parser.screen())
+        let size = TerminalSize::new(rows, cols);
+        let mut terminal = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+        parser.advance(&mut terminal, bytes);
+        Self::from_terminal(&terminal)
     }
 
     #[cfg(test)]
@@ -75,7 +241,7 @@ impl TerminalSnapshot {
             for col in 0..self.cols {
                 let cell = &self.cells[row as usize * self.cols as usize + col as usize];
                 if !cell.is_wide_continuation() {
-                    contents.push_str(&cell.contents());
+                    contents.push_str(cell.contents());
                 }
             }
             contents.push('\n');
@@ -86,16 +252,23 @@ impl TerminalSnapshot {
 
 pub struct EmbeddedTerminal {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: PtyWriter,
     child: Box<dyn Child + Send + Sync>,
     exited: bool,
-    parser: Arc<Mutex<vt100::Parser>>,
+    terminal: Arc<Mutex<TerminalCore>>,
     size: PtySize,
 }
 
 impl EmbeddedTerminal {
-    pub fn spawn(root: &Path) -> Result<Self> {
-        Self::spawn_command(root, CommandBuilder::new_default_prog())
+    pub fn spawn(root: &Path, shell: Option<&str>) -> Result<Self> {
+        let mut command = match shell {
+            Some(shell) => CommandBuilder::new(shell),
+            None => CommandBuilder::new_default_prog(),
+        };
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
+        }
+        Self::spawn_command(root, command)
     }
 
     fn spawn_command(root: &Path, mut command: CommandBuilder) -> Result<Self> {
@@ -111,6 +284,8 @@ impl EmbeddedTerminal {
         command.cwd(root);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        command.env("TERM_PROGRAM", "nole");
+        command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
         let mut child = pair
             .slave
@@ -132,21 +307,35 @@ impl EmbeddedTerminal {
         };
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(
-            size.rows,
-            size.cols,
-            SCROLLBACK_ROWS,
+        let writer = Arc::new(Mutex::new(writer));
+        let terminal_size = TerminalSize::new(size.rows, size.cols);
+        let config = Config {
+            scrolling_history: SCROLLBACK_ROWS,
+            // Nole currently emits traditional xterm key sequences rather than CSI-u.
+            kitty_keyboard: false,
+            ..Config::default()
+        };
+        let event_listener = PtyEventListener {
+            writer: Arc::clone(&writer),
+        };
+        let terminal = Arc::new(Mutex::new(Term::new(
+            config,
+            &terminal_size,
+            event_listener,
         )));
-        let reader_parser = Arc::clone(&parser);
+        let reader_terminal = Arc::clone(&terminal);
         thread::spawn(move || {
             let mut buffer = [0_u8; 16 * 1024];
+            let mut parser: ansi::Processor = ansi::Processor::new();
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(count) => reader_parser
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .process(&buffer[..count]),
+                    Ok(count) => {
+                        let mut terminal = reader_terminal
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        parser.advance(&mut *terminal, &buffer[..count]);
+                    }
                 }
             }
         });
@@ -156,7 +345,7 @@ impl EmbeddedTerminal {
             writer,
             child,
             exited: false,
-            parser,
+            terminal,
             size,
         })
     }
@@ -173,13 +362,13 @@ impl EmbeddedTerminal {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let mut parser = self
-            .parser
+        let mut terminal = self
+            .terminal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        parser.set_size(rows, cols);
+        terminal.resize(TerminalSize::new(rows, cols));
         if let Err(error) = self.master.resize(size) {
-            parser.set_size(self.size.rows, self.size.cols);
+            terminal.resize(TerminalSize::new(self.size.rows, self.size.cols));
             return Err(error).context("resizing pseudo-terminal");
         }
         self.size = size;
@@ -187,21 +376,21 @@ impl EmbeddedTerminal {
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let parser = self
-            .parser
+        let terminal = self
+            .terminal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        TerminalSnapshot::from_screen(parser.screen())
+        TerminalSnapshot::from_terminal(&terminal)
     }
 
     pub fn write_key(&mut self, key: KeyEvent) -> Result<()> {
         let application_cursor = {
-            let mut parser = self
-                .parser
+            let mut terminal = self
+                .terminal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            parser.set_scrollback(0);
-            parser.screen().application_cursor()
+            terminal.scroll_display(Scroll::Bottom);
+            terminal.mode().contains(TermMode::APP_CURSOR)
         };
         if let Some(bytes) = key_bytes(key, application_cursor) {
             self.write_bytes(&bytes)?;
@@ -211,12 +400,12 @@ impl EmbeddedTerminal {
 
     pub fn write_paste(&mut self, text: &str) -> Result<()> {
         let bracketed = {
-            let mut parser = self
-                .parser
+            let mut terminal = self
+                .terminal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            parser.set_scrollback(0);
-            parser.screen().bracketed_paste()
+            terminal.scroll_display(Scroll::Bottom);
+            terminal.mode().contains(TermMode::BRACKETED_PASTE)
         };
         if bracketed {
             let mut bytes = Vec::with_capacity(text.len() + 12);
@@ -236,18 +425,12 @@ impl EmbeddedTerminal {
     }
 
     pub fn scroll(&mut self, delta: i32) {
-        let mut parser = self
-            .parser
+        let mut terminal = self
+            .terminal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current = parser.screen().scrollback();
-        let rows = delta.unsigned_abs() as usize * WHEEL_SCROLL_ROWS;
-        let target = if delta > 0 {
-            current.saturating_sub(rows)
-        } else {
-            current.saturating_add(rows)
-        };
-        parser.set_scrollback(target);
+        let rows = delta.saturating_mul(WHEEL_SCROLL_ROWS as i32);
+        terminal.scroll_display(Scroll::Delta(rows.saturating_neg()));
     }
 
     #[cfg(test)]
@@ -256,10 +439,14 @@ impl EmbeddedTerminal {
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        writer
             .write_all(bytes)
             .context("writing to pseudo-terminal")?;
-        self.writer.flush().context("flushing pseudo-terminal")
+        writer.flush().context("flushing pseudo-terminal")
     }
 }
 
@@ -480,6 +667,50 @@ mod tests {
             KeyCode::Char('~'),
             KeyModifiers::CONTROL
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_core_responses_are_written_back_to_the_pty() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg(
+            r#"stty raw -echo; printf '\033[0c'; \
+             response=$(dd bs=1 count=5 2>/dev/null | od -An -tx1 | tr -d ' \n'); \
+             stty sane; printf 'RESPONSE:%s\n' "$response""#,
+        );
+        let mut terminal = EmbeddedTerminal::spawn_command(directory.path(), command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let contents = terminal.snapshot().contents();
+            if contents.contains("RESPONSE:1b5b3f3663") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "PTY output was {contents:?}");
+            let _ = terminal.try_wait();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_shell_is_spawned_and_exported() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut terminal = EmbeddedTerminal::spawn(directory.path(), Some("/bin/sh")).unwrap();
+        terminal
+            .write_bytes(b"printf 'SHELL:%s\\n' \"$SHELL\"; exit\r")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let contents = terminal.snapshot().contents();
+            if contents.contains("SHELL:/bin/sh") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "PTY output was {contents:?}");
+            let _ = terminal.try_wait();
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]

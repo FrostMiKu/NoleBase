@@ -1382,19 +1382,26 @@ fn compose_paste_normalizes_newlines_at_character_cursor() {
 }
 
 #[test]
-fn compose_agent_prompt_includes_the_current_note_path() {
+fn compose_agent_prompt_includes_the_path_for_the_current_content_view() {
     let (mut app, _directory) = make_app();
+    add_daily_note(&mut app, "Daily context");
+    let date = app.selected_date().unwrap();
+    app.input = "Summarize the key point".to_string();
+
+    let prompt = app.compose_agent_prompt().unwrap();
+    assert!(prompt.contains(&format!("currently viewing daily note: daily/{date}.md")));
+    assert!(prompt.ends_with("Summarize the key point"));
+
     let path = app.storage.data_dir.join("Reference.md");
     fs::write(&path, "# Reference\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
-    app.input = "Summarize the key point".to_string();
 
     let prompt = app.compose_agent_prompt().unwrap();
     assert!(prompt.contains("currently viewing note: data/Reference.md"));
     assert!(prompt.ends_with("Summarize the key point"));
 
     app.document = Some(Document {
-        kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),
+        kind: DocumentKind::Daily(date),
         title: "Daily".to_string(),
         source: String::new(),
         scroll: 0,
@@ -1402,6 +1409,10 @@ fn compose_agent_prompt_includes_the_current_note_path() {
         return_to: DocumentReturn::Daily,
         render_cache: None,
     });
+    let prompt = app.compose_agent_prompt().unwrap();
+    assert!(prompt.contains(&format!("currently viewing daily note: daily/{date}.md")));
+
+    app.center_view = CenterView::Chat;
     assert_eq!(
         app.compose_agent_prompt().as_deref(),
         Some("Summarize the key point")

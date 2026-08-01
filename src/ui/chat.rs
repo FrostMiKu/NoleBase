@@ -104,10 +104,12 @@ fn draw_chat_messages(
                 .saturating_sub(2);
         draw_animated_card_border(
             frame,
-            area,
-            scroll,
-            first,
-            last,
+            CardBorderGeometry {
+                area,
+                scroll,
+                first,
+                last,
+            },
             app.animation_tick,
             app.theme,
             app.theme.surface_message_agent,

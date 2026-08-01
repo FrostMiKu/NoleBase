@@ -459,19 +459,35 @@ impl App {
         if content.is_empty() {
             return None;
         }
-        let document = self
-            .document
-            .as_ref()
-            .filter(|_| self.center_view == CenterView::Document)
-            .and_then(|document| match &document.kind {
-                DocumentKind::File(path) => Some(("note", path)),
-                DocumentKind::Skill(path) => Some(("skill", path)),
-                DocumentKind::Daily(_) => None,
-            });
-        Some(if let Some((kind, path)) = document {
+        let context =
+            match self.center_view {
+                CenterView::Daily => self.selected_date().and_then(|date| {
+                    self.storage
+                        .daily_file_path(&date.to_string())
+                        .ok()
+                        .map(|path| ("daily note", path))
+                }),
+                CenterView::Document => self.document.as_ref().and_then(|document| match &document
+                    .kind
+                {
+                    DocumentKind::File(path) => Some(("note", path.clone())),
+                    DocumentKind::Skill(path) => Some(("skill", path.clone())),
+                    DocumentKind::Daily(date) => self
+                        .storage
+                        .daily_file_path(&date.to_string())
+                        .ok()
+                        .map(|path| ("daily note", path)),
+                }),
+                CenterView::Chat
+                | CenterView::Todo
+                | CenterView::Search
+                | CenterView::DocumentSearch
+                | CenterView::Tags => None,
+            };
+        Some(if let Some((kind, path)) = context {
             let display = path
                 .strip_prefix(&self.storage.root)
-                .unwrap_or(path)
+                .unwrap_or(&path)
                 .to_string_lossy();
             format!("The user is currently viewing {kind}: {display}\n\n{content}")
         } else {

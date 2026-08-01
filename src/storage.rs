@@ -9,9 +9,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::agent_session::AgentSession;
 use crate::model::{DailyNote, NoteFile, TodoItem};
@@ -22,6 +22,14 @@ mod theme;
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
 const SETTINGS_FILE: &str = "settings.toml";
+const DEFAULT_SETTINGS: &str = r#"theme = "default"
+
+# Command used to edit notes. Defaults to $EDITOR, then $VISUAL, then vi.
+# editor = "code -w"
+
+# Executable used by the floating terminal. Defaults to the system login shell.
+# shell = "fish"
+"#;
 const AGENT_SESSION_FILE: &str = "agent-session.json";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
@@ -40,12 +48,12 @@ pub(crate) struct AppendReceipt {
     created: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsFile {
     theme: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<String>,
+    shell: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,19 +75,8 @@ impl LoadedTheme {
     }
 }
 
-fn serialize_settings(settings: &SettingsFile) -> Result<String> {
-    toml::to_string_pretty(settings).context("serializing settings")
-}
-
 fn nonempty_setting(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
-}
-
-fn initial_settings(editor_env: Option<String>) -> SettingsFile {
-    SettingsFile {
-        theme: "default".to_string(),
-        editor: nonempty_setting(editor_env),
-    }
 }
 
 fn resolve_editor_command(
@@ -208,8 +205,7 @@ impl Storage {
             .create_new(true)
             .open(&self.settings_path)
             .with_context(|| format!("creating {}", self.settings_path.display()))?;
-        let settings = initial_settings(std::env::var("EDITOR").ok());
-        file.write_all(serialize_settings(&settings)?.as_bytes())?;
+        file.write_all(DEFAULT_SETTINGS.as_bytes())?;
         Ok(())
     }
 
@@ -241,30 +237,44 @@ impl Storage {
         ))
     }
 
+    pub fn terminal_shell(&self) -> Result<Option<String>> {
+        Ok(nonempty_setting(self.load_settings()?.shell))
+    }
+
     pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
-        let mut settings = self.load_settings()?;
-        settings.theme = selection.to_string();
+        let source = self.read_settings_source()?;
+        self.parse_settings(&source)?;
+        let mut document = source
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parsing {}", self.settings_path.display()))?;
+        document["theme"] = toml_edit::value(selection);
         fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("creating {}", self.config_dir.display()))?;
-        fs::write(&self.settings_path, serialize_settings(&settings)?)
+        fs::write(&self.settings_path, document.to_string())
             .with_context(|| format!("writing {}", self.settings_path.display()))
     }
 
     fn load_settings(&self) -> Result<SettingsFile> {
+        let source = self.read_settings_source()?;
+        self.parse_settings(&source)
+    }
+
+    fn read_settings_source(&self) -> Result<String> {
         let source = match fs::read_to_string(&self.settings_path) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(SettingsFile {
-                    theme: "default".to_string(),
-                    editor: None,
-                });
+                DEFAULT_SETTINGS.to_string()
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("reading {}", self.settings_path.display()));
             }
         };
-        toml::from_str(&source).with_context(|| format!("parsing {}", self.settings_path.display()))
+        Ok(source)
+    }
+
+    fn parse_settings(&self, source: &str) -> Result<SettingsFile> {
+        toml::from_str(source).with_context(|| format!("parsing {}", self.settings_path.display()))
     }
 
     pub fn load_agent_session(&self) -> Result<Option<AgentSession>> {
@@ -1252,10 +1262,9 @@ mod tests {
             st.validate_embedded_file(&file).unwrap(),
             fs::canonicalize(&file).unwrap()
         );
-        assert!(
-            st.validate_embedded_file(&st.root.join("missing.pdf"))
-                .is_err()
-        );
+        assert!(st
+            .validate_embedded_file(&st.root.join("missing.pdf"))
+            .is_err());
 
         let outside = tempdir().unwrap();
         let outside_file = outside.path().join("outside.pdf");
@@ -1372,10 +1381,9 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "# Article\n\nnew paragraph\n"
         );
-        assert!(
-            st.append_document_tracked(Path::new("/tmp/outside.md"), "no")
-                .is_err()
-        );
+        assert!(st
+            .append_document_tracked(Path::new("/tmp/outside.md"), "no")
+            .is_err());
         assert!(st.append_document_tracked(&path, "   ").is_err());
     }
 
@@ -1525,12 +1533,11 @@ mod tests {
         assert!(st.rename_file(&link, "renamed.md").is_err());
         assert!(st.delete_file(&link).is_err());
         assert!(link.exists());
-        assert!(
-            !st.list_note_files()
-                .unwrap()
-                .iter()
-                .any(|file| file.path == link)
-        );
+        assert!(!st
+            .list_note_files()
+            .unwrap()
+            .iter()
+            .any(|file| file.path == link));
     }
 
     #[test]
@@ -1576,7 +1583,7 @@ mod tests {
         assert!(config.contains("max_concurrent_subagents = 4"));
         assert_eq!(
             fs::read_to_string(&st.settings_path).unwrap(),
-            "theme = \"default\"\n"
+            DEFAULT_SETTINGS
         );
         let loaded = st.load_theme(None).unwrap();
         assert_eq!(loaded.requested, "default");
@@ -1720,27 +1727,38 @@ mod tests {
     }
 
     #[test]
-    fn initial_settings_capture_editor_and_theme_changes_preserve_it() {
-        let with_editor = initial_settings(Some("code -w".to_string()));
-        assert_eq!(with_editor.editor.as_deref(), Some("code -w"));
-        assert!(
-            serialize_settings(&with_editor)
-                .unwrap()
-                .contains("editor = \"code -w\"")
-        );
-        assert_eq!(initial_settings(Some(" ".to_string())).editor, None);
+    fn optional_commands_and_theme_changes_preserve_settings_comments() {
+        let defaults: SettingsFile = toml::from_str(DEFAULT_SETTINGS).unwrap();
+        assert_eq!(defaults.editor, None);
+        assert_eq!(defaults.shell, None);
 
         let (_directory, storage) = fresh();
+        storage.write_theme_selection("custom").unwrap();
+        assert_eq!(
+            fs::read_to_string(&storage.settings_path).unwrap(),
+            DEFAULT_SETTINGS.replacen("theme = \"default\"", "theme = \"custom\"", 1)
+        );
+
         fs::write(
             &storage.settings_path,
-            "theme = \"default\"\neditor = \"hx\"\n",
+            "theme = \"default\"\neditor = \"hx\"\nshell = \"fish\"\n",
         )
         .unwrap();
         storage.write_theme_selection("custom").unwrap();
         let settings = storage.load_settings().unwrap();
         assert_eq!(settings.theme, "custom");
         assert_eq!(settings.editor.as_deref(), Some("hx"));
+        assert_eq!(settings.shell.as_deref(), Some("fish"));
         assert_eq!(storage.editor_command().unwrap(), "hx");
+        assert_eq!(storage.terminal_shell().unwrap().as_deref(), Some("fish"));
+
+        fs::write(
+            &storage.settings_path,
+            "theme = \"default\"\neditor = \"  \"\nshell = \"  \"\n",
+        )
+        .unwrap();
+        assert_eq!(storage.editor_command().unwrap(), "vi");
+        assert_eq!(storage.terminal_shell().unwrap(), None);
     }
 
     #[test]

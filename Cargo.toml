@@ -1,6 +1,6 @@
 [package]
 name = "nole"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "An Agent-driven terminal knowledge management system"
 license = "MIT"
@@ -35,11 +35,12 @@ serde_json = "1"
 serde_yml = "0.0.13"
 similar = "2"
 toml = "0.8"
+toml_edit = "0.22"
 tokio = { version = "1", features = ["fs", "macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 eventsource-stream = "0.2"
-vt100 = "0.15"
+alacritty_terminal = { version = "0.26", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
