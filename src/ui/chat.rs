@@ -175,14 +175,24 @@ pub(super) fn render_chat_entry(
             Vec::new(),
             Vec::new(),
         ),
-        crate::agent_session::AgentPanelEntry::Error(text) => (
-            vec![Line::from(Span::styled(
-                text.clone(),
-                Style::default().fg(theme.ui_error),
-            ))],
-            Vec::new(),
-            Vec::new(),
-        ),
+        crate::agent_session::AgentPanelEntry::Error(text) => {
+            let (body_start, _) = centered_daily_body_axis(width, PAGE_PADDING_X);
+            let padding = Span::raw(" ".repeat(body_start));
+            let mut lines = text
+                .lines()
+                .map(|line| {
+                    Line::from(vec![
+                        padding.clone(),
+                        Span::styled(line.to_string(), Style::default().fg(theme.ui_error)),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            if lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::default());
+            (lines, Vec::new(), Vec::new())
+        }
     }
 }
 
@@ -479,6 +489,21 @@ mod tests {
         );
         assert_eq!(ask_user[2].to_string(), format!("{padding}   └─ MBDown"));
         assert_eq!(ask_user[3].to_string(), "");
+
+        let error = render_chat_entry(
+            &AgentPanelEntry::Error("Agent failed: request timed out".to_string()),
+            80,
+            theme,
+        )
+        .0;
+        assert_eq!(error.len(), 2);
+        assert_eq!(
+            error[0].to_string(),
+            format!("{padding}Agent failed: request timed out")
+        );
+        assert_eq!(error[0].spans[1].style.fg, Some(theme.ui_error));
+        assert_eq!(error[1].to_string(), "");
+        assert_eq!(error[1].style.bg, None);
     }
 
     #[test]
