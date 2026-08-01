@@ -1491,6 +1491,47 @@ fn f_focuses_files_and_t_opens_the_todo_page() {
 }
 
 #[test]
+fn todo_filter_accepts_keyboard_and_paste_then_toggles_the_visible_task() {
+    let (mut app, _directory) = make_app();
+    add_daily_note(&mut app, "- [ ] write docs\n- [ ] fix release");
+    app.open_todo();
+
+    for character in ['f', 'i', 'x'] {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert_eq!(app.focus, Focus::Center, "filter characters stay in Todo");
+    assert_eq!(app.todo_query, "fix");
+    assert_eq!(app.visible_todo_indices(), vec![1]);
+    assert_eq!(app.todo_index, 1);
+
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Backspace));
+    app.handle_key(key(KeyCode::Char('i')));
+    app.handle_key(key(KeyCode::End));
+    app.handle_paste(" rele\nase");
+    assert_eq!(app.todo_query, "fix release");
+    assert_eq!(app.todo_cursor, app.todo_query.chars().count());
+
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.todo_items[1].checked);
+    assert!(!app.todo_items[0].checked);
+    assert_eq!(app.todo_query, "fix release");
+}
+
+#[test]
+fn todo_filter_with_no_matches_does_not_toggle_an_unrelated_task() {
+    let (mut app, _directory) = make_app();
+    add_daily_note(&mut app, "- [ ] write docs");
+    app.open_todo();
+    app.handle_paste("missing");
+
+    assert!(app.visible_todo_indices().is_empty());
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(!app.todo_items[0].checked);
+}
+
+#[test]
 fn workspace_view_registry_drives_sidebar_selection() {
     let (mut app, _directory) = make_app();
     assert_eq!(
@@ -1912,6 +1953,15 @@ fn single_line_search_inputs_edit_at_the_shared_character_cursor() {
     assert_eq!(app.search_query, "文档新");
     assert_eq!(app.search_cursor, 3);
 
+    app.open_todo();
+    app.handle_paste("文档ab");
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Backspace));
+    app.handle_key(key(KeyCode::Char('新')));
+    app.handle_key(key(KeyCode::Delete));
+    assert_eq!(app.todo_query, "文档新");
+    assert_eq!(app.todo_cursor, 3);
+
     app.focus = Focus::Files;
     app.files_context = FilesContext::Search;
     app.handle_paste("文档ab");
@@ -2294,6 +2344,11 @@ fn todo_navigation_follows_grouped_display_order() {
     assert_eq!(app.todo_index, 2);
     app.move_todo_selection(1);
     assert_eq!(app.todo_index, 0);
+
+    app.todo_query = "third".to_string();
+    app.ensure_visible_todo_selection();
+    assert_eq!(app.visible_todo_indices(), vec![2]);
+    assert_eq!(app.todo_index, 2);
 }
 
 #[test]

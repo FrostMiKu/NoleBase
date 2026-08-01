@@ -51,12 +51,16 @@ impl App {
         self.todo_items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| (!item.checked).then_some(index))
+            .filter_map(|(index, item)| {
+                (!item.checked && fuzzy_match(&item.text, &self.todo_query)).then_some(index)
+            })
             .chain(
                 self.todo_items
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, item)| item.checked.then_some(index)),
+                    .filter_map(|(index, item)| {
+                        (item.checked && fuzzy_match(&item.text, &self.todo_query)).then_some(index)
+                    }),
             )
             .collect()
     }
@@ -114,7 +118,9 @@ impl App {
             CenterView::Chat => self.agent_scroll = u16::MAX,
             CenterView::Todo => {
                 self.reload_todos();
-                self.todo_index = self.visible_todo_indices().first().copied().unwrap_or(0);
+                self.todo_query.clear();
+                self.todo_cursor = 0;
+                self.ensure_visible_todo_selection();
                 self.todo_list_start = 0;
             }
             CenterView::Search => {
@@ -647,6 +653,13 @@ impl App {
             .unwrap_or(0);
         let next = (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize;
         self.todo_index = visible[next];
+    }
+
+    pub(super) fn ensure_visible_todo_selection(&mut self) {
+        let visible = self.visible_todo_indices();
+        if !visible.contains(&self.todo_index) {
+            self.todo_index = visible.first().copied().unwrap_or(0);
+        }
     }
 
     pub(super) fn move_search_selection(&mut self, delta: i32) {

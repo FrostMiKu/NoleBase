@@ -1,9 +1,12 @@
 [package]
 name = "nole"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
-description = "Nole, a chat-style terminal note app"
+description = "An Agent-driven terminal knowledge management system"
 license = "MIT"
+repository = "https://github.com/FrostMiKu/NoleBase"
+readme = "README.md"
+exclude = [".github/**", "AGENTS.md"]
 
 [[bin]]
 name = "nole"

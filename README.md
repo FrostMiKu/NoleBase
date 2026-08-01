@@ -1,8 +1,19 @@
-# nole
+# NólëBase
 
-A small terminal note app with a chat-style workflow. Capture text into one
-daily card, then archive the day or move it into a Markdown note without
-leaving the keyboard.
+NólëBase is an Agent-driven terminal knowledge management system. It brings
+daily capture, Markdown and MBDown notes, semantic tags, task tracking, and an
+autonomous workspace Agent into one local-first TUI.
+
+Knowledge stays in plain files under `~/.nole`. The Agent can search, read,
+edit, organize, and connect that workspace through approval-gated tools, while
+capture and navigation remain fast, direct, and keyboard-driven.
+
+## Install
+
+```sh
+cargo install nole
+nole
+```
 
 ## Workspace
 
@@ -169,9 +180,9 @@ Errors leave the active input/context in place so they can be corrected.
 
 ### ToDo, documents, Search, and edit
 
-- **ToDo:** scans task-list items from every file in `daily/`. `j`/`k` or
-  arrows select; `Enter`, Space, or `x` toggles the checkbox in its source
-  daily file; `Esc`/`q` returns to Center.
+- **ToDo:** scans task-list items from every file in `daily/`. Typing filters
+  tasks, arrows select, and `Enter` toggles the checkbox in its source daily
+  file. `Esc` returns to Daily.
 - **Document:** arrows or `j`/`k` scroll; `PageUp`/`PageDown` move by pages;
   `i` or Enter focuses Compose; `Esc`/`q` closes. Sending from Compose appends
   to the current article, keeps it open, and scrolls directly to the new content.

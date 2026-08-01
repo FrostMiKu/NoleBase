@@ -226,7 +226,7 @@ fn draw_center(
     match app.center_view {
         CenterView::Daily => draw_daily(frame, app, area, content, interactive, cursor_position),
         CenterView::Chat => draw_chat(frame, app, area, content, interactive, cursor_position),
-        CenterView::Todo => draw_todo(frame, app, content, interactive),
+        CenterView::Todo => draw_todo(frame, app, content, interactive, cursor_position),
         CenterView::Document => draw_document(frame, app, content, interactive, cursor_position),
         CenterView::Search | CenterView::DocumentSearch => {
             draw_search(frame, app, content, interactive, cursor_position)

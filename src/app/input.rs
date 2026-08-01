@@ -124,6 +124,15 @@ impl App {
                 );
                 self.recompute_search();
             }
+            (Focus::Center, CenterView::Todo, _) => {
+                paste_into(
+                    &mut self.todo_query,
+                    &mut self.todo_cursor,
+                    &text.replace('\n', ""),
+                );
+                self.ensure_visible_todo_selection();
+                self.todo_list_start = 0;
+            }
             (Focus::Center, CenterView::Tags, _) => {
                 paste_into(
                     &mut self.tag_query,
@@ -196,7 +205,10 @@ impl App {
             || (self.focus == Focus::Center
                 && matches!(
                     self.center_view,
-                    CenterView::Search | CenterView::DocumentSearch | CenterView::Tags
+                    CenterView::Todo
+                        | CenterView::Search
+                        | CenterView::DocumentSearch
+                        | CenterView::Tags
                 ))
             || (self.focus == Focus::Files
                 && matches!(
@@ -424,31 +436,32 @@ impl App {
 
     pub(super) fn handle_todo(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc => {
                 self.activate_workspace_view(CenterView::Daily);
                 None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 self.move_todo_selection(1);
                 None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.move_todo_selection(-1);
                 None
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.open_files();
+            KeyCode::Enter => {
+                if self.visible_todo_indices().contains(&self.todo_index) {
+                    self.toggle_todo(self.todo_index);
+                }
                 None
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.open_workspace_views();
+            _ => {
+                let edit = edit_single_line(&mut self.todo_query, &mut self.todo_cursor, key);
+                if edit.changed() {
+                    self.ensure_visible_todo_selection();
+                    self.todo_list_start = 0;
+                }
                 None
             }
-            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('x') => {
-                self.toggle_todo(self.todo_index);
-                None
-            }
-            _ => None,
         }
     }
 
@@ -860,7 +873,11 @@ impl App {
             .find(|hitbox| point_in_rect(column, row, hitbox.area))
             .map(|hitbox| hitbox.index)
         {
-            self.activate_workspace_view(CenterView::Todo);
+            if self.center_view == CenterView::Todo {
+                self.focus = Focus::Center;
+            } else {
+                self.activate_workspace_view(CenterView::Todo);
+            }
             self.todo_index = index;
             self.toggle_todo(index);
             return None;

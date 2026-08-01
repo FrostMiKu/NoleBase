@@ -227,6 +227,8 @@ pub struct App {
     pub pending_file: Option<PathBuf>,
 
     pub todo_items: Vec<TodoItem>,
+    pub todo_query: String,
+    pub todo_cursor: usize,
     pub todo_index: usize,
     pub todo_list_start: usize,
     pub workspace_view_index: usize,
@@ -403,6 +405,8 @@ impl App {
             new_note_from_template: false,
             pending_file: None,
             todo_items,
+            todo_query: String::new(),
+            todo_cursor: 0,
             todo_index: 0,
             todo_list_start: 0,
             workspace_view_index: WorkspaceView::index_of(CenterView::Daily)
@@ -534,6 +538,7 @@ impl App {
     pub fn reload_todos(&mut self) {
         self.todo_items = self.storage.load_todo_tasks();
         self.todo_index = self.todo_index.min(self.todo_items.len().saturating_sub(1));
+        self.ensure_visible_todo_selection();
     }
 
     fn apply_loaded_theme(&mut self, loaded: LoadedTheme) {

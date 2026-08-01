@@ -1,6 +1,12 @@
 use super::*;
 
-pub(super) fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+pub(super) fn draw_todo(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    interactive: bool,
+    cursor_position: &mut Option<Position>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -19,21 +25,36 @@ pub(super) fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactiv
     );
     let done = app.todo_items.iter().filter(|item| item.checked).count();
     if header_height >= 3 {
-        frame.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(Padding::horizontal(1))
-                .title(format!(" Todo · {done}/{} ", app.todo_items.len()))
-                .style(Style::default().bg(app.theme.surface_panel))
-                .border_style(focus_border(app.focus == Focus::Center, app.theme)),
-            header,
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new(format!("Todo · {done}/{}", app.todo_items.len()))
-                .alignment(Alignment::Center),
-            header,
-        );
+        clear_widget(frame, header);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .title(format!(" Todo · {done}/{} ", app.todo_items.len()))
+            .style(Style::default().bg(app.theme.surface_panel))
+            .border_style(focus_border(app.focus == Focus::Center, app.theme));
+        let input = block.inner(header);
+        frame.render_widget(block, header);
+        if let Some(position) = draw_single_line_input(
+            frame,
+            input,
+            "/ ",
+            &app.todo_query,
+            app.todo_cursor,
+            app.focus == Focus::Center && interactive,
+            app.theme,
+        ) {
+            *cursor_position = Some(position);
+        }
+    } else if let Some(position) = draw_single_line_input(
+        frame,
+        header,
+        "/ ",
+        &app.todo_query,
+        app.todo_cursor,
+        app.focus == Focus::Center && interactive,
+        app.theme,
+    ) {
+        *cursor_position = Some(position);
     }
 
     let list_y = header.y.saturating_add(header.height).saturating_add(1);
@@ -58,6 +79,13 @@ pub(super) fn draw_todo(frame: &mut Frame, app: &mut App, area: Rect, interactiv
     }
 
     let visible_indices = app.visible_todo_indices();
+    if visible_indices.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matches").alignment(Alignment::Center),
+            list,
+        );
+        return;
+    }
     let selected = app.todo_index.min(app.todo_items.len().saturating_sub(1));
     let selected_position = visible_indices
         .iter()

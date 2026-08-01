@@ -1107,6 +1107,52 @@ fn search_input_renders_the_shared_cursor_position() {
 }
 
 #[test]
+fn todo_filter_renders_cursor_no_matches_and_filtered_selection_geometry() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Todo;
+    app.focus = Focus::Center;
+    app.todo_items = vec![
+        TodoItem {
+            checked: false,
+            text: "buy milk".to_string(),
+        },
+        TodoItem {
+            checked: false,
+            text: "write docs".to_string(),
+        },
+    ];
+    app.handle_paste("milk");
+    let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+
+    let mut end = None;
+    terminal.draw(|frame| end = draw(frame, &mut app)).unwrap();
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("/ milk"));
+    assert!(screen.contains("buy milk"));
+    assert!(!screen.contains("write docs"));
+    assert_eq!(app.todo_hitboxes.len(), 1);
+    assert_eq!(app.todo_hitboxes[0].index, 0);
+    let item = app.todo_hitboxes[0].area;
+    assert_eq!(item.y, app.layout.center.unwrap().y + 5);
+    for y in item.y.saturating_sub(1)..item.y + item.height {
+        assert_eq!(terminal.backend().buffer()[(item.x, y)].symbol(), "▌");
+    }
+
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    let mut moved = None;
+    terminal
+        .draw(|frame| moved = draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(moved.unwrap().x + 1, end.unwrap().x);
+
+    app.todo_query = "missing".to_string();
+    app.todo_cursor = app.todo_query.chars().count();
+    let terminal = render(&mut app, 80, 18);
+    assert!(buffer_string(&terminal).contains("No matches"));
+    assert!(app.todo_hitboxes.is_empty());
+}
+
+#[test]
 fn chat_compose_and_button_hitboxes_stay_inside_visible_center_viewport() {
     for width in [60, 80, 120, 169, 170, 171, 220] {
         let (mut app, _directory) = make_app();

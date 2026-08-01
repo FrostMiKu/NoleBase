@@ -135,7 +135,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
             }
             (Focus::Center, CenterView::Tags) => "type filter · ↑↓ select · Enter search",
             (Focus::Center, CenterView::Chat) => "i message · ↑↓ scroll · C clear",
-            (Focus::Center, CenterView::Todo) => "↑↓ select · Enter toggle",
+            (Focus::Center, CenterView::Todo) => "type filter · ↑↓ select · Enter toggle",
             (Focus::Center, _) => "# tags · Ctrl+P commands",
         };
     }
@@ -188,7 +188,7 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
             "i message · ↑↓ scroll · c cancel · C clear · ← files · → views"
         }
         (_, CenterView::Chat) => "i message · ↑↓ scroll · C clear session · ← files · → views",
-        (_, CenterView::Todo) => "↑↓ select · Enter toggle · ← files · → views · Esc daily",
+        (_, CenterView::Todo) => "type filter · ↑↓ select · Enter toggle · Esc daily",
         _ => "f files · t todo · Ctrl+P commands · ? help",
     }
 }
