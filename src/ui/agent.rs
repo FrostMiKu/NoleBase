@@ -794,7 +794,7 @@ pub(super) fn human_token_count(tokens: u64) -> String {
 /// Eight frames rotate a full braille pattern. Note: U+28xx is classified
 /// Wide in UAX #11, so terminals may render it two columns while ratatui's
 /// unicode-width reserves one; chosen deliberately by the user.
-const BRAILLE_SPINNER_FRAMES: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+const BRAILLE_SPINNER_FRAMES: [char; 8] = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾'];
 
 /// Spinner frame at `tick`, shared with the streaming card label.
 pub(super) fn spinner_frame(tick: u64) -> char {

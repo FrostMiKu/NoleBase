@@ -810,7 +810,7 @@ mod tests {
         // boxed[0] is the top pad row; boxed[1] carries spinner + label.
         assert_eq!(boxed[0].to_string().trim(), "");
         let top = &boxed[1];
-        assert!(top.to_string().starts_with(" \u{28fe} thinking"));
+        assert!(top.to_string().starts_with(" \u{28f7} thinking"));
         assert!(top
             .spans
             .iter()
@@ -887,7 +887,7 @@ mod tests {
             screen.contains("Calling Read File"),
             "active tool not rendered:\n{screen}"
         );
-        let (_, spinner_y) = find_text(&terminal, "\u{28fe} Calling Read File");
+        let (_, spinner_y) = find_text(&terminal, "\u{28f7} Calling Read File");
         let (_, detail_y) = find_text(&terminal, "data/Note.md");
         assert!(spinner_y < detail_y);
     }
@@ -1094,7 +1094,7 @@ mod tests {
         assert!(thinking.last().unwrap().to_string().trim().is_empty());
         assert_eq!(thinking.last().unwrap().style.bg, None);
         // The label row sits right under the top pad, spinner preserved.
-        assert!(thinking[1].to_string().starts_with(" \u{28fe} thinking"));
+        assert!(thinking[1].to_string().starts_with(" \u{28f7} thinking"));
     }
 
     #[test]
@@ -1113,7 +1113,7 @@ mod tests {
         );
         assert_eq!(
             running[0].to_string(),
-            format!("{padding} \u{28bf} Calling Read File...")
+            format!("{padding} \u{287f} Calling Read File...")
         );
         assert_eq!(
             running[1].to_string(),

@@ -599,7 +599,7 @@ fn running_agent_animates_its_border_and_current_activity_only() {
     let first_screen = buffer_string(&first);
 
     let completed = first_screen.find("• Completed Read File.").unwrap();
-    let active = first_screen.find("⣾ Fetching Web...").unwrap();
+    let active = first_screen.find("⣷ Fetching Web...").unwrap();
     let intermediate = first_screen
         .find("I will compare multiple sources.")
         .unwrap();
@@ -645,7 +645,7 @@ fn running_agent_animates_its_border_and_current_activity_only() {
 fn animated_activity_respects_terminal_cell_width() {
     let lines = animated_activity_lines("正在调用工具", 19, 4);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].to_string(), " ⡿ 正在调用工具");
+    assert_eq!(lines[0].to_string(), " ⢿ 正在调用工具");
     assert_eq!(lines[0].width(), 15);
     assert_eq!(
         lines[0]
@@ -675,7 +675,7 @@ fn tool_activity_places_detail_on_a_connected_second_line() {
         assert!(lines[1].to_string().ends_with('…'));
     }
     assert_eq!(static_lines[0].to_string(), " • Calling Read File...");
-    assert_eq!(animated_lines[0].to_string(), " ⡿ Calling Read File...");
+    assert_eq!(animated_lines[0].to_string(), " ⢿ Calling Read File...");
 
     assert_eq!(activity_lines("tool", 1)[0].width(), 1);
     assert_eq!(activity_lines("tool", 2)[0].width(), 2);
