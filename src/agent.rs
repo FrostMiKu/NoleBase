@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 #[cfg(test)]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read as IoRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -482,8 +482,7 @@ impl Agent {
             )));
         }
         agent.register(LoadSkill::new(&skills));
-        agent.register(ReadFile::new(nole_root, reads.clone())?);
-        agent.register(ListDirectory::new(nole_root)?);
+        agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
         agent.register(ListNotes::new(nole_root)?);
         agent.register(SearchContent::new(nole_root)?);
         agent.register(SearchFiles::new(nole_root)?);
@@ -518,9 +517,6 @@ impl Agent {
                 api_key: tavily_api_key.clone(),
             });
         }
-        agent.register(WebFetch {
-            client: client.clone(),
-        });
         let subagent_runtime = subagent::SubagentRuntime::new(
             &agent.config,
             agent.provider.clone(),

@@ -347,7 +347,7 @@
         .unwrap();
         let calls = [ToolCall {
             id: "tool-1".to_string(),
-            name: "read_file".to_string(),
+            name: "read".to_string(),
             input: json!({"path": "data/missing.md"}),
         }];
 
@@ -526,14 +526,14 @@
             .contains("config/agent-session.json: application-managed persisted Agent session"));
         assert!(prompt.contains("config/ai.toml: private credentials and AI settings"));
         assert!(prompt.contains("never read it or expose its contents"));
-        assert!(prompt.contains("Use list_directory on daily/ to discover dates"));
+        assert!(prompt.contains("Use read on daily/ (a directory) to discover dates"));
         assert!(prompt.contains("daily/: ordinary Markdown files named YYYY-MM-DD.md"));
         assert!(prompt.contains("Existing daily Markdown files may be read, edited, or deleted"));
         assert!(!prompt.contains("latest unchanged read_file snapshot"));
         assert!(!prompt.contains("approval"));
         assert!(!prompt.contains("bypass"));
         assert!(!prompt.contains("prevalidated"));
-        assert!(prompt.contains("Use web_fetch when you already have a URL"));
+        assert!(prompt.contains("Use read with a URL when you already have one"));
         assert!(prompt.contains("Delegate broad, multi-step exploration"));
         assert!(prompt.contains("internal work stays out of this conversation"));
         assert!(prompt.contains("Use direct read/search tools only for narrow lookups"));
@@ -781,16 +781,21 @@
             .unwrap();
         });
 
-        let tool = WebFetch {
-            client: build_http_client().unwrap(),
-        };
+        let tool = Read::new(
+            tempfile::tempdir().unwrap().path(),
+            Arc::new(ReadTracker::default()),
+            build_http_client().unwrap(),
+        )
+        .unwrap();
         let output = tool
-            .execute(&json!({"url": format!("http://{address}")}))
+            .execute(&json!({ "path": format!("http://{address}") }))
             .await
             .unwrap();
 
         server.join().unwrap();
-        assert_eq!(output, "runtime-safe response");
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["kind"], "web");
+        assert_eq!(parsed["content"], "runtime-safe response");
     }
 
     #[test]
@@ -808,7 +813,7 @@
         });
         assert!(edit.execute(&input).returns_err());
 
-        let read = ReadFile::new(directory.path(), reads).unwrap();
+        let read = Read::new(directory.path(), reads, build_http_client().unwrap()).unwrap();
         read.execute(&json!({"path": "data/note.md"})).unwrap();
         edit.execute(&input).unwrap();
         assert_eq!(
@@ -862,7 +867,7 @@
         let path = storage.data_dir.join("note.md");
         fs::write(&path, "valid\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/note.md"}))
             .unwrap();
@@ -940,7 +945,7 @@
             .unwrap();
         let existing = storage.skills_dir.join("existing.md");
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "skills/existing.md"}))
             .unwrap();
@@ -1021,7 +1026,7 @@
         let path = storage.data_dir.join("range.md");
         fs::write(&path, "zero\none\ntwo\nthree\nfour\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/range.md"}))
             .unwrap();
@@ -1063,7 +1068,7 @@
         fs::write(&path, &original).unwrap();
 
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
             .unwrap();
@@ -1075,7 +1080,7 @@
 
         fs::write(&path, &original).unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
             .unwrap();
@@ -1090,7 +1095,7 @@
 
         fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 1, "limit": 1}))
             .unwrap();
@@ -1113,7 +1118,7 @@
         let original = "| model | score |\n| --- | --- |\n| MM26 | 0.65 |\n";
         fs::write(&path, original).unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/table.md"}))
             .unwrap();
@@ -1151,7 +1156,7 @@
         let eof_path = storage.data_dir.join("eof.md");
         fs::write(&eof_path, "old").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/eof.md"}))
             .unwrap();
@@ -1167,7 +1172,7 @@
         let crlf_path = storage.data_dir.join("crlf.md");
         fs::write(&crlf_path, "old\r\nvalue\r\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/crlf.md"}))
             .unwrap();
@@ -1188,7 +1193,7 @@
         storage.ensure_files().unwrap();
         storage.append_daily("2026-07-27", "old").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .unwrap();
@@ -1270,7 +1275,7 @@
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("data/note.md"), "old\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        ReadFile::new(directory.path(), reads.clone())
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/note.md"}))
             .unwrap();

@@ -60,11 +60,13 @@ pub(crate) fn empty_response_diagnostic(
 
 pub(crate) fn tool_start_activity(call: &Value) -> String {
     let name = call.get("name").and_then(Value::as_str).unwrap_or("");
-    let target = tool_activity_target(call)
+    let raw_target = tool_activity_target(call);
+    let target = raw_target
+        .as_deref()
         .map(|target| format!("\n{target}"))
         .unwrap_or_default();
     match name {
-        "web_fetch" => format!("Fetching Web...{target}"),
+        "read" if raw_target.as_deref().is_some_and(is_url) => format!("Fetching Web...{target}"),
         "web_search" => format!("Searching Web...{target}"),
         _ => format!("Calling {}...{target}", tool_display_name(name)),
     }
@@ -94,7 +96,13 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
     };
     match name {
         "explore" => text("task"),
-        "web_fetch" => text("url").map(|url| web_base_url(&url)),
+        "read" => text("path").map(|path| {
+            if is_url(&path) {
+                web_base_url(&path)
+            } else {
+                path
+            }
+        }),
         "web_search" | "search_content" | "search_files" | "list_tags" => text("query"),
         "search_tag" => text("tag"),
         "rename_tag" => Some(format!("{} -> {}", text("from")?, text("to")?)),
@@ -126,6 +134,10 @@ pub(crate) fn web_base_url(value: &str) -> String {
         .map(|url| url.origin().ascii_serialization())
         .filter(|origin| origin != "null")
         .unwrap_or_else(|| value.to_string())
+}
+
+fn is_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
 }
 
 pub(crate) fn tool_display_name(name: &str) -> String {

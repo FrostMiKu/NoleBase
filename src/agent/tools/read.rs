@@ -1,4 +1,10 @@
-//! Read-only filesystem and note search tools.
+//! Read-only filesystem, note search, and unified read tools.
+//!
+//! The `read` tool is a parser registry: a target (file path, directory path, or
+//! http(s) URL) is resolved once, then each registered [`ReadParser`] is asked in
+//! order whether it handles that target. Registering a new format (for example a
+//! PDF parser) requires no change to the dispatch logic — only a new parser
+//! registered before the generic text-file parser.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +19,7 @@ use super::util::{
     DEFAULT_SEARCH_RESULTS, MAX_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
     MAX_SEARCH_SNIPPET_CHARS,
 };
+use super::web::{read_limited_http_body, web_fetch_content};
 use crate::agent::{canonical_root, ReadTracker, Tool, ToolExecutionPolicy};
 
 const DEFAULT_READ_LINES: usize = 200;
@@ -22,68 +29,218 @@ const MAX_DIRECTORY_RESULTS: usize = 2_000;
 const MAX_DIRECTORY_SCAN: usize = 10_000;
 const MAX_DIRECTORY_DEPTH: usize = 16;
 
-pub struct ReadFile {
-    root: PathBuf,
-    private_config: PathBuf,
-    reads: Arc<ReadTracker>,
+/// A resolved target for the unified `read` tool.
+#[derive(Clone, Debug)]
+pub(crate) enum Target {
+    File { path: PathBuf },
+    Directory { path: PathBuf },
+    Web { url: String },
 }
 
-impl ReadFile {
-    pub fn new(root: &Path, reads: Arc<ReadTracker>) -> Result<Self> {
+impl Target {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Target::File { .. } => "file",
+            Target::Directory { .. } => "directory",
+            Target::Web { .. } => "web",
+        }
+    }
+
+    /// Root-relative form for local paths, the URL for web targets.
+    pub(crate) fn display(&self, root: &Path) -> String {
+        match self {
+            Target::File { path } | Target::Directory { path } => listed_path(root, path),
+            Target::Web { url } => url.clone(),
+        }
+    }
+}
+
+/// Shared dependencies handed to every [`ReadParser`].
+pub(crate) struct ParseContext {
+    pub(crate) root: PathBuf,
+    pub(crate) reads: Arc<ReadTracker>,
+    pub(crate) client: reqwest::Client,
+}
+
+/// A reader for one kind of target. Implementations are tried in registration
+/// order; specific parsers must be registered before the generic text-file one.
+#[async_trait::async_trait]
+pub(crate) trait ReadParser: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn matches(&self, target: &Target) -> bool;
+
+    /// Parse the target into its structured JSON payload. The caller wraps the
+    /// result in the shared `{ "kind", "target", ... }` envelope.
+    async fn parse(&self, ctx: &ParseContext, target: &Target, input: &Value) -> Result<Value>;
+}
+
+pub struct Read {
+    ctx: ParseContext,
+    parsers: Vec<Box<dyn ReadParser>>,
+}
+
+impl Read {
+    pub fn new(root: &Path, reads: Arc<ReadTracker>, client: reqwest::Client) -> Result<Self> {
         let root = canonical_root(root)?;
-        let private_config = root.join("config/ai.toml");
-        Ok(Self {
-            private_config,
-            reads,
+        let ctx = ParseContext {
             root,
-        })
+            reads,
+            client,
+        };
+        // Order matters: the generic text-file parser must be tried last so a
+        // more specific file parser (for example PDF) can claim a target first.
+        let parsers: Vec<Box<dyn ReadParser>> = vec![
+            Box::new(WebParser),
+            Box::new(DirectoryParser),
+            Box::new(TextFileParser),
+        ];
+        Ok(Self { ctx, parsers })
+    }
+
+    /// Registers a parser ahead of the generic text-file parser so specific
+    /// formats (PDF, images, ...) get a chance to claim matching files first.
+    /// Intentionally unused until such a parser lands; kept as the documented
+    /// extension point for the registry.
+    #[allow(dead_code)]
+    pub fn register(&mut self, parser: impl ReadParser + 'static) {
+        let text_index = self
+            .parsers
+            .iter()
+            .position(|parser| parser.name() == "text_file")
+            .unwrap_or(self.parsers.len());
+        self.parsers.insert(text_index, Box::new(parser));
     }
 }
 
 #[async_trait::async_trait]
-impl Tool for ReadFile {
+impl Tool for Read {
     fn name(&self) -> &'static str {
-        "read_file"
+        "read"
     }
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::LocalRead
     }
+
     fn description(&self) -> &'static str {
-        "Read a paginated range from any UTF-8 text file by absolute path, or by a path relative to the Nole root (maximum 1 MB). offset is a zero-based line number. The response includes every returned line's absolute zero-based line number and text without its line ending."
+        "Read any target: a file (paginated UTF-8 text with absolute zero-based line numbers, maximum 1 MB), a directory (typed listing with metadata, sorting, and pagination), or an http(s) URL (HTML converted to Markdown). Local paths may be absolute or relative to the Nole root. The response is a structured object with a kind field (file, directory, or web) plus a target field identifying what was read."
     }
+
     fn input_schema(&self) -> Value {
         json!({
-            "type": "object", "properties": {
-                "path": { "type": "string" },
-                "offset": { "type": "integer", "minimum": 0, "default": 0 },
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path, directory path, or http(s) URL to read"
+                },
+                "offset": {
+                    "type": "integer", "minimum": 0, "default": 0,
+                    "description": "Zero-based line or entry offset (file and directory targets)"
+                },
                 "limit": {
                     "type": "integer", "minimum": 1,
-                    "maximum": MAX_READ_LINES, "default": DEFAULT_READ_LINES
+                    "maximum": MAX_READ_LINES, "default": DEFAULT_READ_LINES,
+                    "description": "Maximum lines or entries to return (file and directory targets)"
+                },
+                "depth": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": MAX_DIRECTORY_DEPTH, "default": 1,
+                    "description": "Directory recursion depth (directory targets only)"
+                },
+                "sort_by": {
+                    "type": "string",
+                    "enum": ["name", "type", "depth", "line_count", "created_at", "modified_at", "size"],
+                    "default": "name",
+                    "description": "Directory entry sort key (directory targets only)"
+                },
+                "order": {
+                    "type": "string", "enum": ["asc", "desc"], "default": "asc",
+                    "description": "Directory entry sort order (directory targets only)"
                 }
             },
             "required": ["path"], "additionalProperties": false
         })
     }
+
     async fn execute(&self, input: &Value) -> Result<String> {
-        let path = required_string(input, "path")?;
-        let path = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            self.root.join(path)
-        };
-        let path = async_fs::canonicalize(&path)
-            .await
-            .with_context(|| format!("resolving {}", path.display()))?;
-        if path == self.private_config {
-            bail!("AI configuration is private");
+        let target = resolve_target(&self.ctx, input).await?;
+        for parser in &self.parsers {
+            if parser.matches(&target) {
+                let mut payload = match parser.parse(&self.ctx, &target, input).await? {
+                    Value::Object(map) => map,
+                    _ => bail!("parser {} returned non-object payload", parser.name()),
+                };
+                payload.insert("kind".into(), json!(target.kind()));
+                payload.insert("target".into(), json!(target.display(&self.ctx.root)));
+                return serde_json::to_string_pretty(&Value::Object(payload))
+                    .context("encoding read result");
+            }
         }
-        let metadata = async_fs::metadata(&path)
+        bail!(
+            "no parser registered for {} target {}",
+            target.kind(),
+            target.display(&self.ctx.root)
+        )
+    }
+}
+
+/// Resolves the `path` argument into a concrete target, rejecting the private AI
+/// configuration before any parser sees it.
+async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
+    let requested = required_string(input, "path")?;
+    if requested.starts_with("https://") || requested.starts_with("http://") {
+        return Ok(Target::Web {
+            url: requested.to_string(),
+        });
+    }
+    let path = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        ctx.root.join(requested)
+    };
+    let path = async_fs::canonicalize(&path)
+        .await
+        .with_context(|| format!("resolving {}", path.display()))?;
+    let private_config = ctx.root.join("config/ai.toml");
+    if path == private_config {
+        bail!("AI configuration is private");
+    }
+    let metadata = async_fs::metadata(&path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    if metadata.is_file() {
+        Ok(Target::File { path })
+    } else if metadata.is_dir() {
+        Ok(Target::Directory { path })
+    } else {
+        bail!("path is not a regular file or directory: {}", path.display())
+    }
+}
+
+struct TextFileParser;
+
+#[async_trait::async_trait]
+impl ReadParser for TextFileParser {
+    fn name(&self) -> &'static str {
+        "text_file"
+    }
+
+    fn matches(&self, target: &Target) -> bool {
+        matches!(target, Target::File { .. })
+    }
+
+    async fn parse(&self, ctx: &ParseContext, target: &Target, input: &Value) -> Result<Value> {
+        let Target::File { path } = target else {
+            bail!("text_file parser received non-file target");
+        };
+        let metadata = async_fs::metadata(path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
             bail!("file must be a regular UTF-8 file no larger than 1 MB");
         }
-        let content = async_fs::read_to_string(&path)
+        let content = async_fs::read_to_string(path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
         let offset = optional_usize(input, "offset", 0, usize::MAX)?;
@@ -97,17 +254,15 @@ impl Tool for ReadFile {
             .enumerate()
             .map(|(index, text)| json!({ "line": start + index, "text": text }))
             .collect::<Vec<_>>();
-        self.reads
+        ctx.reads
             .mark_file(path.clone(), content, start, end, total_lines)?;
-        serde_json::to_string_pretty(&json!({
-            "path": display_path(&self.root, &path),
+        Ok(json!({
             "offset": start,
             "returned_lines": end - start,
             "total_lines": total_lines,
             "has_more": end < total_lines,
             "lines": returned_lines,
         }))
-        .context("encoding file read")
     }
 }
 
@@ -123,75 +278,22 @@ struct DirectoryEntryMetadata {
     size: Option<u64>,
 }
 
-pub struct ListDirectory {
-    root: PathBuf,
-}
-
-impl ListDirectory {
-    pub fn new(root: &Path) -> Result<Self> {
-        Ok(Self {
-            root: canonical_root(root)?,
-        })
-    }
-}
+struct DirectoryParser;
 
 #[async_trait::async_trait]
-impl Tool for ListDirectory {
+impl ReadParser for DirectoryParser {
     fn name(&self) -> &'static str {
-        "list_directory"
-    }
-    fn execution_policy(&self) -> ToolExecutionPolicy {
-        ToolExecutionPolicy::LocalRead
+        "directory"
     }
 
-    fn description(&self) -> &'static str {
-        "List files and subdirectories in any directory with type, nesting depth, extension, byte size, line count, creation time, and modification time. depth=1 lists direct children; larger values recurse without following symlinks. Supports metadata sorting and pagination."
+    fn matches(&self, target: &Target) -> bool {
+        matches!(target, Target::Directory { .. })
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "default": "." },
-                "depth": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": MAX_DIRECTORY_DEPTH, "default": 1
-                },
-                "sort_by": {
-                    "type": "string",
-                    "enum": ["name", "type", "depth", "line_count", "created_at", "modified_at", "size"],
-                    "default": "name"
-                },
-                "order": { "type": "string", "enum": ["asc", "desc"], "default": "asc" },
-                "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": MAX_DIRECTORY_RESULTS, "default": 200
-                }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let requested = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let requested_path = Path::new(requested);
-        let directory = if requested_path.is_absolute() {
-            requested_path.to_path_buf()
-        } else {
-            self.root.join(requested_path)
+    async fn parse(&self, ctx: &ParseContext, target: &Target, input: &Value) -> Result<Value> {
+        let Target::Directory { path } = target else {
+            bail!("directory parser received non-directory target");
         };
-        let directory = async_fs::canonicalize(&directory)
-            .await
-            .with_context(|| format!("resolving directory {}", directory.display()))?;
-        if !async_fs::metadata(&directory)
-            .await
-            .with_context(|| format!("reading metadata for {}", directory.display()))?
-            .is_dir()
-        {
-            bail!("path is not a directory: {}", directory.display());
-        }
-
         let depth = optional_usize(input, "depth", 1, MAX_DIRECTORY_DEPTH)?;
         let sort_by = input
             .get("sort_by")
@@ -210,7 +312,7 @@ impl Tool for ListDirectory {
         };
         let offset = optional_usize(input, "offset", 0, usize::MAX)?;
         let limit = optional_usize(input, "limit", 200, MAX_DIRECTORY_RESULTS)?;
-        let (mut entries, truncated) = directory_entries(&directory, depth).await?;
+        let (mut entries, truncated) = directory_entries(path, depth).await?;
         entries.sort_by(|a, b| {
             let ordering = match sort_by {
                 "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -236,7 +338,7 @@ impl Tool for ListDirectory {
             .iter()
             .map(|entry| {
                 json!({
-                    "path": listed_path(&self.root, &entry.path),
+                    "path": listed_path(&ctx.root, &entry.path),
                     "name": entry.name,
                     "type": entry.kind,
                     "depth": entry.depth,
@@ -248,8 +350,7 @@ impl Tool for ListDirectory {
                 })
             })
             .collect::<Vec<_>>();
-        serde_json::to_string_pretty(&json!({
-            "directory": listed_path(&self.root, &directory),
+        Ok(json!({
             "depth": depth,
             "sort_by": sort_by,
             "order": if descending { "desc" } else { "asc" },
@@ -260,7 +361,42 @@ impl Tool for ListDirectory {
             "scan_truncated": truncated,
             "entries": entries,
         }))
-        .context("encoding directory listing")
+    }
+}
+
+struct WebParser;
+
+#[async_trait::async_trait]
+impl ReadParser for WebParser {
+    fn name(&self) -> &'static str {
+        "web"
+    }
+
+    fn matches(&self, target: &Target) -> bool {
+        matches!(target, Target::Web { .. })
+    }
+
+    async fn parse(&self, ctx: &ParseContext, target: &Target, _input: &Value) -> Result<Value> {
+        let Target::Web { url } = target else {
+            bail!("web parser received non-web target");
+        };
+        let response = ctx
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?;
+        if !response.status().is_success() {
+            bail!("fetch returned HTTP {}", response.status());
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = read_limited_http_body(response, "response").await?;
+        let content = web_fetch_content(content_type.as_deref(), bytes)?;
+        Ok(json!({ "content": content }))
     }
 }
 
@@ -709,4 +845,51 @@ fn paginated_search_result(
         "matches": &matches[start..end],
     }))
     .context("encoding search results")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    struct FakeParser;
+
+    #[async_trait::async_trait]
+    impl ReadParser for FakeParser {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn matches(&self, target: &Target) -> bool {
+            matches!(target, Target::File { .. })
+        }
+
+        async fn parse(
+            &self,
+            _ctx: &ParseContext,
+            _target: &Target,
+            _input: &Value,
+        ) -> Result<Value> {
+            Ok(json!({ "parsed_by": "fake" }))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_dispatches_to_registered_parsers_before_text_file() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("sample.pdf"), b"%PDF-1.4").unwrap();
+        let mut read =
+            Read::new(directory.path(), Arc::new(ReadTracker::default()), reqwest::Client::new())
+                .unwrap();
+        read.register(FakeParser);
+
+        let output = read
+            .execute(&json!({ "path": "sample.pdf" }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["kind"], "file");
+        assert_eq!(parsed["parsed_by"], "fake");
+    }
 }

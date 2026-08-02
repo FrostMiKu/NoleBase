@@ -85,7 +85,7 @@
             Message::user("old request"),
             Message::assistant(vec![MessagePart::ToolUse(ToolCall {
                 id: "tool-1".to_string(),
-                name: "read_file".to_string(),
+                name: "read".to_string(),
                 input: json!({}),
             })]),
             Message::tool(ToolResult {
@@ -152,10 +152,10 @@
         create
             .execute(&json!({"path": "data/test.md", "content": "hello"}))
             .unwrap();
-        let read = ReadFile::new(directory.path(), Arc::new(ReadTracker::default())).unwrap();
+        let read = Read::new(directory.path(), Arc::new(ReadTracker::default()), build_http_client().unwrap()).unwrap();
         let result: Value =
             serde_json::from_str(&read.execute(&json!({"path": "data/test.md"})).unwrap()).unwrap();
-        assert_eq!(result["path"], "data/test.md");
+        assert_eq!(result["target"], "data/test.md");
         assert_eq!(result["lines"][0]["line"], 0);
         assert_eq!(result["lines"][0]["text"], "hello");
         assert_eq!(result["total_lines"], 1);
@@ -165,7 +165,7 @@
         fs::write(&outside, "outside").unwrap();
         let result: Value =
             serde_json::from_str(&read.execute(&json!({"path": outside})).unwrap()).unwrap();
-        assert!(result["path"]
+        assert!(result["target"]
             .as_str()
             .is_some_and(|path| Path::new(path).is_absolute()));
         assert_eq!(result["lines"][0]["line"], 0);
@@ -183,7 +183,7 @@
             .collect::<String>();
         fs::write(directory.path().join("data/large.md"), &content).unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
 
         let first: Value = serde_json::from_str(
@@ -221,7 +221,7 @@
         fs::write(&alpha, "alpha\n").unwrap();
         fs::write(&beta, "beta\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         read.execute(&json!({"path": "data/alpha.md"})).unwrap();
         read.execute(&json!({"path": "data/beta.md"})).unwrap();
         let alpha = fs::canonicalize(alpha).unwrap();
@@ -303,7 +303,7 @@
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("config/ai.toml"), "api_key='secret'").unwrap();
         fs::write(directory.path().join("daily/2026-07-27.md"), "daily entry").unwrap();
-        let read = ReadFile::new(directory.path(), Arc::new(ReadTracker::default())).unwrap();
+        let read = Read::new(directory.path(), Arc::new(ReadTracker::default()), build_http_client().unwrap()).unwrap();
         assert!(read
             .execute(&json!({"path": "config/ai.toml"}))
             .returns_err());
@@ -332,7 +332,7 @@
         fs::write(directory.path().join("MEMORY.md"), "old memory\n").unwrap();
 
         let reads = Arc::new(ReadTracker::default());
-        let read = ReadFile::new(directory.path(), reads.clone()).unwrap();
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
         let create = CreateFile::new(directory.path()).unwrap();
 
@@ -387,7 +387,12 @@
         fs::create_dir_all(storage.data_dir.join("Nested")).unwrap();
         fs::write(storage.data_dir.join("Alpha.md"), "one\ntwo\n").unwrap();
         fs::write(storage.data_dir.join("Nested/Beta.txt"), "three\n").unwrap();
-        let list = ListDirectory::new(directory.path()).unwrap();
+        let list = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            build_http_client().unwrap(),
+        )
+        .unwrap();
 
         let direct: Value = serde_json::from_str(
             &list
@@ -644,8 +649,8 @@
     #[test]
     fn tool_activity_uses_readable_names_and_identifying_arguments() {
         let fetch = json!({
-            "name": "web_fetch",
-            "input": {"url": "https://docs.example.com:8443/guide/page?q=private"}
+            "name": "read",
+            "input": {"path": "https://docs.example.com:8443/guide/page?q=private"}
         });
         assert_eq!(
             tool_start_activity(&fetch),
@@ -653,7 +658,7 @@
         );
         assert_eq!(
             tool_finish_activity(&fetch, None),
-            "Completed Web Fetch.\nhttps://docs.example.com:8443"
+            "Completed Read.\nhttps://docs.example.com:8443"
         );
 
         let search = json!({
@@ -666,16 +671,16 @@
         );
 
         let read = json!({
-            "name": "read_file",
+            "name": "read",
             "input": {"path": "data/project notes.md", "offset": 100}
         });
         assert_eq!(
             tool_start_activity(&read),
-            "Calling Read File...\ndata/project notes.md"
+            "Calling Read...\ndata/project notes.md"
         );
         assert_eq!(
             tool_finish_activity(&read, None),
-            "Completed Read File.\ndata/project notes.md"
+            "Completed Read.\ndata/project notes.md"
         );
         assert_eq!(tool_display_name("add_daily_entry"), "Add Daily Entry");
 
@@ -690,7 +695,7 @@
 
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
-            "Failed Read File: file not found\ndata/project notes.md"
+            "Failed Read: file not found\ndata/project notes.md"
         );
     }
 

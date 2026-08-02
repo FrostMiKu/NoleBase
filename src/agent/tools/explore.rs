@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::{
-    ListDirectory, ListNotes, ListTags, LoadSkill, ReadFile, SearchContent, SearchFiles, SearchTag,
-    WebFetch, WebSearch,
+    ListNotes, ListTags, LoadSkill, Read, SearchContent, SearchFiles, SearchTag,
+    WebSearch,
 };
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
@@ -38,8 +38,7 @@ impl Explore {
             runner: SubagentRunner::new(runtime, profile),
         };
         let reads = Arc::new(ReadTracker::default());
-        explore.register(ReadFile::new(root, reads)?);
-        explore.register(ListDirectory::new(root)?);
+        explore.register(Read::new(root, reads, client.clone())?);
         explore.register(ListNotes::new(root)?);
         explore.register(SearchContent::new(root)?);
         explore.register(SearchFiles::new(root)?);
@@ -52,7 +51,6 @@ impl Explore {
                 api_key: tavily_api_key,
             });
         }
-        explore.register(WebFetch { client });
         Ok(explore)
     }
 
@@ -243,7 +241,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(tool_names.contains(&"read_file"));
+        assert!(tool_names.contains(&"read"));
         assert!(tool_names.contains(&"search_files"));
         assert!(!tool_names.contains(&"explore"));
         assert!(!tool_names.contains(&"edit_file"));

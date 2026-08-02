@@ -104,7 +104,7 @@ Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never em
 ## Workspace
 Root: {root} (the user's `.nole` workspace)
 - data/: ordinary .md/.mb articles and notes; create them here by default.
-- daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read_file, edit_file, and delete_file tools as other text files.
+- daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read, edit_file, and delete_file tools as other text files.
 - archives/: archived daily and regular Markdown files.
 - themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
 - template.mb: editable content used only by Create note from template; ordinary New note does not use it.
@@ -119,10 +119,10 @@ Root: {root} (the user's `.nole` workspace)
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
 - Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. When several investigations are independent, call explore multiple times in the same response so they can run concurrently. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
-- Use list_directory on daily/ to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
+- Use read on daily/ (a directory) to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
 - Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
 - Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches, rename_file for file renames, and rename_tag for exact workspace-wide tag renames.
-- Use web_fetch when you already have a URL.
+- Use read with a URL when you already have one.
 {web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
 - Use open_file when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
 

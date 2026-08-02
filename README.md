@@ -441,20 +441,23 @@ Agent output, approval diffs, help, searches, file/Todo lists, and multiline
 inputs submit only their currently visible rows to Ratatui; off-screen rows are
 retained as scroll state rather than rendered.
 
-The Agent can read arbitrary text files with zero-based `offset`/`limit` line
-pagination. Each returned line includes its absolute zero-based line number
-and text without the line ending. It can write only inside the Nole directory,
-and fetch HTTP(S) text, converting HTML responses to Markdown. When
-configured, `web_search` queries Tavily with optional topic, depth, time range,
-answer, result-count, and included/excluded domain controls, then returns compact
-ranked results.
+The Agent reads through a single unified `read` tool that dispatches on its
+target: a file path returns paginated UTF-8 text with zero-based `offset`/`limit`
+line pagination, a directory path returns a typed listing, and an http(s) URL
+returns the fetched content (HTML converted to Markdown). Every response is a
+structured object with a `kind` field (`file`, `directory`, or `web`) plus a
+`target` field identifying what was read. The reader is a parser registry, so
+additional formats can be added by registering new parsers without changing the
+dispatch logic. When configured, `web_search` queries Tavily with optional topic,
+depth, time range, answer, result-count, and included/excluded domain controls,
+then returns compact ranked results.
 Every user prompt sent to the Agent includes the current local date and time.
-`read_file` defaults to 200 lines and accepts at most 2,000 lines per call. Its
-structured response includes the total line count and whether more content
+`read` on a file defaults to 200 lines and accepts at most 2,000 lines per call.
+Its structured response includes the total line count and whether more content
 remains. Paths under the Nole root are returned in root-relative form so they
 can be passed directly to other file tools.
 
-`list_directory` lists any directory by absolute path or a path relative to
+`read` on a directory lists any directory by absolute path or a path relative to
 the Nole root. `depth=1` returns direct children and values up to 16 include
 nested descendants without following symlinks. Each entry includes its type,
 depth, extension, byte size, line count for files up to 1 MB, and creation and
@@ -475,13 +478,13 @@ filename matching as the Files sidebar. Both search tools support result
 `create_file` creates new files and refuses existing paths. `edit_file` accepts
 one or more zero-based edits and preserves the rest of the file internally, so
 large files do not need to be read or submitted in full. `replace` operations
-use inclusive `start_line` and `end_line` values from the original `read_file`
+use inclusive `start_line` and `end_line` values from the original `read`
 snapshot; `insert` operations use a separate `line` value and insert before it.
 Each edit provides a `lines` array of complete lines without line-ending
 characters; the tool adds separators and never requires the Agent to repeat
 adjacent anchor text. Changed/deleted ranges must have been covered by
-`read_file` since the file last changed; insertions require adjacent anchor
-lines. Existing `daily/YYYY-MM-DD.md` files use the same `read_file`,
+`read` since the file last changed; insertions require adjacent anchor
+lines. Existing `daily/YYYY-MM-DD.md` files use the same `read`,
 `edit_file`, and `delete_file` operations as other Markdown files.
 `add_daily_entry` remains the high-level create-or-append operation and does not
 require approval. Its optional `date` uses `YYYY-MM-DD`; omitting it records

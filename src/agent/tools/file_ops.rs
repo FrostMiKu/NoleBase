@@ -41,7 +41,7 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Edit an existing UTF-8 file under the Nole root outside config/ using zero-based lines from the latest read_file result. Only previously read ranges and adjacent insertion anchors may change."
+        "Edit an existing UTF-8 file under the Nole root outside config/ using zero-based lines from the latest read result. Only previously read ranges and adjacent insertion anchors may change."
     }
 
     fn input_schema(&self) -> Value {
@@ -120,10 +120,10 @@ impl Tool for EditFile {
         let state = self
             .reads
             .file_state(&path)?
-            .context("edit_file requires read_file on the same path first")?;
+            .context("edit_file requires read on the same path first")?;
         if state.snapshot != old {
             self.reads.consume_file(&path)?;
-            bail!("file changed since read_file; read it again before editing");
+            bail!("file changed since read; read it again before editing");
         }
         let offsets = line_byte_offsets(&old);
         let total_lines = offsets.len().saturating_sub(1);

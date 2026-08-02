@@ -228,52 +228,7 @@ fn optional_string_array(
         .map(Some)
 }
 
-pub struct WebFetch {
-    pub client: Client,
-}
-
-#[async_trait::async_trait]
-impl Tool for WebFetch {
-    fn name(&self) -> &'static str {
-        "web_fetch"
-    }
-    fn execution_policy(&self) -> ToolExecutionPolicy {
-        ToolExecutionPolicy::Network
-    }
-    fn description(&self) -> &'static str {
-        "Fetch an HTTP or HTTPS URL (maximum 1 MB). HTML responses are converted to Markdown; other UTF-8 text is returned unchanged."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object", "properties": { "url": { "type": "string" } },
-            "required": ["url"], "additionalProperties": false
-        })
-    }
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let url = required_string(input, "url")?;
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            bail!("URL must use http or https");
-        }
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("fetching {url}"))?;
-        if !response.status().is_success() {
-            bail!("fetch returned HTTP {}", response.status());
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let bytes = read_limited_http_body(response, "response").await?;
-        web_fetch_content(content_type.as_deref(), bytes)
-    }
-}
-
-async fn read_limited_http_body(response: reqwest::Response, label: &str) -> Result<Vec<u8>> {
+pub(crate) async fn read_limited_http_body(response: reqwest::Response, label: &str) -> Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_FETCH_BYTES)
