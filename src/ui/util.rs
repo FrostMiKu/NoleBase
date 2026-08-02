@@ -278,7 +278,10 @@ pub(super) fn focus_border(focused: bool, theme: Theme) -> Style {
 pub(super) fn animated_color(position: usize, tick: u64, theme: Theme) -> Color {
     let stops = theme.animation_gradient.map(rgb_components);
     const STEPS: usize = 24;
-    let phase = (position + tick as usize * 3) % (stops.len() * STEPS);
+    // Phase walks backward along the character position as the tick advances,
+    // so the gradient flows left-to-right across the line (and clockwise along
+    // animated borders). Six phase steps per tick double the original speed.
+    let phase = (tick as usize * 6).wrapping_sub(position) % (stops.len() * STEPS);
     let stop = phase / STEPS;
     let amount = phase % STEPS;
     let from = stops[stop];
