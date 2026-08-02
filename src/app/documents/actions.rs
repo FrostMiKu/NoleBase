@@ -28,19 +28,6 @@ impl App {
                 self.focus = Focus::Files;
                 None
             }
-            Action::Archive => {
-                if let Some(note) = self.daily_note_clone(date) {
-                    match self.storage.archive_daily(&note.date.to_string()) {
-                        Ok(_) => {
-                            self.record_undo(UndoOp::Archive(note));
-                            self.set_status("Daily note archived");
-                            self.reload_workspace();
-                        }
-                        Err(error) => self.set_error(format!("Error: {error}")),
-                    }
-                }
-                None
-            }
             Action::New => {
                 self.pending_daily_date = Some(date);
                 self.new_file_input.clear();

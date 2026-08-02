@@ -152,7 +152,7 @@ use crate::agent::AskUserKind;
 use crate::agent::{ApprovalKind, ApprovalRequest};
 use crate::agent_session::AgentPanelEntry;
 use crate::app::{Document, DocumentKind, DocumentReturn};
-use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate};
+use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate, WikiLinkLocation};
 use crate::storage::Storage;
 
 fn make_app() -> (App, tempfile::TempDir) {
@@ -1289,27 +1289,33 @@ fn hashtags_are_clickable_in_daily_and_document_views() {
 }
 
 #[test]
-fn wikilink_choice_marks_archive_and_file_format_as_muted_metadata() {
+fn wikilink_choice_marks_location_and_file_format_as_muted_metadata() {
     let (mut app, directory) = make_app();
     app.wiki_link_target = Some("Project".to_string());
     app.wiki_link_candidates = vec![
         WikiLinkCandidate {
+            path: directory.path().join("daily/2026-08-02.md"),
+            location: WikiLinkLocation::Daily,
+        },
+        WikiLinkCandidate {
             path: directory.path().join("data/Project.md"),
-            archived: false,
+            location: WikiLinkLocation::Notes,
         },
         WikiLinkCandidate {
             path: directory.path().join("archives/Project.mb"),
-            archived: true,
+            location: WikiLinkLocation::Archives,
         },
     ];
     app.set_overlay(Overlay::WikiLinkChoice);
-    let terminal = render(&mut app, 100, 18);
+    let terminal = render(&mut app, 100, 20);
     let screen = buffer_string(&terminal);
+    assert!(screen.contains("2026-08-02.md"));
+    assert!(screen.contains("Daily"));
     assert!(screen.contains("Project.md"));
     assert!(screen.contains("MD"));
     assert!(screen.contains("Archived"));
     assert!(screen.contains("MB"));
-    assert_eq!(app.wiki_link_hitboxes.len(), 2);
+    assert_eq!(app.wiki_link_hitboxes.len(), 3);
 }
 
 #[test]

@@ -46,7 +46,6 @@ Messages are appended to `daily/YYYY-MM-DD.md` and all content from one day is
 shown as one card. Each card provides:
 
 - `move` — select an existing note in Files
-- `archive` — move the complete daily file into `archives/`
 - `new` — name a new note in Files and move it there
 - `edit` — edit that message in the configured editor through a temporary Markdown file
 - `del` — delete it after confirmation
@@ -54,6 +53,10 @@ shown as one card. Each card provides:
 
 Messages render Markdown directly in Daily. Press `v` when a dedicated document
 view is useful for scrolling through a long message.
+
+Wikilinks resolve matching filenames across `daily/`, `data/`, and `archives/`.
+When the same name exists in multiple locations, Nole shows a source-labelled
+chooser instead of silently preferring one copy.
 
 ## Markup
 
@@ -110,10 +113,10 @@ are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
 Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
-with the system default application. Clicking `[[wikilink]]` searches both
-`data/` and `archives/` by filename or filename stem. Multiple MD/MB matches
-open a chooser showing archive and format metadata; a missing note is created
-as a new `.md` file under `data/`.
+with the system default application. Clicking `[[wikilink]]` searches `daily/`,
+`data/`, and `archives/` by filename or filename stem. Multiple MD/MB matches
+open a chooser showing source and format metadata; a missing note is created as
+a new `.md` file under `data/`.
 
 Hashtags are an exact navigation layer over workspace search. Clicking a
 `#tag` in Daily or a document opens all lines carrying that exact tag, so
@@ -156,7 +159,7 @@ restarting Nole.
 | --- | --- |
 | `j`/`k`, `↓`/`↑` | select a message |
 | `g` / `G` | first / last message |
-| `m` / `a` / `n` | move / archive / new note |
+| `m` / `n` | move / new note |
 | `v` / `e` / `d` | view / edit / delete selected message |
 | `u` | undo the last move, delete, or edit |
 | `/` | search messages and files in Center |
@@ -228,8 +231,7 @@ MEMORY.md       # Agent-maintained persistent memory
 template.mb     # initial content for "Note: New from template"
 daily/         # chat cards; absent dates have no file
   YYYY-MM-DD.md
-archives/      # flat storage for archived daily cards and articles
-  YYYY-MM-DD.md
+archives/      # flat storage for archived articles
   <name>.md
   <name>.mb
 data/          # flat note storage

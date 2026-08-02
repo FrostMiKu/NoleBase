@@ -18,7 +18,6 @@ pub struct DailyNote {
 pub enum Action {
     Ai,
     Move,
-    Archive,
     New,
     View,
     Edit,
@@ -31,7 +30,6 @@ impl Action {
         match self {
             Action::Ai => "AI",
             Action::Move => "move",
-            Action::Archive => "archive",
             Action::New => "new",
             Action::View => "view",
             Action::Edit => "edit",
@@ -43,7 +41,6 @@ impl Action {
     pub fn all() -> &'static [Action] {
         &[
             Action::Move,
-            Action::Archive,
             Action::New,
             Action::Edit,
             Action::Delete,
@@ -67,10 +64,17 @@ pub enum LinkTarget {
     EmbeddedFile(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WikiLinkLocation {
+    Daily,
+    Notes,
+    Archives,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WikiLinkCandidate {
     pub path: PathBuf,
-    pub archived: bool,
+    pub location: WikiLinkLocation,
 }
 
 /// A recorded screen rectangle for a wikilink candidate in its chooser.

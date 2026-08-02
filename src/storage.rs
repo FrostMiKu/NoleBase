@@ -2,8 +2,7 @@
 //!
 //! Daily entries are persisted as one Markdown file per day under `daily/`.
 //! The first entry of a day creates `YYYY-MM-DD.md`; later entries append to it.
-//! `archives/` is a flat archive containing both whole daily files and articles
-//! moved from `data/`; archived daily files retain their `YYYY-MM-DD.md` names.
+//! `archives/` is flat storage for articles moved from `data/`.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -485,35 +484,6 @@ impl Storage {
         Ok(content)
     }
 
-    /// Move one daily file into archives without rewriting its contents.
-    pub fn archive_daily(&self, date: &str) -> Result<PathBuf> {
-        let date = parse_daily_date(date)?;
-        let source = self.daily_path(date);
-        let destination = self.archives_dir.join(date_file_name(date));
-        if destination.exists() {
-            bail!("archive already exists for {date}");
-        }
-        fs::rename(&source, &destination).with_context(|| {
-            format!(
-                "archiving daily note {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-        Ok(destination)
-    }
-
-    pub fn restore_archived_daily(&self, date: &str) -> Result<()> {
-        let date = parse_daily_date(date)?;
-        let source = self.archives_dir.join(date_file_name(date));
-        let destination = self.daily_path(date);
-        if destination.exists() {
-            bail!("daily note already exists for {date}");
-        }
-        fs::rename(source, destination)?;
-        Ok(())
-    }
-
     /// Restore a deleted or filed DailyNote.
     pub fn restore_daily(&self, note: &DailyNote) -> Result<()> {
         let path = self.daily_path(note.date);
@@ -738,6 +708,16 @@ impl Storage {
                 .set_len(receipt.original_len)?;
         }
         Ok(())
+    }
+
+    /// List daily Markdown files, newest date first.
+    pub fn list_daily_file_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut dates = self.daily_dates()?;
+        dates.reverse();
+        Ok(dates
+            .into_iter()
+            .map(|date| self.daily_path(date))
+            .collect())
     }
 
     /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
@@ -1123,24 +1103,6 @@ mod tests {
         let notes = st.load_daily_notes().unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].date.to_string(), "2026-07-26");
-    }
-
-    #[test]
-    fn archive_moves_the_complete_daily_file_and_can_restore_it() {
-        let (_dir, st) = fresh();
-        st.append_daily("2026-07-27", "first\n\n- [ ] task")
-            .unwrap();
-        let source = st.daily_dir.join("2026-07-27.md");
-        let original = fs::read_to_string(&source).unwrap();
-
-        let archived = st.archive_daily("2026-07-27").unwrap();
-        assert!(!source.exists());
-        assert_eq!(archived, st.archives_dir.join("2026-07-27.md"));
-        assert_eq!(fs::read_to_string(&archived).unwrap(), original);
-
-        st.restore_archived_daily("2026-07-27").unwrap();
-        assert_eq!(fs::read_to_string(source).unwrap(), original);
-        assert!(!archived.exists());
     }
 
     #[test]

@@ -19,15 +19,26 @@ impl App {
                 let requested = target.trim().to_string();
                 let mut candidates = self
                     .storage
-                    .list_note_files()
+                    .list_daily_file_paths()
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|note| wiki_name_matches(&note.path, &requested))
-                    .map(|note| WikiLinkCandidate {
-                        path: note.path,
-                        archived: false,
+                    .filter(|path| wiki_name_matches(path, &requested))
+                    .map(|path| WikiLinkCandidate {
+                        path,
+                        location: WikiLinkLocation::Daily,
                     })
                     .collect::<Vec<_>>();
+                candidates.extend(
+                    self.storage
+                        .list_note_files()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|note| wiki_name_matches(&note.path, &requested))
+                        .map(|note| WikiLinkCandidate {
+                            path: note.path,
+                            location: WikiLinkLocation::Notes,
+                        }),
+                );
                 candidates.extend(
                     self.storage
                         .list_archived_note_files()
@@ -36,7 +47,7 @@ impl App {
                         .filter(|note| wiki_name_matches(&note.path, &requested))
                         .map(|note| WikiLinkCandidate {
                             path: note.path,
-                            archived: true,
+                            location: WikiLinkLocation::Archives,
                         }),
                 );
                 if candidates.is_empty() {
@@ -62,10 +73,10 @@ impl App {
     }
 
     pub(in crate::app) fn open_wiki_candidate(&mut self, candidate: &WikiLinkCandidate) {
-        let source = if candidate.archived {
-            self.storage.read_archived_note_file(&candidate.path)
-        } else {
-            self.storage.read_note_file(&candidate.path)
+        let source = match candidate.location {
+            WikiLinkLocation::Daily => self.storage.read_document_file(&candidate.path),
+            WikiLinkLocation::Notes => self.storage.read_note_file(&candidate.path),
+            WikiLinkLocation::Archives => self.storage.read_archived_note_file(&candidate.path),
         };
         match source {
             Ok(source) => {

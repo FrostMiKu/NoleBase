@@ -208,7 +208,6 @@ pub(super) enum UndoOp {
         input: String,
     },
     Delete(DailyNote),
-    Archive(DailyNote),
     Move {
         daily_note: DailyNote,
         target: PathBuf,

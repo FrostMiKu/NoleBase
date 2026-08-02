@@ -217,12 +217,6 @@ impl App {
                 }
                 Err(error) => format!("Undo error: {error}"),
             },
-            UndoOp::Archive(note) => {
-                match self.storage.restore_archived_daily(&note.date.to_string()) {
-                    Ok(()) => "Undid archive".to_string(),
-                    Err(error) => format!("Undo error: {error}"),
-                }
-            }
         };
         if status.starts_with("Undo error:") {
             self.set_error(status);

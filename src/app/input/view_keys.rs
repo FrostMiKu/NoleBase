@@ -118,7 +118,6 @@ impl App {
                 None
             }
             KeyCode::Char('m') => self.act(Action::Move),
-            KeyCode::Char('a') => self.act(Action::Archive),
             KeyCode::Char('n') => self.act(Action::New),
             KeyCode::Char('v') => self.act(Action::View),
             KeyCode::Char('e') => self.act(Action::Edit),

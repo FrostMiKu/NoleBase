@@ -1981,9 +1981,9 @@ fn document_render_lru_evicts_the_oldest_entries() {
 }
 
 #[test]
-fn file_document_supports_rename_delete_and_archive_shortcuts() {
+fn file_document_archives_and_restores_date_named_articles_as_regular_notes() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage.data_dir.join("2026-08-02.md");
     fs::write(&path, "# Project\n").unwrap();
     app.reload_files();
     app.open_file_document(&path, DocumentReturn::Daily);
@@ -2003,15 +2003,35 @@ fn file_document_supports_rename_delete_and_archive_shortcuts() {
     app.handle_key(key(KeyCode::Esc));
 
     app.handle_key(key(KeyCode::Char('a')));
-    let archived = app.storage.archives_dir.join("Project.md");
+    let archived = app.storage.archives_dir.join("2026-08-02.md");
     assert!(!path.exists());
     assert!(archived.exists());
     assert_eq!(app.center_view, CenterView::Document);
     assert_eq!(
-        app.document.as_ref().map(|document| &document.kind),
-        Some(&DocumentKind::File(archived))
+        app.document
+            .as_ref()
+            .and_then(|document| match &document.kind {
+                DocumentKind::File(path) => Some(path),
+                _ => None,
+            }),
+        Some(&archived)
     );
     assert_eq!(app.status, "Note archived");
+
+    app.handle_key(key(KeyCode::Char('u')));
+    assert!(path.exists());
+    assert!(!archived.exists());
+    assert_eq!(app.center_view, CenterView::Document);
+    assert_eq!(
+        app.document
+            .as_ref()
+            .and_then(|document| match &document.kind {
+                DocumentKind::File(path) => Some(path),
+                _ => None,
+            }),
+        Some(&path)
+    );
+    assert_eq!(app.status, "Note restored");
 }
 
 #[test]
@@ -2100,9 +2120,22 @@ fn escape_from_document_search_returns_to_document() {
 }
 
 #[test]
-fn move_and_new_are_file_contexts() {
+fn daily_shortcuts_exclude_archive_and_keep_move_and_new_contexts() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "file this");
+    let daily_path = app
+        .storage
+        .daily_file_path(&app.selected_date().unwrap().to_string())
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(daily_path.is_file());
+    assert!(app
+        .storage
+        .archives_dir
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_none());
     app.handle_key(key(KeyCode::Char('m')));
     assert_eq!(app.focus, Focus::Files);
     assert_eq!(app.files_context, FilesContext::MoveTarget);
@@ -2559,30 +2592,43 @@ fn file_embed_clicks_open_existing_files_from_any_location() {
 }
 
 #[test]
-fn wikilink_chooses_between_data_and_archived_matches_and_creates_missing_notes() {
+fn wikilink_searches_daily_notes_and_chooses_between_all_matching_locations() {
     let (mut app, _directory) = make_app();
-    let data = app.storage.data_dir.join("Project.md");
-    let archived = app.storage.archives_dir.join("Project.md");
+    app.storage
+        .append_daily("2026-08-02", "daily version")
+        .unwrap();
+    let data = app.storage.data_dir.join("2026-08-02.md");
+    let archived = app.storage.archives_dir.join("2026-08-02.md");
     fs::write(&data, "data version").unwrap();
     fs::write(&archived, "archived version").unwrap();
     app.link_hitboxes.push(LinkHitbox {
-        target: LinkTarget::WikiLink("Project".to_string()),
+        target: LinkTarget::WikiLink("2026-08-02".to_string()),
         area: Rect::new(1, 1, 8, 1),
     });
+
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 1,
         row: 1,
         modifiers: KeyModifiers::NONE,
     });
+
     assert_eq!(app.overlay, Some(Overlay::WikiLinkChoice));
-    assert_eq!(app.wiki_link_candidates.len(), 2);
-    assert!(!app.wiki_link_candidates[0].archived);
-    assert!(app.wiki_link_candidates[1].archived);
-    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.wiki_link_candidates.len(), 3);
+    assert_eq!(
+        app.wiki_link_candidates
+            .iter()
+            .map(|candidate| candidate.location)
+            .collect::<Vec<_>>(),
+        vec![
+            WikiLinkLocation::Daily,
+            WikiLinkLocation::Notes,
+            WikiLinkLocation::Archives,
+        ]
+    );
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.overlay, None);
-    assert_eq!(app.document.as_ref().unwrap().source, "archived version");
+    assert_eq!(app.document.as_ref().unwrap().source, "daily version\n");
 
     app.document = None;
     app.center_view = CenterView::Daily;

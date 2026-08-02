@@ -21,7 +21,7 @@ use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSna
 use crate::model::{
     Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
     FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
-    TodoItem, WikiLinkCandidate, WikiLinkHitbox, WorkspaceViewHitbox,
+    TodoItem, WikiLinkCandidate, WikiLinkHitbox, WikiLinkLocation, WorkspaceViewHitbox,
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;

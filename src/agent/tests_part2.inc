@@ -504,6 +504,7 @@
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("#tag"));
         assert!(prompt.contains("[[wikilink]]"));
+        assert!(prompt.contains("Wikilinks resolve .md/.mb notes in daily/, data/, and archives/"));
         assert!(prompt.contains("![[file]]"));
         assert!(prompt.contains("Fenced mermaid code blocks render locally"));
         assert!(prompt.contains("must start a source line or follow whitespace"));
@@ -513,7 +514,7 @@
         assert!(prompt.contains("Nole root when emitted in the Agent panel"));
         assert!(prompt.contains("absolute paths may point outside Nole"));
         assert!(prompt.contains("A box border only accepts `single` or `none`"));
-        assert!(prompt.contains("archived daily and regular Markdown files"));
+        assert!(prompt.contains("regular Markdown files archived from data/"));
         assert!(prompt.contains("create them here by default"));
         assert!(prompt.contains("themes/: editable TOML theme definitions"));
         assert!(

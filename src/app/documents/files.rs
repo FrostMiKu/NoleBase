@@ -567,41 +567,6 @@ impl App {
             self.set_status("Select an archived note to restore");
             return;
         }
-        let daily_date = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .filter(|stem| {
-                path.extension().and_then(|ext| ext.to_str()) == Some("md")
-                    && chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d").is_ok()
-            });
-        if let Some(date) = daily_date {
-            match self.storage.restore_archived_daily(date) {
-                Ok(()) => {
-                    self.document_render_lru
-                        .remove(&DocumentKind::File(path.clone()));
-                    if self
-                        .document
-                        .as_ref()
-                        .is_some_and(|document| document.kind == DocumentKind::File(path.clone()))
-                    {
-                        self.document = None;
-                        self.center_view = CenterView::Daily;
-                        self.focus = Focus::Center;
-                    }
-                    self.reload_workspace();
-                    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                        .expect("daily archive name was already validated");
-                    if let Some(index) = self.daily_notes.iter().position(|note| note.date == date)
-                    {
-                        self.selected = index;
-                        self.reveal_selected_daily = true;
-                    }
-                    self.set_status("Daily note restored");
-                }
-                Err(error) => self.set_error(format!("Error: {error}")),
-            }
-            return;
-        }
         match self.storage.restore_archived_note(&path) {
             Ok(to) => {
                 self.retarget_open_document(&path, &to);

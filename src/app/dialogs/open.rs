@@ -315,10 +315,10 @@ impl App {
                             .extension()
                             .map(|extension| extension.to_string_lossy().to_ascii_uppercase())
                             .unwrap_or_else(|| "?".to_string());
-                        let hint = if candidate.archived {
-                            format!("Archived · {extension}")
-                        } else {
-                            extension
+                        let hint = match candidate.location {
+                            WikiLinkLocation::Daily => format!("Daily · {extension}"),
+                            WikiLinkLocation::Notes => extension,
+                            WikiLinkLocation::Archives => format!("Archived · {extension}"),
                         };
                         DialogOption::with_hint(filename, hint)
                     })
