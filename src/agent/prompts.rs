@@ -120,6 +120,7 @@ Root: {root} (the user's `.nole` workspace)
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
 - Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. When several investigations are independent, call explore multiple times in the same response so they can run concurrently. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
 - Use read on daily/ (a directory) to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
+- Local file reads return a `[path#TAG]` snapshot header followed by absolute one-based `N:text` rows. Pass that exact TAG to edit_file, edit only displayed lines or adjacent anchors, and read again after each successful edit before making another.
 - Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
 - Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches, rename_file for file renames, and rename_tag for exact workspace-wide tag renames.
 - Use read with a URL when you already have one.

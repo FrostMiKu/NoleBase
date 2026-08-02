@@ -41,7 +41,7 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Edit an existing UTF-8 file under the Nole root outside config/ using zero-based lines from the latest read result. Only previously read ranges and adjacent insertion anchors may change."
+        "Edit an existing UTF-8 file under the Nole root outside config/ using a `[path#TAG]` snapshot from read and one-based line anchors. The tag must match the latest read snapshot, and only displayed ranges or adjacent insertion anchors may change."
     }
 
     fn input_schema(&self) -> Value {
@@ -49,6 +49,11 @@ impl Tool for EditFile {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
+                "tag": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{4}$",
+                    "description": "Four-hex snapshot tag from the latest `[path#TAG]` read header"
+                },
                 "edits": {
                     "type": "array", "minItems": 1, "maxItems": 100,
                     "items": {
@@ -58,12 +63,12 @@ impl Tool for EditFile {
                                 "properties": {
                                     "operation": { "type": "string", "const": "replace" },
                                     "start_line": {
-                                        "type": "integer", "minimum": 0,
-                                        "description": "Zero-based first line to replace, inclusive"
+                                        "type": "integer", "minimum": 1,
+                                        "description": "One-based first line to replace, inclusive"
                                     },
                                     "end_line": {
-                                        "type": "integer", "minimum": 0,
-                                        "description": "Zero-based last line to replace, inclusive"
+                                        "type": "integer", "minimum": 1,
+                                        "description": "One-based last line to replace, inclusive"
                                     },
                                     "lines": {
                                         "type": "array",
@@ -79,8 +84,12 @@ impl Tool for EditFile {
                                 "properties": {
                                     "operation": { "type": "string", "const": "insert" },
                                     "line": {
-                                        "type": "integer", "minimum": 0,
-                                        "description": "Zero-based source line before which to insert; use the total line count to append"
+                                        "type": "integer", "minimum": 1,
+                                        "description": "One-based source line used as the insertion anchor"
+                                    },
+                                    "position": {
+                                        "type": "string", "enum": ["before", "after"],
+                                        "description": "Insert before or after the anchor line; use before line 1 for an empty file"
                                     },
                                     "lines": {
                                         "type": "array", "minItems": 1,
@@ -88,19 +97,20 @@ impl Tool for EditFile {
                                         "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
                                     }
                                 },
-                                "required": ["operation", "line", "lines"],
+                                "required": ["operation", "line", "position", "lines"],
                                 "additionalProperties": false
                             }
                         ]
                     }
                 }
             },
-            "required": ["path", "edits"], "additionalProperties": false
+            "required": ["path", "tag", "edits"], "additionalProperties": false
         })
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
         let relative = required_string(input, "path")?;
+        let tag = required_string(input, "tag")?;
         let edits = parse_line_edits(input)?;
         let unresolved = safe_relative(&self.root, relative)?;
         if fs::symlink_metadata(&unresolved)?.file_type().is_symlink() {
@@ -121,6 +131,9 @@ impl Tool for EditFile {
             .reads
             .file_state(&path)?
             .context("edit_file requires read on the same path first")?;
+        if !state.tag.eq_ignore_ascii_case(tag) {
+            bail!("snapshot tag mismatch for {relative}; read the file again before editing");
+        }
         if state.snapshot != old {
             self.reads.consume_file(&path)?;
             bail!("file changed since read; read it again before editing");
@@ -131,12 +144,15 @@ impl Tool for EditFile {
             if edit.end_line_exclusive > total_lines {
                 if edit.insertion {
                     bail!(
-                        "invalid insertion line {} for file with {total_lines} lines",
-                        edit.start_line
+                        "invalid insertion anchor for line {} in file with {total_lines} lines",
+                        edit.anchor_line
                     );
                 }
-                let end_line = edit.end_line_exclusive.saturating_sub(1);
-                bail!("invalid inclusive edit range {} through {end_line} for file with {total_lines} lines", edit.start_line);
+                bail!(
+                    "invalid inclusive edit range {} through {} for file with {total_lines} lines",
+                    edit.start_line + 1,
+                    edit.end_line_exclusive
+                );
             }
             state.ensure_edit_read(edit.start_line, edit.end_line_exclusive)?;
         }
@@ -173,6 +189,7 @@ pub struct LineEdit {
     end_line_exclusive: usize,
     lines: Vec<String>,
     insertion: bool,
+    anchor_line: usize,
 }
 
 pub fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
@@ -195,12 +212,11 @@ pub fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
                         bail!("replace start_line must not exceed inclusive end_line");
                     }
                     Ok(LineEdit {
-                        start_line,
-                        end_line_exclusive: end_line
-                            .checked_add(1)
-                            .context("end_line is too large")?,
+                        start_line: start_line - 1,
+                        end_line_exclusive: end_line,
                         lines,
                         insertion: false,
+                        anchor_line: start_line,
                     })
                 }
                 Some("insert") => {
@@ -208,11 +224,21 @@ pub fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
                         bail!("insert lines must not be empty");
                     }
                     let line = edit_line_number(value, "line")?;
+                    let position = value
+                        .get("position")
+                        .and_then(Value::as_str)
+                        .context("insert position must be 'before' or 'after'")?;
+                    let start_line = match position {
+                        "before" => line - 1,
+                        "after" => line,
+                        other => bail!("unsupported insert position: {other}"),
+                    };
                     Ok(LineEdit {
-                        start_line: line,
-                        end_line_exclusive: line,
+                        start_line,
+                        end_line_exclusive: start_line,
                         lines,
                         insertion: true,
+                        anchor_line: line,
                     })
                 }
                 Some(operation) => bail!("unsupported edit operation: {operation}"),
@@ -237,7 +263,8 @@ fn edit_line_number(value: &Value, field: &str) -> Result<usize> {
     let line = value
         .get(field)
         .and_then(Value::as_u64)
-        .with_context(|| format!("edit {field} must be a non-negative integer"))?;
+        .filter(|line| *line > 0)
+        .with_context(|| format!("edit {field} must be a positive one-based integer"))?;
     usize::try_from(line).with_context(|| format!("{field} is too large"))
 }
 

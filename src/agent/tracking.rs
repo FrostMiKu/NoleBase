@@ -1,4 +1,4 @@
-//! Tracks which file ranges the model has already read, to gate `edit_file`.
+//! Tracks hash-tagged file snapshots and read ranges to gate `edit_file`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,8 +15,22 @@ pub(crate) struct ReadTracker {
 #[derive(Clone)]
 pub(crate) struct FileReadState {
     pub(crate) snapshot: String,
+    pub(crate) tag: String,
     ranges: Vec<(usize, usize)>,
     total_lines: usize,
+}
+
+pub(crate) fn snapshot_tag(content: &str) -> String {
+    // Stable FNV-1a folded to the four hexadecimal digits used by hashline
+    // anchors. Exact snapshot equality remains the authoritative stale-write
+    // check; the compact tag is the model-facing handle.
+    let hash = content
+        .as_bytes()
+        .iter()
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        });
+    format!("{:04X}", (hash ^ (hash >> 16)) & 0xffff)
 }
 
 impl ReadTracker {
@@ -44,19 +58,22 @@ impl ReadTracker {
         start: usize,
         end: usize,
         total_lines: usize,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let tag = snapshot_tag(&content);
         let mut files = self
             .files
             .lock()
             .map_err(|_| anyhow::anyhow!("file read tracker lock poisoned"))?;
         let state = files.entry(path).or_insert_with(|| FileReadState {
             snapshot: content.clone(),
+            tag: tag.clone(),
             ranges: Vec::new(),
             total_lines,
         });
         if state.snapshot != content || state.total_lines != total_lines {
             *state = FileReadState {
                 snapshot: content,
+                tag: tag.clone(),
                 ranges: Vec::new(),
                 total_lines,
             };
@@ -74,7 +91,7 @@ impl ReadTracker {
             }
             state.ranges = merged;
         }
-        Ok(())
+        Ok(state.tag.clone())
     }
 
     pub(crate) fn file_state(&self, path: &Path) -> Result<Option<FileReadState>> {
@@ -106,9 +123,10 @@ impl FileReadState {
     pub(crate) fn ensure_edit_read(&self, start_line: usize, end_line: usize) -> Result<()> {
         if start_line < end_line {
             if !self.covers(start_line, end_line) {
-                let last_line = end_line.saturating_sub(1);
                 bail!(
-                    "edit_file must read changed zero-based lines {start_line} through {last_line} first"
+                    "edit_file must read changed lines {} through {} first",
+                    start_line + 1,
+                    end_line
                 );
             }
         } else if self.total_lines > 0 {
@@ -116,7 +134,9 @@ impl FileReadState {
             let anchor_end = (start_line + 1).min(self.total_lines);
             if !self.covers(anchor_start, anchor_end) {
                 bail!(
-                    "edit_file must read insertion anchor lines {anchor_start}..{anchor_end} first"
+                    "edit_file must read insertion anchor lines {} through {} first",
+                    anchor_start + 1,
+                    anchor_end
                 );
             }
         }

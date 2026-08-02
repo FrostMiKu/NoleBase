@@ -529,7 +529,9 @@
         assert!(prompt.contains("Use read on daily/ (a directory) to discover dates"));
         assert!(prompt.contains("daily/: ordinary Markdown files named YYYY-MM-DD.md"));
         assert!(prompt.contains("Existing daily Markdown files may be read, edited, or deleted"));
-        assert!(!prompt.contains("latest unchanged read_file snapshot"));
+        assert!(prompt.contains("Local file reads return a `[path#TAG]` snapshot header"));
+        assert!(prompt.contains("absolute one-based `N:text` rows"));
+        assert!(prompt.contains("read again after each successful edit"));
         assert!(!prompt.contains("approval"));
         assert!(!prompt.contains("bypass"));
         assert!(!prompt.contains("prevalidated"));
@@ -809,12 +811,20 @@
         let edit = EditFile::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
         let input = json!({
             "path": "data/note.md",
-            "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new"]}]
+            "tag": file_snapshot_tag(directory.path().join("data/note.md")),
+            "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["new"]}]
         });
         assert!(edit.execute(&input).returns_err());
 
         let read = Read::new(directory.path(), reads, build_http_client().unwrap()).unwrap();
         read.execute(&json!({"path": "data/note.md"})).unwrap();
+        let mut wrong_tag = input.clone();
+        wrong_tag["tag"] = json!(if input["tag"] == "0000" { "FFFF" } else { "0000" });
+        assert!(edit
+            .execute(&wrong_tag)
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot tag mismatch"));
         edit.execute(&input).unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("data/note.md")).unwrap(),
@@ -823,7 +833,8 @@
         assert!(edit
             .execute(&json!({
                 "path": "data/note.md",
-                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["again"]}]
+                "tag": file_snapshot_tag(directory.path().join("data/note.md")),
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["again"]}]
             }))
             .returns_err());
 
@@ -831,6 +842,35 @@
         assert!(create
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
             .returns_err());
+    }
+
+    #[test]
+    fn file_edit_rejects_a_hashline_snapshot_after_external_change() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("data")).unwrap();
+        fs::create_dir(directory.path().join("config")).unwrap();
+        fs::create_dir(directory.path().join("daily")).unwrap();
+        let path = directory.path().join("data/note.md");
+        fs::write(&path, "old\n").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
+        let output = read
+            .execute(&json!({"path": "data/note.md"}))
+            .unwrap();
+        assert!(output.starts_with(&format!("[data/note.md#{}]", snapshot_tag("old\n"))));
+
+        fs::write(&path, "changed elsewhere\n").unwrap();
+        let error = EditFile::new(directory.path(), bypass_gate(), reads)
+            .unwrap()
+            .execute(&json!({
+                "path": "data/note.md",
+                "tag": snapshot_tag("old\n"),
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["agent change"]}]
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("file changed since read"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "changed elsewhere\n");
     }
 
     #[test]
@@ -887,10 +927,11 @@
         let error = test_runtime()
             .block_on(edit.execute(&json!({
                 "path": "data/note.md",
+                "tag": file_snapshot_tag(&path),
                 "edits": [{
                     "operation": "replace",
-                    "start_line": 0,
-                    "end_line": 0,
+                    "start_line": 1,
+                    "end_line": 1,
                     "lines": ["[box border=double]", "body", "[/box]"]
                 }]
             })))
@@ -903,10 +944,11 @@
         let error = test_runtime()
             .block_on(edit.execute(&json!({
                 "path": "data/note.md",
+                "tag": file_snapshot_tag(&path),
                 "edits": [{
                     "operation": "replace",
-                    "start_line": 0,
-                    "end_line": 0,
+                    "start_line": 1,
+                    "end_line": 1,
                     "lines": ["```mermaid", "classDiagram", "class Agent~T~ {}", "```"]
                 }]
             })))
@@ -953,10 +995,11 @@
         let edit_error = edit
             .execute(&json!({
                 "path": "skills/existing.md",
+                "tag": file_snapshot_tag(&existing),
                 "edits": [{
                     "operation": "replace",
-                    "start_line": 1,
-                    "end_line": 1,
+                    "start_line": 2,
+                    "end_line": 2,
                     "lines": ["desc: Wrong field"]
                 }]
             }))
@@ -1031,13 +1074,25 @@
             .execute(&json!({"path": "data/range.md"}))
             .unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let schema = edit.input_schema();
+        assert_eq!(schema["required"], json!(["path", "tag", "edits"]));
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["oneOf"][0]["properties"]
+                ["start_line"]["minimum"],
+            1
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["oneOf"][1]["required"],
+            json!(["operation", "line", "position", "lines"])
+        );
 
         edit.execute(&json!({
             "path": "data/range.md",
+            "tag": file_snapshot_tag(&path),
             "edits": [{
                 "operation": "replace",
-                "start_line": 1,
-                "end_line": 3,
+                "start_line": 2,
+                "end_line": 4,
                 "lines": ["replacement"]
             }]
         }))
@@ -1074,7 +1129,8 @@
             .unwrap();
         edit.execute(&json!({
             "path": "data/large.md",
-            "edits": [{"operation": "replace", "start_line": 10, "end_line": 10, "lines": ["changed 10"]}]
+            "tag": file_snapshot_tag(&path),
+            "edits": [{"operation": "replace", "start_line": 11, "end_line": 11, "lines": ["changed 10"]}]
         }))
         .unwrap();
 
@@ -1087,11 +1143,12 @@
         let error = edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"operation": "replace", "start_line": 2, "end_line": 2, "lines": ["changed 2"]}]
+                "tag": file_snapshot_tag(&path),
+                "edits": [{"operation": "replace", "start_line": 3, "end_line": 3, "lines": ["changed 2"]}]
             }))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("changed zero-based lines 2 through 2"));
+        assert!(error.contains("changed lines 3 through 3"));
 
         fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
@@ -1102,11 +1159,12 @@
         let error = edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"operation": "insert", "line": 1, "lines": ["inserted"]}]
+                "tag": file_snapshot_tag(&path),
+                "edits": [{"operation": "insert", "line": 2, "position": "before", "lines": ["inserted"]}]
             }))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("insertion anchor lines 0..2"));
+        assert!(error.contains("insertion anchor lines 1 through 2"));
     }
 
     #[test]
@@ -1127,9 +1185,11 @@
         let error = edit
             .execute(&json!({
                 "path": "data/table.md",
+                "tag": file_snapshot_tag(&path),
                 "edits": [{
                     "operation": "insert",
-                    "line": 2,
+                    "line": 3,
+                    "position": "before",
                     "lines": ["| SAC | 0.639 |\n| MM26"]
                 }]
             }))
@@ -1141,9 +1201,11 @@
 
         edit.execute(&json!({
                 "path": "data/table.md",
+                "tag": file_snapshot_tag(&path),
                 "edits": [{
                     "operation": "insert",
-                    "line": 2,
+                    "line": 3,
+                    "position": "before",
                     "lines": ["| SAC | 0.639 |"]
                 }]
         }))
@@ -1164,7 +1226,8 @@
             .unwrap()
             .execute(&json!({
                 "path": "data/eof.md",
-                "edits": [{"operation": "insert", "line": 1, "lines": ["new"]}]
+                "tag": file_snapshot_tag(&eof_path),
+                "edits": [{"operation": "insert", "line": 1, "position": "after", "lines": ["new"]}]
             }))
             .unwrap();
         assert_eq!(fs::read_to_string(&eof_path).unwrap(), "old\nnew\n");
@@ -1180,7 +1243,8 @@
             .unwrap()
             .execute(&json!({
                 "path": "data/crlf.md",
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["changed"]}]
+                "tag": file_snapshot_tag(&crlf_path),
+                "edits": [{"operation": "replace", "start_line": 2, "end_line": 2, "lines": ["changed"]}]
             }))
             .unwrap();
         assert_eq!(fs::read_to_string(crlf_path).unwrap(), "old\r\nchanged\r\n");
@@ -1201,7 +1265,8 @@
             .unwrap()
             .execute(&json!({
                 "path": "daily/2026-07-27.md",
-                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["edited"]}]
+                "tag": file_snapshot_tag(storage.daily_file_path("2026-07-27").unwrap()),
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["edited"]}]
             }))
             .unwrap();
         assert_eq!(storage.load_daily_notes().unwrap()[0].body, "edited");
@@ -1291,7 +1356,8 @@
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(edit.execute(&json!({
                 "path": "data/note.md",
-                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new"]}]
+                "tag": snapshot_tag("old\n"),
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["new"]}]
             })))
         });
 

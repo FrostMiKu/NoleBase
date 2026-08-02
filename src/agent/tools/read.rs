@@ -6,6 +6,7 @@
 //! PDF parser) requires no change to the dispatch logic — only a new parser
 //! registered before the generic text-file parser.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use super::util::{
     MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::web::{read_limited_http_body, web_fetch_content};
-use crate::agent::{canonical_root, ReadTracker, Tool, ToolExecutionPolicy};
+use crate::agent::{canonical_root, snapshot_tag, ReadTracker, Tool, ToolExecutionPolicy};
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
@@ -62,6 +63,11 @@ pub(crate) struct ParseContext {
     pub(crate) client: reqwest::Client,
 }
 
+pub(crate) enum ReadPayload {
+    Text(String),
+    Structured(Value),
+}
+
 /// A reader for one kind of target. Implementations are tried in registration
 /// order; specific parsers must be registered before the generic text-file one.
 #[async_trait::async_trait]
@@ -70,9 +76,12 @@ pub(crate) trait ReadParser: Send + Sync {
 
     fn matches(&self, target: &Target) -> bool;
 
-    /// Parse the target into its structured JSON payload. The caller wraps the
-    /// result in the shared `{ "kind", "target", ... }` envelope.
-    async fn parse(&self, ctx: &ParseContext, target: &Target, input: &Value) -> Result<Value>;
+    async fn parse(
+        &self,
+        ctx: &ParseContext,
+        target: &Target,
+        input: &Value,
+    ) -> Result<ReadPayload>;
 }
 
 pub struct Read {
@@ -123,7 +132,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read any target: a file (paginated UTF-8 text with absolute zero-based line numbers, maximum 1 MB), a directory (typed listing with metadata, sorting, and pagination), or an http(s) URL (HTML converted to Markdown). Local paths may be absolute or relative to the Nole root. The response is a structured object with a kind field (file, directory, or web) plus a target field identifying what was read."
+        "Read any target: a local UTF-8 file as hashline text (`[path#TAG]` plus absolute one-based `N:text` rows), a directory as a typed JSON listing, or an http(s) URL as structured extracted content. File reads are paginated, limited to 1 MB, and their snapshot tag and visible ranges gate edit_file."
     }
 
     fn input_schema(&self) -> Value {
@@ -136,7 +145,7 @@ impl Tool for Read {
                 },
                 "offset": {
                     "type": "integer", "minimum": 0, "default": 0,
-                    "description": "Zero-based line or entry offset (file and directory targets)"
+                    "description": "Number of preceding lines or entries to skip (file and directory targets)"
                 },
                 "limit": {
                     "type": "integer", "minimum": 1,
@@ -167,14 +176,18 @@ impl Tool for Read {
         let target = resolve_target(&self.ctx, input).await?;
         for parser in &self.parsers {
             if parser.matches(&target) {
-                let mut payload = match parser.parse(&self.ctx, &target, input).await? {
-                    Value::Object(map) => map,
-                    _ => bail!("parser {} returned non-object payload", parser.name()),
+                return match parser.parse(&self.ctx, &target, input).await? {
+                    ReadPayload::Text(text) => Ok(text),
+                    ReadPayload::Structured(Value::Object(mut payload)) => {
+                        payload.insert("kind".into(), json!(target.kind()));
+                        payload.insert("target".into(), json!(target.display(&self.ctx.root)));
+                        serde_json::to_string_pretty(&Value::Object(payload))
+                            .context("encoding read result")
+                    }
+                    ReadPayload::Structured(_) => {
+                        bail!("parser {} returned non-object payload", parser.name())
+                    }
                 };
-                payload.insert("kind".into(), json!(target.kind()));
-                payload.insert("target".into(), json!(target.display(&self.ctx.root)));
-                return serde_json::to_string_pretty(&Value::Object(payload))
-                    .context("encoding read result");
             }
         }
         bail!(
@@ -233,7 +246,12 @@ impl ReadParser for TextFileParser {
         matches!(target, Target::File { .. })
     }
 
-    async fn parse(&self, ctx: &ParseContext, target: &Target, input: &Value) -> Result<Value> {
+    async fn parse(
+        &self,
+        ctx: &ParseContext,
+        target: &Target,
+        input: &Value,
+    ) -> Result<ReadPayload> {
         let Target::File { path } = target else {
             bail!("text_file parser received non-file target");
         };
@@ -252,20 +270,23 @@ impl ReadParser for TextFileParser {
         let total_lines = lines.len();
         let start = offset.min(total_lines);
         let end = start.saturating_add(limit).min(total_lines);
-        let returned_lines = lines[start..end]
-            .iter()
-            .enumerate()
-            .map(|(index, text)| json!({ "line": start + index, "text": text }))
-            .collect::<Vec<_>>();
-        ctx.reads
+        let tag = snapshot_tag(&content);
+        let target = listed_path(&ctx.root, path);
+        let mut output = format!("[{target}#{tag}]");
+        for (index, text) in lines[start..end].iter().enumerate() {
+            write!(output, "\n{}:{text}", start + index + 1)?;
+        }
+        let first = if start < end { start + 1 } else { 0 };
+        write!(output, "\n\n[Showing lines {first}-{end} of {total_lines}")?;
+        if end < total_lines {
+            write!(output, ". Use offset {end} to continue")?;
+        }
+        output.push(']');
+        let tracked_tag = ctx
+            .reads
             .mark_file(path.clone(), content, start, end, total_lines)?;
-        Ok(json!({
-            "offset": start,
-            "returned_lines": end - start,
-            "total_lines": total_lines,
-            "has_more": end < total_lines,
-            "lines": returned_lines,
-        }))
+        debug_assert_eq!(tag, tracked_tag);
+        Ok(ReadPayload::Text(output))
     }
 }
 
@@ -293,7 +314,12 @@ impl ReadParser for DirectoryParser {
         matches!(target, Target::Directory { .. })
     }
 
-    async fn parse(&self, ctx: &ParseContext, target: &Target, input: &Value) -> Result<Value> {
+    async fn parse(
+        &self,
+        ctx: &ParseContext,
+        target: &Target,
+        input: &Value,
+    ) -> Result<ReadPayload> {
         let Target::Directory { path } = target else {
             bail!("directory parser received non-directory target");
         };
@@ -353,7 +379,7 @@ impl ReadParser for DirectoryParser {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({
+        Ok(ReadPayload::Structured(json!({
             "depth": depth,
             "sort_by": sort_by,
             "order": if descending { "desc" } else { "asc" },
@@ -363,7 +389,7 @@ impl ReadParser for DirectoryParser {
             "has_more": end < total,
             "scan_truncated": truncated,
             "entries": entries,
-        }))
+        })))
     }
 }
 
@@ -379,7 +405,12 @@ impl ReadParser for WebParser {
         matches!(target, Target::Web { .. })
     }
 
-    async fn parse(&self, ctx: &ParseContext, target: &Target, _input: &Value) -> Result<Value> {
+    async fn parse(
+        &self,
+        ctx: &ParseContext,
+        target: &Target,
+        _input: &Value,
+    ) -> Result<ReadPayload> {
         let Target::Web { url } = target else {
             bail!("web parser received non-web target");
         };
@@ -399,7 +430,7 @@ impl ReadParser for WebParser {
             .map(str::to_string);
         let bytes = read_limited_http_body(response, "response").await?;
         let content = web_fetch_content(content_type.as_deref(), bytes)?;
-        Ok(json!({ "content": content }))
+        Ok(ReadPayload::Structured(json!({ "content": content })))
     }
 }
 
@@ -873,8 +904,8 @@ mod tests {
             _ctx: &ParseContext,
             _target: &Target,
             _input: &Value,
-        ) -> Result<Value> {
-            Ok(json!({ "parsed_by": "fake" }))
+        ) -> Result<ReadPayload> {
+            Ok(ReadPayload::Structured(json!({ "parsed_by": "fake" })))
         }
     }
 

@@ -1,6 +1,10 @@
     use super::*;
     use super::test_support::*;
 
+    fn file_snapshot_tag(path: impl AsRef<std::path::Path>) -> String {
+        snapshot_tag(&fs::read_to_string(path).unwrap())
+    }
+
     #[test]
     fn agent_config_defaults_to_twenty_five_rounds_and_validates_overrides() {
         let directory = tempfile::tempdir().unwrap();
@@ -152,24 +156,25 @@
         create
             .execute(&json!({"path": "data/test.md", "content": "hello"}))
             .unwrap();
-        let read = Read::new(directory.path(), Arc::new(ReadTracker::default()), build_http_client().unwrap()).unwrap();
-        let result: Value =
-            serde_json::from_str(&read.execute(&json!({"path": "data/test.md"})).unwrap()).unwrap();
-        assert_eq!(result["target"], "data/test.md");
-        assert_eq!(result["lines"][0]["line"], 0);
-        assert_eq!(result["lines"][0]["text"], "hello");
-        assert_eq!(result["total_lines"], 1);
-        assert_eq!(result["has_more"], false);
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            build_http_client().unwrap(),
+        )
+        .unwrap();
+        let result = read
+            .execute(&json!({"path": "data/test.md"}))
+            .unwrap();
+        assert!(result.starts_with(&format!("[data/test.md#{}]", snapshot_tag("hello"))));
+        assert!(result.contains("\n1:hello\n"));
+        assert!(result.ends_with("[Showing lines 1-1 of 1]"));
         let outside_directory = tempfile::tempdir().unwrap();
         let outside = outside_directory.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
-        let result: Value =
-            serde_json::from_str(&read.execute(&json!({"path": outside})).unwrap()).unwrap();
-        assert!(result["target"]
-            .as_str()
-            .is_some_and(|path| Path::new(path).is_absolute()));
-        assert_eq!(result["lines"][0]["line"], 0);
-        assert_eq!(result["lines"][0]["text"], "outside");
+        let result = read.execute(&json!({"path": outside})).unwrap();
+        let header = result.lines().next().unwrap();
+        assert!(header.starts_with("[/") && header.contains("outside.txt#") && header.ends_with(']'));
+        assert!(result.contains("\n1:outside\n"));
     }
 
     #[test]
@@ -186,27 +191,29 @@
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
 
-        let first: Value = serde_json::from_str(
-            &read
-                .execute(&json!({"path": "data/large.md", "offset": 0, "limit": 200}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first["returned_lines"], 200);
-        assert_eq!(first["total_lines"], 450);
-        assert_eq!(first["has_more"], true);
+        let first = read
+            .execute(&json!({"path": "data/large.md", "offset": 0, "limit": 200}))
+            .unwrap();
+        assert!(first.starts_with("[data/large.md#"));
+        assert!(first.contains("\n1:line 0\n"));
+        assert!(first.ends_with("[Showing lines 1-200 of 450. Use offset 200 to continue]"));
         assert!(edit
             .execute(&json!({
                 "path": "data/large.md",
-                "edits": [{"operation": "insert", "line": 450, "lines": ["done"]}]
+                "tag": snapshot_tag(&content),
+                "edits": [{"operation": "insert", "line": 450, "position": "after", "lines": ["done"]}]
             }))
             .returns_err());
 
-        read.execute(&json!({"path": "data/large.md", "offset": 400, "limit": 50}))
+        let last = read
+            .execute(&json!({"path": "data/large.md", "offset": 400, "limit": 50}))
             .unwrap();
+        assert_eq!(first.lines().next(), last.lines().next());
+        assert!(last.ends_with("[Showing lines 401-450 of 450]"));
         edit.execute(&json!({
             "path": "data/large.md",
-            "edits": [{"operation": "insert", "line": 450, "lines": ["done"]}]
+            "tag": snapshot_tag(&content),
+            "edits": [{"operation": "insert", "line": 450, "position": "after", "lines": ["done"]}]
         }))
         .unwrap();
     }
@@ -307,14 +314,11 @@
         assert!(read
             .execute(&json!({"path": "config/ai.toml"}))
             .returns_err());
-        let daily: Value = serde_json::from_str(
-            &read
-                .execute(&json!({"path": "daily/2026-07-27.md"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(daily["lines"][0]["line"], 0);
-        assert_eq!(daily["lines"][0]["text"], "daily entry");
+        let daily = read
+            .execute(&json!({"path": "daily/2026-07-27.md"}))
+            .unwrap();
+        assert!(daily.starts_with("[daily/2026-07-27.md#"));
+        assert!(daily.contains("\n1:daily entry\n"));
     }
 
     #[test]
@@ -340,7 +344,8 @@
         assert!(edit
             .execute(&json!({
                 "path": "config/AGENTS.md",
-                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["changed"]}]
+                "tag": file_snapshot_tag(directory.path().join("config/AGENTS.md")),
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["changed"]}]
             }))
             .returns_err());
         assert!(create
@@ -359,7 +364,8 @@
             .unwrap();
         edit.execute(&json!({
             "path": "themes/custom.toml",
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["action = \"#010203\""]}]
+            "tag": file_snapshot_tag(directory.path().join("themes/custom.toml")),
+                "edits": [{"operation": "replace", "start_line": 2, "end_line": 2, "lines": ["action = \"#010203\""]}]
         }))
         .unwrap();
         assert_eq!(
@@ -370,7 +376,8 @@
         read.execute(&json!({"path": "MEMORY.md"})).unwrap();
         edit.execute(&json!({
             "path": "MEMORY.md",
-                "edits": [{"operation": "replace", "start_line": 0, "end_line": 0, "lines": ["new memory"]}]
+            "tag": file_snapshot_tag(directory.path().join("MEMORY.md")),
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["new memory"]}]
         }))
         .unwrap();
         assert_eq!(
