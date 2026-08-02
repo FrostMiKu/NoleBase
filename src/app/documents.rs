@@ -4,9 +4,12 @@
 //! whole workspace behavior.
 
 mod actions;
+mod attachments;
 mod document_view;
 mod files;
 mod search;
 mod tags;
 mod todos;
 mod workspace_views;
+
+pub(crate) use attachments::human_size;

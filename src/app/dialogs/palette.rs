@@ -99,6 +99,7 @@ impl App {
                 return Some(Command::Edit(self.storage.memory_path.clone()));
             }
             AppCommand::BrowseSkills => self.open_skill_browser(),
+            AppCommand::BrowseAttachments => self.open_attachments(),
         }
         None
     }
@@ -123,7 +124,8 @@ impl App {
             | AppCommand::RenameTag
             | AppCommand::EditAgentInstructions
             | AppCommand::EditAgentMemory
-            | AppCommand::BrowseSkills => true,
+            | AppCommand::BrowseSkills
+            | AppCommand::BrowseAttachments => true,
         }
     }
 

@@ -1,10 +1,11 @@
 //! Read-only filesystem, note search, and unified read tools.
 //!
-//! The `read` tool is a parser registry: a target (file path, directory path, or
-//! http(s) URL) is resolved once, then each registered [`ReadParser`] is asked in
-//! order whether it handles that target. Registering a new format (for example a
-//! PDF parser) requires no change to the dispatch logic — only a new parser
-//! registered before the generic text-file parser.
+//! The `read` tool is a parser registry: a target (file path, directory path,
+//! http(s) URL, or attachment URI) is resolved once, then each registered
+//! [`ReadParser`] is asked in order whether it handles that target. Registering
+//! a new format (for example a PDF parser) requires no change to the dispatch
+//! logic — only a new parser registered before the generic text-file parser.
+//! Attachment reads are read-only: they never register an edit snapshot.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ use super::util::{
 };
 use super::web::{read_limited_http_body, web_fetch_content};
 use crate::agent::{canonical_root, snapshot_tag, ReadTracker, Tool, ToolExecutionPolicy};
+use crate::attachment::{AttachmentStore, AttachmentUri};
+use crate::storage::ATTACHMENTS_DIR;
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
@@ -36,6 +39,7 @@ pub(crate) enum Target {
     File { path: PathBuf },
     Directory { path: PathBuf },
     Web { url: String },
+    Attachment { uri: AttachmentUri },
 }
 
 impl Target {
@@ -44,14 +48,17 @@ impl Target {
             Target::File { .. } => "file",
             Target::Directory { .. } => "directory",
             Target::Web { .. } => "web",
+            Target::Attachment { .. } => "attachment",
         }
     }
 
-    /// Root-relative form for local paths, the URL for web targets.
+    /// Root-relative form for local paths, the URL for web targets, and the
+    /// canonical URI for attachments.
     pub(crate) fn display(&self, root: &Path) -> String {
         match self {
             Target::File { path } | Target::Directory { path } => listed_path(root, path),
             Target::Web { url } => url.clone(),
+            Target::Attachment { uri } => uri.to_string(),
         }
     }
 }
@@ -61,6 +68,7 @@ pub(crate) struct ParseContext {
     pub(crate) root: PathBuf,
     pub(crate) reads: Arc<ReadTracker>,
     pub(crate) client: reqwest::Client,
+    pub(crate) attachments: AttachmentStore,
 }
 
 pub(crate) enum ReadPayload {
@@ -92,16 +100,19 @@ pub struct Read {
 impl Read {
     pub fn new(root: &Path, reads: Arc<ReadTracker>, client: reqwest::Client) -> Result<Self> {
         let root = canonical_root(root)?;
+        let attachments = AttachmentStore::new(root.join(ATTACHMENTS_DIR));
         let ctx = ParseContext {
             root,
             reads,
             client,
+            attachments,
         };
         // Order matters: the generic text-file parser must be tried last so a
         // more specific file parser (for example PDF) can claim a target first.
         let parsers: Vec<Box<dyn ReadParser>> = vec![
             Box::new(WebParser),
             Box::new(DirectoryParser),
+            Box::new(AttachmentParser),
             Box::new(TextFileParser),
         ];
         Ok(Self { ctx, parsers })
@@ -132,7 +143,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read any target: a local UTF-8 file as hashline text (`[path#TAG]` plus absolute one-based `N:text` rows), a directory as a typed JSON listing, or an http(s) URL as structured extracted content. File reads are paginated, limited to 1 MB, and their snapshot tag and visible ranges gate edit."
+        "Read any target: a local UTF-8 file as hashline text (`[path#TAG]` plus absolute one-based `N:text` rows), a directory as a typed JSON listing, an http(s) URL as structured extracted content, or an attachment URI as structured read-only content or metadata. File reads are paginated, limited to 1 MB, and their snapshot tag and visible ranges gate edit; attachment content is read-only and never gates edit."
     }
 
     fn input_schema(&self) -> Value {
@@ -141,7 +152,7 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path, directory path, or http(s) URL to read"
+                    "description": "File path, directory path, http(s) URL, or nole-attachment:// URI to read"
                 },
                 "offset": {
                     "type": "integer", "minimum": 0, "default": 0,
@@ -198,10 +209,14 @@ impl Tool for Read {
     }
 }
 
-/// Resolves the `path` argument into a concrete target, rejecting the private AI
-/// configuration before any parser sees it.
+/// Resolves the `path` argument into a concrete target, rejecting the private
+/// AI configuration and attachment internals before any parser sees them.
 async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     let requested = required_string(input, "path")?;
+    if AttachmentUri::is_attachment_uri(&requested) {
+        let uri = AttachmentUri::parse(&requested)?;
+        return Ok(Target::Attachment { uri });
+    }
     if requested.starts_with("https://") || requested.starts_with("http://") {
         return Ok(Target::Web {
             url: requested.to_string(),
@@ -215,6 +230,9 @@ async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     let path = async_fs::canonicalize(&path)
         .await
         .with_context(|| format!("resolving {}", path.display()))?;
+    if path.starts_with(ctx.root.join(ATTACHMENTS_DIR)) {
+        bail!("generic tools cannot read attachment internals");
+    }
     let private_config = ctx.root.join("config/ai.toml");
     if path == private_config {
         bail!("AI configuration is private");
@@ -288,6 +306,113 @@ impl ReadParser for TextFileParser {
         debug_assert_eq!(tag, tracked_tag);
         Ok(ReadPayload::Text(output))
     }
+}
+
+struct AttachmentParser;
+
+#[async_trait::async_trait]
+impl ReadParser for AttachmentParser {
+    fn name(&self) -> &'static str {
+        "attachment"
+    }
+
+    fn matches(&self, target: &Target) -> bool {
+        matches!(target, Target::Attachment { .. })
+    }
+
+    async fn parse(
+        &self,
+        ctx: &ParseContext,
+        target: &Target,
+        input: &Value,
+    ) -> Result<ReadPayload> {
+        let Target::Attachment { uri } = target else {
+            bail!("attachment parser received non-attachment target");
+        };
+        let metadata = ctx
+            .attachments
+            .metadata(uri.id())
+            .with_context(|| format!("reading attachment {uri}"))?;
+        let bytes = ctx
+            .attachments
+            .read_object(uri.id())
+            .with_context(|| format!("reading attachment {uri}"))?;
+        let mime = metadata.mime_type.as_deref().unwrap_or("");
+        if mime.starts_with("image/") {
+            // Images return structured metadata with dimensions when decodable;
+            // undecodable image types (for example SVG) still return metadata.
+            let mut payload = attachment_metadata_json(*uri, &metadata);
+            if let Ok((width, height, format)) = image_dimensions(&bytes) {
+                payload["width"] = json!(width);
+                payload["height"] = json!(height);
+                payload["format"] = json!(format);
+            }
+            return Ok(ReadPayload::Structured(payload));
+        }
+        // Read-only attachment content never registers an edit snapshot, so it
+        // can never gate a later edit: pagination is a plain content window.
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                return Ok(ReadPayload::Structured(attachment_metadata_json(
+                    *uri, &metadata,
+                )));
+            }
+        };
+        let offset = optional_usize(input, "offset", 0, usize::MAX)?;
+        let limit = optional_usize(input, "limit", DEFAULT_READ_LINES, MAX_READ_LINES)?;
+        let lines = source_lines(&content);
+        let total_lines = lines.len();
+        let start = offset.min(total_lines);
+        let end = start.saturating_add(limit).min(total_lines);
+        let mut payload = attachment_metadata_json(*uri, &metadata);
+        payload["offset"] = json!(start);
+        payload["returned"] = json!(end - start);
+        payload["total_lines"] = json!(total_lines);
+        payload["has_more"] = json!(end < total_lines);
+        payload["lines"] = json!(lines[start..end]);
+        Ok(ReadPayload::Structured(payload))
+    }
+}
+
+/// Structured metadata shared by every attachment read result. Physical object
+/// paths stay private; the URI is the only address exposed to the model.
+fn attachment_metadata_json(
+    uri: AttachmentUri,
+    metadata: &crate::attachment::AttachmentMetadata,
+) -> Value {
+    json!({
+        "name": attachment_name(&metadata.source),
+        "uri": uri.to_string(),
+        "mime_type": metadata.mime_type,
+        "size": metadata.size,
+        "imported_at": metadata.imported_at.to_rfc3339(),
+    })
+}
+
+/// The import source's basename, falling back to the raw source string.
+fn attachment_name(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| source.to_string())
+}
+
+/// Decode image dimensions without decoding pixel data.
+fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32, String)> {
+    use std::io::Cursor;
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detecting image format")?;
+    let format = reader
+        .format()
+        .map(|format| format!("{format:?}").to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+    let (width, height) = reader
+        .into_dimensions()
+        .context("reading image dimensions")?;
+    Ok((width, height, format))
 }
 
 struct DirectoryEntryMetadata {
@@ -883,6 +1008,7 @@ fn paginated_search_result(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
 
     use super::*;
 
@@ -927,5 +1053,197 @@ mod tests {
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["kind"], "file");
         assert_eq!(parsed["parsed_by"], "fake");
+    }
+
+    fn attachment_ctx(directory: &std::path::Path) -> ParseContext {
+        ParseContext {
+            root: directory.to_path_buf(),
+            reads: Arc::new(ReadTracker::default()),
+            client: reqwest::Client::new(),
+            attachments: AttachmentStore::new(directory.join(ATTACHMENTS_DIR)),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_uris_dispatch_before_http_and_local_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = attachment_ctx(directory.path());
+        let hex = "ab".repeat(32);
+        let uri = format!("nole-attachment://sha256/{hex}");
+
+        let target = resolve_target(&ctx, &json!({ "path": uri })).await.unwrap();
+        assert!(
+            matches!(&target, Target::Attachment { uri: resolved } if resolved.to_string() == uri)
+        );
+        assert_eq!(target.kind(), "attachment");
+        assert_eq!(target.display(&ctx.root), uri);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_attachment_uris_are_rejected_at_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = attachment_ctx(directory.path());
+        for malformed in [
+            "nole-attachment://sha256/not-hex".to_string(),
+            format!("nole-attachment://sha256/{}", "AB".repeat(32)),
+            format!("nole-attachment://sha256/{}", "ab".repeat(31)),
+            "nole-attachment://sha256/".to_string(),
+            "nole-attachment://md5/ab".to_string(),
+        ] {
+            assert!(
+                resolve_target(&ctx, &json!({ "path": malformed }))
+                    .await
+                    .is_err(),
+                "expected rejection for {malformed}"
+            );
+        }
+        // A non-attachment URL still dispatches to the web target.
+        let target = resolve_target(&ctx, &json!({ "path": "https://example.test" }))
+            .await
+            .unwrap();
+        assert!(matches!(target, Target::Web { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_attachments_read_paginated_without_an_edit_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(directory.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let content = (1..=5)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let uri = store
+            .import_bytes(content.as_bytes(), Some("notes.txt"))
+            .unwrap()
+            .uri()
+            .to_string();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let output = read
+            .execute(&json!({ "path": uri, "offset": 2, "limit": 2 }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["kind"], "attachment");
+        assert_eq!(parsed["target"], uri);
+        assert_eq!(parsed["name"], "notes.txt");
+        assert_eq!(parsed["mime_type"], "text/plain");
+        assert_eq!(parsed["size"], content.len() as u64);
+        assert_eq!(parsed["offset"], 2);
+        assert_eq!(parsed["returned"], 2);
+        assert_eq!(parsed["total_lines"], 5);
+        assert_eq!(parsed["has_more"], true);
+        assert_eq!(parsed["lines"], json!(["line 3", "line 4"]));
+        // Structured read-only content: no hashline `[path#TAG]` snapshot header
+        // and no tag field, because attachment reads never gate edit.
+        assert!(parsed.get("tag").is_none());
+        assert!(!output.contains(&format!("[notes.txt#")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_attachments_return_dimensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(directory.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let image = image::DynamicImage::new_rgb8(8, 4);
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let uri = store
+            .import_bytes(&bytes.into_inner(), Some("diagram.png"))
+            .unwrap()
+            .uri()
+            .to_string();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let parsed: Value =
+            serde_json::from_str(&read.execute(&json!({ "path": uri })).await.unwrap()).unwrap();
+        assert_eq!(parsed["kind"], "attachment");
+        assert_eq!(parsed["mime_type"], "image/png");
+        assert_eq!(parsed["width"], 8);
+        assert_eq!(parsed["height"], 4);
+        assert_eq!(parsed["format"], "png");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn binary_attachments_return_metadata_without_utf8_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(directory.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let bytes: Vec<u8> = vec![0xFF, 0x00, 0x01, 0xFE, 0x7F];
+        let uri = store
+            .import_bytes(&bytes, Some("blob.bin"))
+            .unwrap()
+            .uri()
+            .to_string();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let parsed: Value =
+            serde_json::from_str(&read.execute(&json!({ "path": uri })).await.unwrap()).unwrap();
+        assert_eq!(parsed["kind"], "attachment");
+        assert_eq!(parsed["name"], "blob.bin");
+        assert_eq!(parsed["size"], 5);
+        assert_eq!(parsed["mime_type"], Value::Null);
+        assert!(parsed.get("lines").is_none());
+        assert!(parsed.get("width").is_none());
+        assert!(parsed.get("content").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_reads_of_attachment_internals_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(directory.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let metadata = store.import_bytes(b"payload", Some("secret.txt")).unwrap();
+        let object = directory
+            .path()
+            .join(ATTACHMENTS_DIR)
+            .join("objects")
+            .join(metadata.id.to_hex());
+        assert!(object.exists());
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let error = read
+            .execute(&json!({ "path": object.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("attachment internals"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn absent_attachments_error_without_physical_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let uri = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        let error = read.execute(&json!({ "path": uri })).await.unwrap_err();
+        // anyhow Display shows only the outer context; the "no such attachment"
+        // cause is visible in the Debug chain.
+        assert!(format!("{error:?}").contains("no such attachment"));
+        assert!(!format!("{error:?}").contains("objects"));
     }
 }

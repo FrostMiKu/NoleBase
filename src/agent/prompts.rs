@@ -106,6 +106,8 @@ Root: {root} (the user's `.nole` workspace)
 - data/: ordinary .md/.mb articles and notes; create them here by default.
 - daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read, edit, and delete tools as other text files.
 - archives/: regular Markdown files archived from data/.
+- workspace/main/: your private working sandbox for the current Agent session. Every file mutation inside it (write, edit, copy, move, move_many, rename, delete, mkdir, remove_dir) proceeds without approval; it persists across restarts and is rebuilt whenever the Agent session is cleared. copy_attachment_to_workspace materializes attachments here as new files so they can be edited with the generic file tools.
+- attachments/: application-managed, immutable, content-addressed files (SHA-256). Never read, write, edit, copy, move, rename, or delete attachment internals through generic tools; use the dedicated attachment tools and their `nole-attachment://sha256/<64 lowercase hex>` URIs.
 - themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
 - template.mb: editable content used only by Create note from template; ordinary New note does not use it.
 - config/: application-managed configuration. You may inspect it read-only except config/ai.toml; never modify, move, copy, rename, or delete anything here.
@@ -123,10 +125,17 @@ Root: {root} (the user's `.nole` workspace)
 - Local file reads return a `[path#TAG]` snapshot header followed by absolute one-based `N:text` rows. Pass that exact TAG to edit, edit only displayed lines or adjacent anchors, and read again after each successful edit before making another.
 - Use write only for complete new files; it always refuses existing paths. Use read followed by edit for every change to an existing file. Both validate complete MBDown and Skill candidates before mutation.
 - Existing daily Markdown files may be read, edited, or deleted with read, edit, and delete. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. write, copy, move, move_many, and rename remain excluded from daily/, and config/ remains read-only.
-- copy and move sources may be outside Nole; destinations must be new paths under Nole. Use move_many for batches, rename for file renames, and rename_tag for exact workspace-wide tag renames.
+- Inside workspace/main, edit, delete, rename, move, move_many, and remove_dir run without approval, but edit still requires a matching read snapshot, symlinks are never followed, and no existing file is ever overwritten. mkdir creates directories (including parents); remove_dir recursively removes a directory tree and only works inside workspace/main.
+- copy and move sources may be outside Nole; destinations must be new paths under Nole. A move that removes a source outside workspace/main (including absolute external paths) requires approval before it touches the source; moves inside workspace/main do not. Use move_many for batches, rename for file renames, and rename_tag for exact workspace-wide tag renames.
 - Use read with a URL when you already have one.
 {web_search_guidance}- Use ask for blocking questions and notify for short TUI notifications.
 - Use open when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
+
+## Attachments
+- import_attachment copies an existing file (absolute or Nole-relative path) into the immutable attachment store without modifying the source, and returns the canonical nole-attachment://sha256/<hex> URI plus a Markdown embed (images) or link (other files) to paste into notes. Importing identical content again returns the same URI.
+- Attachments cannot be edited in place. To publish a new version, copy_attachment_to_workspace materializes the bytes as a NEW file under workspace/main, edit that copy with read and edit, then import_attachment the result to publish a new version.
+- list_attachments and attachment_info report metadata only; attachment object paths are never exposed.
+- delete_attachment asks for approval and moves the attachment to trash.
 
 ## Project instructions (config/AGENTS.md)
 {agents_instructions}

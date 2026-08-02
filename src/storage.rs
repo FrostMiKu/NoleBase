@@ -41,6 +41,9 @@ const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
 const ARCHIVES_DIR: &str = "archives";
 const SKILLS_DIR: &str = "skills";
+pub(crate) const ATTACHMENTS_DIR: &str = "attachments";
+pub(crate) const WORKSPACE_DIR: &str = "workspace";
+pub(crate) const AGENT_WORKSPACE_SUBDIR: &str = "main";
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppendReceipt {
@@ -105,6 +108,8 @@ pub struct Storage {
     pub daily_dir: PathBuf,
     pub archives_dir: PathBuf,
     pub skills_dir: PathBuf,
+    pub attachments_dir: PathBuf,
+    pub workspace_dir: PathBuf,
     pub ai_config_path: PathBuf,
     pub settings_path: PathBuf,
     pub agent_session_path: PathBuf,
@@ -131,6 +136,8 @@ impl Storage {
             daily_dir: root.join(DAILY_DIR),
             archives_dir: root.join(ARCHIVES_DIR),
             skills_dir: root.join(SKILLS_DIR),
+            attachments_dir: root.join(ATTACHMENTS_DIR),
+            workspace_dir: root.join(WORKSPACE_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
             settings_path: root.join(CONFIG_DIR).join(SETTINGS_FILE),
             agent_session_path: root.join(CONFIG_DIR).join(AGENT_SESSION_FILE),
@@ -154,6 +161,10 @@ impl Storage {
             .with_context(|| format!("creating {}", self.daily_dir.display()))?;
         fs::create_dir_all(&self.archives_dir)
             .with_context(|| format!("creating {}", self.archives_dir.display()))?;
+        crate::attachment::AttachmentStore::new(self.attachments_dir.clone()).ensure_layout()?;
+        let agent_workspace = self.agent_workspace_dir();
+        fs::create_dir_all(&agent_workspace)
+            .with_context(|| format!("creating {}", agent_workspace.display()))?;
         crate::skill::ensure_skills_directory(&self.skills_dir)?;
         fs::create_dir_all(&self.themes_dir)
             .with_context(|| format!("creating {}", self.themes_dir.display()))?;
@@ -342,11 +353,39 @@ impl Storage {
 
     pub fn clear_agent_session(&self) -> Result<bool> {
         match fs::remove_file(&self.agent_session_path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(()) => {
+                self.reset_agent_workspace()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.reset_agent_workspace()?;
+                Ok(false)
+            }
             Err(error) => Err(error)
                 .with_context(|| format!("removing {}", self.agent_session_path.display())),
         }
+    }
+
+    /// The current persisted main Agent session's sandbox directory
+    /// (`workspace/main`). It is preserved across app restarts and rebuilt
+    /// whenever the Agent session is cleared.
+    pub fn agent_workspace_dir(&self) -> PathBuf {
+        self.workspace_dir.join(AGENT_WORKSPACE_SUBDIR)
+    }
+
+    /// Clear and recreate the Agent workspace so a fresh session starts empty.
+    /// Only called after the session file itself was removed successfully.
+    fn reset_agent_workspace(&self) -> Result<()> {
+        let workspace = self.agent_workspace_dir();
+        match fs::remove_dir_all(&workspace) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("clearing {}", workspace.display()));
+            }
+        }
+        fs::create_dir_all(&workspace)
+            .with_context(|| format!("recreating {}", workspace.display()))
     }
 
     /// Load one card per daily file, oldest first.
@@ -1519,6 +1558,9 @@ mod tests {
         assert!(st.daily_dir.is_dir());
         assert!(st.archives_dir.is_dir());
         assert!(st.themes_dir.is_dir());
+        assert!(st.agent_workspace_dir().is_dir());
+        assert_eq!(st.workspace_dir, st.root.join("workspace"));
+        assert_eq!(st.agent_workspace_dir(), st.workspace_dir.join("main"));
         assert!(fs::read_dir(&st.daily_dir).unwrap().next().is_none());
         assert!(st.append_daily("2026-07-27", "   ").is_err());
         assert!(!st.daily_dir.join("2026-07-27.md").exists());
@@ -1617,6 +1659,54 @@ mod tests {
         assert!(storage.clear_agent_session().unwrap());
         assert!(!storage.agent_session_path.exists());
         assert!(!storage.clear_agent_session().unwrap());
+    }
+
+    #[test]
+    fn clearing_the_agent_session_resets_the_workspace_but_failed_clears_leave_it_alone() {
+        use crate::agent_session::{AgentConversation, AgentPanelEntry};
+
+        let (_directory, storage) = fresh();
+        let workspace = storage.agent_workspace_dir();
+        assert!(workspace.is_dir());
+        // The workspace is session-bound: it survives unrelated storage work.
+        storage.append_daily("2026-07-27", "note").unwrap();
+        assert!(workspace.is_dir());
+
+        let session = AgentSession::from_parts(
+            &AgentConversation::seeded_for_test(),
+            &[AgentPanelEntry::Prompt {
+                text: "work".to_string(),
+                muted: false,
+            }],
+            crate::agent_session::TokenUsage::default(),
+            0,
+            std::time::Duration::ZERO,
+        );
+        storage.write_agent_session(&session).unwrap();
+        fs::create_dir_all(workspace.join("sub")).unwrap();
+        fs::write(workspace.join("sub/draft.md"), "wip").unwrap();
+
+        // Successful clear removes the session file and rebuilds the workspace.
+        assert!(storage.clear_agent_session().unwrap());
+        assert!(!storage.agent_session_path.exists());
+        assert!(
+            workspace.is_dir(),
+            "workspace/main is recreated after a clear"
+        );
+        assert!(
+            !workspace.join("sub").exists(),
+            "workspace content is cleared"
+        );
+
+        // A failed clear (session path blocked) must not touch the workspace.
+        fs::create_dir_all(workspace.join("keep")).unwrap();
+        fs::write(workspace.join("keep/notes.txt"), "keep").unwrap();
+        fs::create_dir(&storage.agent_session_path).unwrap();
+        assert!(storage.clear_agent_session().is_err());
+        assert!(
+            workspace.join("keep/notes.txt").exists(),
+            "failed clear must leave the workspace untouched"
+        );
     }
 
     #[cfg(unix)]

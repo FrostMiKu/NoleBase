@@ -528,7 +528,7 @@
             .returns_err());
 
         let (event_sender, mut event_receiver) = event_channel();
-        let move_file = Move::new(directory.path(), event_sender).unwrap();
+        let move_file = Move::new(directory.path(), event_sender, bypass_gate()).unwrap();
         move_file
             .execute(&json!({
                 "source": move_source,
@@ -561,7 +561,7 @@
         fs::write(&beta, "beta").unwrap();
 
         let (event_sender, mut event_receiver) = event_channel();
-        let mover = MoveMany::new(directory.path(), event_sender.clone()).unwrap();
+        let mover = MoveMany::new(directory.path(), event_sender.clone(), bypass_gate()).unwrap();
         let result = mover
             .execute(&json!({
                 "sources": [alpha, beta],
@@ -588,7 +588,7 @@
             .iter()
             .all(|event| matches!(event, AgentEvent::FileMoved { .. })));
 
-        let rename = Rename::new(directory.path(), event_sender).unwrap();
+        let rename = Rename::new(directory.path(), event_sender, bypass_gate()).unwrap();
         rename
             .execute(&json!({
                 "path": "data/collected/alpha.md",
@@ -646,6 +646,55 @@
         worker.join().unwrap().unwrap();
         assert!(!target.exists());
         assert!(outside.path().exists());
+    }
+
+    #[test]
+    fn attachment_tools_are_registered_with_canonical_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(&storage.ai_config_path, TEST_MESSAGES_CONFIG).unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let names = agent
+            .definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        for name in [
+            "import_attachment",
+            "list_attachments",
+            "attachment_info",
+            "copy_attachment_to_workspace",
+            "delete_attachment",
+        ] {
+            assert!(names.contains(&name), "missing registered tool {name}");
+        }
+    }
+
+    #[test]
+    fn system_prompt_describes_the_attachment_publish_and_edit_workflow() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
+        assert!(prompt.contains("import_attachment"));
+        assert!(prompt.contains("copy_attachment_to_workspace"));
+        assert!(prompt.contains("workspace/main"));
+        assert!(prompt.contains("nole-attachment://sha256"));
+        assert!(prompt.contains("delete_attachment"));
+        assert!(prompt.contains("Attachments cannot be edited in place"));
     }
 
     #[test]

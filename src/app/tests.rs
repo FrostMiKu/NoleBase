@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::attachment::AttachmentStore;
+
 use super::*;
 use std::fs;
 
@@ -1646,6 +1648,7 @@ fn workspace_view_registry_drives_sidebar_selection() {
             ("Tag", "Browse tags", CenterView::Tags),
             ("Search", "Find notes", CenterView::Search),
             ("Daily", "Daily notes", CenterView::Daily),
+            ("Attachment", "Browse attachments", CenterView::Attachments),
         ]
     );
 
@@ -2592,6 +2595,52 @@ fn file_embed_clicks_open_existing_files_from_any_location() {
 }
 
 #[test]
+fn attachment_link_clicks_open_a_materialized_workspace_file() {
+    let (mut app, _directory) = make_app();
+    let store = AttachmentStore::new(app.storage.attachments_dir.clone());
+    store.ensure_layout().unwrap();
+    let metadata = store
+        .import_bytes(b"attachment payload", Some("report.pdf"))
+        .unwrap();
+    let uri = metadata.uri().to_string();
+    app.link_hitboxes.push(LinkHitbox {
+        target: LinkTarget::Attachment(uri),
+        area: Rect::new(4, 3, 7, 1),
+    });
+    let command = app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 5,
+        row: 3,
+        modifiers: KeyModifiers::NONE,
+    });
+    let Some(Command::OpenPath(path)) = command else {
+        panic!("expected an OpenPath command");
+    };
+    // The opened file is a materialized copy under workspace/main containing
+    // the attachment bytes; the custom URI is never sent to a web opener.
+    assert_eq!(fs::read(&path).unwrap(), b"attachment payload");
+    assert!(path.starts_with(app.storage.agent_workspace_dir()));
+}
+
+#[test]
+fn malformed_attachment_links_error_without_opening() {
+    let (mut app, _directory) = make_app();
+    app.link_hitboxes.push(LinkHitbox {
+        target: LinkTarget::Attachment("nole-attachment://sha256/nothex".to_string()),
+        area: Rect::new(4, 3, 7, 1),
+    });
+    assert!(app
+        .handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })
+        .is_none());
+    assert!(app.status.starts_with("Attachment error:"));
+}
+
+#[test]
 fn wikilink_searches_daily_notes_and_chooses_between_all_matching_locations() {
     let (mut app, _directory) = make_app();
     app.storage
@@ -2818,4 +2867,121 @@ fn delete_overlay_and_undo_keep_business_behavior() {
     app.handle_key(key(KeyCode::Char('u')));
     assert_eq!(app.daily_notes.len(), 1);
     assert_eq!(app.daily_notes[0].body, "remove me");
+}
+
+fn import_attachment(app: &mut App, name: &str, bytes: &[u8]) -> AttachmentId {
+    app.attachment_store
+        .import_bytes(bytes, Some(name))
+        .unwrap()
+        .id
+}
+
+fn refresh_attachment_refs(app: &mut App) {
+    app.apply_attachment_index(crate::attachment_index::AttachmentReferenceIndex::build(
+        &app.storage,
+    ));
+}
+
+#[test]
+fn attachments_view_lists_name_kind_size_and_reference_count() {
+    let (mut app, _directory) = make_app();
+    let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
+    let uri = crate::attachment::AttachmentUri::from_id(id).to_string();
+    fs::write(
+        app.storage.data_dir.join("Note.md"),
+        format!("[report]({uri}) twice [report]({uri})\n"),
+    )
+    .unwrap();
+    fs::write(
+        app.storage.daily_dir.join("2026-07-28.md"),
+        format!("[a]({uri})\n"),
+    )
+    .unwrap();
+    refresh_attachment_refs(&mut app);
+
+    app.open_attachments();
+    assert_eq!(app.center_view, CenterView::Attachments);
+    assert_eq!(app.focus, Focus::Center);
+    assert_eq!(app.attachment_entries.len(), 1);
+    let entry = &app.attachment_entries[0];
+    assert_eq!(entry.id, id);
+    assert_eq!(entry.name, "report.pdf");
+    assert_eq!(entry.kind, "pdf");
+    assert_eq!(entry.size, 9);
+    assert_eq!(entry.references, 3, "shared references across two files");
+}
+
+#[test]
+fn referenced_attachment_delete_is_refused_and_reports_locations() {
+    let (mut app, _directory) = make_app();
+    let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
+    let uri = crate::attachment::AttachmentUri::from_id(id).to_string();
+    fs::write(
+        app.storage.data_dir.join("Note.md"),
+        format!("[a]({uri})\n"),
+    )
+    .unwrap();
+    refresh_attachment_refs(&mut app);
+
+    app.open_attachments();
+    app.request_delete_attachment();
+
+    // Refused up front: no confirm dialog, attachment stays, locations shown.
+    assert_eq!(app.overlay, None);
+    assert_eq!(app.dialog, None);
+    assert!(app.attachment_store.lookup(id).unwrap().is_some());
+    assert!(app.status.contains("referenced"), "{}", app.status);
+    assert!(app.status.contains("Note.md"), "{}", app.status);
+}
+
+#[test]
+fn unreferenced_attachment_confirm_moves_to_trash() {
+    let (mut app, _directory) = make_app();
+    let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
+    refresh_attachment_refs(&mut app);
+
+    app.open_attachments();
+    assert_eq!(app.attachment_entries.len(), 1);
+    app.request_delete_attachment();
+    assert_eq!(app.overlay, Some(Overlay::Dialog));
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::DeleteAttachment)
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.overlay, None);
+    assert!(app.attachment_store.lookup(id).unwrap().is_none());
+    assert!(app.attachment_entries.is_empty());
+    assert!(app.status.contains("trash"), "{}", app.status);
+}
+
+#[test]
+fn cancel_keeps_unreferenced_attachment() {
+    let (mut app, _directory) = make_app();
+    let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
+    refresh_attachment_refs(&mut app);
+
+    app.open_attachments();
+    app.request_delete_attachment();
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.overlay, None);
+    assert!(app.attachment_store.lookup(id).unwrap().is_some());
+}
+
+#[test]
+fn opening_attachment_writes_a_workspace_copy_and_opens_it() {
+    let (mut app, _directory) = make_app();
+    let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
+    refresh_attachment_refs(&mut app);
+
+    app.open_attachments();
+    let command = app.open_attachment_at(0);
+    let Some(Command::OpenPath(path)) = command else {
+        panic!("expected OpenPath command, got {command:?}");
+    };
+    assert_eq!(fs::read(&path).unwrap(), b"pdf-bytes");
+    assert!(path.starts_with(app.storage.root.join("workspace").join("main")));
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.ends_with("report.pdf"), "{name}");
 }

@@ -108,6 +108,11 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
         "rename_tag" => Some(format!("{} -> {}", text("from")?, text("to")?)),
         "add_daily_entry" => Some(text("date").unwrap_or_else(|| "Today".to_string())),
         "copy" | "move" => Some(format!("{} -> {}", text("source")?, text("destination")?)),
+        "import_attachment" => text("source"),
+        "attachment_info" | "delete_attachment" => text("uri"),
+        "copy_attachment_to_workspace" => {
+            Some(format!("{} -> {}", text("uri")?, text("destination")?))
+        }
         "move_many" => {
             let count = input.get("sources").and_then(Value::as_array)?.len();
             Some(format!(

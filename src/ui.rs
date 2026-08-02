@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod agent;
+mod attachments;
 mod chat;
 mod compose;
 mod daily;
@@ -26,8 +27,9 @@ mod util;
 mod views;
 
 use self::{
-    agent::*, chat::*, compose::*, daily::*, dialog::*, diff::*, document::*, files::*, footer::*,
-    input::*, notification::*, search::*, tags::*, terminal::*, todo::*, util::*, views::*,
+    agent::*, attachments::*, chat::*, compose::*, daily::*, dialog::*, diff::*, document::*,
+    files::*, footer::*, input::*, notification::*, search::*, tags::*, terminal::*, todo::*,
+    util::*, views::*,
 };
 
 use chrono::{DateTime, Local, NaiveDate};
@@ -41,13 +43,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::PermissionMode;
 use crate::app::{
-    App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus, LayoutSnapshot,
-    Overlay, SidebarSelection, WorkspaceView,
+    human_size, App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus,
+    LayoutSnapshot, Overlay, SidebarSelection, WorkspaceView,
 };
 use crate::embedded_terminal::{TerminalColor, TerminalSnapshot};
 use crate::model::{
-    Action, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox,
-    LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox, WorkspaceViewHitbox,
+    Action, AttachmentHitbox, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow,
+    LinkHitbox, LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox, WorkspaceViewHitbox,
 };
 use crate::theme::Theme;
 
@@ -64,6 +66,9 @@ pub(in crate::ui) const APPROVAL_UNIFIED_WIDTH: u16 = 110;
 pub(in crate::ui) const APPROVAL_SIDE_BY_SIDE_WIDTH: u16 = 160;
 pub(in crate::ui) const APPROVAL_SIDE_BY_SIDE_MIN_WIDTH: u16 = 140;
 pub(in crate::ui) const SELECT_OPTION_HEIGHT: u16 = 2;
+/// Minimum rows reserved for the agent panel header so its statistics line
+/// stays visible when the workspace view list grows past the panel.
+pub(in crate::ui) const MIN_AGENT_HEADER_ROWS: u16 = 3;
 
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
 /// position without changing the terminal's hardware cursor.
@@ -121,6 +126,7 @@ fn clear_hitboxes(app: &mut App) {
     app.todo_hitboxes.clear();
     app.workspace_view_hitboxes.clear();
     app.search_hitboxes.clear();
+    app.attachment_hitboxes.clear();
 }
 
 fn body_and_footer(area: Rect) -> (Rect, Rect) {
@@ -166,7 +172,7 @@ fn draw_wide_workspace(
 fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
     let views_height = selection_list_height(WorkspaceView::ALL.len() as u16, 3)
         .saturating_add(2)
-        .min(area.height);
+        .min(area.height.saturating_sub(MIN_AGENT_HEADER_ROWS));
     let agent = Rect::new(
         area.x,
         area.y,
@@ -232,6 +238,9 @@ fn draw_center(
             draw_search(frame, app, content, interactive, cursor_position)
         }
         CenterView::Tags => draw_tags(frame, app, content, interactive, cursor_position),
+        CenterView::Attachments => {
+            draw_attachments(frame, app, content, interactive, cursor_position)
+        }
     }
 }
 

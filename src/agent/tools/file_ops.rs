@@ -14,10 +14,10 @@ use crate::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
     ReadTracker, Tool,
 };
+use crate::storage::{AGENT_WORKSPACE_SUBDIR, ATTACHMENTS_DIR, WORKSPACE_DIR};
 
 pub struct Edit {
     root: PathBuf,
-    config_dir: PathBuf,
     gate: ApprovalGate,
     reads: Arc<ReadTracker>,
 }
@@ -25,12 +25,7 @@ pub struct Edit {
 impl Edit {
     pub fn new(root: &Path, gate: ApprovalGate, reads: Arc<ReadTracker>) -> Result<Self> {
         let root = canonical_root(root)?;
-        Ok(Self {
-            config_dir: root.join("config"),
-            root,
-            gate,
-            reads,
-        })
+        Ok(Self { root, gate, reads })
     }
 }
 
@@ -41,7 +36,7 @@ impl Tool for Edit {
     }
 
     fn description(&self) -> &'static str {
-        "Edit an existing UTF-8 file under the Nole root outside config/ using a `[path#TAG]` snapshot from read and one-based line anchors. The tag must match the latest read snapshot, and only displayed ranges or adjacent insertion anchors may change."
+        "Edit an existing UTF-8 file under the Nole root outside config/ and attachments/ using a `[path#TAG]` snapshot from read and one-based line anchors. The tag must match the latest read snapshot, and only displayed ranges or adjacent insertion anchors may change. Edits inside workspace/main proceed directly; elsewhere the user is asked to confirm."
     }
 
     fn input_schema(&self) -> Value {
@@ -118,8 +113,12 @@ impl Tool for Edit {
         }
         let path = fs::canonicalize(&unresolved)
             .with_context(|| format!("resolving existing file {}", unresolved.display()))?;
-        if path.starts_with(&self.config_dir) {
-            bail!("edit cannot operate inside config/");
+        match path_zone(&self.root, &path) {
+            PathZone::Config => bail!("edit cannot operate inside config/"),
+            PathZone::Attachments => {
+                bail!("generic file tools cannot operate inside attachments/")
+            }
+            _ => {}
         }
         let metadata = fs::metadata(&path)?;
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
@@ -164,13 +163,15 @@ impl Tool for Edit {
             return Ok(format!("no changes needed for {relative}"));
         }
         validate_write(&self.root, &path, WriteSource::Text(&content))?;
-        self.gate
-            .request(ApprovalRequest {
-                title: format!("Edit {relative}"),
-                message: limited_diff(&old, &content, relative, relative),
-                kind: ApprovalKind::Diff,
-            })
-            .await?;
+        if outside_agent_workspace(&self.root, &path) {
+            self.gate
+                .request(ApprovalRequest {
+                    title: format!("Edit {relative}"),
+                    message: limited_diff(&old, &content, relative, relative),
+                    kind: ApprovalKind::Diff,
+                })
+                .await?;
+        }
         let current =
             fs::read_to_string(&path).with_context(|| format!("rechecking {}", path.display()))?;
         if current != old {
@@ -373,11 +374,53 @@ fn resolve_new_destination(root: &Path, input: &str) -> Result<PathBuf> {
     }
 }
 
-pub fn ensure_not_special(root: &Path, path: &Path) -> Result<()> {
-    if path.starts_with(root.join("config")) || path.starts_with(root.join("daily")) {
-        bail!("generic file tools cannot operate on this special file");
+/// A named path zone under the Nole root. Zone classification drives both the
+/// approval gate (mutations inside the Agent workspace run unapproved) and the
+/// paths generic tools may touch at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathZone {
+    /// `config/`: application-managed configuration, read-only for generic tools.
+    Config,
+    /// `daily/`: calendar notes with their own tools; several generic tools are excluded.
+    Daily,
+    /// `attachments/`: content-addressed attachment internals; generic tools must
+    /// never read or mutate these paths. Use the dedicated attachment tools instead.
+    Attachments,
+    /// `workspace/main`: the current persisted main Agent session's sandbox.
+    /// Mutations here proceed without approval.
+    Workspace,
+    /// Everything else (`data/`, `archives/`, `themes/`, `skills/`, root files).
+    Normal,
+}
+
+/// Classify a canonical path under `root` by zone.
+pub(crate) fn path_zone(root: &Path, path: &Path) -> PathZone {
+    if path.starts_with(root.join("config")) {
+        PathZone::Config
+    } else if path.starts_with(root.join("daily")) {
+        PathZone::Daily
+    } else if path.starts_with(root.join(ATTACHMENTS_DIR)) {
+        PathZone::Attachments
+    } else if path.starts_with(root.join(WORKSPACE_DIR).join(AGENT_WORKSPACE_SUBDIR)) {
+        PathZone::Workspace
+    } else {
+        PathZone::Normal
     }
-    Ok(())
+}
+
+/// Whether mutating `path` requires user approval. Everything under
+/// `workspace/main` is the current session's sandbox and bypasses the gate.
+fn outside_agent_workspace(root: &Path, path: &Path) -> bool {
+    !matches!(path_zone(root, path), PathZone::Workspace)
+}
+
+pub fn ensure_not_special(root: &Path, path: &Path) -> Result<()> {
+    match path_zone(root, path) {
+        PathZone::Config | PathZone::Daily | PathZone::Attachments => {
+            bail!("generic file tools cannot operate on this special file");
+        }
+        PathZone::Workspace | PathZone::Normal => Ok(()),
+    }
 }
 
 fn copy_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
@@ -434,7 +477,7 @@ impl Tool for Copy {
     }
 
     fn description(&self) -> &'static str {
-        "Copy a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/ and daily/."
+        "Copy a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/, daily/, and attachments/."
     }
 
     fn input_schema(&self) -> Value {
@@ -454,13 +497,15 @@ impl Tool for Copy {
 pub struct Move {
     root: PathBuf,
     events: AgentEventSender,
+    gate: ApprovalGate,
 }
 
 impl Move {
-    pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
+    pub fn new(root: &Path, events: AgentEventSender, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
             events,
+            gate,
         })
     }
 }
@@ -472,7 +517,7 @@ impl Tool for Move {
     }
 
     fn description(&self) -> &'static str {
-        "Move a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/ and daily/."
+        "Move a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/, daily/, and attachments/. Moving a source outside workspace/main asks the user to confirm first; moves inside workspace/main proceed directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -484,6 +529,19 @@ impl Tool for Move {
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
         validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        if outside_agent_workspace(&self.root, &source) {
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Move file".to_string(),
+                    message: format!(
+                        "Move {} to {}?",
+                        display_path(&self.root, &source),
+                        display_path(&self.root, &destination)
+                    ),
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
+        }
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!("moved {bytes} bytes to {destination_text}"))
@@ -493,13 +551,15 @@ impl Tool for Move {
 pub struct MoveMany {
     root: PathBuf,
     events: AgentEventSender,
+    gate: ApprovalGate,
 }
 
 impl MoveMany {
-    pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
+    pub fn new(root: &Path, events: AgentEventSender, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
             events,
+            gate,
         })
     }
 }
@@ -511,7 +571,7 @@ impl Tool for MoveMany {
     }
 
     fn description(&self) -> &'static str {
-        "Move multiple regular files from absolute or Nole-relative sources into one existing directory under the Nole root outside config/ and daily/, preserving each basename. Each destination must be new."
+        "Move multiple regular files from absolute or Nole-relative sources into one existing directory under the Nole root outside config/, daily/, and attachments/, preserving each basename. Each destination must be new. Moving sources outside workspace/main asks the user to confirm first; moves inside workspace/main proceed directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -567,6 +627,24 @@ impl Tool for MoveMany {
             }
             validate_write(&self.root, &destination, WriteSource::File(&source))?;
             transfers.push((source, destination));
+        }
+
+        if transfers
+            .iter()
+            .any(|(source, _)| outside_agent_workspace(&self.root, source))
+        {
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Move files".to_string(),
+                    message: format!(
+                        "Move {} file{} into {}?",
+                        transfers.len(),
+                        if transfers.len() == 1 { "" } else { "s" },
+                        directory_text
+                    ),
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
         }
 
         let mut completed = Vec::with_capacity(transfers.len());
@@ -646,13 +724,15 @@ fn rollback_moves(completed: &[(PathBuf, PathBuf, u64)]) -> Vec<String> {
 pub struct Rename {
     root: PathBuf,
     events: AgentEventSender,
+    gate: ApprovalGate,
 }
 
 impl Rename {
-    pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
+    pub fn new(root: &Path, events: AgentEventSender, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
             events,
+            gate,
         })
     }
 }
@@ -664,7 +744,7 @@ impl Tool for Rename {
     }
 
     fn description(&self) -> &'static str {
-        "Rename one regular file under the Nole root outside config/ and daily/ without changing its directory. The new name must be a basename and the destination must be new."
+        "Rename one regular file under the Nole root outside config/, daily/, and attachments/ without changing its directory. The new name must be a basename and the destination must be new. Renames inside workspace/main proceed directly; elsewhere the user is asked to confirm."
     }
 
     fn input_schema(&self) -> Value {
@@ -707,6 +787,19 @@ impl Tool for Rename {
             Err(error) => return Err(error).context("checking rename destination"),
         }
         validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        if outside_agent_workspace(&self.root, &source) {
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Rename file".to_string(),
+                    message: format!(
+                        "Rename {} to {}?",
+                        display_path(&self.root, &source),
+                        display_path(&self.root, &destination)
+                    ),
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
+        }
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!(
@@ -760,7 +853,7 @@ impl Tool for Delete {
     }
 
     fn description(&self) -> &'static str {
-        "Delete a regular file under the Nole root outside config/."
+        "Delete a regular file under the Nole root outside config/ and attachments/. Deletions inside workspace/main proceed directly; elsewhere the user is asked to confirm."
     }
 
     fn input_schema(&self) -> Value {
@@ -781,17 +874,23 @@ impl Tool for Delete {
             bail!("delete only accepts regular files, not symlinks or directories");
         }
         let path = fs::canonicalize(&unresolved)?;
-        if path.starts_with(self.root.join("config")) {
-            bail!("delete cannot operate inside config/");
+        match path_zone(&self.root, &path) {
+            PathZone::Config => bail!("delete cannot operate inside config/"),
+            PathZone::Attachments => {
+                bail!("generic file tools cannot operate inside attachments/")
+            }
+            _ => {}
         }
         let modified = metadata.modified().ok();
-        self.gate
-            .request(ApprovalRequest {
-                title: "Delete file".to_string(),
-                message: format!("Delete {relative}?"),
-                kind: ApprovalKind::Confirm,
-            })
-            .await?;
+        if outside_agent_workspace(&self.root, &path) {
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Delete file".to_string(),
+                    message: format!("Delete {relative}?"),
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
+        }
 
         let current = fs::symlink_metadata(&unresolved)
             .with_context(|| format!("rechecking {}", unresolved.display()))?;
@@ -810,17 +909,12 @@ impl Tool for Delete {
 
 pub struct Write {
     root: PathBuf,
-    config_dir: PathBuf,
-    daily_dir: PathBuf,
 }
 
 impl Write {
     pub fn new(root: &Path) -> Result<Self> {
-        let root = canonical_root(root)?;
         Ok(Self {
-            config_dir: root.join("config"),
-            daily_dir: root.join("daily"),
-            root,
+            root: canonical_root(root)?,
         })
     }
 }
@@ -831,7 +925,7 @@ impl Tool for Write {
         "write"
     }
     fn description(&self) -> &'static str {
-        "Create a complete new UTF-8 text file under the Nole root outside config/ and daily/. Existing paths are always refused; use read and edit to change an existing file. The complete candidate is validated before creation."
+        "Create a complete new UTF-8 text file under the Nole root outside config/, daily/, and attachments/. Existing paths are always refused; use read and edit to change an existing file. The complete candidate is validated before creation."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -853,8 +947,14 @@ impl Tool for Write {
             bail!("content exceeds 1 MB");
         }
         let path = safe_relative(&self.root, relative)?;
-        if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
-            bail!("generic file tools cannot operate on this special file");
+        match path_zone(&self.root, &path) {
+            PathZone::Config | PathZone::Daily => {
+                bail!("generic file tools cannot operate on this special file");
+            }
+            PathZone::Attachments => {
+                bail!("generic file tools cannot operate inside attachments/")
+            }
+            _ => {}
         }
         match fs::symlink_metadata(&path) {
             Ok(_) => bail!("write only creates new files; use read and edit for existing files"),
@@ -872,6 +972,155 @@ impl Tool for Write {
     }
 }
 
+/// Resolve a directory path to create, canonicalizing the deepest existing
+/// ancestor and appending the missing components. The result stays within the
+/// Nole root and no symlink is followed.
+fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
+    let relative = Path::new(input);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("path must stay within the Nole root");
+    }
+    let mut existing = root.to_path_buf();
+    let mut missing = Vec::new();
+    for component in relative.components() {
+        let candidate = existing.join(component.as_os_str());
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("refusing to create a directory through a symlink");
+                }
+                existing = candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(component.as_os_str().to_os_string());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", candidate.display()));
+            }
+        }
+    }
+    if missing.is_empty() {
+        bail!("destination already exists: {input}");
+    }
+    let canonical = fs::canonicalize(&existing)
+        .with_context(|| format!("resolving parent directory {}", existing.display()))?;
+    if !canonical.starts_with(root) {
+        bail!("path escapes the Nole root");
+    }
+    let mut path = canonical;
+    for part in missing {
+        path.push(part);
+    }
+    Ok(path)
+}
+
+pub struct Mkdir {
+    root: PathBuf,
+}
+
+impl Mkdir {
+    pub fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: canonical_root(root)?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Mkdir {
+    fn name(&self) -> &'static str {
+        "mkdir"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a new directory under the Nole root, including any missing parents, outside config/, daily/, and attachments/. Refuses existing paths and never creates through symlinks."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory path relative to the Nole root" }
+            },
+            "required": ["path"], "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: &Value) -> Result<String> {
+        let relative = required_string(input, "path")?;
+        let path = resolve_new_directory(&self.root, relative)?;
+        match path_zone(&self.root, &path) {
+            PathZone::Config | PathZone::Daily | PathZone::Attachments => {
+                bail!("generic file tools cannot operate on this special file");
+            }
+            _ => {}
+        }
+        fs::create_dir_all(&path)
+            .with_context(|| format!("creating directory {}", path.display()))?;
+        Ok(format!("created directory {relative}"))
+    }
+}
+
+pub struct RemoveDir {
+    root: PathBuf,
+}
+
+impl RemoveDir {
+    pub fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: canonical_root(root)?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for RemoveDir {
+    fn name(&self) -> &'static str {
+        "remove_dir"
+    }
+
+    fn description(&self) -> &'static str {
+        "Recursively remove a directory tree (files and subdirectories) inside workspace/main, without asking the user. Refuses paths outside the Agent workspace and never removes through symlinks."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory path relative to the Nole root, inside workspace/main" }
+            },
+            "required": ["path"], "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: &Value) -> Result<String> {
+        let relative = required_string(input, "path")?;
+        let unresolved = safe_relative(&self.root, relative)?;
+        let metadata = fs::symlink_metadata(&unresolved)
+            .with_context(|| format!("checking {}", unresolved.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("refusing to remove a directory through a symlink");
+        }
+        if !metadata.is_dir() {
+            bail!("remove_dir only removes directories; use delete for regular files");
+        }
+        let path = fs::canonicalize(&unresolved)
+            .with_context(|| format!("resolving {}", unresolved.display()))?;
+        if !matches!(path_zone(&self.root, &path), PathZone::Workspace) {
+            bail!("recursive removal is only allowed inside workspace/main");
+        }
+        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+        Ok(format!("removed directory {relative}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
@@ -879,8 +1128,50 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::agent::test_support::{drain_events, event_channel, test_runtime};
+    use crate::agent::snapshot_tag;
+    use crate::agent::test_support::{
+        drain_events, event_channel, test_runtime, TestFutureResultExt,
+    };
     use crate::agent::ApprovalDecision;
+
+    fn gate_without_decisions() -> (ApprovalGate, tokio::sync::broadcast::Receiver<AgentEvent>) {
+        let (event_sender, event_receiver) = event_channel();
+        let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ApprovalGate {
+                bypass: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                events: event_sender,
+                decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+            },
+            event_receiver,
+        )
+    }
+
+    /// Run a tool without supplying any approval decision. A tool that requests
+    /// approval would block forever; the timeout turns that hang into a failure.
+    fn execute_unapproved<F>(run: F) -> String
+    where
+        F: FnOnce() -> Result<String> + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(run());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("tool must complete without waiting for approval")
+            .expect("tool must succeed without approval")
+    }
+
+    fn assert_no_approval_requested(events: Vec<AgentEvent>) {
+        assert!(
+            events
+                .into_iter()
+                .all(|event| !matches!(event, AgentEvent::Approval(_))),
+            "expected no approval request"
+        );
+    }
 
     #[test]
     fn delete_file_requests_a_confirm_approval_naming_the_target() {
@@ -913,5 +1204,330 @@ mod tests {
         assert_eq!(request.kind, ApprovalKind::Confirm);
         assert_eq!(request.title, "Delete file");
         assert_eq!(request.message, "Delete Old.md?");
+    }
+
+    #[test]
+    fn workspace_edit_and_delete_bypass_approval_but_keep_snapshot_checks() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let workspace = root.join("workspace/main");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let draft = workspace.join("draft.md");
+        fs::write(&draft, "wip\n").unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        let content = fs::read_to_string(&draft).unwrap();
+        let canonical_draft = fs::canonicalize(&draft).unwrap();
+        reads
+            .mark_file(canonical_draft, content.clone(), 0, 1, 1)
+            .unwrap();
+        let (gate, mut events) = gate_without_decisions();
+        let edit = Edit::new(&root, gate, reads).unwrap();
+        let input = json!({
+            "path": "workspace/main/draft.md",
+            "tag": snapshot_tag(&content),
+            "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["edited"]}]
+        });
+        let output = execute_unapproved(move || test_runtime().block_on(edit.execute(&input)));
+        assert!(output.contains("edited workspace/main/draft.md"));
+        assert_eq!(fs::read_to_string(&draft).unwrap(), "edited\n");
+        assert_no_approval_requested(drain_events(&mut events));
+
+        // Snapshot checks still gate workspace edits: a stale tag is refused.
+        let reads = Arc::new(ReadTracker::default());
+        let content = fs::read_to_string(&draft).unwrap();
+        let canonical_draft = fs::canonicalize(&draft).unwrap();
+        reads
+            .mark_file(canonical_draft, content.clone(), 0, 1, 1)
+            .unwrap();
+        let (gate, _) = gate_without_decisions();
+        let edit = Edit::new(&root, gate, reads).unwrap();
+        let input = json!({
+            "path": "workspace/main/draft.md",
+            "tag": "DEAD",
+            "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["again"]}]
+        });
+        let error = test_runtime().block_on(edit.execute(&input)).unwrap_err();
+        assert!(error.to_string().contains("snapshot tag mismatch"));
+        assert_eq!(fs::read_to_string(&draft).unwrap(), "edited\n");
+
+        let removed = workspace.join("trash.md");
+        fs::write(&removed, "remove").unwrap();
+        let (gate, mut events) = gate_without_decisions();
+        let delete = Delete::new(&root, gate).unwrap();
+        let input = json!({"path": "workspace/main/trash.md"});
+        let output = execute_unapproved(move || test_runtime().block_on(delete.execute(&input)));
+        assert!(output.contains("deleted workspace/main/trash.md"));
+        assert!(!removed.exists());
+        assert_no_approval_requested(drain_events(&mut events));
+    }
+
+    #[test]
+    fn workspace_transfers_and_directory_tools_bypass_approval() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let workspace = root.join("workspace/main");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+
+        // move and rename inside workspace/main proceed without approval.
+        let moved = workspace.join("a.txt");
+        fs::write(&moved, "a").unwrap();
+        let (event_sender, mut events) = event_channel();
+        let (gate, mut gate_events) = gate_without_decisions();
+        let mover = Move::new(&root, event_sender, gate).unwrap();
+        let input =
+            json!({"source": "workspace/main/a.txt", "destination": "workspace/main/b.txt"});
+        let output = execute_unapproved(move || test_runtime().block_on(mover.execute(&input)));
+        assert!(output.contains("moved"));
+        assert!(!moved.exists());
+        assert_eq!(fs::read_to_string(workspace.join("b.txt")).unwrap(), "a");
+        assert_no_approval_requested(drain_events(&mut gate_events));
+        let _ = drain_events(&mut events);
+
+        let (event_sender, _) = event_channel();
+        let (gate, mut gate_events) = gate_without_decisions();
+        let renamer = Rename::new(&root, event_sender, gate).unwrap();
+        let input = json!({"path": "workspace/main/b.txt", "new_name": "c.txt"});
+        let output = execute_unapproved(move || test_runtime().block_on(renamer.execute(&input)));
+        assert!(output.contains("renamed"));
+        assert!(!workspace.join("b.txt").exists());
+        assert_eq!(fs::read_to_string(workspace.join("c.txt")).unwrap(), "a");
+        assert_no_approval_requested(drain_events(&mut gate_events));
+
+        // mkdir and remove_dir manage directories inside the workspace freely.
+        // Neither tool consults an approval gate; they run unapproved by design.
+        let mkdir = Mkdir::new(&root).unwrap();
+        let output = execute_unapproved(move || {
+            test_runtime().block_on(mkdir.execute(&json!({
+                "path": "workspace/main/newdir/sub"
+            })))
+        });
+        assert!(output.contains("created directory workspace/main/newdir/sub"));
+        assert!(workspace.join("newdir/sub").is_dir());
+
+        let remover = RemoveDir::new(&root).unwrap();
+        let output = execute_unapproved(move || {
+            test_runtime().block_on(remover.execute(&json!({"path": "workspace/main/newdir"})))
+        });
+        assert!(output.contains("removed directory workspace/main/newdir"));
+        assert!(!workspace.join("newdir").exists());
+
+        // remove_dir refuses trees outside workspace/main.
+        fs::create_dir_all(root.join("data/notes")).unwrap();
+        let remover = RemoveDir::new(&root).unwrap();
+        let error = test_runtime()
+            .block_on(remover.execute(&json!({"path": "data/notes"})))
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace/main"));
+        assert!(root.join("data/notes").is_dir());
+    }
+
+    #[test]
+    fn external_source_moves_require_approval_and_denial_preserves_the_source() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(root.join("data")).unwrap();
+        let outside = tempdir().unwrap();
+        let move_source = outside.path().join("move.txt");
+        fs::write(&move_source, "move me").unwrap();
+
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender.clone(),
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let mover = Move::new(&root, event_sender, gate).unwrap();
+        let input = json!({
+            "source": move_source,
+            "destination": "data/moved.md"
+        });
+        let worker = std::thread::spawn(move || test_runtime().block_on(mover.execute(&input)));
+        let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        assert_eq!(request.kind, ApprovalKind::Confirm);
+        assert_eq!(request.title, "Move file");
+        assert!(request.message.contains("Move"));
+        decision_sender.send(ApprovalDecision::Deny).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("change denied by user"));
+        assert!(move_source.exists(), "denied move must preserve the source");
+        assert!(!root.join("data/moved.md").exists());
+
+        // Approval before mutation: re-run with approval and the source moves.
+        fs::write(&move_source, "move me").unwrap();
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender.clone(),
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let mover = Move::new(&root, event_sender, gate).unwrap();
+        let input = json!({
+            "source": move_source,
+            "destination": "data/moved.md"
+        });
+        let worker = std::thread::spawn(move || test_runtime().block_on(mover.execute(&input)));
+        let AgentEvent::Approval(_) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        decision_sender.send(ApprovalDecision::Approve).unwrap();
+        let output = worker.join().unwrap().unwrap();
+        assert!(output.contains("moved"));
+        assert!(!move_source.exists());
+        assert_eq!(
+            fs::read_to_string(root.join("data/moved.md")).unwrap(),
+            "move me"
+        );
+
+        // Batch move with any external source is denied atomically.
+        let alpha = outside.path().join("alpha.txt");
+        let beta = outside.path().join("beta.txt");
+        fs::write(&alpha, "alpha").unwrap();
+        fs::write(&beta, "beta").unwrap();
+        fs::create_dir_all(root.join("data/collected")).unwrap();
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender.clone(),
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let mover = MoveMany::new(&root, event_sender, gate).unwrap();
+        let input = json!({
+            "sources": [alpha, beta],
+            "destination_directory": "data/collected"
+        });
+        let worker = std::thread::spawn(move || test_runtime().block_on(mover.execute(&input)));
+        let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        assert_eq!(request.title, "Move files");
+        decision_sender.send(ApprovalDecision::Deny).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("change denied by user"));
+        assert!(alpha.exists());
+        assert!(beta.exists());
+        assert!(!root.join("data/collected/alpha.txt").exists());
+    }
+
+    #[test]
+    fn generic_file_tools_reject_attachment_internals() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let attachments = root.join("attachments/objects");
+        fs::create_dir_all(&attachments).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(attachments.join("ab.txt"), "content").unwrap();
+        fs::write(root.join("data/foo.txt"), "plain").unwrap();
+        let attachment_path = "attachments/objects/ab.txt";
+
+        let (event_sender, _) = event_channel();
+        let (gate, _) = gate_without_decisions();
+        assert!(Delete::new(&root, gate)
+            .unwrap()
+            .execute(&json!({"path": attachment_path}))
+            .returns_err());
+        assert!(Write::new(&root)
+            .unwrap()
+            .execute(&json!({"path": "attachments/objects/new.txt", "content": "x"}))
+            .returns_err());
+        assert!(Copy::new(&root)
+            .unwrap()
+            .execute(&json!({"source": attachment_path, "destination": "data/copied.txt"}))
+            .returns_err());
+        assert!(Copy::new(&root)
+            .unwrap()
+            .execute(&json!({"source": "data/foo.txt", "destination": "attachments/objects/x.txt"}))
+            .returns_err());
+        assert!(
+            Move::new(&root, event_sender.clone(), gate_without_decisions().0)
+                .unwrap()
+                .execute(&json!({"source": attachment_path, "destination": "data/moved.txt"}))
+                .returns_err()
+        );
+        assert!(
+            Rename::new(&root, event_sender.clone(), gate_without_decisions().0)
+                .unwrap()
+                .execute(&json!({"path": attachment_path, "new_name": "x.txt"}))
+                .returns_err()
+        );
+        assert!(Mkdir::new(&root)
+            .unwrap()
+            .execute(&json!({"path": "attachments/newdir"}))
+            .returns_err());
+        assert!(RemoveDir::new(&root)
+            .unwrap()
+            .execute(&json!({"path": "attachments/objects"}))
+            .returns_err());
+        assert!(attachments.join("ab.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_tools_resist_path_traversal_and_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let workspace = root.join("workspace/main");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+
+        assert!(Mkdir::new(&root)
+            .unwrap()
+            .execute(&json!({"path": "workspace/../data/evil"}))
+            .returns_err());
+        fs::write(workspace.join("victim.md"), "victim").unwrap();
+        let escape = workspace.join("escape.md");
+        symlink(&outside_file, &escape).unwrap();
+
+        let reads = Arc::new(ReadTracker::default());
+        let (gate, _) = gate_without_decisions();
+        let edit = Edit::new(&root, gate, reads).unwrap();
+        let error = test_runtime()
+            .block_on(edit.execute(&json!({
+                "path": "workspace/main/escape.md",
+                "tag": "0000",
+                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["x"]}]
+            })))
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+
+        let (gate, _) = gate_without_decisions();
+        let delete = Delete::new(&root, gate).unwrap();
+        assert!(delete
+            .execute(&json!({"path": "workspace/main/escape.md"}))
+            .returns_err());
+        assert!(escape.exists());
+        assert!(outside_file.exists());
+
+        let outside_dir = outside.path().join("dir");
+        fs::create_dir(&outside_dir).unwrap();
+        let linked_dir = workspace.join("linked");
+        symlink(&outside_dir, &linked_dir).unwrap();
+        let remover = RemoveDir::new(&root).unwrap();
+        assert!(remover
+            .execute(&json!({"path": "workspace/main/linked"}))
+            .returns_err());
+        assert!(linked_dir.exists());
+        assert!(outside_dir.is_dir());
+
+        let (event_sender, _) = event_channel();
+        let (gate, _) = gate_without_decisions();
+        assert!(Move::new(&root, event_sender, gate)
+            .unwrap()
+            .execute(&json!({"source": "workspace/main/escape.md", "destination": "workspace/main/copy.md"}))
+            .returns_err());
     }
 }

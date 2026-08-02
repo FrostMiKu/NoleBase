@@ -51,6 +51,13 @@ impl App {
                 self.tag_list_start = 0;
                 self.recompute_tags();
             }
+            CenterView::Attachments => {
+                self.attachment_query.clear();
+                self.attachment_cursor = 0;
+                self.attachment_index = 0;
+                self.attachment_list_start = 0;
+                self.recompute_attachments();
+            }
             _ => {}
         }
     }

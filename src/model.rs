@@ -62,6 +62,10 @@ pub enum LinkTarget {
     External(String),
     WikiLink(String),
     EmbeddedFile(PathBuf),
+    /// A content-addressed attachment URI
+    /// (`nole-attachment://sha256/<64 lowercase hex>`), resolved through the
+    /// attachment store only when activated.
+    Attachment(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +181,13 @@ pub enum SearchHit {
 /// A recorded screen rectangle for a clickable search result row.
 #[derive(Debug, Clone)]
 pub struct SearchHitbox {
+    pub index: usize,
+    pub area: Rect,
+}
+
+/// A recorded screen rectangle for a clickable attachment row in the browser.
+#[derive(Debug, Clone)]
+pub struct AttachmentHitbox {
     pub index: usize,
     pub area: Rect,
 }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use ratatui::layout::Rect;
 
 use super::fuzzy_match;
+use crate::attachment::AttachmentId;
 use crate::model::DailyNote;
 use crate::storage::AppendReceipt;
 
@@ -39,6 +40,7 @@ pub(super) enum AppCommand {
     EditAgentInstructions,
     EditAgentMemory,
     BrowseSkills,
+    BrowseAttachments,
 }
 
 pub(super) struct AppCommandDefinition {
@@ -146,6 +148,12 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
         keywords: "skill skills agent browse workflow instructions",
     },
     AppCommandDefinition {
+        id: AppCommand::BrowseAttachments,
+        label: "Attachments: Browse",
+        description: "Browse attachments by name, type, size, and references",
+        keywords: "attachment attachments browse files media open trash delete",
+    },
+    AppCommandDefinition {
         id: AppCommand::SwitchTheme,
         label: "Theme: Switch",
         description: "Choose the active theme",
@@ -215,6 +223,18 @@ pub(super) enum UndoOp {
     },
 }
 
+/// One row of the attachment browser: store metadata joined with the number
+/// of managed notes that reference it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentEntry {
+    pub id: AttachmentId,
+    pub name: String,
+    /// Short display type: media type or file extension when unrecognized.
+    pub kind: String,
+    pub size: u64,
+    pub references: usize,
+}
+
 /// Keyboard focus is independent from the content shown in the center pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -235,6 +255,7 @@ pub enum CenterView {
     Search,
     DocumentSearch,
     Tags,
+    Attachments,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +275,8 @@ impl CenterView {
             | Self::Todo
             | Self::Search
             | Self::DocumentSearch
-            | Self::Tags => SidebarSelection::Views,
+            | Self::Tags
+            | Self::Attachments => SidebarSelection::Views,
         }
     }
 }
@@ -297,6 +319,11 @@ impl WorkspaceView {
             center_view: CenterView::Daily,
             label: "Daily",
             description: "Daily notes",
+        },
+        Self {
+            center_view: CenterView::Attachments,
+            label: "Attachment",
+            description: "Browse attachments",
         },
     ];
 

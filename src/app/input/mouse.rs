@@ -51,6 +51,7 @@ impl App {
                     self.move_search_selection(delta)
                 }
                 CenterView::Tags => self.move_tag_selection(delta),
+                CenterView::Attachments => self.move_attachment_selection(delta),
             }
         }
     }
@@ -130,6 +131,16 @@ impl App {
             {
                 self.search_index = index;
                 self.jump_to_search_result(index);
+                return None;
+            }
+
+            if let Some(index) = self
+                .attachment_hitboxes
+                .iter()
+                .find(|hitbox| point_in_rect(column, row, hitbox.area))
+                .map(|hitbox| hitbox.index)
+            {
+                self.attachment_index = index;
                 return None;
             }
         }

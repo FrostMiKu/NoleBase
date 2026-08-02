@@ -17,11 +17,14 @@ use crate::agent::{
     AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
+use crate::attachment::{AttachmentId, AttachmentStore};
+use crate::attachment_index::AttachmentReferenceIndex;
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
 use crate::model::{
-    Action, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup, FileGroupHitbox, FileHitbox,
-    FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
-    TodoItem, WikiLinkCandidate, WikiLinkHitbox, WikiLinkLocation, WorkspaceViewHitbox,
+    Action, AttachmentHitbox, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup,
+    FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit,
+    SearchHitbox, TagHitbox, TodoHitbox, TodoItem, WikiLinkCandidate, WikiLinkHitbox,
+    WikiLinkLocation, WorkspaceViewHitbox,
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
@@ -46,6 +49,7 @@ mod tests;
 mod text_input;
 mod vlist;
 
+pub(crate) use self::documents::human_size;
 pub(in crate::app) use self::text_input::{edit_single_line, TextInputEdit};
 pub(crate) use self::vlist::*;
 pub use self::{dialog::*, document::*, model::*};
@@ -283,6 +287,16 @@ pub struct App {
     tags_return_view: CenterView,
     workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
+
+    pub attachment_store: AttachmentStore,
+    pub attachment_refs: AttachmentReferenceIndex,
+    pub attachment_entries: Vec<AttachmentEntry>,
+    pub attachment_index: usize,
+    pub attachment_list_start: usize,
+    pub attachment_query: String,
+    pub attachment_cursor: usize,
+    /// Attachment awaiting trash confirmation.
+    pending_attachment: Option<AttachmentId>,
     pub skill_entries: Vec<Skill>,
     pub skill_index: usize,
     skill_browser_return: Option<SkillBrowserReturn>,
@@ -302,6 +316,7 @@ pub struct App {
     pub todo_hitboxes: Vec<TodoHitbox>,
     pub workspace_view_hitboxes: Vec<WorkspaceViewHitbox>,
     pub search_hitboxes: Vec<SearchHitbox>,
+    pub attachment_hitboxes: Vec<AttachmentHitbox>,
     pub wiki_link_hitboxes: Vec<WikiLinkHitbox>,
     pub dialog_hitboxes: Vec<DialogOptionHitbox>,
 
@@ -389,6 +404,7 @@ impl App {
         let file_row = usize::from(first_note.is_some());
         let todo_items = storage.load_todo_tasks();
         let images = crate::media::ImageService::new(&storage.root);
+        let attachment_store = AttachmentStore::new(storage.attachments_dir.clone());
         let workspace_index = WorkspaceIndexHandle::default();
         let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
         let permission_bypass = Arc::new(AtomicBool::new(false));
@@ -466,6 +482,14 @@ impl App {
             tags_return_view: CenterView::Daily,
             workspace_index,
             pending_tag_rename: None,
+            attachment_store,
+            attachment_refs: AttachmentReferenceIndex::default(),
+            attachment_entries: Vec::new(),
+            attachment_index: 0,
+            attachment_list_start: 0,
+            attachment_query: String::new(),
+            attachment_cursor: 0,
+            pending_attachment: None,
             skill_entries: Vec::new(),
             skill_index: 0,
             skill_browser_return: None,
@@ -482,6 +506,7 @@ impl App {
             todo_hitboxes: Vec::new(),
             workspace_view_hitboxes: Vec::new(),
             search_hitboxes: Vec::new(),
+            attachment_hitboxes: Vec::new(),
             wiki_link_hitboxes: Vec::new(),
             dialog_hitboxes: Vec::new(),
             dialog: None,

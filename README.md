@@ -112,6 +112,14 @@ short cooldown. Images reserve twelve terminal rows, scale proportionally, and
 are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
+Managed attachments use immutable, content-addressed objects referenced as
+`nole-attachment://sha256/<digest>`. The same URI works from Daily cards, notes,
+and Agent messages, so moving a note does not break its attachments. Open the
+**Attachment** workspace view, or run `Attachments: Browse`, to inspect type,
+size, and reference count; `Enter` opens an attachment and `d` moves an
+unreferenced attachment to trash after confirmation. Referenced attachments
+cannot be deleted.
+
 Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
 with the system default application. Clicking `[[wikilink]]` searches `daily/`,
 `data/`, and `archives/` by filename or filename stem. Multiple MD/MB matches
@@ -202,6 +210,9 @@ Errors leave the active input/context in place so they can be corrected.
   the article.
 - **Search:** type to filter; arrows select; `Enter` or click opens a result;
   `Esc` returns to Daily. Closing a search result first returns to Search.
+- **Attachment:** arrows select; `Enter` opens a workspace copy with the system
+  application; `d` confirms deletion of an unreferenced attachment. The first
+  row remains separated from the panel header by a blank selection row.
 
 Message card edits suspend the TUI and open a temporary `.md` file in the
 configured editor. When the editor exits successfully, Nole
@@ -237,7 +248,17 @@ archives/      # flat storage for archived articles
 data/          # flat note storage
   <name>.md
   <name>.mb
+attachments/   # immutable, content-addressed managed attachments and trash
+workspace/
+  main/         # Agent-owned scratch files; preserved across restarts
 ```
+
+The Agent may create, edit, move, and delete files freely inside
+`workspace/main/`. Clearing the Agent session clears and recreates this
+directory. Moving a source from elsewhere remains approval-gated because it
+removes user-owned data. Generic file tools cannot access attachment internals;
+the Agent imports, reads, lists, copies, and deletes attachments through the
+dedicated attachment tools.
 
 `.md` and `.mb` extensions are recognized case-insensitively. NoleBase shows
 direct, regular files from both `data/` and `archives/` as separate Notes and

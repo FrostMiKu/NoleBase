@@ -388,6 +388,16 @@ impl App {
         }
     }
 
+    pub fn apply_attachment_index(
+        &mut self,
+        index: crate::attachment_index::AttachmentReferenceIndex,
+    ) {
+        self.attachment_refs = index;
+        if self.center_view == CenterView::Attachments {
+            self.recompute_attachments();
+        }
+    }
+
     pub fn invalidate_agent_reads(&mut self, paths: &[PathBuf]) {
         if let Err(error) = self.agent_worker.invalidate_reads(paths) {
             self.set_error(format!("Agent read-state error: {error:#}"));
@@ -559,7 +569,8 @@ impl App {
                 | CenterView::Todo
                 | CenterView::Search
                 | CenterView::DocumentSearch
-                | CenterView::Tags => None,
+                | CenterView::Tags
+                | CenterView::Attachments => None,
             };
         Some(if let Some((kind, path)) = context {
             let display = path

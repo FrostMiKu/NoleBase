@@ -32,6 +32,7 @@ pub enum DialogPurpose {
     TagRenameSource,
     TagRenameTarget,
     SkillBrowser,
+    DeleteAttachment,
     Custom,
 }
 

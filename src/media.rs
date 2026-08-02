@@ -20,6 +20,8 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::Resize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::attachment::{AttachmentStore, AttachmentUri};
+use crate::storage::ATTACHMENTS_DIR;
 use crate::theme::Theme;
 
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
@@ -45,6 +47,9 @@ struct ImageKey {
 enum ResolvedSource {
     Local(PathBuf),
     Remote(String),
+    /// A content-addressed attachment; bytes are read through the store, so
+    /// physical object paths never leave [`AttachmentStore`].
+    Attachment(AttachmentUri),
 }
 
 enum ImageState {
@@ -94,6 +99,7 @@ pub(crate) struct ImageService {
     sender: Sender<LoadResult>,
     receiver: Receiver<LoadResult>,
     remote_sources: Arc<Mutex<RemoteSourceCache>>,
+    attachments: AttachmentStore,
 }
 
 impl ImageService {
@@ -108,6 +114,7 @@ impl ImageService {
             sender,
             receiver,
             remote_sources: Arc::new(Mutex::new(RemoteSourceCache::default())),
+            attachments: AttachmentStore::new(root.join(ATTACHMENTS_DIR)),
         }
     }
 
@@ -205,6 +212,25 @@ impl ImageService {
         width: u16,
         height: u16,
     ) -> Result<(ImageKey, ResolvedSource)> {
+        if AttachmentUri::is_attachment_uri(source) {
+            let uri = AttachmentUri::parse(source)?;
+            let metadata = self
+                .attachments
+                .metadata(uri.id())
+                .with_context(|| format!("reading attachment {uri}"))?;
+            if metadata.size > MAX_IMAGE_BYTES {
+                bail!("attachment image exceeds 8 MB");
+            }
+            return Ok((
+                ImageKey {
+                    source: uri.to_string(),
+                    width,
+                    height,
+                    picker_generation: self.picker_generation,
+                },
+                ResolvedSource::Attachment(uri),
+            ));
+        }
         if let Ok(url) = reqwest::Url::parse(source) {
             let url = validate_remote_image_url(url)?;
             return Ok((
@@ -263,12 +289,14 @@ impl ImageService {
         let sender = self.sender.clone();
         let picker = self.picker.clone();
         let remote_sources = Arc::clone(&self.remote_sources);
+        let attachments = self.attachments.clone();
         std::thread::spawn(move || {
             let result = load_protocol(
                 &picker,
                 &source,
                 Size::new(key.width, key.height),
                 &remote_sources,
+                &attachments,
             )
             .map_err(|error| error.to_string());
             let _ = sender.send(LoadResult { key, result });
@@ -306,12 +334,18 @@ fn load_protocol(
     source: &ResolvedSource,
     size: Size,
     remote_sources: &Arc<Mutex<RemoteSourceCache>>,
+    attachments: &AttachmentStore,
 ) -> Result<SlicedProtocol> {
     let bytes = match source {
         ResolvedSource::Local(path) => Arc::<[u8]>::from(
             fs::read(path).with_context(|| format!("reading image {}", path.display()))?,
         ),
         ResolvedSource::Remote(url) => remote_image_bytes(remote_sources, url)?,
+        ResolvedSource::Attachment(uri) => Arc::<[u8]>::from(
+            attachments
+                .read_object(uri.id())
+                .with_context(|| format!("reading attachment {uri}"))?,
+        ),
     };
     let image = decode_image(bytes.as_ref())?;
     SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None))
@@ -748,6 +782,59 @@ mod tests {
                 10,
             )
             .is_err());
+    }
+
+    #[test]
+    fn attachment_image_uris_resolve_through_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(root.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let png = bytes.into_inner();
+        let uri = store.import_bytes(&png, Some("photo.png")).unwrap().uri();
+        let service = ImageService::new(root.path());
+
+        let (key, source) = service
+            .resolve(&uri.to_string(), root.path(), 20, 10)
+            .unwrap();
+        assert_eq!(key.source, uri.to_string());
+        assert!(matches!(source, ResolvedSource::Attachment(resolved) if resolved == uri));
+    }
+
+    #[test]
+    fn attachment_image_protocol_loads_bytes_from_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(root.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let image = image::DynamicImage::new_rgb8(4, 4);
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let png = bytes.into_inner();
+        let uri = store.import_bytes(&png, Some("photo.png")).unwrap().uri();
+        let cache = Arc::new(Mutex::new(RemoteSourceCache::default()));
+
+        let protocol = load_protocol(
+            &Picker::halfblocks(),
+            &ResolvedSource::Attachment(uri),
+            Size::new(4, 2),
+            &cache,
+            &store,
+        )
+        .unwrap();
+        assert!(protocol.size().width > 0 && protocol.size().height > 0);
+    }
+
+    #[test]
+    fn malformed_or_absent_attachment_image_uris_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ImageService::new(root.path());
+        assert!(service
+            .resolve("nole-attachment://sha256/not-hex", root.path(), 20, 10)
+            .is_err());
+        let missing = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        assert!(service.resolve(&missing, root.path(), 20, 10).is_err());
     }
 
     #[test]

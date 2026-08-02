@@ -388,7 +388,9 @@ fn wide_layout_uses_terminal_edges_and_center_content_axis() {
         assert_eq!(views.x + views.width, width, "width {width}");
         assert_eq!(
             views.height,
-            selection_list_height(WorkspaceView::ALL.len() as u16, 3) + 2,
+            selection_list_height(WorkspaceView::ALL.len() as u16, 3)
+                .saturating_add(2)
+                .min(23 - MIN_AGENT_HEADER_ROWS),
             "width {width}"
         );
         assert_eq!(agent.y, 0, "width {width}");
@@ -1051,6 +1053,57 @@ fn narrow_center_renders_each_center_view_in_place() {
     assert!(screen.contains("2 documents · 3 mentions"));
     assert_eq!(app.tag_hitboxes.len(), 2);
     assert_eq!(app.tag_hitboxes[0].area.height, SELECT_OPTION_HEIGHT);
+}
+
+#[test]
+fn attachments_browser_keeps_blank_row_and_full_area_selection_invariants() {
+    let (mut app, _directory) = make_app();
+    for (name, bytes) in [
+        ("report.pdf", b"pdf-bytes".as_slice()),
+        ("photo.png", b"png-bytes".as_slice()),
+        ("notes.txt", b"text-bytes".as_slice()),
+    ] {
+        app.attachment_store
+            .import_bytes(bytes, Some(name))
+            .unwrap();
+    }
+    let uri = app.attachment_store.list().unwrap()[0].uri().to_string();
+    fs::write(
+        app.storage.data_dir.join("Note.md"),
+        format!("[a]({uri})\n"),
+    )
+    .unwrap();
+    app.apply_attachment_index(crate::attachment_index::AttachmentReferenceIndex::build(
+        &app.storage,
+    ));
+    app.open_attachments();
+
+    let terminal = render(&mut app, 80, 18);
+    let buffer = terminal.backend().buffer();
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Attachments · 3"), "{screen}");
+    assert!(screen.contains("report.pdf"), "{screen}");
+    assert!(screen.contains("photo.png"), "{screen}");
+    assert!(screen.contains("1 ref"), "{screen}");
+    assert_eq!(app.attachment_hitboxes.len(), 3);
+
+    let first = app.attachment_hitboxes[0].area;
+    assert_eq!(first.height, SELECT_OPTION_HEIGHT);
+    assert!(first.y >= 1, "first item starts below the filter header");
+    assert_eq!(
+        buffer[(first.x + 2, first.y - 1)].symbol(),
+        " ",
+        "the row above the first item is a shared blank row"
+    );
+    for y in first.y - 1..first.y + first.height {
+        assert_eq!(
+            buffer[(first.x + first.width - 1, y)].bg,
+            app.theme.selection_background,
+            "selection spans the full list width including the shared blank row"
+        );
+        assert_eq!(buffer[(first.x, y)].symbol(), "▌");
+        assert_eq!(buffer[(first.x, y)].fg, app.theme.selection_indicator);
+    }
 }
 
 #[test]

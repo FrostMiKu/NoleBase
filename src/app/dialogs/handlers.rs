@@ -15,6 +15,7 @@ impl App {
         match dialog.purpose {
             DialogPurpose::DeleteDaily => return self.handle_delete_daily_overlay(key),
             DialogPurpose::DeleteFile => return self.handle_delete_file_overlay(key),
+            DialogPurpose::DeleteAttachment => return self.handle_delete_attachment_overlay(key),
             DialogPurpose::Help => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {

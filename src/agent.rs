@@ -495,12 +495,14 @@ impl Agent {
         )?);
         agent.register(Write::new(nole_root)?);
         agent.register(Copy::new(nole_root)?);
+        agent.register(Mkdir::new(nole_root)?);
+        agent.register(RemoveDir::new(nole_root)?);
         let file_events = agent.events.clone();
-        agent.register(Move::new(nole_root, file_events.clone())?);
-        agent.register(MoveMany::new(nole_root, file_events.clone())?);
-        agent.register(Rename::new(nole_root, file_events)?);
+        agent.register(Move::new(nole_root, file_events.clone(), gate.clone())?);
+        agent.register(MoveMany::new(nole_root, file_events.clone(), gate.clone())?);
+        agent.register(Rename::new(nole_root, file_events, gate.clone())?);
         agent.register(Delete::new(nole_root, gate.clone())?);
-        agent.register(Edit::new(nole_root, gate, reads)?);
+        agent.register(Edit::new(nole_root, gate.clone(), reads)?);
         agent.register(AddDailyEntry::new(nole_root)?);
         agent.register(Open::new(nole_root, agent.events.clone())?);
         agent.register(Notify {
@@ -533,6 +535,11 @@ impl Agent {
             tavily_api_key,
             &skills,
         )?);
+        agent.register(ImportAttachment::new(nole_root)?);
+        agent.register(ListAttachments::new(nole_root)?);
+        agent.register(AttachmentInfo::new(nole_root)?);
+        agent.register(CopyAttachmentToWorkspace::new(nole_root)?);
+        agent.register(DeleteAttachment::new(nole_root, gate.clone())?);
         if let Some(definition) = agent.definitions.last_mut() {
             definition.cache = true;
         }

@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
+use crate::attachment::AttachmentUri;
 use crate::model::LinkTarget;
 use crate::theme::Theme;
 
@@ -66,8 +67,9 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
                         }));
                     }
                     mbtui::SemanticKind::Embed { target } => {
+                        let target = embed_link_target(&target);
                         links.extend(semantic.regions.into_iter().map(|region| RenderedLink {
-                            target: LinkTarget::EmbeddedFile(target.clone().into()),
+                            target: target.clone(),
                             row: region.row,
                             column: region.column,
                             width: region.width,
@@ -125,6 +127,28 @@ struct LinkSpec {
     target: LinkTarget,
 }
 
+/// Classify a raw link target. Anything with the attachment scheme stays an
+/// attachment target — even a malformed URI — so it is never handed to a web
+/// opener; strict parsing happens only at activation, where the error can be
+/// shown to the user.
+fn link_target(raw: &str) -> LinkTarget {
+    if AttachmentUri::is_attachment_uri(raw) {
+        LinkTarget::Attachment(raw.to_string())
+    } else {
+        LinkTarget::External(raw.to_string())
+    }
+}
+
+/// Classify an embed (`![[...]]`) target: attachment URIs become attachment
+/// links, everything else an embedded file.
+fn embed_link_target(raw: &str) -> LinkTarget {
+    if AttachmentUri::is_attachment_uri(raw) {
+        LinkTarget::Attachment(raw.to_string())
+    } else {
+        LinkTarget::EmbeddedFile(raw.into())
+    }
+}
+
 #[derive(Clone)]
 struct RenderedCell {
     character: char,
@@ -165,7 +189,7 @@ fn collect_event_links(events: &[mbdown::SpannedEvent<'_>], links: &mut Vec<Link
                     .map_or(events.len(), |offset| index + 1 + offset);
                 links.push(LinkSpec {
                     label: visible_event_text(&events[index + 1..end]),
-                    target: LinkTarget::External(target.to_string()),
+                    target: link_target(&target),
                 });
                 index = end.saturating_add(1);
                 continue;
@@ -195,7 +219,7 @@ fn collect_event_links(events: &[mbdown::SpannedEvent<'_>], links: &mut Vec<Link
                     .map_or(events.len(), |offset| index + 1 + offset);
                 links.push(LinkSpec {
                     label: visible_event_text(&events[index + 1..end]),
-                    target: LinkTarget::External(target.clone()),
+                    target: link_target(target),
                 });
                 index = end.saturating_add(1);
                 continue;
@@ -652,6 +676,42 @@ mod tests {
             link.target == LinkTarget::EmbeddedFile("attachments/report.pdf".into())
         }));
         assert!(text(&file.lines).contains("![[attachments/report.pdf]]"));
+    }
+
+    #[test]
+    fn attachment_links_are_clickable_and_never_external() {
+        let uri = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        let rendered = render_at_width(&format!("[report]({uri})"), WIDTH);
+        assert!(rendered
+            .links
+            .iter()
+            .any(|link| { link.target == LinkTarget::Attachment(uri.clone()) && link.width == 6 }));
+
+        // A malformed attachment URI still classifies as an attachment link so
+        // it can never reach a web opener; activation reports the parse error.
+        let rendered = render_at_width("[bad](nole-attachment://sha256/nothex)", WIDTH);
+        assert!(rendered.links.iter().any(|link| {
+            matches!(&link.target, LinkTarget::Attachment(target)
+                if target == "nole-attachment://sha256/nothex")
+        }));
+
+        let rendered = render_at_width(&format!("[link={uri}]open[/link]"), WIDTH);
+        assert!(rendered
+            .links
+            .iter()
+            .any(|link| { link.target == LinkTarget::Attachment(uri.clone()) }));
+    }
+
+    #[test]
+    fn attachment_embeds_become_attachment_links() {
+        let uri = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        let rendered = render_at_width(&format!("![[{uri}]]"), WIDTH);
+        assert!(rendered.images.is_empty());
+        assert!(rendered
+            .links
+            .iter()
+            .any(|link| { link.target == LinkTarget::Attachment(uri.clone()) }));
+        assert!(text(&rendered.lines).contains(&format!("![[{uri}]]")));
     }
 
     #[test]

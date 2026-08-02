@@ -341,6 +341,36 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn handle_attachments(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.activate_workspace_view(CenterView::Daily);
+                None
+            }
+            KeyCode::Down => {
+                self.move_attachment_selection(1);
+                None
+            }
+            KeyCode::Up => {
+                self.move_attachment_selection(-1);
+                None
+            }
+            KeyCode::Enter => self.open_attachment_at(self.attachment_index),
+            KeyCode::Char('d') => {
+                self.request_delete_attachment();
+                None
+            }
+            _ => {
+                let edit =
+                    edit_single_line(&mut self.attachment_query, &mut self.attachment_cursor, key);
+                if edit.changed() {
+                    self.recompute_attachments();
+                }
+                None
+            }
+        }
+    }
+
     pub(in crate::app) fn handle_document(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             code if is_cancel_key(code) => {

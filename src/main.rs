@@ -3,6 +3,8 @@
 mod agent;
 mod agent_session;
 mod app;
+mod attachment;
+mod attachment_index;
 mod backend;
 mod embedded_terminal;
 mod markdown;
@@ -40,6 +42,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use app::{App, Command};
+use attachment_index::AttachmentIndexer;
 use backend::FrameBackend;
 use workspace_index::WorkspaceIndexer;
 
@@ -187,11 +190,24 @@ fn watch_workspace(path: &std::path::Path) -> Result<(RecommendedWatcher, WatchE
 }
 
 fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::path::PathBuf> {
+    // The agent workspace sandbox (workspace/main) churns constantly while an
+    // Agent task runs. Its events must never reload the workspace UI or feed
+    // the note/attachment indexes; session file handling is the workspace
+    // policy's job.
+    let workspace_dir = app.storage.workspace_dir.clone();
     let mut changed = false;
     let mut indexed_paths = Vec::new();
     let mut watcher_error = None;
     for event in events.try_iter() {
         if let Ok(event) = &event {
+            if !event.paths.is_empty()
+                && event
+                    .paths
+                    .iter()
+                    .all(|path| path.starts_with(&workspace_dir))
+            {
+                continue;
+            }
             app.invalidate_agent_reads(&event.paths);
         }
         match event {
@@ -259,13 +275,18 @@ fn run(
     app: &mut App,
     workspace_events: &WatchEvents,
     workspace_indexer: &WorkspaceIndexer,
+    attachment_indexer: &AttachmentIndexer,
 ) -> Result<()> {
     let animation_epoch = Instant::now();
     loop {
         let indexed_paths = process_workspace_events(workspace_events, app);
-        workspace_indexer.paths_changed(indexed_paths);
+        workspace_indexer.paths_changed(indexed_paths.clone());
+        attachment_indexer.paths_changed(indexed_paths);
         if let Some(index) = workspace_indexer.try_latest_update() {
             app.apply_workspace_index(index);
+        }
+        if let Some(index) = attachment_indexer.try_latest_update() {
+            app.apply_attachment_index(index);
         }
         app.poll_agent();
         app.poll_terminal();
@@ -383,6 +404,7 @@ fn main() -> Result<()> {
     storage.ensure_files()?;
     let (_watcher, workspace_events) = watch_workspace(&storage.root)?;
     let workspace_indexer = WorkspaceIndexer::spawn(storage.clone());
+    let attachment_indexer = AttachmentIndexer::spawn(storage.clone());
     let mut app = App::new(storage)?;
 
     enter_tui()?;
@@ -400,6 +422,7 @@ fn main() -> Result<()> {
         &mut app,
         &workspace_events,
         &workspace_indexer,
+        &attachment_indexer,
     )
     .context("event loop failed")?;
     Ok(())
@@ -547,6 +570,43 @@ mod tests {
         process_workspace_events(&receiver, &mut app);
 
         assert!(app.daily_notes.is_empty());
+    }
+
+    #[test]
+    fn workspace_events_do_not_reload_the_ui_or_feed_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+        app.storage.append_to_today("loaded").unwrap();
+        app.reload();
+        assert_eq!(app.daily_notes.len(), 1);
+
+        let workspace_dir = app.storage.workspace_dir.clone();
+        let session = workspace_dir.join("main").join("session.json");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(&session, "{}").unwrap();
+        let session_note = workspace_dir.join("main").join("scratch.md");
+        fs::write(&session_note, "# scratch").unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        for path in [session, session_note] {
+            sender
+                .send(Ok(
+                    notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
+                ))
+                .unwrap();
+        }
+        let indexed = process_workspace_events(&receiver, &mut app);
+        assert!(
+            indexed.is_empty(),
+            "workspace events must not reach the note/attachment indexes"
+        );
+        assert_eq!(
+            app.daily_notes.len(),
+            1,
+            "workspace events must not reload the workspace UI"
+        );
     }
 
     #[test]

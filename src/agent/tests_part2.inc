@@ -533,9 +533,11 @@
         assert!(prompt.contains("Local file reads return a `[path#TAG]` snapshot header"));
         assert!(prompt.contains("absolute one-based `N:text` rows"));
         assert!(prompt.contains("read again after each successful edit"));
-        assert!(!prompt.contains("approval"));
-        assert!(!prompt.contains("bypass"));
         assert!(!prompt.contains("prevalidated"));
+        assert!(prompt.contains("workspace/main/: your private working sandbox"));
+        assert!(prompt.contains("proceeds without approval"));
+        assert!(prompt.contains("requires approval"));
+        assert!(prompt.contains("nole-attachment://sha256/<64 lowercase hex>"));
         assert!(prompt.contains("Use read with a URL when you already have one"));
         assert!(prompt.contains("Delegate broad, multi-step exploration"));
         assert!(prompt.contains("internal work stays out of this conversation"));
@@ -1089,7 +1091,7 @@
         assert!(!storage.skills_dir.join("copied.md").exists());
 
         let (event_sender, _) = event_channel();
-        assert!(Move::new(directory.path(), event_sender.clone())
+        assert!(Move::new(directory.path(), event_sender.clone(), bypass_gate())
             .unwrap()
             .execute(&json!({
                 "source": move_source,
@@ -1104,7 +1106,7 @@
         fs::write(&batch_valid, valid).unwrap();
         fs::write(&batch_invalid, invalid).unwrap();
         let (batch_events, _) = event_channel();
-        assert!(MoveMany::new(directory.path(), batch_events)
+        assert!(MoveMany::new(directory.path(), batch_events, bypass_gate())
             .unwrap()
             .execute(&json!({
                 "sources": [batch_valid, batch_invalid],
@@ -1116,7 +1118,7 @@
         assert!(!storage.skills_dir.join("batch-valid.md").exists());
         assert!(!storage.skills_dir.join("batch-invalid.md").exists());
 
-        assert!(Rename::new(directory.path(), event_sender)
+        assert!(Rename::new(directory.path(), event_sender, bypass_gate())
             .unwrap()
             .execute(&json!({
                 "path": "skills/existing.md",

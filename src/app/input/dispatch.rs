@@ -68,6 +68,7 @@ impl App {
                 CenterView::Document => self.handle_document(key),
                 CenterView::Search | CenterView::DocumentSearch => self.handle_search(key),
                 CenterView::Tags => self.handle_tags(key),
+                CenterView::Attachments => self.handle_attachments(key),
             },
         }
     }
@@ -142,6 +143,14 @@ impl App {
                 );
                 self.recompute_tags();
             }
+            (Focus::Center, CenterView::Attachments, _) => {
+                paste_into(
+                    &mut self.attachment_query,
+                    &mut self.attachment_cursor,
+                    &text.replace('\n', ""),
+                );
+                self.recompute_attachments();
+            }
             (Focus::Files, _, FilesContext::Search) => {
                 paste_into(
                     &mut self.file_query,
@@ -210,6 +219,7 @@ impl App {
                         | CenterView::Search
                         | CenterView::DocumentSearch
                         | CenterView::Tags
+                        | CenterView::Attachments
                 ))
             || (self.focus == Focus::Files
                 && matches!(
