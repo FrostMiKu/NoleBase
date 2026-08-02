@@ -829,7 +829,7 @@
     }
 
     #[test]
-    fn edit_requires_read_and_write_overwrite_is_explicit() {
+    fn edit_requires_read_and_write_is_create_only() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
@@ -868,21 +868,24 @@
 
         let write = Write::new(directory.path()).unwrap();
         let schema = write.input_schema();
-        assert_eq!(schema["properties"]["overwrite"]["default"], false);
-        assert!(write
+        assert!(schema["properties"].get("overwrite").is_none());
+        let existing_error = write
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
-            .returns_err());
-
-        write
+            .unwrap_err()
+            .to_string();
+        assert!(existing_error.contains("write only creates new files"));
+        let explicit_overwrite_error = write
             .execute(&json!({
                 "path": "data/note.md",
                 "content": "overwritten\n",
                 "overwrite": true
             }))
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(explicit_overwrite_error.contains("write only creates new files"));
         assert_eq!(
             fs::read_to_string(directory.path().join("data/note.md")).unwrap(),
-            "overwritten\n"
+            "new\n"
         );
     }
 
@@ -956,7 +959,7 @@
             }))
             .unwrap_err()
             .to_string();
-        assert!(overwrite_error.contains("box border must be single or none"));
+        assert!(overwrite_error.contains("write only creates new files"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
         let reads = Arc::new(ReadTracker::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
@@ -1046,7 +1049,7 @@
             }))
             .unwrap_err()
             .to_string();
-        assert!(overwrite_error.contains("front matter"));
+        assert!(overwrite_error.contains("write only creates new files"));
         assert_eq!(fs::read_to_string(&existing).unwrap(), valid);
         let reads = Arc::new(ReadTracker::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())

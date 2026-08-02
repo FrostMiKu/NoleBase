@@ -23,6 +23,9 @@ const AI_CONFIG_FILE: &str = "ai.toml";
 const SETTINGS_FILE: &str = "settings.toml";
 const DEFAULT_SETTINGS: &str = r#"theme = "default"
 
+# Show complete thinking blocks instead of a five-line scrolling window.
+show_full_thinking = false
+
 # Command used to edit notes. Defaults to $EDITOR, then $VISUAL, then vi.
 # editor = "code -w"
 
@@ -53,6 +56,8 @@ struct SettingsFile {
     theme: String,
     editor: Option<String>,
     shell: Option<String>,
+    #[serde(default)]
+    show_full_thinking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +243,10 @@ impl Storage {
 
     pub fn terminal_shell(&self) -> Result<Option<String>> {
         Ok(nonempty_setting(self.load_settings()?.shell))
+    }
+
+    pub fn show_full_thinking(&self) -> Result<bool> {
+        Ok(self.load_settings()?.show_full_thinking)
     }
 
     pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
@@ -1547,6 +1556,10 @@ mod tests {
             fs::read_to_string(&st.settings_path).unwrap(),
             DEFAULT_SETTINGS
         );
+        let settings = fs::read_to_string(&st.settings_path).unwrap();
+        assert!(settings
+            .contains("# Show complete thinking blocks instead of a five-line scrolling window."));
+        assert!(settings.contains("show_full_thinking = false"));
         let loaded = st.load_theme(None).unwrap();
         assert_eq!(loaded.requested, "default");
         assert_eq!(loaded.active, "default");
@@ -1693,6 +1706,7 @@ mod tests {
         let defaults: SettingsFile = toml::from_str(DEFAULT_SETTINGS).unwrap();
         assert_eq!(defaults.editor, None);
         assert_eq!(defaults.shell, None);
+        assert!(!defaults.show_full_thinking);
 
         let (_directory, storage) = fresh();
         storage.write_theme_selection("custom").unwrap();
@@ -1711,6 +1725,7 @@ mod tests {
         assert_eq!(settings.theme, "custom");
         assert_eq!(settings.editor.as_deref(), Some("hx"));
         assert_eq!(settings.shell.as_deref(), Some("fish"));
+        assert!(!settings.show_full_thinking);
         assert_eq!(storage.editor_command().unwrap(), "hx");
         assert_eq!(storage.terminal_shell().unwrap().as_deref(), Some("fish"));
 

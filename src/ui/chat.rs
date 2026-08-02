@@ -3,6 +3,8 @@ use super::*;
 /// Horizontal padding (columns) shared by every chat block. The left pad also
 /// carries the user prompt's "> " prefix and the thinking spinner.
 const CHAT_BLOCK_PAD: usize = 1;
+pub(super) const DEFAULT_THINKING_BODY_ROWS: usize = 5;
+const TRUNCATED_THINKING_LABEL: &str = "truncated";
 
 pub(super) fn draw_chat(
     frame: &mut Frame,
@@ -107,9 +109,23 @@ fn draw_chat_messages(
     }
 }
 
+#[cfg(test)]
 pub(super) fn render_chat_entry(
     entry: &crate::agent_session::AgentPanelEntry,
     width: usize,
+    theme: Theme,
+) -> (
+    Vec<Line<'static>>,
+    Vec<crate::markdown::RenderedLink>,
+    Vec<mbtui::ImagePlacement>,
+) {
+    render_chat_entry_with_thinking_mode(entry, width, false, theme)
+}
+
+pub(super) fn render_chat_entry_with_thinking_mode(
+    entry: &crate::agent_session::AgentPanelEntry,
+    width: usize,
+    show_full_thinking: bool,
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
@@ -128,7 +144,7 @@ pub(super) fn render_chat_entry(
             render_chat_plain_text(text, width, theme)
         }
         crate::agent_session::AgentPanelEntry::Thinking { text, streaming } => {
-            render_chat_thinking_box(text, *streaming, width, 0, theme)
+            render_chat_thinking_box(text, *streaming, width, 0, show_full_thinking, theme)
         }
         crate::agent_session::AgentPanelEntry::Tool { text, preview, .. } => (
             render_chat_tool(text, preview.as_deref(), width, 0, false, theme),
@@ -304,6 +320,7 @@ pub(super) fn render_chat_thinking_box(
     streaming: bool,
     width: usize,
     tick: u64,
+    show_full_thinking: bool,
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
@@ -319,29 +336,47 @@ pub(super) fn render_chat_thinking_box(
     } else {
         '\u{2713}'
     };
+    let body_indent = CHAT_BLOCK_PAD + 1 + 1;
+    let body_width = width.saturating_sub(body_indent * 2).max(1);
+    let mut markdown = crate::markdown::render_at_width(text, body_width, theme);
+    let hidden_rows = if show_full_thinking {
+        0
+    } else {
+        markdown
+            .lines
+            .len()
+            .saturating_sub(DEFAULT_THINKING_BODY_ROWS)
+    };
+    let mut title_spans = vec![
+        Span::raw(" ".repeat(CHAT_BLOCK_PAD)),
+        Span::styled(
+            marker.to_string(),
+            Style::default()
+                .fg(theme.ui_activity_marker)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("thinking", Style::default().fg(theme.text_muted)),
+    ];
+    let title_width = CHAT_BLOCK_PAD + 1 + 1 + "thinking".len();
+    let truncated_width = TRUNCATED_THINKING_LABEL.len() + CHAT_BLOCK_PAD;
+    if hidden_rows > 0 && width > title_width + truncated_width {
+        title_spans.push(Span::raw(" ".repeat(width - title_width - truncated_width)));
+        title_spans.push(Span::styled(
+            TRUNCATED_THINKING_LABEL,
+            Style::default().fg(theme.text_subtle),
+        ));
+        title_spans.push(Span::raw(" ".repeat(CHAT_BLOCK_PAD)));
+    }
     let mut lines = vec![line_with_background(Vec::new(), width, style)];
-    lines.push(line_with_background(
-        vec![
-            Span::raw(" ".repeat(CHAT_BLOCK_PAD)),
-            Span::styled(
-                marker.to_string(),
-                Style::default()
-                    .fg(theme.ui_activity_marker)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled("thinking", Style::default().fg(theme.text_muted)),
-        ],
-        width,
-        style,
-    ));
+    lines.push(line_with_background(title_spans, width, style));
     // A pad row separates the label from the body.
     lines.push(line_with_background(Vec::new(), width, style));
     // Body rows align with the "thinking" label's first letter: one pad column
     // plus the spinner cell plus its trailing space. Thinking text stays muted.
-    let body_indent = CHAT_BLOCK_PAD + 1 + 1;
-    let body_width = width.saturating_sub(body_indent * 2).max(1);
-    let mut markdown = crate::markdown::render_at_width(text, body_width, theme);
+    if hidden_rows > 0 {
+        markdown.lines.drain(..hidden_rows);
+    }
     for line in &mut markdown.lines {
         for span in &mut line.spans {
             span.style = span.style.fg(theme.text_muted);
@@ -351,19 +386,25 @@ pub(super) fn render_chat_thinking_box(
     let links = markdown
         .links
         .into_iter()
-        .map(|mut link| {
-            link.row += body_row;
+        .filter_map(|mut link| {
+            if link.row < hidden_rows {
+                return None;
+            }
+            link.row = link.row - hidden_rows + body_row;
             link.column += body_indent;
-            link
+            Some(link)
         })
         .collect();
     let images = markdown
         .images
         .into_iter()
-        .map(|mut image| {
-            image.row += body_row;
+        .filter_map(|mut image| {
+            if image.row < hidden_rows {
+                return None;
+            }
+            image.row = image.row - hidden_rows + body_row;
             image.column += body_indent;
-            image
+            Some(image)
         })
         .collect();
     for markdown_line in markdown.lines {
@@ -597,6 +638,7 @@ mod tests {
                 &entry,
                 width,
                 crate::app::AgentEntryRenderStyle::Cards,
+                false,
             );
             let actual = render_chat_entry(&entry, width, theme).0.len();
             assert!(
@@ -845,6 +887,52 @@ mod tests {
         assert!(done[1].to_string().starts_with(" \u{2713} thinking"));
     }
 
+    #[test]
+    fn chat_thinking_defaults_to_latest_five_rows_and_can_show_full_block() {
+        let source = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7";
+        let theme = Theme::default();
+
+        let truncated = render_chat_thinking_box(source, true, 80, 0, false, theme).0;
+        let truncated_body = &truncated[3..truncated.len() - 2];
+        assert_eq!(truncated_body.len(), DEFAULT_THINKING_BODY_ROWS);
+        assert!(!truncated_body
+            .iter()
+            .any(|line| line.to_string().contains("line 1")));
+        assert!(truncated_body
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("line 7"));
+        let truncated_title = truncated[1].to_string();
+        let label_byte = truncated_title.find(TRUNCATED_THINKING_LABEL).unwrap();
+        assert_eq!(
+            truncated_title[..label_byte].chars().count(),
+            80 - CHAT_BLOCK_PAD - TRUNCATED_THINKING_LABEL.len()
+        );
+
+        let full = render_chat_thinking_box(source, false, 80, 0, true, theme).0;
+        let full_body = &full[3..full.len() - 2];
+        assert!(full_body.len() > DEFAULT_THINKING_BODY_ROWS);
+        assert!(full_body
+            .iter()
+            .any(|line| line.to_string().contains("line 1")));
+        assert!(!full[1].to_string().contains(TRUNCATED_THINKING_LABEL));
+    }
+
+    #[test]
+    fn chat_loads_full_thinking_mode_from_settings() {
+        let directory = tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let config = std::fs::read_to_string(&storage.settings_path)
+            .unwrap()
+            .replace("show_full_thinking = false", "show_full_thinking = true");
+        std::fs::write(&storage.settings_path, config).unwrap();
+
+        let app = App::new(storage).unwrap();
+
+        assert!(app.show_full_thinking);
+    }
     #[test]
     fn enter_in_chat_compose_sends_to_the_agent_instead_of_daily() {
         let (mut app, _directory) = make_app();
@@ -1147,7 +1235,7 @@ mod tests {
             "4:\t  1. 注意简表必须导师和本人手签，不能电子签。\n",
             "```",
         );
-        let (lines, _, _) = render_chat_thinking_box(source, true, 110, 0, Theme::default());
+        let (lines, _, _) = render_chat_thinking_box(source, true, 110, 0, false, Theme::default());
 
         assert!(lines[..lines.len() - 1]
             .iter()

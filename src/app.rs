@@ -328,6 +328,7 @@ pub struct App {
     pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
     pub(crate) agent_follow_tail: bool,
+    pub(crate) show_full_thinking: bool,
     pub agent_usage: TokenUsage,
     pub agent_context_window: u64,
     pub agent_context_capacity: u64,
@@ -408,6 +409,7 @@ impl App {
             )
             .with_workspace_index(workspace_index.clone()),
         );
+        let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
         Ok(Self {
             storage,
             theme: loaded_theme.theme,
@@ -501,6 +503,7 @@ impl App {
             agent_vlist: AgentVirtualList::default(),
             agent_scroll,
             agent_follow_tail,
+            show_full_thinking,
             agent_usage,
             agent_context_window: 0,
             agent_context_capacity: 0,
@@ -529,7 +532,18 @@ impl App {
         })
     }
 
+    pub(super) fn reload_thinking_display_config(&mut self) {
+        let Ok(show_full_thinking) = self.storage.show_full_thinking() else {
+            return;
+        };
+        if self.show_full_thinking != show_full_thinking {
+            self.show_full_thinking = show_full_thinking;
+            self.agent_vlist = AgentVirtualList::default();
+        }
+    }
+
     pub fn reload(&mut self) {
+        self.reload_thinking_display_config();
         let selected_date = self.selected_date();
         match self.storage.load_daily_notes() {
             Ok(daily_notes) => {

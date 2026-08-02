@@ -590,6 +590,7 @@ impl App {
             self.set_status("AI is already working");
             return false;
         }
+        self.reload_thinking_display_config();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }

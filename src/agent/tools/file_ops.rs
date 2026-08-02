@@ -831,18 +831,14 @@ impl Tool for Write {
         "write"
     }
     fn description(&self) -> &'static str {
-        "Write a complete UTF-8 text file under the Nole root outside config/ and daily/. Existing files are refused unless overwrite is true. The complete candidate is validated before any file is created or replaced."
+        "Create a complete new UTF-8 text file under the Nole root outside config/ and daily/. Existing paths are always refused; use read and edit to change an existing file. The complete candidate is validated before creation."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "content": { "type": "string" },
-                "overwrite": {
-                    "type": "boolean", "default": false,
-                    "description": "Replace an existing regular file when true; otherwise existing paths are refused"
-                }
+                "content": { "type": "string" }
             },
             "required": ["path", "content"], "additionalProperties": false
         })
@@ -850,11 +846,9 @@ impl Tool for Write {
     async fn execute(&self, input: &Value) -> Result<String> {
         let relative = required_string(input, "path")?;
         let content = required_string(input, "content")?;
-        let overwrite = input
-            .get("overwrite")
-            .map(|value| value.as_bool().context("field overwrite must be a boolean"))
-            .transpose()?
-            .unwrap_or(false);
+        if input.get("overwrite").is_some() {
+            bail!("write only creates new files; use read and edit for existing files");
+        }
         if content.len() as u64 > MAX_FILE_BYTES {
             bail!("content exceeds 1 MB");
         }
@@ -862,22 +856,14 @@ impl Tool for Write {
         if path.starts_with(&self.config_dir) || path.starts_with(&self.daily_dir) {
             bail!("generic file tools cannot operate on this special file");
         }
+        match fs::symlink_metadata(&path) {
+            Ok(_) => bail!("write only creates new files; use read and edit for existing files"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
+        }
         validate_write(&self.root, &path, WriteSource::Text(content))?;
         let mut options = OpenOptions::new();
-        options.write(true);
-        if overwrite {
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                    bail!("overwrite target must be a regular file and cannot be a symlink");
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
-            }
-            options.create(true).truncate(true);
-        } else {
-            options.create_new(true);
-        }
+        options.write(true).create_new(true);
         let mut file = options
             .open(&path)
             .with_context(|| format!("writing file {}", path.display()))?;

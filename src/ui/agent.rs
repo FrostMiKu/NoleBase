@@ -242,9 +242,10 @@ fn sync_agent_vlist_with_style(
     app.agent_vlist.caches.resize(app.agent_panel.len(), None);
     app.agent_vlist.geometry.resize(app.agent_panel.len());
     for (index, entry) in app.agent_panel.iter().enumerate() {
-        app.agent_vlist
-            .geometry
-            .set_estimate(index, estimated_agent_entry_height(entry, width, style));
+        app.agent_vlist.geometry.set_estimate(
+            index,
+            estimated_agent_entry_height(entry, width, style, app.show_full_thinking),
+        );
     }
     for (index, cache) in app.agent_vlist.caches.iter_mut().enumerate() {
         let entry = &app.agent_panel[index];
@@ -295,6 +296,7 @@ pub(super) fn estimated_agent_entry_height(
     entry: &crate::agent_session::AgentPanelEntry,
     width: usize,
     style: crate::app::AgentEntryRenderStyle,
+    show_full_thinking: bool,
 ) -> usize {
     let width = width.max(1);
     match (style, entry) {
@@ -310,7 +312,14 @@ pub(super) fn estimated_agent_entry_height(
         (
             crate::app::AgentEntryRenderStyle::Cards,
             crate::agent_session::AgentPanelEntry::Thinking { text, .. },
-        ) => 5 + text.len().div_ceil(width.saturating_sub(6).max(1)),
+        ) => {
+            let body_rows = text.len().div_ceil(width.saturating_sub(6).max(1));
+            5 + if show_full_thinking {
+                body_rows
+            } else {
+                body_rows.min(crate::ui::chat::DEFAULT_THINKING_BODY_ROWS)
+            }
+        }
         (
             crate::app::AgentEntryRenderStyle::Cards,
             crate::agent_session::AgentPanelEntry::Error(text),
@@ -716,6 +725,7 @@ fn render_agent_entry_current(
                 true,
                 app.agent_vlist.width,
                 app.animation_tick,
+                app.show_full_thinking,
                 app.theme,
             ),
             crate::agent_session::AgentPanelEntry::Assistant {
@@ -723,7 +733,12 @@ fn render_agent_entry_current(
                 streaming: true,
                 ..
             } => render_chat_plain_text(text, app.agent_vlist.width, app.theme),
-            _ => render_chat_entry(entry, app.agent_vlist.width, app.theme),
+            _ => render_chat_entry_with_thinking_mode(
+                entry,
+                app.agent_vlist.width,
+                app.show_full_thinking,
+                app.theme,
+            ),
         },
     }
 }
