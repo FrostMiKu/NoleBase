@@ -72,11 +72,18 @@ pub(super) fn draw_document(
             )),
             header,
         );
+        document.ensure_rendered(document_area.width as usize, app.theme);
         if let Some(target_line) = document.target_line.take() {
             let target_scroll = DOCUMENT_TOP_MARGIN
-                .saturating_add(crate::markdown::rendered_row_for_source_line(
+                .saturating_add(crate::markdown::rendered_row_for_source_line_in(
                     &document.source,
                     target_line,
+                    &document
+                        .render_cache
+                        .as_ref()
+                        .expect("completed document render cache")
+                        .rendered
+                        .lines,
                     document_area.width as usize,
                     app.theme,
                 ))
@@ -87,7 +94,6 @@ pub(super) fn draw_document(
                 document.scroll = target_scroll as u16;
             }
         }
-        document.ensure_rendered(document_area.width as usize, app.theme);
         let rendered = &document
             .render_cache
             .as_ref()

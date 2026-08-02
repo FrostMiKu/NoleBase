@@ -15,13 +15,13 @@ use crate::agent::{
 };
 use crate::storage::Storage;
 
-pub struct OpenFile {
+pub struct Open {
     root: PathBuf,
     storage: Storage,
     events: AgentEventSender,
 }
 
-impl OpenFile {
+impl Open {
     pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -32,9 +32,9 @@ impl OpenFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for OpenFile {
+impl Tool for Open {
     fn name(&self) -> &'static str {
-        "open_file"
+        "open"
     }
 
     fn description(&self) -> &'static str {
@@ -105,16 +105,16 @@ impl Tool for Notify {
     }
 }
 
-pub struct AskUser {
+pub struct Ask {
     pub events: AgentEventSender,
     pub responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>>>,
     pub cancelled: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
-impl Tool for AskUser {
+impl Tool for Ask {
     fn name(&self) -> &'static str {
-        "ask_user"
+        "ask"
     }
 
     fn description(&self) -> &'static str {

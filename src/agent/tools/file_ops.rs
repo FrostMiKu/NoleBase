@@ -1,7 +1,7 @@
-//! File mutation tools: create, edit, copy, move, rename, and delete.
+//! File mutation tools: write, edit, copy, move, rename, and delete.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,14 +15,14 @@ use crate::agent::{
     ReadTracker, Tool,
 };
 
-pub struct EditFile {
+pub struct Edit {
     root: PathBuf,
     config_dir: PathBuf,
     gate: ApprovalGate,
     reads: Arc<ReadTracker>,
 }
 
-impl EditFile {
+impl Edit {
     pub fn new(root: &Path, gate: ApprovalGate, reads: Arc<ReadTracker>) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
@@ -35,9 +35,9 @@ impl EditFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for EditFile {
+impl Tool for Edit {
     fn name(&self) -> &'static str {
-        "edit_file"
+        "edit"
     }
 
     fn description(&self) -> &'static str {
@@ -119,7 +119,7 @@ impl Tool for EditFile {
         let path = fs::canonicalize(&unresolved)
             .with_context(|| format!("resolving existing file {}", unresolved.display()))?;
         if path.starts_with(&self.config_dir) {
-            bail!("edit_file cannot operate inside config/");
+            bail!("edit cannot operate inside config/");
         }
         let metadata = fs::metadata(&path)?;
         if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
@@ -130,7 +130,7 @@ impl Tool for EditFile {
         let state = self
             .reads
             .file_state(&path)?
-            .context("edit_file requires read on the same path first")?;
+            .context("edit requires read on the same path first")?;
         if !state.tag.eq_ignore_ascii_case(tag) {
             bail!("snapshot tag mismatch for {relative}; read the file again before editing");
         }
@@ -415,11 +415,11 @@ fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
-pub struct CopyFile {
+pub struct Copy {
     root: PathBuf,
 }
 
-impl CopyFile {
+impl Copy {
     pub fn new(root: &Path) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -428,9 +428,9 @@ impl CopyFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for CopyFile {
+impl Tool for Copy {
     fn name(&self) -> &'static str {
-        "copy_file"
+        "copy"
     }
 
     fn description(&self) -> &'static str {
@@ -451,12 +451,12 @@ impl Tool for CopyFile {
     }
 }
 
-pub struct MoveFile {
+pub struct Move {
     root: PathBuf,
     events: AgentEventSender,
 }
 
-impl MoveFile {
+impl Move {
     pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -466,9 +466,9 @@ impl MoveFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for MoveFile {
+impl Tool for Move {
     fn name(&self) -> &'static str {
-        "move_file"
+        "move"
     }
 
     fn description(&self) -> &'static str {
@@ -490,12 +490,12 @@ impl Tool for MoveFile {
     }
 }
 
-pub struct MoveFiles {
+pub struct MoveMany {
     root: PathBuf,
     events: AgentEventSender,
 }
 
-impl MoveFiles {
+impl MoveMany {
     pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -505,9 +505,9 @@ impl MoveFiles {
 }
 
 #[async_trait::async_trait]
-impl Tool for MoveFiles {
+impl Tool for MoveMany {
     fn name(&self) -> &'static str {
-        "move_files"
+        "move_many"
     }
 
     fn description(&self) -> &'static str {
@@ -643,12 +643,12 @@ fn rollback_moves(completed: &[(PathBuf, PathBuf, u64)]) -> Vec<String> {
     errors
 }
 
-pub struct RenameFile {
+pub struct Rename {
     root: PathBuf,
     events: AgentEventSender,
 }
 
-impl RenameFile {
+impl Rename {
     pub fn new(root: &Path, events: AgentEventSender) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -658,9 +658,9 @@ impl RenameFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for RenameFile {
+impl Tool for Rename {
     fn name(&self) -> &'static str {
-        "rename_file"
+        "rename"
     }
 
     fn description(&self) -> &'static str {
@@ -681,11 +681,11 @@ impl Tool for RenameFile {
     async fn execute(&self, input: &Value) -> Result<String> {
         let path_text = required_string(input, "path")?;
         if Path::new(path_text).is_absolute() {
-            bail!("rename_file path must be relative to the Nole root");
+            bail!("rename path must be relative to the Nole root");
         }
         let source = resolve_transfer_source(&self.root, path_text)?;
         if !source.starts_with(&self.root) {
-            bail!("rename_file source must be under the Nole root");
+            bail!("rename source must be under the Nole root");
         }
         let new_name = required_string(input, "new_name")?;
         let candidate = Path::new(new_name);
@@ -739,12 +739,12 @@ fn transfer_schema() -> Value {
     })
 }
 
-pub struct DeleteFile {
+pub struct Delete {
     root: PathBuf,
     gate: ApprovalGate,
 }
 
-impl DeleteFile {
+impl Delete {
     pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -754,9 +754,9 @@ impl DeleteFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for DeleteFile {
+impl Tool for Delete {
     fn name(&self) -> &'static str {
-        "delete_file"
+        "delete"
     }
 
     fn description(&self) -> &'static str {
@@ -778,11 +778,11 @@ impl Tool for DeleteFile {
         let metadata = fs::symlink_metadata(&unresolved)
             .with_context(|| format!("checking {}", unresolved.display()))?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            bail!("delete_file only accepts regular files, not symlinks or directories");
+            bail!("delete only accepts regular files, not symlinks or directories");
         }
         let path = fs::canonicalize(&unresolved)?;
         if path.starts_with(self.root.join("config")) {
-            bail!("delete_file cannot operate inside config/");
+            bail!("delete cannot operate inside config/");
         }
         let modified = metadata.modified().ok();
         self.gate
@@ -808,13 +808,13 @@ impl Tool for DeleteFile {
     }
 }
 
-pub struct CreateFile {
+pub struct Write {
     root: PathBuf,
     config_dir: PathBuf,
     daily_dir: PathBuf,
 }
 
-impl CreateFile {
+impl Write {
     pub fn new(root: &Path) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
@@ -826,19 +826,23 @@ impl CreateFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for CreateFile {
+impl Tool for Write {
     fn name(&self) -> &'static str {
-        "create_file"
+        "write"
     }
     fn description(&self) -> &'static str {
-        "Create a UTF-8 text file at a new path under the Nole root outside config/ and daily/."
+        "Write a complete UTF-8 text file under the Nole root outside config/ and daily/. Existing files are refused unless overwrite is true. The complete candidate is validated before any file is created or replaced."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "content": { "type": "string" }
+                "content": { "type": "string" },
+                "overwrite": {
+                    "type": "boolean", "default": false,
+                    "description": "Replace an existing regular file when true; otherwise existing paths are refused"
+                }
             },
             "required": ["path", "content"], "additionalProperties": false
         })
@@ -846,6 +850,11 @@ impl Tool for CreateFile {
     async fn execute(&self, input: &Value) -> Result<String> {
         let relative = required_string(input, "path")?;
         let content = required_string(input, "content")?;
+        let overwrite = input
+            .get("overwrite")
+            .map(|value| value.as_bool().context("field overwrite must be a boolean"))
+            .transpose()?
+            .unwrap_or(false);
         if content.len() as u64 > MAX_FILE_BYTES {
             bail!("content exceeds 1 MB");
         }
@@ -854,11 +863,24 @@ impl Tool for CreateFile {
             bail!("generic file tools cannot operate on this special file");
         }
         validate_write(&self.root, &path, WriteSource::Text(content))?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if overwrite {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    bail!("overwrite target must be a regular file and cannot be a symlink");
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
+            }
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+        let mut file = options
             .open(&path)
-            .with_context(|| format!("creating new file {}", path.display()))?;
+            .with_context(|| format!("writing file {}", path.display()))?;
         file.write_all(content.as_bytes())?;
         Ok(format!("wrote {} bytes to {relative}", content.len()))
     }
@@ -888,7 +910,7 @@ mod tests {
             events: event_sender,
             decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         };
-        let tool = DeleteFile::new(&root, gate).unwrap();
+        let tool = Delete::new(&root, gate).unwrap();
         let input = json!({"path": "Old.md"});
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         let output = test_runtime().block_on(tool.execute(&input)).unwrap();

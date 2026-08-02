@@ -97,30 +97,6 @@ fn command_dialog_supports_single_multi_and_free_text_modes() {
 }
 
 #[test]
-fn animation_phase_advances_for_daily_agent_or_bypass() {
-    let (mut app, _directory) = make_app();
-    app.advance_animation();
-    assert_eq!(app.animation_tick, 1);
-    app.center_view = CenterView::Document;
-    app.advance_animation();
-    assert_eq!(app.animation_tick, 1);
-    app.focus = Focus::Compose;
-    app.advance_animation();
-    assert_eq!(app.animation_tick, 2);
-    app.focus = Focus::Center;
-    app.ai_running = true;
-    app.advance_animation();
-    app.advance_animation();
-    assert_eq!(app.animation_tick, 4);
-    app.ai_running = false;
-    app.advance_animation();
-    assert_eq!(app.animation_tick, 4);
-    app.permission_mode = PermissionMode::Bypass;
-    app.advance_animation();
-    assert_eq!(app.animation_tick, 5);
-}
-
-#[test]
 fn command_palette_names_mouse_support_action_for_the_next_state() {
     let (mut app, _directory) = make_app();
     let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
@@ -789,7 +765,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
     app.ai_user_sender = Some(answer_sender);
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
-        text: "Calling Ask User...\nChoose a format".to_string(),
+        text: "Calling Ask...\nChoose a format".to_string(),
         active: true,
         preview: None,
     }));
@@ -813,13 +789,13 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     assert!(matches!(
         app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Tool { text, active: true, .. })
-            if text == "Calling Ask User...\nChoose a format\nMBDown"
+            if text == "Calling Ask...\nChoose a format\nMBDown"
     ));
 
     event_sender
         .send(AgentEvent::ToolFinished {
             id: "ask-user".to_string(),
-            message: "Completed Ask User.\nChoose a format".to_string(),
+            message: "Completed Ask.\nChoose a format".to_string(),
             preview: None,
         })
         .unwrap();
@@ -827,7 +803,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     assert!(matches!(
         app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Tool { text, active: false, .. })
-            if text == "Completed Ask User.\nChoose a format\nMBDown"
+            if text == "Completed Ask.\nChoose a format\nMBDown"
     ));
 
     event_sender

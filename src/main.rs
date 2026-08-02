@@ -21,7 +21,7 @@ mod workspace_index;
 use std::io::{self, Stdout, Write};
 use std::process::Command as ProcCommand;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
@@ -46,9 +46,21 @@ use workspace_index::WorkspaceIndexer;
 type Tui = Terminal<FrameBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const EVENT_BATCH_LIMIT: usize = 16_384;
 const MAX_WHEEL_DELTA_PER_FRAME: i32 = 3;
+
+fn animation_tick(epoch: Instant, now: Instant) -> u64 {
+    let elapsed = now.saturating_duration_since(epoch);
+    let tick = elapsed.as_nanos() / ANIMATION_FRAME_INTERVAL.as_nanos();
+    u64::try_from(tick).unwrap_or(u64::MAX)
+}
+
+fn until_next_animation_frame(epoch: Instant, now: Instant) -> Duration {
+    let elapsed = now.saturating_duration_since(epoch);
+    let remainder = elapsed.as_nanos() % ANIMATION_FRAME_INTERVAL.as_nanos();
+    Duration::from_nanos((ANIMATION_FRAME_INTERVAL.as_nanos() - remainder) as u64)
+}
 
 fn enter_tui() -> Result<()> {
     enable_raw_mode()?;
@@ -248,6 +260,7 @@ fn run(
     workspace_events: &WatchEvents,
     workspace_indexer: &WorkspaceIndexer,
 ) -> Result<()> {
+    let animation_epoch = Instant::now();
     loop {
         let indexed_paths = process_workspace_events(workspace_events, app);
         workspace_indexer.paths_changed(indexed_paths);
@@ -264,9 +277,10 @@ fn run(
             }
             output.flush()?;
         }
-        app.advance_animation();
+        let now = Instant::now();
+        app.animation_tick = animation_tick(animation_epoch, now);
         draw_frame(terminal, app)?;
-        if !event::poll(EVENT_POLL_INTERVAL)? {
+        if !event::poll(until_next_animation_frame(animation_epoch, Instant::now()))? {
             continue;
         }
         let mut events = vec![event::read()?];
@@ -417,6 +431,28 @@ mod tests {
     }
 
     #[test]
+    fn animation_phase_uses_elapsed_time_not_event_frequency() {
+        let epoch = Instant::now();
+
+        for _ in 0..10_000 {
+            assert_eq!(animation_tick(epoch, epoch + Duration::from_millis(99)), 0);
+        }
+        for _ in 0..10_000 {
+            assert_eq!(animation_tick(epoch, epoch + Duration::from_millis(100)), 1);
+        }
+        assert_eq!(animation_tick(epoch, epoch + Duration::from_millis(350)), 3);
+        assert_eq!(animation_tick(epoch, epoch + Duration::from_millis(400)), 4);
+        assert_eq!(
+            until_next_animation_frame(epoch, epoch + Duration::from_millis(450)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            until_next_animation_frame(epoch, epoch + Duration::from_millis(500)),
+            ANIMATION_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
     fn draw_frame_tracks_chat_cursor_while_agent_animation_advances() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
@@ -450,7 +486,7 @@ mod tests {
         {
             text.push_str(" with another streamed chunk");
         }
-        app.advance_animation();
+        app.animation_tick = 1;
         assert_eq!(app.animation_tick, 1);
         draw_frame(&mut terminal, &mut app).unwrap();
         assert!(terminal.backend().cursor_visible());

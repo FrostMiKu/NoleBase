@@ -1,4 +1,4 @@
-//! Tracks hash-tagged file snapshots and read ranges to gate `edit_file`.
+//! Tracks hash-tagged file snapshots and read ranges to gate `edit`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -124,7 +124,7 @@ impl FileReadState {
         if start_line < end_line {
             if !self.covers(start_line, end_line) {
                 bail!(
-                    "edit_file must read changed lines {} through {} first",
+                    "edit must read changed lines {} through {} first",
                     start_line + 1,
                     end_line
                 );
@@ -134,7 +134,7 @@ impl FileReadState {
             let anchor_end = (start_line + 1).min(self.total_lines);
             if !self.covers(anchor_start, anchor_end) {
                 bail!(
-                    "edit_file must read insertion anchor lines {} through {} first",
+                    "edit must read insertion anchor lines {} through {} first",
                     anchor_start + 1,
                     anchor_end
                 );

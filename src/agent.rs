@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 #[cfg(test)]
-use std::io::{BufRead, BufReader, Read as IoRead, Write};
+use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -493,26 +493,26 @@ impl Agent {
             workspace_index.clone(),
             gate.clone(),
         )?);
-        agent.register(CreateFile::new(nole_root)?);
-        agent.register(CopyFile::new(nole_root)?);
+        agent.register(Write::new(nole_root)?);
+        agent.register(Copy::new(nole_root)?);
         let file_events = agent.events.clone();
-        agent.register(MoveFile::new(nole_root, file_events.clone())?);
-        agent.register(MoveFiles::new(nole_root, file_events.clone())?);
-        agent.register(RenameFile::new(nole_root, file_events)?);
-        agent.register(DeleteFile::new(nole_root, gate.clone())?);
-        agent.register(EditFile::new(nole_root, gate, reads)?);
+        agent.register(Move::new(nole_root, file_events.clone())?);
+        agent.register(MoveMany::new(nole_root, file_events.clone())?);
+        agent.register(Rename::new(nole_root, file_events)?);
+        agent.register(Delete::new(nole_root, gate.clone())?);
+        agent.register(Edit::new(nole_root, gate, reads)?);
         agent.register(AddDailyEntry::new(nole_root)?);
-        agent.register(OpenFile::new(nole_root, agent.events.clone())?);
+        agent.register(Open::new(nole_root, agent.events.clone())?);
         agent.register(Notify {
             events: agent.events.clone(),
         });
-        agent.register(AskUser {
+        agent.register(Ask {
             events: agent.events.clone(),
             responses: user_responses,
             cancelled,
         });
         if has_web_search {
-            agent.register(WebSearch {
+            agent.register(SearchWeb {
                 client: client.clone(),
                 api_key: tavily_api_key.clone(),
             });
@@ -661,7 +661,7 @@ impl Agent {
                     empty_response_retries += 1;
                     append_user_text(
                         &mut conversation.messages,
-                        "Provide a non-empty final answer to the user's request. If required information is missing, use ask_user.".to_string(),
+                        "Provide a non-empty final answer to the user's request. If required information is missing, use ask.".to_string(),
                     );
                     self.checkpoint_conversation(conversation);
                     continue;
@@ -1058,9 +1058,9 @@ impl Agent {
             ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => result,
         };
         let error = result.is_error.then_some(result.content.as_str());
-        // Ask User's answer already lands in the activity text, so it is not
+        // Ask's answer already lands in the activity text, so it is not
         // duplicated as a preview line.
-        let preview = (!result.is_error && call.name != "ask_user")
+        let preview = (!result.is_error && call.name != "ask")
             .then(|| tool_result_preview(&result.content))
             .flatten();
         let _ = self.events.send(AgentEvent::ToolFinished {

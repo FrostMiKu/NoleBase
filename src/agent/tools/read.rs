@@ -132,7 +132,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read any target: a local UTF-8 file as hashline text (`[path#TAG]` plus absolute one-based `N:text` rows), a directory as a typed JSON listing, or an http(s) URL as structured extracted content. File reads are paginated, limited to 1 MB, and their snapshot tag and visible ranges gate edit_file."
+        "Read any target: a local UTF-8 file as hashline text (`[path#TAG]` plus absolute one-based `N:text` rows), a directory as a typed JSON listing, or an http(s) URL as structured extracted content. File reads are paginated, limited to 1 MB, and their snapshot tag and visible ranges gate edit."
     }
 
     fn input_schema(&self) -> Value {
@@ -836,9 +836,8 @@ fn source_lines(content: &str) -> Vec<&str> {
     content
         .split_inclusive('\n')
         .map(|line| {
-            line.strip_suffix('\n')
-                .and_then(|line| line.strip_suffix('\r'))
-                .unwrap_or(line)
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            line.strip_suffix('\r').unwrap_or(line)
         })
         .collect()
 }

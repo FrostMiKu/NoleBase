@@ -355,7 +355,7 @@ Agent output enters a daily card only when the Agent explicitly calls
 `add_daily_entry`; omitting its date records the content on the current local
 date.
 
-Set `tavily_api_key` to enable the Agent's Tavily `web_search` tool. When the
+Set `tavily_api_key` to enable the Agent's Tavily `search_web` tool. When the
 key is empty or absent, Nole omits the tool and its instructions entirely, so
 the Agent does not know that web search is available.
 
@@ -442,20 +442,17 @@ inputs submit only their currently visible rows to Ratatui; off-screen rows are
 retained as scroll state rather than rendered.
 
 The Agent reads through a single unified `read` tool that dispatches on its
-target: a file path returns paginated UTF-8 text with zero-based `offset`/`limit`
-line pagination, a directory path returns a typed listing, and an http(s) URL
-returns the fetched content (HTML converted to Markdown). Every response is a
-structured object with a `kind` field (`file`, `directory`, or `web`) plus a
-`target` field identifying what was read. The reader is a parser registry, so
-additional formats can be added by registering new parsers without changing the
-dispatch logic. When configured, `web_search` queries Tavily with optional topic,
-depth, time range, answer, result-count, and included/excluded domain controls,
-then returns compact ranked results.
+target. A UTF-8 file returns hashline text: a `[path#TAG]` header, absolute
+one-based `N:text` rows, and a pagination footer. A directory returns a typed
+JSON listing, while an http(s) URL returns structured fetched content with HTML
+converted to Markdown. The reader is a parser registry, so additional formats
+can be added without changing dispatch logic. When configured, `search_web`
+queries Tavily with optional topic, depth, time range, answer, result-count, and
+included/excluded domain controls, then returns compact ranked results.
 Every user prompt sent to the Agent includes the current local date and time.
-`read` on a file defaults to 200 lines and accepts at most 2,000 lines per call.
-Its structured response includes the total line count and whether more content
-remains. Paths under the Nole root are returned in root-relative form so they
-can be passed directly to other file tools.
+File reads default to 200 lines and accept at most 2,000 lines per call;
+`offset` counts preceding source lines. Paths under the Nole root are returned
+in root-relative form so they can be passed directly to other file tools.
 
 `read` on a directory lists any directory by absolute path or a path relative to
 the Nole root. `depth=1` returns direct children and values up to 16 include
@@ -475,30 +472,33 @@ zero-based source line numbers. `search_files` uses the same case-insensitive fu
 filename matching as the Files sidebar. Both search tools support result
 `offset`/`limit` pagination.
 
-`create_file` creates new files and refuses existing paths. `edit_file` accepts
-one or more zero-based edits and preserves the rest of the file internally, so
-large files do not need to be read or submitted in full. `replace` operations
-use inclusive `start_line` and `end_line` values from the original `read`
-snapshot; `insert` operations use a separate `line` value and insert before it.
-Each edit provides a `lines` array of complete lines without line-ending
-characters; the tool adds separators and never requires the Agent to repeat
-adjacent anchor text. Changed/deleted ranges must have been covered by
-`read` since the file last changed; insertions require adjacent anchor
-lines. Existing `daily/YYYY-MM-DD.md` files use the same `read`,
-`edit_file`, and `delete_file` operations as other Markdown files.
+`write` writes a complete file. It refuses existing paths by default and only
+replaces an existing regular file when `overwrite` is explicitly true. The full
+candidate content passes the same MBDown or Skill parser validation before the
+file is created or replaced. `edit` accepts one or more line edits and preserves
+the rest of the file internally, so large files do not need to be read or
+submitted in full. `replace` operations use inclusive one-based `start_line` and
+`end_line` values from the original `read` snapshot; `insert` operations use a
+separate one-based `line` anchor and insert before or after it. Each edit provides
+a `lines` array of complete lines without line-ending characters; the tool adds
+separators and never requires the Agent to repeat adjacent anchor text.
+Changed/deleted ranges must have been covered by `read` since the file last
+changed; insertions require adjacent anchor lines. Existing
+`daily/YYYY-MM-DD.md` files use the same `read`, `edit`, and `delete`
+operations as other Markdown files.
 `add_daily_entry` remains the high-level create-or-append operation and does not
 require approval. Its optional `date` uses `YYYY-MM-DD`; omitting it records
 content on the current local date.
 The Agent can list `daily/` to discover available dates before reading the
 relevant files.
 
-`copy_file` and `move_file` accept a regular source file anywhere on the
-filesystem, but the destination must be a new path inside the Nole directory;
-neither operation requires approval. `move_files` moves up to 200 sources into
-one existing Nole directory, preserves basenames, preflights all collisions,
-and attempts rollback if a later move fails. `rename_file` gives same-directory
-renames an explicit non-overwriting operation. `delete_file` only accepts
-regular files inside Nole and uses the common approval dialog. Generic file
+`copy` and `move` accept a regular source file anywhere on the filesystem, but
+the destination must be a new path inside the Nole directory; neither operation
+requires approval. `move_many` moves up to 200 sources into one existing Nole
+directory, preserves basenames, preflights all collisions, and attempts rollback
+if a later move fails. `rename` gives same-directory renames an explicit
+non-overwriting operation. `delete` only accepts regular files inside Nole and
+uses the common approval dialog. Generic file
 creation, transfer, and rename tools cannot operate directly inside `daily/`,
 preserving its `YYYY-MM-DD.md` naming invariant. Agent file tools cannot mutate
 anything inside `config/`, and `config/ai.toml` cannot be read.
@@ -506,17 +506,17 @@ anything inside `config/`, and `config/ai.toml` cannot be read.
 The `notify` tool lets the Agent display a short notification card in the TUI's
 top-right corner and emits the terminal bell. Notifications are non-blocking
 and expire automatically.
-The `open_file` tool switches the TUI to an existing managed `.md` or `.mb`
-note in `daily/`, `data/`, or `archives/`, so the Agent can present relevant material to
+The `open` tool switches the TUI to an existing managed `.md` or `.mb` note in
+`daily/`, `data/`, or `archives/`, so the Agent can present relevant material to
 the user directly.
-The `ask_user` tool pauses the Agent and opens a TUI dialog for clarification.
+The `ask` tool pauses the Agent and opens a TUI dialog for clarification.
 The Agent may provide up to ten choices; use Up/Down and Enter to select one,
 or type a different free-text response. Esc cancels the question. Questions
 are interactive requests rather than permission checks, so APPROVE/BYPASS does
 not skip them.
 
-The system prompt requires the Agent to use `ask_user` when it needs an answer
-before it can complete the current task. Later `Ctrl+Enter` prompts remain part
+The system prompt requires the Agent to use `ask` when it needs an answer before
+it can complete the current task. Later `Ctrl+Enter` prompts remain part
 of the same conversation until `C` is pressed or `Agent: Clear session` is run.
 
 Nole creates an empty `template.mb`. `Note: New from template` starts the new
@@ -524,8 +524,8 @@ note with its exact contents; regular note creation still generates the note tit
 Nole also creates empty `config/AGENTS.md` and `MEMORY.md` files. Their complete
 contents are appended to the system prompt in that order for every Agent task.
 `config/AGENTS.md` is user-owned: Agent file tools cannot mutate anything in
-`config/`. The Agent may read and update root-level `MEMORY.md` through the
-normal read-before-update and approval flow.
+`config/`. The Agent may read and update root-level `MEMORY.md`; localized
+updates use the normal read-before-`edit` approval flow.
 
 In `APPROVE` mode, updates and deletes pause and show an MBTUI-rendered diff or
 deletion preview. Use Enter/Y to approve or N/Esc to deny. In `BYPASS` mode

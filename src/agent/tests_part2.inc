@@ -491,9 +491,9 @@
     }
 
     #[test]
-    fn system_prompt_describes_ask_user_without_runtime_protocol_details() {
+    fn system_prompt_describes_ask_without_runtime_protocol_details() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        assert!(prompt.contains("Use ask_user"));
+        assert!(prompt.contains("Use ask"));
         assert!(!prompt.contains("conversation is multi-turn"));
         assert!(!prompt.contains("buffers it and delivers it before pending tool calls"));
         assert!(!prompt.contains("Final text is not saved automatically"));
@@ -539,7 +539,7 @@
         assert!(prompt.contains("Delegate broad, multi-step exploration"));
         assert!(prompt.contains("internal work stays out of this conversation"));
         assert!(prompt.contains("Use direct read/search tools only for narrow lookups"));
-        assert!(prompt.contains("Use open_file"));
+        assert!(prompt.contains("Use open"));
         assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
     }
 
@@ -612,20 +612,47 @@
         };
 
         let without_key = make_agent("");
-        assert!(!without_key.tools.contains_key("web_search"));
+        assert!(!without_key.tools.contains_key("search_web"));
         assert!(!serde_json::to_string(&without_key.system)
             .unwrap()
-            .contains("web_search"));
-        assert!(without_key.tools.contains_key("create_file"));
-        assert!(without_key.tools.contains_key("edit_file"));
-        assert!(without_key.tools.contains_key("add_daily_entry"));
-        assert!(without_key.tools.contains_key("explore"));
-        assert!(without_key.tools.contains_key("load_skill"));
+            .contains("search_web"));
+        for name in [
+            "write",
+            "edit",
+            "copy",
+            "move",
+            "move_many",
+            "rename",
+            "delete",
+            "open",
+            "ask",
+            "notify",
+            "add_daily_entry",
+            "explore",
+            "load_skill",
+        ] {
+            assert!(without_key.tools.contains_key(name), "missing tool {name}");
+        }
         let serialized_system = serde_json::to_string(&without_key.system).unwrap();
         assert!(serialized_system.contains("Available skills"));
         assert!(serialized_system.contains("create-skill"));
         assert!(!serialized_system.contains("# Create a Skill"));
-        for removed in ["update_file", "read_daily", "update_daily", "append_daily"] {
+        for removed in [
+            "create_file",
+            "edit_file",
+            "copy_file",
+            "move_file",
+            "move_files",
+            "rename_file",
+            "delete_file",
+            "open_file",
+            "ask_user",
+            "web_search",
+            "update_file",
+            "read_daily",
+            "update_daily",
+            "append_daily",
+        ] {
             assert!(!without_key.tools.contains_key(removed));
         }
         assert!(without_key.system.last().unwrap().cache);
@@ -645,10 +672,10 @@
         assert_eq!(without_key.definitions, second_without_key.definitions);
 
         let with_key = make_agent("tvly-test");
-        assert!(with_key.tools.contains_key("web_search"));
+        assert!(with_key.tools.contains_key("search_web"));
         assert!(serde_json::to_string(&with_key.system)
             .unwrap()
-            .contains("web_search"));
+            .contains("search_web"));
     }
 
     #[test]
@@ -701,7 +728,7 @@
         );
         assert_eq!(filtered["exclude_domains"], json!(["example.com"]));
 
-        let schema = WebSearch {
+        let schema = SearchWeb {
             client: Client::new(),
             api_key: "tvly-test".to_string(),
         }
@@ -801,14 +828,14 @@
     }
 
     #[test]
-    fn file_edit_requires_read_and_create_file_never_overwrites() {
+    fn edit_requires_read_and_write_overwrite_is_explicit() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("data/note.md"), "old\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
         let input = json!({
             "path": "data/note.md",
             "tag": file_snapshot_tag(directory.path().join("data/note.md")),
@@ -838,10 +865,24 @@
             }))
             .returns_err());
 
-        let create = CreateFile::new(directory.path()).unwrap();
-        assert!(create
+        let write = Write::new(directory.path()).unwrap();
+        let schema = write.input_schema();
+        assert_eq!(schema["properties"]["overwrite"]["default"], false);
+        assert!(write
             .execute(&json!({"path": "data/note.md", "content": "overwrite"}))
             .returns_err());
+
+        write
+            .execute(&json!({
+                "path": "data/note.md",
+                "content": "overwritten\n",
+                "overwrite": true
+            }))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("data/note.md")).unwrap(),
+            "overwritten\n"
+        );
     }
 
     #[test]
@@ -860,7 +901,7 @@
         assert!(output.starts_with(&format!("[data/note.md#{}]", snapshot_tag("old\n"))));
 
         fs::write(&path, "changed elsewhere\n").unwrap();
-        let error = EditFile::new(directory.path(), bypass_gate(), reads)
+        let error = Edit::new(directory.path(), bypass_gate(), reads)
             .unwrap()
             .execute(&json!({
                 "path": "data/note.md",
@@ -880,15 +921,15 @@
         storage.ensure_files().unwrap();
         let invalid = "[box border=double]\nbody\n[/box]\n";
 
-        let create = CreateFile::new(directory.path()).unwrap();
-        let error = create
+        let write = Write::new(directory.path()).unwrap();
+        let error = write
             .execute(&json!({"path": "data/invalid.md", "content": invalid}))
             .unwrap_err()
             .to_string();
         assert!(error.contains("box border must be single or none"));
         assert!(!storage.data_dir.join("invalid.md").exists());
 
-        let mermaid_error = create
+        let mermaid_error = write
             .execute(&json!({
                 "path": "data/invalid-mermaid.md",
                 "content": "# Diagram\n\n```mermaid\nclassDiagram\nclass Agent~T~ {}\n```\n"
@@ -899,13 +940,23 @@
         assert!(mermaid_error.contains("generics not yet supported"));
         assert!(!storage.data_dir.join("invalid-mermaid.md").exists());
 
-        create
+        write
             .execute(&json!({"path": "data/plain.txt", "content": invalid}))
             .unwrap();
         assert_eq!(fs::read_to_string(storage.data_dir.join("plain.txt")).unwrap(), invalid);
 
         let path = storage.data_dir.join("note.md");
         fs::write(&path, "valid\n").unwrap();
+        let overwrite_error = write
+            .execute(&json!({
+                "path": "data/note.md",
+                "content": invalid,
+                "overwrite": true
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(overwrite_error.contains("box border must be single or none"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
         let reads = Arc::new(ReadTracker::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
@@ -913,7 +964,7 @@
             .unwrap();
         let (event_sender, mut event_receiver) = event_channel();
         let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let edit = EditFile::new(
+        let edit = Edit::new(
             directory.path(),
             ApprovalGate {
                 bypass: Arc::new(AtomicBool::new(false)),
@@ -968,8 +1019,8 @@
         let valid = "---\ndescription: Original workflow\n---\n\n# Steps\n";
         let invalid = "# Missing front matter\n";
 
-        let create = CreateFile::new(directory.path()).unwrap();
-        let create_error = create
+        let write = Write::new(directory.path()).unwrap();
+        let create_error = write
             .execute(&json!({
                 "path": "skills/broken.md",
                 "content": invalid
@@ -979,19 +1030,29 @@
         assert!(create_error.contains("front matter"));
         assert!(!storage.skills_dir.join("broken.md").exists());
 
-        create
+        write
             .execute(&json!({
                 "path": "skills/existing.md",
                 "content": valid
             }))
             .unwrap();
         let existing = storage.skills_dir.join("existing.md");
+        let overwrite_error = write
+            .execute(&json!({
+                "path": "skills/existing.md",
+                "content": invalid,
+                "overwrite": true
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(overwrite_error.contains("front matter"));
+        assert_eq!(fs::read_to_string(&existing).unwrap(), valid);
         let reads = Arc::new(ReadTracker::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "skills/existing.md"}))
             .unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
         let edit_error = edit
             .execute(&json!({
                 "path": "skills/existing.md",
@@ -1013,7 +1074,7 @@
         let move_source = outside.path().join("moved.md");
         fs::write(&copy_source, invalid).unwrap();
         fs::write(&move_source, invalid).unwrap();
-        assert!(CopyFile::new(directory.path())
+        assert!(Copy::new(directory.path())
             .unwrap()
             .execute(&json!({
                 "source": copy_source,
@@ -1024,7 +1085,7 @@
         assert!(!storage.skills_dir.join("copied.md").exists());
 
         let (event_sender, _) = event_channel();
-        assert!(MoveFile::new(directory.path(), event_sender.clone())
+        assert!(Move::new(directory.path(), event_sender.clone())
             .unwrap()
             .execute(&json!({
                 "source": move_source,
@@ -1039,7 +1100,7 @@
         fs::write(&batch_valid, valid).unwrap();
         fs::write(&batch_invalid, invalid).unwrap();
         let (batch_events, _) = event_channel();
-        assert!(MoveFiles::new(directory.path(), batch_events)
+        assert!(MoveMany::new(directory.path(), batch_events)
             .unwrap()
             .execute(&json!({
                 "sources": [batch_valid, batch_invalid],
@@ -1051,7 +1112,7 @@
         assert!(!storage.skills_dir.join("batch-valid.md").exists());
         assert!(!storage.skills_dir.join("batch-invalid.md").exists());
 
-        assert!(RenameFile::new(directory.path(), event_sender)
+        assert!(Rename::new(directory.path(), event_sender)
             .unwrap()
             .execute(&json!({
                 "path": "skills/existing.md",
@@ -1073,7 +1134,7 @@
             .unwrap()
             .execute(&json!({"path": "data/range.md"}))
             .unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
         let schema = edit.input_schema();
         assert_eq!(schema["required"], json!(["path", "tag", "edits"]));
         assert_eq!(
@@ -1124,7 +1185,7 @@
 
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
             .unwrap();
         edit.execute(&json!({
@@ -1137,7 +1198,7 @@
         fs::write(&path, &original).unwrap();
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
             .unwrap();
         let error = edit
@@ -1153,7 +1214,7 @@
         fs::write(&path, "first\nsecond\nthird\n").unwrap();
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
         read.execute(&json!({"path": "data/large.md", "offset": 1, "limit": 1}))
             .unwrap();
         let error = edit
@@ -1180,7 +1241,7 @@
             .unwrap()
             .execute(&json!({"path": "data/table.md"}))
             .unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
 
         let error = edit
             .execute(&json!({
@@ -1222,7 +1283,7 @@
             .unwrap()
             .execute(&json!({"path": "data/eof.md"}))
             .unwrap();
-        EditFile::new(directory.path(), bypass_gate(), reads)
+        Edit::new(directory.path(), bypass_gate(), reads)
             .unwrap()
             .execute(&json!({
                 "path": "data/eof.md",
@@ -1239,7 +1300,7 @@
             .unwrap()
             .execute(&json!({"path": "data/crlf.md"}))
             .unwrap();
-        EditFile::new(directory.path(), bypass_gate(), reads)
+        Edit::new(directory.path(), bypass_gate(), reads)
             .unwrap()
             .execute(&json!({
                 "path": "data/crlf.md",
@@ -1261,7 +1322,7 @@
             .unwrap()
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .unwrap();
-        EditFile::new(directory.path(), bypass_gate(), reads)
+        Edit::new(directory.path(), bypass_gate(), reads)
             .unwrap()
             .execute(&json!({
                 "path": "daily/2026-07-27.md",
@@ -1271,12 +1332,12 @@
             .unwrap();
         assert_eq!(storage.load_daily_notes().unwrap()[0].body, "edited");
 
-        DeleteFile::new(directory.path(), bypass_gate())
+        Delete::new(directory.path(), bypass_gate())
             .unwrap()
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .unwrap();
         assert!(!storage.daily_dir.join("2026-07-27.md").exists());
-        assert!(CreateFile::new(directory.path())
+        assert!(Write::new(directory.path())
             .unwrap()
             .execute(&json!({
                 "path": "daily/2026-07-27.md",
@@ -1352,7 +1413,7 @@
             events: event_sender,
             decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         };
-        let edit = EditFile::new(directory.path(), gate, reads).unwrap();
+        let edit = Edit::new(directory.path(), gate, reads).unwrap();
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(edit.execute(&json!({
                 "path": "data/note.md",
@@ -1395,7 +1456,7 @@
         let unsupported = storage.data_dir.join("raw.txt");
         fs::write(&unsupported, "raw\n").unwrap();
         let (sender, mut receiver) = event_channel();
-        let tool = OpenFile::new(directory.path(), sender).unwrap();
+        let tool = Open::new(directory.path(), sender).unwrap();
 
         let result = tool.execute(&json!({"path": "data/Guide.md"})).unwrap();
         assert!(result.contains("Guide.md"));
@@ -1422,7 +1483,7 @@
     fn ask_user_waits_for_and_returns_the_tui_answer() {
         let (event_sender, mut event_receiver) = event_channel();
         let (response_sender, response_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let tool = AskUser {
+        let tool = Ask {
             events: event_sender,
             responses: Arc::new(tokio::sync::Mutex::new(response_receiver)),
             cancelled: Arc::new(AtomicBool::new(false)),

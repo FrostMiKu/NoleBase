@@ -542,16 +542,6 @@ impl App {
         }
     }
 
-    pub fn advance_animation(&mut self) {
-        if self.center_view == CenterView::Daily
-            || self.ai_running
-            || self.focus == Focus::Compose
-            || self.permission_mode == PermissionMode::Bypass
-        {
-            self.animation_tick = self.animation_tick.wrapping_add(1);
-        }
-    }
-
     pub fn reload_files(&mut self) {
         let selected = self.selected_file.clone();
         match self.combined_note_files() {

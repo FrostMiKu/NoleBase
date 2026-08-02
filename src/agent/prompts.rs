@@ -84,7 +84,7 @@ fn system_prompt_text(
     memory: &str,
 ) -> String {
     let web_search_guidance = if has_web_search {
-        "- Use web_search for current information when you do not already have a URL.\n"
+        "- Use search_web for current information when you do not already have a URL.\n"
     } else {
         ""
     };
@@ -104,7 +104,7 @@ Close tags. Prefer ordinary Markdown unless MBDown improves the result. Never em
 ## Workspace
 Root: {root} (the user's `.nole` workspace)
 - data/: ordinary .md/.mb articles and notes; create them here by default.
-- daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read, edit_file, and delete_file tools as other text files.
+- daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read, edit, and delete tools as other text files.
 - archives/: archived daily and regular Markdown files.
 - themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
 - template.mb: editable content used only by Create note from template; ordinary New note does not use it.
@@ -113,19 +113,20 @@ Root: {root} (the user's `.nole` workspace)
 - config/agent-session.json: application-managed persisted Agent session; never edit or delete it.
 - config/ai.toml: private credentials and AI settings; never read it or expose its contents.
 - config/AGENTS.md: user instructions injected below.
-- MEMORY.md: persistent Agent memory injected below; you may update it.
+- MEMORY.md: persistent Agent memory injected below; use read and edit for localized updates.
 - skills/: user-owned Agent workflow instructions stored as flat `{{id}}.md` files.
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
 - Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. When several investigations are independent, call explore multiple times in the same response so they can run concurrently. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
 - Use read on daily/ (a directory) to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
-- Local file reads return a `[path#TAG]` snapshot header followed by absolute one-based `N:text` rows. Pass that exact TAG to edit_file, edit only displayed lines or adjacent anchors, and read again after each successful edit before making another.
-- Existing daily Markdown files may be read, edited, or deleted with the generic file tools. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. config/ remains read-only, and generic creation/transfer/rename tools remain excluded from daily/.
-- Copy/move sources may be outside Nole; destinations must be new paths under Nole. config/ and daily/ remain excluded. Use move_files for batches, rename_file for file renames, and rename_tag for exact workspace-wide tag renames.
+- Local file reads return a `[path#TAG]` snapshot header followed by absolute one-based `N:text` rows. Pass that exact TAG to edit, edit only displayed lines or adjacent anchors, and read again after each successful edit before making another.
+- Use write for complete new files. Set `overwrite` only when intentionally replacing a whole existing file; use edit for localized changes. Both validate complete MBDown and Skill candidates before mutation.
+- Existing daily Markdown files may be read, edited, or deleted with read, edit, and delete. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. write, copy, move, move_many, and rename remain excluded from daily/, and config/ remains read-only.
+- copy and move sources may be outside Nole; destinations must be new paths under Nole. Use move_many for batches, rename for file renames, and rename_tag for exact workspace-wide tag renames.
 - Use read with a URL when you already have one.
-{web_search_guidance}- Use ask_user for blocking questions and notify for short TUI notifications.
-- Use open_file when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
+{web_search_guidance}- Use ask for blocking questions and notify for short TUI notifications.
+- Use open when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
 
 ## Project instructions (config/AGENTS.md)
 {agents_instructions}

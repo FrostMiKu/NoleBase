@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::{
-    ListNotes, ListTags, LoadSkill, Read, SearchContent, SearchFiles, SearchTag, WebSearch,
+    ListNotes, ListTags, LoadSkill, Read, SearchContent, SearchFiles, SearchTag, SearchWeb,
 };
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
@@ -45,7 +45,7 @@ impl Explore {
         explore.register(SearchTag::new(root, workspace_index)?);
         explore.register(LoadSkill::new(skills));
         if !tavily_api_key.is_empty() {
-            explore.register(WebSearch {
+            explore.register(SearchWeb {
                 client: client.clone(),
                 api_key: tavily_api_key,
             });
@@ -243,8 +243,8 @@ mod tests {
         assert!(tool_names.contains(&"read"));
         assert!(tool_names.contains(&"search_files"));
         assert!(!tool_names.contains(&"explore"));
-        assert!(!tool_names.contains(&"edit_file"));
-        assert!(!tool_names.contains(&"ask_user"));
+        assert!(!tool_names.contains(&"edit"));
+        assert!(!tool_names.contains(&"ask"));
         assert_eq!(requests[1].messages.len(), 3);
         assert_eq!(
             requests[1].messages[2].role,

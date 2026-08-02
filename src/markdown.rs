@@ -2,6 +2,8 @@
 //!
 //! MBDown owns the language and syntax tree. MBTUI owns Nole's Ratatui layout.
 
+use std::borrow::Cow;
+
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
 use mbtui::Renderer;
 use ratatui::style::Color;
@@ -43,7 +45,8 @@ pub fn to_lines_at_width(source: &str, width: usize, theme: Theme) -> Vec<Line<'
 }
 
 pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMarkup {
-    match mbdown::parse(source) {
+    let source = expand_tabs(source);
+    match mbdown::parse(source.as_ref()) {
         Ok(document) => {
             let rendered = Renderer::with_theme(width.max(1), theme.markdown_theme())
                 .with_image_height(12)
@@ -87,6 +90,34 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
             images: Vec::new(),
         },
     }
+}
+
+fn expand_tabs(source: &str) -> Cow<'_, str> {
+    if !source.contains('\t') {
+        return Cow::Borrowed(source);
+    }
+
+    const TAB_STOP: usize = 4;
+    let mut expanded = String::with_capacity(source.len());
+    let mut column = 0;
+    for character in source.chars() {
+        match character {
+            '\t' => {
+                let spaces = TAB_STOP - column % TAB_STOP;
+                expanded.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            '\n' | '\r' => {
+                expanded.push(character);
+                column = 0;
+            }
+            _ => {
+                expanded.push(character);
+                column += UnicodeWidthChar::width(character).unwrap_or(0);
+            }
+        }
+    }
+    Cow::Owned(expanded)
 }
 
 struct LinkSpec {
@@ -285,6 +316,7 @@ fn link_segments(cells: &[RenderedCell], target: &LinkTarget) -> Vec<RenderedLin
 }
 
 /// Map a one-based source line to its first terminal row after MBTUI layout.
+#[cfg(test)]
 pub fn rendered_row_for_source_line(
     source: &str,
     line_no: usize,
@@ -292,6 +324,17 @@ pub fn rendered_row_for_source_line(
     theme: Theme,
 ) -> usize {
     let rendered = to_lines_at_width(source, width, theme);
+    rendered_row_for_source_line_in(source, line_no, &rendered, width, theme)
+}
+
+/// Map a source line using an existing complete render.
+pub fn rendered_row_for_source_line_in(
+    source: &str,
+    line_no: usize,
+    rendered: &[Line<'_>],
+    width: usize,
+    theme: Theme,
+) -> usize {
     if rendered.is_empty() {
         return 0;
     }
@@ -426,6 +469,24 @@ mod tests {
     fn renders_nested_lists_with_hierarchical_indent() {
         let output = text(&to_lines_at_width("- AAA\n  - BBB\n- CCC", WIDTH));
         assert_eq!(output, " • AAA\n    • BBB\n • CCC");
+    }
+
+    #[test]
+    fn expands_tabs_before_rendering_terminal_text() {
+        let lines = to_lines_at_width(
+            "```text\n1:- 今天健完身\n3:\t- @所有人\n4:\t  1. 注意简表\n```",
+            48,
+        );
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| !span.content.contains('\t')));
+        let output = text(&lines);
+        assert!(output.contains("3:  - @所有人"), "{output:?}");
+        assert!(output.contains("4:    1. 注意简表"), "{output:?}");
+        assert!(output
+            .lines()
+            .all(|line| UnicodeWidthStr::width(line) <= 48));
     }
 
     #[test]

@@ -193,8 +193,8 @@ impl App {
                             preview: entry_preview,
                         } = Arc::make_mut(entry)
                         {
-                            let answer = (message.starts_with("Completed Ask User.")
-                                && text.starts_with("Calling Ask User..."))
+                            let answer = (message.starts_with("Completed Ask.")
+                                && text.starts_with("Calling Ask..."))
                             .then(|| text.lines().nth(2).map(str::to_string))
                             .flatten();
                             *text = answer
@@ -755,7 +755,7 @@ impl App {
                                 text,
                                 active: true,
                                 ..
-                            } if text.starts_with("Calling Ask User...")
+                            } if text.starts_with("Calling Ask...")
                         )
                     }) {
                         if let AgentPanelEntry::Tool { text, .. } = Arc::make_mut(entry) {

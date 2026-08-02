@@ -13,15 +13,15 @@ const MAX_WEB_SEARCH_RESULTS: usize = 10;
 pub const MAX_WEB_SEARCH_DOMAINS: usize = 300;
 const MAX_FETCH_BYTES: u64 = 1_000_000;
 
-pub struct WebSearch {
+pub struct SearchWeb {
     pub client: Client,
     pub api_key: String,
 }
 
 #[async_trait::async_trait]
-impl Tool for WebSearch {
+impl Tool for SearchWeb {
     fn name(&self) -> &'static str {
-        "web_search"
+        "search_web"
     }
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::Network

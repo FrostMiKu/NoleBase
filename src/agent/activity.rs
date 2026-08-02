@@ -67,7 +67,7 @@ pub(crate) fn tool_start_activity(call: &Value) -> String {
         .unwrap_or_default();
     match name {
         "read" if raw_target.as_deref().is_some_and(is_url) => format!("Fetching Web...{target}"),
-        "web_search" => format!("Searching Web...{target}"),
+        "search_web" => format!("Searching Web...{target}"),
         _ => format!("Calling {}...{target}", tool_display_name(name)),
     }
 }
@@ -103,23 +103,21 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
                 path
             }
         }),
-        "web_search" | "search_content" | "search_files" | "list_tags" => text("query"),
+        "search_web" | "search_content" | "search_files" | "list_tags" => text("query"),
         "search_tag" => text("tag"),
         "rename_tag" => Some(format!("{} -> {}", text("from")?, text("to")?)),
         "add_daily_entry" => Some(text("date").unwrap_or_else(|| "Today".to_string())),
-        "copy_file" | "move_file" => {
-            Some(format!("{} -> {}", text("source")?, text("destination")?))
-        }
-        "move_files" => {
+        "copy" | "move" => Some(format!("{} -> {}", text("source")?, text("destination")?)),
+        "move_many" => {
             let count = input.get("sources").and_then(Value::as_array)?.len();
             Some(format!(
                 "{count} files -> {}",
                 text("destination_directory")?
             ))
         }
-        "rename_file" => Some(format!("{} -> {}", text("path")?, text("new_name")?)),
+        "rename" => Some(format!("{} -> {}", text("path")?, text("new_name")?)),
         "notify" => text("message"),
-        "ask_user" => text("question"),
+        "ask" => text("question"),
         _ => text("path"),
     }
 }

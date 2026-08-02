@@ -640,8 +640,7 @@ mod tests {
 
         let tool = render_chat_entry(
             &AgentPanelEntry::Tool {
-                text: "Failed Create File: MBDown validation failed\ndata/gantt-2026-08.md"
-                    .to_string(),
+                text: "Failed Write: MBDown validation failed\ndata/gantt-2026-08.md".to_string(),
                 active: false,
                 preview: None,
             },
@@ -651,35 +650,29 @@ mod tests {
         .0;
         assert_eq!(tool.len(), 3);
         let padding = " ".repeat(CHAT_BLOCK_PAD);
-        assert_eq!(
-            tool[0].to_string(),
-            format!("{padding} • Failed Create File")
-        );
+        assert_eq!(tool[0].to_string(), format!("{padding} • Failed Write"));
         assert!(tool[1].to_string().starts_with(&format!(
             "{padding}   └─ MBDown validation failed · data/gantt-2026-08.md"
         )));
         assert_eq!(tool[2].to_string(), "");
         assert_eq!(tool[2].style.bg, None);
 
-        let ask_user = render_chat_tool(
-            "Completed Ask User.\nChoose a format\nMBDown",
+        let ask = render_chat_tool(
+            "Completed Ask.\nChoose a format\nMBDown",
             None,
             80,
             0,
             false,
             theme,
         );
-        assert_eq!(ask_user.len(), 4);
+        assert_eq!(ask.len(), 4);
+        assert_eq!(ask[0].to_string(), format!("{padding} • Completed Ask."));
         assert_eq!(
-            ask_user[0].to_string(),
-            format!("{padding} • Completed Ask User.")
-        );
-        assert_eq!(
-            ask_user[1].to_string(),
+            ask[1].to_string(),
             format!("{padding}   ├─ Choose a format")
         );
-        assert_eq!(ask_user[2].to_string(), format!("{padding}   └─ MBDown"));
-        assert_eq!(ask_user[3].to_string(), "");
+        assert_eq!(ask[2].to_string(), format!("{padding}   └─ MBDown"));
+        assert_eq!(ask[3].to_string(), "");
 
         let with_preview = render_chat_tool(
             "Completed Read.\ndata/Note.md",
@@ -1143,5 +1136,32 @@ mod tests {
             format!("{padding}   └─ first line of the note")
         );
         assert_eq!(done[3].to_string(), "");
+    }
+
+    #[test]
+    fn chat_thinking_code_blocks_never_emit_terminal_tabs() {
+        let source = concat!(
+            "```text\n",
+            "1:- 今天健完身给游泳的东西给忘共享单车篮子里了\n",
+            "3:\t- @所有人 学位系统没问题的可以准备纸质材料，有问题的继续改：\n",
+            "4:\t  1. 注意简表必须导师和本人手签，不能电子签。\n",
+            "```",
+        );
+        let (lines, _, _) = render_chat_thinking_box(source, true, 110, 0, Theme::default());
+
+        assert!(lines[..lines.len() - 1]
+            .iter()
+            .all(|line| line.width() == 110));
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| !span.content.contains('\t')));
+        let output = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(output.contains("3:  - @所有人"), "{output:?}");
+        assert!(output.contains("4:    1. 注意简表"), "{output:?}");
     }
 }

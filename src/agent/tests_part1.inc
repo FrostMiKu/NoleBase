@@ -152,9 +152,9 @@
     fn file_tools_stay_inside_root() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
-        let create = CreateFile::new(directory.path()).unwrap();
-        create
-            .execute(&json!({"path": "data/test.md", "content": "hello"}))
+        let write = Write::new(directory.path()).unwrap();
+        write
+            .execute(&json!({"path": "data/test.md", "content": "hello\nworld\n"}))
             .unwrap();
         let read = Read::new(
             directory.path(),
@@ -165,9 +165,13 @@
         let result = read
             .execute(&json!({"path": "data/test.md"}))
             .unwrap();
-        assert!(result.starts_with(&format!("[data/test.md#{}]", snapshot_tag("hello"))));
-        assert!(result.contains("\n1:hello\n"));
-        assert!(result.ends_with("[Showing lines 1-1 of 1]"));
+        assert_eq!(
+            result,
+            format!(
+                "[data/test.md#{}]\n1:hello\n2:world\n\n[Showing lines 1-2 of 2]",
+                snapshot_tag("hello\nworld\n")
+            )
+        );
         let outside_directory = tempfile::tempdir().unwrap();
         let outside = outside_directory.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
@@ -189,7 +193,7 @@
         fs::write(directory.path().join("data/large.md"), &content).unwrap();
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
 
         let first = read
             .execute(&json!({"path": "data/large.md", "offset": 0, "limit": 200}))
@@ -337,8 +341,8 @@
 
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = EditFile::new(directory.path(), bypass_gate(), reads).unwrap();
-        let create = CreateFile::new(directory.path()).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let write = Write::new(directory.path()).unwrap();
 
         read.execute(&json!({"path": "config/AGENTS.md"})).unwrap();
         assert!(edit
@@ -348,10 +352,10 @@
                 "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["changed"]}]
             }))
             .returns_err());
-        assert!(create
+        assert!(write
             .execute(&json!({"path": "config/new.md", "content": "forbidden"}))
             .returns_err());
-        assert!(DeleteFile::new(directory.path(), bypass_gate())
+        assert!(Delete::new(directory.path(), bypass_gate())
             .unwrap()
             .execute(&json!({"path": "config/AGENTS.md"}))
             .returns_err());
@@ -499,7 +503,7 @@
         fs::write(&move_source, "move me").unwrap();
         let canonical_move_source = fs::canonicalize(&move_source).unwrap();
 
-        let copy = CopyFile::new(directory.path()).unwrap();
+        let copy = Copy::new(directory.path()).unwrap();
         copy.execute(&json!({
             "source": copy_source,
             "destination": "data/copied.md"
@@ -524,7 +528,7 @@
             .returns_err());
 
         let (event_sender, mut event_receiver) = event_channel();
-        let move_file = MoveFile::new(directory.path(), event_sender).unwrap();
+        let move_file = Move::new(directory.path(), event_sender).unwrap();
         move_file
             .execute(&json!({
                 "source": move_source,
@@ -557,7 +561,7 @@
         fs::write(&beta, "beta").unwrap();
 
         let (event_sender, mut event_receiver) = event_channel();
-        let mover = MoveFiles::new(directory.path(), event_sender.clone()).unwrap();
+        let mover = MoveMany::new(directory.path(), event_sender.clone()).unwrap();
         let result = mover
             .execute(&json!({
                 "sources": [alpha, beta],
@@ -584,7 +588,7 @@
             .iter()
             .all(|event| matches!(event, AgentEvent::FileMoved { .. })));
 
-        let rename = RenameFile::new(directory.path(), event_sender).unwrap();
+        let rename = Rename::new(directory.path(), event_sender).unwrap();
         rename
             .execute(&json!({
                 "path": "data/collected/alpha.md",
@@ -625,7 +629,7 @@
             events: event_sender,
             decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         };
-        let delete = DeleteFile::new(directory.path(), gate).unwrap();
+        let delete = Delete::new(directory.path(), gate).unwrap();
         assert!(delete
             .execute(&json!({"path": outside.path()}))
             .returns_err());
@@ -669,7 +673,7 @@
         );
 
         let search = json!({
-            "name": "web_search",
+            "name": "search_web",
             "input": {"query": "Rust terminal user interface"}
         });
         assert_eq!(
@@ -1395,13 +1399,13 @@
                 {
                     "type": "tool_use",
                     "id": "delete-first",
-                    "name": "delete_file",
+                    "name": "delete",
                     "input": {"path": "data/first.md"}
                 },
                 {
                     "type": "tool_use",
                     "id": "delete-second",
-                    "name": "delete_file",
+                    "name": "delete",
                     "input": {"path": "data/second.md"}
                 }
             ],
