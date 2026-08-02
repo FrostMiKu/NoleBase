@@ -446,8 +446,7 @@ mod tests {
         let Some(entry) = app.agent_panel.last_mut() else {
             panic!("streaming assistant entry");
         };
-        if let crate::agent_session::AgentPanelEntry::Assistant { text, .. } =
-            Arc::make_mut(entry)
+        if let crate::agent_session::AgentPanelEntry::Assistant { text, .. } = Arc::make_mut(entry)
         {
             text.push_str(" with another streamed chunk");
         }

@@ -176,9 +176,17 @@ impl CompletionsProvider {
                 .context("decoding Completions response")?;
             let answer = parse_response(value, started.elapsed())?;
             if let Some(events) = events {
-                let text = answer.text();
-                if !text.is_empty() {
-                    let _ = events.send(ProviderEvent::TextDelta(text));
+                for part in &answer.message.parts {
+                    match part {
+                        MessagePart::Thinking { thinking, .. } if !thinking.is_empty() => {
+                            let _ = events.send(ProviderEvent::ThinkingDelta(thinking.clone()));
+                            let _ = events.send(ProviderEvent::ThinkingFinished);
+                        }
+                        MessagePart::Text { text } if !text.is_empty() => {
+                            let _ = events.send(ProviderEvent::TextDelta(text.clone()));
+                        }
+                        _ => {}
+                    }
                 }
                 if !answer.token_usage.is_empty() {
                     let _ = events.send(ProviderEvent::Usage {
@@ -235,6 +243,8 @@ async fn decode_stream(
 ) -> Result<AssistantMessage> {
     let mut stream = response.bytes_stream().eventsource();
     let mut text = String::new();
+    let mut thinking = String::new();
+    let mut thinking_open = false;
     let mut tools = BTreeMap::<usize, PartialToolCall>::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason = StopReason::Unknown("unknown".to_string());
@@ -282,7 +292,26 @@ async fn decode_stream(
             stop_reason = parse_stop_reason(reason);
         }
         let delta = choice.get("delta").unwrap_or(&Value::Null);
-        if let Some(part) = delta.get("content").and_then(Value::as_str) {
+        // DeepSeek-style reasoning streams under `reasoning_content`; keep it
+        // separate from the final reply exactly like Anthropic thinking blocks.
+        if let Some(part) = delta
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|part| !part.is_empty())
+        {
+            thinking.push_str(part);
+            thinking_open = true;
+            let _ = events.send(ProviderEvent::ThinkingDelta(part.to_string()));
+        }
+        if let Some(part) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|part| !part.is_empty())
+        {
+            if thinking_open {
+                let _ = events.send(ProviderEvent::ThinkingFinished);
+                thinking_open = false;
+            }
             text.push_str(part);
             let _ = events.send(ProviderEvent::TextDelta(part.to_string()));
         }
@@ -303,8 +332,17 @@ async fn decode_stream(
             }
         }
     }
+    if thinking_open {
+        let _ = events.send(ProviderEvent::ThinkingFinished);
+    }
     emit_usage(&events, usage, first_event);
     let mut parts = Vec::new();
+    if !thinking.is_empty() {
+        parts.push(MessagePart::Thinking {
+            thinking,
+            signature: None,
+        });
+    }
     if !text.is_empty() {
         parts.push(MessagePart::Text { text });
     }
@@ -349,6 +387,14 @@ fn parse_response(value: Value, duration: Duration) -> Result<AssistantMessage> 
         .get("message")
         .context("Completions response choice has no message")?;
     let mut parts = Vec::new();
+    if let Some(thinking) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !thinking.is_empty() {
+            parts.push(MessagePart::Thinking {
+                thinking: thinking.to_string(),
+                signature: None,
+            });
+        }
+    }
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
             parts.push(MessagePart::Text {
@@ -715,6 +761,77 @@ mod tests {
             events.try_recv(),
             Ok(ProviderEvent::Usage { usage, .. })
                 if usage.input_tokens == 4 && usage.output_tokens == 2
+        ));
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_forwards_reasoning_content_as_thinking() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; content_length];
+            reader.read_exact(&mut request_body).unwrap();
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" harder.\",\"content\":\"Answer\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            reader.get_mut().flush().unwrap();
+            (
+                request_line,
+                serde_json::from_slice::<Value>(&request_body).unwrap(),
+            )
+        });
+
+        let provider = CompletionsProvider::new("secret", format!("http://{address}/")).unwrap();
+        let observable = provider.call_streaming(request());
+        let mut events = observable.events;
+        let answer = observable.output.await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(answer.text(), "Answer");
+        assert_eq!(answer.message.parts.len(), 2);
+        assert!(matches!(
+            &answer.message.parts[0],
+            MessagePart::Thinking { thinking, .. } if thinking == "Let me think harder."
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderEvent::ThinkingDelta(text)) if text == "Let me think"
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderEvent::ThinkingDelta(text)) if text == " harder."
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderEvent::ThinkingFinished)
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderEvent::TextDelta(text)) if text == "Answer"
         ));
     }
 }

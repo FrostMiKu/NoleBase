@@ -219,7 +219,10 @@ fn app_restores_the_single_agent_session() {
     storage
         .write_agent_session(&AgentSession::from_parts(
             &conversation,
-            &panel.iter().map(|entry| entry.as_ref().clone()).collect::<Vec<_>>(),
+            &panel
+                .iter()
+                .map(|entry| entry.as_ref().clone())
+                .collect::<Vec<_>>(),
             TokenUsage {
                 input_tokens: 10,
                 output_tokens: 4,
@@ -235,7 +238,8 @@ fn app_restores_the_single_agent_session() {
 
     assert!(app.agent_conversation.clear());
     assert_eq!(app.agent_panel, panel);
-    assert_eq!(app.agent_scroll, u16::MAX);
+    assert_eq!(app.agent_scroll, 0);
+    assert!(app.agent_follow_tail);
     assert_eq!(app.agent_usage.input_tokens, 10);
     assert_eq!(app.agent_timed_output_tokens, 4);
     assert_eq!(app.agent_response_duration, Duration::from_secs(2));
@@ -787,6 +791,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Calling Ask User...\nChoose a format".to_string(),
         active: true,
+        preview: None,
     }));
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
@@ -807,7 +812,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     assert_eq!(app.overlay, None);
     assert!(matches!(
         app.agent_panel.last().map(|entry| entry.as_ref()),
-        Some(AgentPanelEntry::Tool { text, active: true })
+        Some(AgentPanelEntry::Tool { text, active: true, .. })
             if text == "Calling Ask User...\nChoose a format\nMBDown"
     ));
 
@@ -815,12 +820,13 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
         .send(AgentEvent::ToolFinished {
             id: "ask-user".to_string(),
             message: "Completed Ask User.\nChoose a format".to_string(),
+            preview: None,
         })
         .unwrap();
     app.poll_agent();
     assert!(matches!(
         app.agent_panel.last().map(|entry| entry.as_ref()),
-        Some(AgentPanelEntry::Tool { text, active: false })
+        Some(AgentPanelEntry::Tool { text, active: false, .. })
             if text == "Completed Ask User.\nChoose a format\nMBDown"
     ));
 
@@ -937,7 +943,7 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
     ));
     assert!(matches!(
         app.agent_panel[3].as_ref(),
-        AgentPanelEntry::Tool { text, active: true } if text == "Calling Read File..."
+        AgentPanelEntry::Tool { text, active: true, .. } if text == "Calling Read File..."
     ));
     assert_eq!(app.agent_round, 2);
     assert_eq!(app.agent_round_limit, 25);
@@ -959,12 +965,18 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
         .send(AgentEvent::ToolFinished {
             id: "read".to_string(),
             message: "Completed Read File.".to_string(),
+            preview: Some("first line of the note".to_string()),
         })
         .unwrap();
     app.poll_agent();
     assert!(matches!(
         app.agent_panel[3].as_ref(),
-        AgentPanelEntry::Tool { text, active: false } if text == "Completed Read File."
+        AgentPanelEntry::Tool {
+            text,
+            active: false,
+            preview,
+        } if text == "Completed Read File."
+            && preview.as_deref() == Some("first line of the note")
     ));
 
     sender
@@ -1001,6 +1013,92 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
 }
 
 #[test]
+fn thinking_events_build_and_finish_thinking_entries() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ThinkingDelta("Let me read".to_string()))
+        .unwrap();
+    sender
+        .send(AgentEvent::ThinkingDelta(" the file.".to_string()))
+        .unwrap();
+    app.poll_agent();
+    assert!(matches!(
+        app.agent_panel.last().map(|entry| entry.as_ref()),
+        Some(AgentPanelEntry::Thinking { text, streaming: true })
+            if text == "Let me read the file."
+    ));
+    sender.send(AgentEvent::ThinkingFinished).unwrap();
+    app.poll_agent();
+    assert!(matches!(
+        app.agent_panel.last().map(|entry| entry.as_ref()),
+        Some(AgentPanelEntry::Thinking {
+            streaming: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn ordinary_text_stays_an_assistant_message() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::AssistantDelta("I need to inspect".to_string()))
+        .unwrap();
+    app.poll_agent();
+    sender
+        .send(AgentEvent::AssistantMessageFinished {
+            text: "I need to inspect".to_string(),
+            final_output: false,
+        })
+        .unwrap();
+    app.poll_agent();
+    assert!(matches!(
+        app.agent_panel.last().map(|entry| entry.as_ref()),
+        Some(AgentPanelEntry::Assistant {
+            text,
+            streaming: false,
+            final_output: false,
+        }) if text == "I need to inspect"
+    ));
+}
+
+#[test]
+fn manual_agent_scroll_disables_tail_follow() {
+    let (mut app, _directory) = make_app();
+    app.agent_follow_tail = true;
+    app.agent_scroll = 20;
+
+    app.scroll_agent_by(-5);
+
+    assert!(!app.agent_follow_tail);
+    assert_eq!(app.agent_scroll, 15);
+}
+
+#[test]
+fn streaming_events_preserve_manual_agent_scroll() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    app.agent_follow_tail = false;
+    app.agent_scroll = 7;
+    sender
+        .send(AgentEvent::ThinkingDelta("still working".to_string()))
+        .unwrap();
+    sender
+        .send(AgentEvent::AssistantDelta("response".to_string()))
+        .unwrap();
+
+    app.poll_agent();
+
+    assert!(!app.agent_follow_tail);
+    assert_eq!(app.agent_scroll, 7);
+}
+
+#[test]
 fn concurrent_tool_events_finish_the_matching_timeline_entries() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
@@ -1020,18 +1118,19 @@ fn concurrent_tool_events_finish_the_matching_timeline_entries() {
         .send(AgentEvent::ToolFinished {
             id: "a".to_string(),
             message: "Completed Web Fetch.\nhttps://a.example".to_string(),
+            preview: None,
         })
         .unwrap();
     app.poll_agent();
 
     assert!(matches!(
         app.agent_panel[0].as_ref(),
-        AgentPanelEntry::Tool { text, active: false }
+        AgentPanelEntry::Tool { text, active: false, .. }
             if text.contains("https://a.example")
     ));
     assert!(matches!(
         app.agent_panel[1].as_ref(),
-        AgentPanelEntry::Tool { text, active: true }
+        AgentPanelEntry::Tool { text, active: true, .. }
             if text.contains("https://b.example")
     ));
 }
@@ -1117,6 +1216,7 @@ fn application_errors_notify_but_agent_tool_failures_do_not() {
         .send(AgentEvent::ToolFinished {
             id: "failed-read".to_string(),
             message: "Failed Read File: file not found".to_string(),
+            preview: None,
         })
         .unwrap();
     app.poll_agent();
@@ -1165,6 +1265,7 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
         active: true,
+        preview: None,
     }));
     app.focus = Focus::Center;
 
@@ -1209,6 +1310,7 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
         Arc::new(AgentPanelEntry::Tool {
             text: "Searching Web...".to_string(),
             active: true,
+            preview: None,
         }),
         Arc::new(AgentPanelEntry::Assistant {
             text: "Looking for sources.".to_string(),

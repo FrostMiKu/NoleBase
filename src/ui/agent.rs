@@ -24,7 +24,12 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let prompts = app
         .agent_panel
         .iter()
-        .filter(|entry| matches!(entry.as_ref(), crate::agent_session::AgentPanelEntry::Prompt { .. }))
+        .filter(|entry| {
+            matches!(
+                entry.as_ref(),
+                crate::agent_session::AgentPanelEntry::Prompt { .. }
+            )
+        })
         .count();
     let replies = app
         .agent_panel
@@ -39,7 +44,12 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let tools = app
         .agent_panel
         .iter()
-        .filter(|entry| matches!(entry.as_ref(), crate::agent_session::AgentPanelEntry::Tool { .. }))
+        .filter(|entry| {
+            matches!(
+                entry.as_ref(),
+                crate::agent_session::AgentPanelEntry::Tool { .. }
+            )
+        })
         .count();
     let context_rate = if app.agent_context_capacity == 0 {
         0.0
@@ -170,12 +180,19 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = inner.width as usize;
     let view_height = inner.height as usize;
     sync_agent_vlist(app, width);
-    let tail_pinned = app.agent_scroll == u16::MAX;
-    let mut scroll =
-        (app.agent_scroll as usize).min(app.agent_vlist.geometry.max_scroll(view_height));
+    let tail_pinned = app.agent_follow_tail || app.agent_scroll == u16::MAX;
+    let maximum = app.agent_vlist.geometry.max_scroll(view_height);
+    let mut scroll = if tail_pinned {
+        maximum
+    } else {
+        (app.agent_scroll as usize).min(maximum)
+    };
     scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
     evict_agent_caches(app, scroll, view_height);
     app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
+    if scroll >= app.agent_vlist.geometry.max_scroll(view_height) {
+        app.agent_follow_tail = true;
+    }
     let (visible, rendered_links, rendered_images) = visible_agent_lines(app, scroll, view_height);
     let message_rows = Rect::new(
         area.x.saturating_add(1),
@@ -227,12 +244,25 @@ fn sync_agent_vlist_with_style(
     for (index, entry) in app.agent_panel.iter().enumerate() {
         app.agent_vlist
             .geometry
-            .set_estimate(index, estimated_agent_entry_height(entry, width));
+            .set_estimate(index, estimated_agent_entry_height(entry, width, style));
     }
     for (index, cache) in app.agent_vlist.caches.iter_mut().enumerate() {
         let entry = &app.agent_panel[index];
         let volatile = is_volatile_agent_entry(entry);
-        if volatile || cache.as_ref().is_some_and(|cached| !Arc::ptr_eq(&cached.entry, entry)) {
+        // A stable entry must always carry a render cache: its measured height
+        // is only trustworthy while the cached render it was measured from is
+        // still the current entry. Entries that streamed in place (a running
+        // tool that completed, streamed text that finished) were volatile —
+        // never cached — so `Arc::make_mut` mutates them in place without
+        // changing the pointer, leaving the stale measured height from the
+        // volatile phase behind unless we invalidate it here. Evicted entries
+        // are already unmeasured, so invalidating again is a no-op.
+        if volatile
+            || cache.is_none()
+            || cache
+                .as_ref()
+                .is_some_and(|cached| !Arc::ptr_eq(&cached.entry, entry))
+        {
             *cache = None;
             app.agent_vlist.geometry.invalidate(index);
         }
@@ -249,21 +279,58 @@ fn is_volatile_agent_entry(entry: &Arc<crate::agent_session::AgentPanelEntry>) -
         crate::agent_session::AgentPanelEntry::Assistant {
             streaming: true,
             ..
+        } | crate::agent_session::AgentPanelEntry::Thinking {
+            streaming: true,
+            ..
         } | crate::agent_session::AgentPanelEntry::Tool { active: true, .. }
     )
 }
 
 /// Rough per-type height estimate used before an entry is measured. Keeps the
 /// visible-range window tight so few out-of-view entries are rendered speculatively.
-fn estimated_agent_entry_height(entry: &crate::agent_session::AgentPanelEntry, width: usize) -> usize {
+/// The Chat style needs its own numbers: the thinking box and plain assistant text
+/// differ structurally from the panel's status rows, and underestimating clips the
+/// block's outer blank row while streaming (when entries are re-rendered per frame).
+pub(super) fn estimated_agent_entry_height(
+    entry: &crate::agent_session::AgentPanelEntry,
+    width: usize,
+    style: crate::app::AgentEntryRenderStyle,
+) -> usize {
     let width = width.max(1);
-    match entry {
-        crate::agent_session::AgentPanelEntry::Prompt { text, .. }
-        | crate::agent_session::AgentPanelEntry::Assistant { text, .. } => {
-            4 + text.len().div_ceil(width)
+    match (style, entry) {
+        (
+            crate::app::AgentEntryRenderStyle::Cards,
+            crate::agent_session::AgentPanelEntry::Prompt { text, .. },
+        ) => 3 + text.len().div_ceil(width.saturating_sub(4).max(1)),
+        (
+            crate::app::AgentEntryRenderStyle::Cards,
+            crate::agent_session::AgentPanelEntry::Assistant { text, .. },
+        ) => 1 + text.len().div_ceil(width.saturating_sub(2).max(1)),
+        // Box rows: top pad + label + gap + body + bottom pad + blank.
+        (
+            crate::app::AgentEntryRenderStyle::Cards,
+            crate::agent_session::AgentPanelEntry::Thinking { text, .. },
+        ) => 5 + text.len().div_ceil(width.saturating_sub(6).max(1)),
+        (
+            crate::app::AgentEntryRenderStyle::Cards,
+            crate::agent_session::AgentPanelEntry::Error(text),
+        ) => text.lines().count() + 1,
+        // Message blocks: top pad + label + gap + body + bottom pad + blank.
+        (
+            crate::app::AgentEntryRenderStyle::Panel,
+            crate::agent_session::AgentPanelEntry::Prompt { text, .. }
+            | crate::agent_session::AgentPanelEntry::Assistant { text, .. },
+        ) => 6 + text.len().div_ceil(width),
+        // The panel shows thinking as a single status row plus a trailing blank.
+        (
+            crate::app::AgentEntryRenderStyle::Panel,
+            crate::agent_session::AgentPanelEntry::Thinking { .. },
+        ) => 2,
+        // Tool and error rows match across styles (activity lines + trailing blank).
+        (_, crate::agent_session::AgentPanelEntry::Tool { text, preview, .. }) => {
+            text.lines().count() + 2 + usize::from(preview.is_some())
         }
-        crate::agent_session::AgentPanelEntry::Tool { text, .. } => text.lines().count() + 1,
-        crate::agent_session::AgentPanelEntry::Error(_) => 1,
+        (_, crate::agent_session::AgentPanelEntry::Error(_)) => 1,
     }
 }
 
@@ -272,18 +339,9 @@ pub(super) fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
         return;
     }
     let entry = Arc::clone(&app.agent_panel[index]);
-    let (lines, links, images) = match app.agent_vlist.style {
-        crate::app::AgentEntryRenderStyle::Panel => render_agent_entry(
-            &entry,
-            app.agent_vlist.width,
-            app.animation_tick,
-            false,
-            app.theme,
-        ),
-        crate::app::AgentEntryRenderStyle::Cards => {
-            render_chat_entry(&entry, app.agent_vlist.width, app.theme)
-        }
-    };
+    // Measure with the same renderer the display pass uses so volatile entry
+    // heights cannot clip content or shift scroll anchors between frames.
+    let (lines, links, images) = render_agent_entry_current(app, index);
     let height = lines.len();
     if !is_volatile_agent_entry(&entry) {
         app.agent_vlist.caches[index] = Some(crate::app::AgentEntryRenderCache {
@@ -408,6 +466,8 @@ pub(super) fn render_agent_entry(
                 width,
                 background,
             ));
+            // A gap row separates the label from the message body.
+            lines.push(agent_message_line(Line::default(), width, background));
             let row = lines.len();
             let mut rendered = crate::markdown::render_at_width(text, width, theme);
             if *muted {
@@ -432,6 +492,7 @@ pub(super) fn render_agent_entry(
                     .map(|line| agent_message_line(line, width, background)),
             );
             lines.push(agent_message_line(Line::default(), width, background));
+            lines.push(Line::default());
         }
         crate::agent_session::AgentPanelEntry::Assistant { text, .. } if text.trim().is_empty() => {
             lines.push(Line::default());
@@ -449,6 +510,8 @@ pub(super) fn render_agent_entry(
                 width,
                 background,
             ));
+            // A gap row separates the label from the message body.
+            lines.push(agent_message_line(Line::default(), width, background));
             let row = lines.len();
             let rendered = crate::markdown::render_at_width(text, width, theme);
             links.extend(rendered.links.into_iter().map(|mut link| {
@@ -466,13 +529,34 @@ pub(super) fn render_agent_entry(
                     .map(|line| agent_message_line(line, width, background)),
             );
             lines.push(agent_message_line(Line::default(), width, background));
+            lines.push(Line::default());
         }
-        crate::agent_session::AgentPanelEntry::Tool { text, active } => {
+        crate::agent_session::AgentPanelEntry::Tool { text, active, .. } => {
             lines.extend(if *active && animate {
                 animated_activity_lines(text, width, tick, theme)
             } else {
                 activity_lines(text, width, theme)
             });
+            lines.push(Line::default());
+        }
+        crate::agent_session::AgentPanelEntry::Thinking { streaming, .. } => {
+            // The panel shows only a status row, not the reasoning detail: a
+            // braille spinner while streaming, a check mark once done.
+            let marker = if *streaming {
+                animated_activity_marker(width, tick, theme)
+            } else {
+                Span::styled(
+                    " ✓ ",
+                    Style::default()
+                        .fg(theme.ui_activity_marker)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            lines.push(Line::from(vec![
+                marker,
+                Span::styled("thinking", Style::default().fg(theme.text_muted)),
+            ]));
+            lines.push(Line::default());
         }
         crate::agent_session::AgentPanelEntry::Error(text) => lines.push(Line::from(Span::styled(
             text.clone(),
@@ -556,7 +640,12 @@ pub(super) fn visible_agent_lines(
             // keeps it out of the cache, so render it fresh with the current tick.
             let (rendered_lines, rendered_links, rendered_images) =
                 render_agent_entry_current(app, index);
-            let content_to = to.min(rendered_lines.len());
+            // The geometry height may still be an estimate when the measure
+            // budget left this entry unmeasured this frame; never clip the fresh
+            // render to that estimate or the block's trailing rows (body padding,
+            // the shared outer blank) vanish while streaming. Slice to the real
+            // rendered length instead so live rows match a fresh full render.
+            let content_to = rendered_lines.len().min(end.saturating_sub(item_top));
             visible.extend(
                 rendered_lines[content_from.min(content_to)..content_to]
                     .iter()
@@ -601,11 +690,39 @@ fn render_agent_entry_current(
             app.theme,
         ),
         crate::app::AgentEntryRenderStyle::Cards => match entry {
-            crate::agent_session::AgentPanelEntry::Tool { text, active: true, .. } => (
-                render_chat_tool(text, app.agent_vlist.width, app.animation_tick, true, app.theme),
+            crate::agent_session::AgentPanelEntry::Tool {
+                text,
+                active: true,
+                preview,
+                ..
+            } => (
+                render_chat_tool(
+                    text,
+                    preview.as_deref(),
+                    app.agent_vlist.width,
+                    app.animation_tick,
+                    true,
+                    app.theme,
+                ),
                 Vec::new(),
                 Vec::new(),
             ),
+            crate::agent_session::AgentPanelEntry::Thinking {
+                text,
+                streaming: true,
+                ..
+            } => render_chat_thinking_box(
+                text,
+                true,
+                app.agent_vlist.width,
+                app.animation_tick,
+                app.theme,
+            ),
+            crate::agent_session::AgentPanelEntry::Assistant {
+                text,
+                streaming: true,
+                ..
+            } => render_chat_plain_text(text, app.agent_vlist.width, app.theme),
             _ => render_chat_entry(entry, app.agent_vlist.width, app.theme),
         },
     }
@@ -673,6 +790,33 @@ pub(super) fn human_token_count(tokens: u64) -> String {
     format!("{}{suffix}", formatted.trim_end_matches(".0"))
 }
 
+/// Braille spinner frames for running tools; advanced by `animation_tick`.
+/// Eight frames rotate a full braille pattern. Note: U+28xx is classified
+/// Wide in UAX #11, so terminals may render it two columns while ratatui's
+/// unicode-width reserves one; chosen deliberately by the user.
+const BRAILLE_SPINNER_FRAMES: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+
+/// Spinner frame at `tick`, shared with the streaming card label.
+pub(super) fn spinner_frame(tick: u64) -> char {
+    BRAILLE_SPINNER_FRAMES[(tick as usize) % BRAILLE_SPINNER_FRAMES.len()]
+}
+
+fn animated_activity_marker(width: usize, tick: u64, theme: Theme) -> Span<'static> {
+    let frame = spinner_frame(tick);
+    let marker = match width {
+        0 => String::new(),
+        1 => frame.to_string(),
+        2 => format!("{frame} "),
+        _ => format!(" {frame} "),
+    };
+    Span::styled(
+        marker,
+        Style::default()
+            .fg(theme.ui_activity_marker)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 pub(super) fn animated_activity_lines(
     text: &str,
     width: usize,
@@ -680,56 +824,66 @@ pub(super) fn animated_activity_lines(
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let (status, details) = activity_parts(text);
-    let marker = activity_marker(width, theme);
-    let available = width.saturating_sub(marker.width());
-    let characters = compact_activity_line(&status, available)
-        .chars()
-        .filter(|character| UnicodeWidthChar::width(*character).unwrap_or(0) > 0)
-        .collect::<Vec<_>>();
-    let mut spans = vec![marker];
-    spans.extend(
-        characters
-            .into_iter()
-            .enumerate()
-            .map(|(index, character)| {
-                Span::styled(
-                    character.to_string(),
-                    Style::default()
-                        .fg(animated_color(index * 8, tick, theme))
-                        .add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-    let mut lines = vec![Line::from(spans)];
-    let detail_count = details.len();
-    for (index, detail) in details.into_iter().enumerate() {
-        lines.push(activity_detail_line(
-            &detail,
-            width,
-            theme,
-            index + 1 == detail_count,
-        ));
-    }
-    lines
+    activity_rows(&status, &details, width, tick, true, theme)
 }
 
 pub(super) fn activity_lines(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
     let (status, details) = activity_parts(text);
-    let marker = activity_marker(width, theme);
-    let available = width.saturating_sub(marker.width());
-    let spans = vec![
-        marker,
-        Span::styled(
-            compact_activity_line(&status, available),
-            Style::default().fg(theme.text_muted),
-        ),
-    ];
-    let mut lines = vec![Line::from(spans)];
+    activity_rows(&status, &details, width, 0, false, theme)
+}
+
+/// Shared activity rows used by both the agent panel and the chat tool block:
+/// one status row (optionally animated with the braille spinner for a running
+/// tool) followed by one tree row per detail, using the `├─`/`└─` convention
+/// from [`activity_detail_line`]. The chat block appends a successful result
+/// preview as the final detail so it shares the same glyphs and indentation.
+pub(super) fn activity_rows(
+    status: &str,
+    details: &[String],
+    width: usize,
+    tick: u64,
+    animate: bool,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(1 + details.len());
+    if animate {
+        let marker = animated_activity_marker(width, tick, theme);
+        let available = width.saturating_sub(marker.width());
+        let characters = compact_activity_line(status, available)
+            .chars()
+            .filter(|character| UnicodeWidthChar::width(*character).unwrap_or(0) > 0)
+            .collect::<Vec<_>>();
+        let mut spans = vec![marker];
+        spans.extend(
+            characters
+                .into_iter()
+                .enumerate()
+                .map(|(index, character)| {
+                    Span::styled(
+                        character.to_string(),
+                        Style::default()
+                            .fg(animated_color(index * 8, tick, theme))
+                            .add_modifier(Modifier::BOLD),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        lines.push(Line::from(spans));
+    } else {
+        let marker = activity_marker(width, theme);
+        let available = width.saturating_sub(marker.width());
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(
+                compact_activity_line(status, available),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]));
+    }
     let detail_count = details.len();
-    for (index, detail) in details.into_iter().enumerate() {
+    for (index, detail) in details.iter().enumerate() {
         lines.push(activity_detail_line(
-            &detail,
+            detail,
             width,
             theme,
             index + 1 == detail_count,

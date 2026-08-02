@@ -214,7 +214,10 @@ async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     } else if metadata.is_dir() {
         Ok(Target::Directory { path })
     } else {
-        bail!("path is not a regular file or directory: {}", path.display())
+        bail!(
+            "path is not a regular file or directory: {}",
+            path.display()
+        )
     }
 }
 
@@ -879,9 +882,12 @@ mod tests {
     async fn read_dispatches_to_registered_parsers_before_text_file() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("sample.pdf"), b"%PDF-1.4").unwrap();
-        let mut read =
-            Read::new(directory.path(), Arc::new(ReadTracker::default()), reqwest::Client::new())
-                .unwrap();
+        let mut read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
         read.register(FakeParser);
 
         let output = read

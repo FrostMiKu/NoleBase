@@ -228,7 +228,10 @@ fn optional_string_array(
         .map(Some)
 }
 
-pub(crate) async fn read_limited_http_body(response: reqwest::Response, label: &str) -> Result<Vec<u8>> {
+pub(crate) async fn read_limited_http_body(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_FETCH_BYTES)

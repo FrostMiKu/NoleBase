@@ -762,6 +762,12 @@ impl Agent {
                         Ok(ProviderEvent::TextDelta(text)) => {
                             let _ = self.events.send(AgentEvent::AssistantDelta(text));
                         }
+                        Ok(ProviderEvent::ThinkingDelta(text)) => {
+                            let _ = self.events.send(AgentEvent::ThinkingDelta(text));
+                        }
+                        Ok(ProviderEvent::ThinkingFinished) => {
+                            let _ = self.events.send(AgentEvent::ThinkingFinished);
+                        }
                         Ok(ProviderEvent::Usage { usage, generation_duration }) => {
                             report_provider_metrics(
                                 &self.events,
@@ -786,6 +792,12 @@ impl Agent {
                         match event {
                             ProviderEvent::TextDelta(text) => {
                                 let _ = self.events.send(AgentEvent::AssistantDelta(text));
+                            }
+                            ProviderEvent::ThinkingDelta(text) => {
+                                let _ = self.events.send(AgentEvent::ThinkingDelta(text));
+                            }
+                            ProviderEvent::ThinkingFinished => {
+                                let _ = self.events.send(AgentEvent::ThinkingFinished);
                             }
                             ProviderEvent::Usage { usage, generation_duration } => {
                                 report_provider_metrics(
@@ -1046,9 +1058,15 @@ impl Agent {
             ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => result,
         };
         let error = result.is_error.then_some(result.content.as_str());
+        // Ask User's answer already lands in the activity text, so it is not
+        // duplicated as a preview line.
+        let preview = (!result.is_error && call.name != "ask_user")
+            .then(|| tool_result_preview(&result.content))
+            .flatten();
         let _ = self.events.send(AgentEvent::ToolFinished {
             id: call.id.clone(),
             message: tool_finish_activity(&tool_call_value(call), error),
+            preview,
         });
         execution
     }

@@ -128,6 +128,29 @@ pub(crate) fn compact_activity_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Compact single-line preview of a successful tool result for the Agent Chat
+/// activity stream. Structured (JSON) and empty results are withheld: the
+/// preview stays human-readable, while tool input/output JSON remains in the
+/// conversation history.
+pub(crate) fn tool_result_preview(content: &str) -> Option<String> {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let content = content.trim();
+    if content.is_empty() || content.starts_with('{') || content.starts_with('[') {
+        return None;
+    }
+    let mut preview = compact_activity_value(content);
+    if preview.chars().count() > MAX_PREVIEW_CHARS {
+        preview = preview
+            .chars()
+            .take(MAX_PREVIEW_CHARS.saturating_sub(1))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+            + "…";
+    }
+    Some(preview)
+}
+
 pub(crate) fn web_base_url(value: &str) -> String {
     reqwest::Url::parse(value)
         .ok()

@@ -59,6 +59,10 @@ pub enum AgentEvent {
         text: String,
         final_output: bool,
     },
+    /// Streamed reasoning text (thinking blocks), distinct from the final reply.
+    ThinkingDelta(String),
+    /// The reasoning text finished streaming.
+    ThinkingFinished,
     BufferedInputConsumed(usize),
     ToolStarted {
         id: String,
@@ -67,6 +71,9 @@ pub enum AgentEvent {
     ToolFinished {
         id: String,
         message: String,
+        /// Single-line human-readable result preview; `None` for failed or
+        /// structured (JSON) results. Rendered by the wide Agent Chat view.
+        preview: Option<String>,
     },
     Usage(TokenUsage),
     ContextWindow {

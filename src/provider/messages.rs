@@ -312,6 +312,7 @@ async fn decode_stream(
                     Some("thinking_delta") => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
                             append_string(&mut content[index], "thinking", text);
+                            let _ = events.send(ProviderEvent::ThinkingDelta(text.to_string()));
                         }
                     }
                     Some("signature_delta") => {
@@ -338,6 +339,14 @@ async fn decode_stream(
                             .to_string();
                         block["input"] = parse_tool_input(&id, &partial, &mut tool_input_errors);
                     }
+                }
+                if content
+                    .get(index)
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("thinking")
+                {
+                    let _ = events.send(ProviderEvent::ThinkingFinished);
                 }
             }
             Some("message_delta") => {

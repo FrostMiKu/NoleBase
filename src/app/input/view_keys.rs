@@ -173,19 +173,19 @@ impl App {
                 None
             }
             code if is_up_key(code) => {
-                self.agent_scroll = self.agent_scroll.saturating_sub(1);
+                self.scroll_agent_by(-1);
                 None
             }
             code if is_down_key(code) => {
-                self.agent_scroll = self.agent_scroll.saturating_add(1);
+                self.scroll_agent_by(1);
                 None
             }
             KeyCode::PageUp => {
-                self.agent_scroll = self.agent_scroll.saturating_sub(AGENT_PAGE_STEP);
+                self.scroll_agent_by(-i32::from(AGENT_PAGE_STEP));
                 None
             }
             KeyCode::PageDown => {
-                self.agent_scroll = self.agent_scroll.saturating_add(AGENT_PAGE_STEP);
+                self.scroll_agent_by(i32::from(AGENT_PAGE_STEP));
                 None
             }
             code if is_left_key(code) => {
@@ -247,19 +247,19 @@ impl App {
                 None
             }
             code if is_up_key(code) => {
-                self.agent_scroll = self.agent_scroll.saturating_sub(1);
+                self.scroll_agent_by(-1);
                 None
             }
             code if is_down_key(code) => {
-                self.agent_scroll = self.agent_scroll.saturating_add(1);
+                self.scroll_agent_by(1);
                 None
             }
             KeyCode::PageUp => {
-                self.agent_scroll = self.agent_scroll.saturating_sub(AGENT_PAGE_STEP);
+                self.scroll_agent_by(-i32::from(AGENT_PAGE_STEP));
                 None
             }
             KeyCode::PageDown => {
-                self.agent_scroll = self.agent_scroll.saturating_add(AGENT_PAGE_STEP);
+                self.scroll_agent_by(i32::from(AGENT_PAGE_STEP));
                 None
             }
             KeyCode::Char('c') if self.ai_running => {

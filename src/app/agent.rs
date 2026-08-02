@@ -6,6 +6,16 @@ use std::sync::Arc;
 use super::*;
 
 impl App {
+    pub(in crate::app) fn scroll_agent_by(&mut self, delta: i32) {
+        self.agent_follow_tail = false;
+        self.agent_scroll = if delta > 0 {
+            self.agent_scroll.saturating_add(delta as u16)
+        } else {
+            self.agent_scroll
+                .saturating_sub(delta.unsigned_abs() as u16)
+        };
+    }
+
     pub fn poll_agent(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -52,9 +62,7 @@ impl App {
                                 }
                             ) =>
                         {
-                            if let AgentPanelEntry::Assistant { text, .. } =
-                                Arc::make_mut(entry)
-                            {
+                            if let AgentPanelEntry::Assistant { text, .. } = Arc::make_mut(entry) {
                                 text.push_str(&delta);
                             }
                         }
@@ -64,7 +72,6 @@ impl App {
                             final_output: false,
                         })),
                     }
-                    self.agent_scroll = u16::MAX;
                 }
                 AgentEvent::AssistantMessageFinished { text, final_output } => {
                     if text.trim().is_empty() {
@@ -104,6 +111,45 @@ impl App {
                         }));
                     }
                 }
+                AgentEvent::ThinkingDelta(delta) => {
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    match self.agent_panel.last_mut() {
+                        Some(entry)
+                            if matches!(
+                                entry.as_ref(),
+                                AgentPanelEntry::Thinking {
+                                    streaming: true,
+                                    ..
+                                }
+                            ) =>
+                        {
+                            if let AgentPanelEntry::Thinking { text, .. } = Arc::make_mut(entry) {
+                                text.push_str(&delta);
+                            }
+                        }
+                        _ => self.agent_panel.push(Arc::new(AgentPanelEntry::Thinking {
+                            text: delta,
+                            streaming: true,
+                        })),
+                    }
+                }
+                AgentEvent::ThinkingFinished => {
+                    if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
+                        matches!(
+                            entry.as_ref(),
+                            AgentPanelEntry::Thinking {
+                                streaming: true,
+                                ..
+                            }
+                        )
+                    }) {
+                        if let AgentPanelEntry::Thinking { streaming, .. } = Arc::make_mut(entry) {
+                            *streaming = false;
+                        }
+                    }
+                }
                 AgentEvent::BufferedInputConsumed(count) => {
                     for followup in self
                         .agent_panel
@@ -124,12 +170,16 @@ impl App {
                     self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
                         text: message.clone(),
                         active: true,
+                        preview: None,
                     }));
                     self.active_agent_tools.insert(id, index);
-                    self.agent_scroll = u16::MAX;
                     self.set_status(message);
                 }
-                AgentEvent::ToolFinished { id, message } => {
+                AgentEvent::ToolFinished {
+                    id,
+                    message,
+                    preview,
+                } => {
                     let index = self.active_agent_tools.remove(&id).or_else(|| {
                         self.agent_panel.iter().rposition(|entry| {
                             matches!(entry.as_ref(), AgentPanelEntry::Tool { active: true, .. })
@@ -137,7 +187,12 @@ impl App {
                     });
                     let entry = index.and_then(|index| self.agent_panel.get_mut(index));
                     if let Some(entry) = entry {
-                        if let AgentPanelEntry::Tool { text, active } = Arc::make_mut(entry) {
+                        if let AgentPanelEntry::Tool {
+                            text,
+                            active,
+                            preview: entry_preview,
+                        } = Arc::make_mut(entry)
+                        {
                             let answer = (message.starts_with("Completed Ask User.")
                                 && text.starts_with("Calling Ask User..."))
                             .then(|| text.lines().nth(2).map(str::to_string))
@@ -146,14 +201,15 @@ impl App {
                                 .map(|answer| format!("{message}\n{answer}"))
                                 .unwrap_or_else(|| message.clone());
                             *active = false;
+                            *entry_preview = preview;
                         }
                     } else {
                         self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
                             text: message.clone(),
                             active: false,
+                            preview,
                         }));
                     }
-                    self.agent_scroll = u16::MAX;
                     self.set_status(message);
                 }
                 AgentEvent::Usage(usage) => self.agent_usage.add(usage),
@@ -232,7 +288,6 @@ impl App {
                     }
                     self.ai_running = false;
                     self.ai_cancel = None;
-                    self.agent_scroll = u16::MAX;
                     let (notification, status) = match reason {
                         AgentStopReason::RequestRoundLimit => (
                             "Agent stopped at the request-round limit",
@@ -273,7 +328,6 @@ impl App {
                     self.ai_cancel = None;
                     match result {
                         Ok(_) => {
-                            self.agent_scroll = u16::MAX;
                             self.notifications.notify("Agent finished");
                             self.set_status("Agent finished");
                         }
@@ -285,10 +339,10 @@ impl App {
                                     *streaming = false;
                                 }
                             }
-                            self.agent_panel.push(Arc::new(AgentPanelEntry::Error(format!(
-                                "Agent failed: {error}"
-                            ))));
-                            self.agent_scroll = u16::MAX;
+                            self.agent_panel
+                                .push(Arc::new(AgentPanelEntry::Error(format!(
+                                    "Agent failed: {error}"
+                                ))));
                             self.set_error(format!("AI error: {error}"));
                         }
                     }
@@ -317,7 +371,6 @@ impl App {
             self.agent_panel.push(Arc::new(AgentPanelEntry::Error(
                 "Agent worker stopped unexpectedly".to_string(),
             )));
-            self.agent_scroll = u16::MAX;
             self.clear_ask_user();
             self.set_error("AI error: worker stopped unexpectedly");
         }
@@ -473,7 +526,7 @@ impl App {
             text: display_prompt,
             muted: true,
         }));
-        self.agent_scroll = u16::MAX;
+        self.agent_follow_tail = true;
         self.set_status("Prompt buffered for Agent");
         true
     }
@@ -528,7 +581,7 @@ impl App {
             text: display_prompt,
             muted: false,
         }));
-        self.agent_scroll = u16::MAX;
+        self.agent_follow_tail = true;
         self.start_agent_worker(prompt)
     }
 
@@ -612,7 +665,6 @@ impl App {
         self.deactivate_agent_tools();
         self.agent_panel
             .push(Arc::new(AgentPanelEntry::Error("Cancelled".to_string())));
-        self.agent_scroll = u16::MAX;
         self.notifications.notify("Agent task cancelled");
         self.set_status("Agent task cancelled");
     }
@@ -649,6 +701,7 @@ impl App {
             buffer.clear();
         }
         self.agent_scroll = 0;
+        self.agent_follow_tail = false;
         self.agent_usage = TokenUsage::default();
         self.agent_context_window = 0;
         self.agent_context_capacity = 0;
@@ -698,15 +751,17 @@ impl App {
                     if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
                         matches!(
                             entry.as_ref(),
-                            AgentPanelEntry::Tool { text, active: true }
-                                if text.starts_with("Calling Ask User...")
+                            AgentPanelEntry::Tool {
+                                text,
+                                active: true,
+                                ..
+                            } if text.starts_with("Calling Ask User...")
                         )
                     }) {
                         if let AgentPanelEntry::Tool { text, .. } = Arc::make_mut(entry) {
                             if text.lines().count() < 3 {
                                 text.push('\n');
                                 text.push_str(&answer);
-                                self.agent_scroll = u16::MAX;
                             }
                         }
                     }

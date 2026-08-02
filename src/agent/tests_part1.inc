@@ -700,6 +700,22 @@
     }
 
     #[test]
+    fn tool_result_preview_withholds_json_and_compacts_text() {
+        assert_eq!(tool_result_preview(""), None);
+        assert_eq!(tool_result_preview("   \n  "), None);
+        assert_eq!(tool_result_preview("{\"key\": 1}"), None);
+        assert_eq!(tool_result_preview("[1, 2, 3]"), None);
+        assert_eq!(
+            tool_result_preview("  line one\nline two  "),
+            Some("line one line two".to_string())
+        );
+        let long = "word ".repeat(60);
+        let preview = tool_result_preview(&long).unwrap();
+        assert!(preview.chars().count() <= 120);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
     fn tool_batch_emits_one_timeline_activity_per_call() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();

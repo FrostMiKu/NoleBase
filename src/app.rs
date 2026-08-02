@@ -327,6 +327,7 @@ pub struct App {
     active_agent_tools: HashMap<String, usize>,
     pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
+    pub(crate) agent_follow_tail: bool,
     pub agent_usage: TokenUsage,
     pub agent_context_window: u64,
     pub agent_context_capacity: u64,
@@ -376,7 +377,8 @@ impl App {
             .load_agent_session()?
             .unwrap_or_default()
             .into_parts();
-        let agent_scroll = if agent_panel.is_empty() { 0 } else { u16::MAX };
+        let agent_follow_tail = !agent_panel.is_empty();
+        let agent_scroll = 0;
         let agent_panel = agent_panel.into_iter().map(Arc::new).collect();
         let daily_notes = storage.load_daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
@@ -498,6 +500,7 @@ impl App {
             active_agent_tools: HashMap::new(),
             agent_vlist: AgentVirtualList::default(),
             agent_scroll,
+            agent_follow_tail,
             agent_usage,
             agent_context_window: 0,
             agent_context_capacity: 0,

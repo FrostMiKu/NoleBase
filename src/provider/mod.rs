@@ -157,6 +157,11 @@ impl AssistantMessage {
 #[derive(Clone, Debug)]
 pub enum ProviderEvent {
     TextDelta(String),
+    /// Streamed reasoning block text (Anthropic `thinking` blocks), kept
+    /// separate from the final reply so the UI can render it as process.
+    ThinkingDelta(String),
+    /// The reasoning block finished streaming.
+    ThinkingFinished,
     Usage {
         usage: TokenUsage,
         generation_duration: std::time::Duration,

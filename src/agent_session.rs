@@ -82,9 +82,20 @@ pub enum AgentPanelEntry {
         streaming: bool,
         final_output: bool,
     },
+    /// Interim reasoning text (thinking blocks, or pre-tool plain text) rendered
+    /// as an activity tree, distinct from the final reply card.
+    Thinking {
+        text: String,
+        streaming: bool,
+    },
     Tool {
         text: String,
         active: bool,
+        /// Single-line human-readable preview of a successful tool result.
+        /// Shown only in the wide Agent Chat view; withheld for structured
+        /// (JSON) and failed results. See `agent::activity::tool_result_preview`.
+        #[serde(default)]
+        preview: Option<String>,
     },
     Error(String),
 }
@@ -125,9 +136,14 @@ impl AgentSession {
                     streaming: false,
                     final_output: *final_output,
                 }),
-                AgentPanelEntry::Tool { text, .. } => Some(AgentPanelEntry::Tool {
+                AgentPanelEntry::Thinking { text, .. } => Some(AgentPanelEntry::Thinking {
+                    text: text.clone(),
+                    streaming: false,
+                }),
+                AgentPanelEntry::Tool { text, preview, .. } => Some(AgentPanelEntry::Tool {
                     text: text.clone(),
                     active: false,
+                    preview: preview.clone(),
                 }),
                 AgentPanelEntry::Error(text) => Some(AgentPanelEntry::Error(text.clone())),
             })
@@ -199,9 +215,14 @@ mod tests {
                     streaming: true,
                     final_output: true,
                 },
+                AgentPanelEntry::Thinking {
+                    text: "I will read first".to_string(),
+                    streaming: true,
+                },
                 AgentPanelEntry::Tool {
                     text: "Reading".to_string(),
                     active: true,
+                    preview: None,
                 },
                 AgentPanelEntry::Assistant {
                     text: String::new(),
@@ -215,10 +236,17 @@ mod tests {
         );
         let (_, panel, _, _, _) = session.into_parts();
 
-        assert_eq!(panel.len(), 3);
+        assert_eq!(panel.len(), 4);
         assert!(matches!(
             &panel[1],
             AgentPanelEntry::Assistant {
+                streaming: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &panel[2],
+            AgentPanelEntry::Thinking {
                 streaming: false,
                 ..
             }
@@ -230,7 +258,7 @@ mod tests {
             )
         }));
         assert!(matches!(
-            &panel[2],
+            &panel[3],
             AgentPanelEntry::Tool { active: false, .. }
         ));
     }

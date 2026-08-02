@@ -24,7 +24,7 @@ impl App {
         self.center_view = center_view;
         self.focus = Focus::Center;
         match center_view {
-            CenterView::Chat => self.agent_scroll = u16::MAX,
+            CenterView::Chat => self.agent_follow_tail = true,
             CenterView::Todo => {
                 self.reload_todos();
                 self.todo_query.clear();

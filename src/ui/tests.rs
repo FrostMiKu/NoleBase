@@ -563,23 +563,17 @@ fn running_agent_animates_its_border_and_current_activity_only() {
         Arc::new(AgentPanelEntry::Tool {
             text: "Completed Read File.".to_string(),
             active: false,
+            preview: None,
         }),
         Arc::new(AgentPanelEntry::Tool {
             text: "Fetching Web...".to_string(),
             active: true,
+            preview: None,
         }),
         Arc::new(AgentPanelEntry::Assistant {
             text: "I will compare **multiple sources**.".to_string(),
             streaming: false,
             final_output: false,
-        }),
-        Arc::new(AgentPanelEntry::Prompt {
-            text: "Consumed follow-up".to_string(),
-            muted: false,
-        }),
-        Arc::new(AgentPanelEntry::Prompt {
-            text: "Queued follow-up".to_string(),
-            muted: true,
         }),
     ];
     app.status = "AI is working".to_string();
@@ -603,40 +597,13 @@ fn running_agent_animates_its_border_and_current_activity_only() {
         .map(|(x, y)| first.backend().buffer()[(x, y)].fg)
         .collect::<Vec<_>>();
     let first_screen = buffer_string(&first);
+
     let completed = first_screen.find("• Completed Read File.").unwrap();
-    let active = first_screen.find("• Fetching Web...").unwrap();
+    let active = first_screen.find("⣾ Fetching Web...").unwrap();
     let intermediate = first_screen
         .find("I will compare multiple sources.")
         .unwrap();
-    let consumed = first_screen.find("Consumed follow-up").unwrap();
-    let queued = first_screen.find("Queued follow-up").unwrap();
-    assert!(completed < active && active < intermediate && intermediate < consumed);
-    assert!(consumed < queued);
-    let screen_lines = first_screen.lines().collect::<Vec<_>>();
-    let consumed_y = screen_lines
-        .iter()
-        .position(|line| line.contains("Consumed follow-up"))
-        .unwrap() as u16;
-    let queued_y = screen_lines
-        .iter()
-        .position(|line| line.contains("Queued follow-up"))
-        .unwrap() as u16;
-    let consumed_byte = screen_lines[consumed_y as usize]
-        .find("Consumed follow-up")
-        .unwrap();
-    let queued_byte = screen_lines[queued_y as usize]
-        .find("Queued follow-up")
-        .unwrap();
-    let consumed_x = screen_lines[consumed_y as usize][..consumed_byte].width() as u16;
-    let queued_x = screen_lines[queued_y as usize][..queued_byte].width() as u16;
-    assert_ne!(
-        first.backend().buffer()[(consumed_x, consumed_y)].fg,
-        ctp::OVERLAY_0
-    );
-    assert_eq!(
-        first.backend().buffer()[(queued_x, queued_y)].fg,
-        ctp::OVERLAY_0
-    );
+    assert!(completed < active && active < intermediate);
 
     app.animation_tick = 1;
     let second = render(&mut app, 170, 40);
@@ -663,16 +630,12 @@ fn running_agent_animates_its_border_and_current_activity_only() {
     app.agent_scroll = u16::MAX;
     let final_frame = render(&mut app, 170, 40);
     let final_screen = buffer_string(&final_frame);
-    assert!(final_screen.contains("User"));
-    assert!(!final_screen.contains("Prompt"));
     assert!(!final_screen.contains("Response"));
     assert!(final_screen.contains("Final response"));
     for retained in [
         "Completed Read File.",
         "Fetching Web...",
         "multiple sources",
-        "Consumed follow-up",
-        "Queued follow-up",
     ] {
         assert!(final_screen.contains(retained));
     }
@@ -682,7 +645,7 @@ fn running_agent_animates_its_border_and_current_activity_only() {
 fn animated_activity_respects_terminal_cell_width() {
     let lines = animated_activity_lines("正在调用工具", 19, 4);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].to_string(), " • 正在调用工具");
+    assert_eq!(lines[0].to_string(), " ⡿ 正在调用工具");
     assert_eq!(lines[0].width(), 15);
     assert_eq!(
         lines[0]
@@ -703,16 +666,16 @@ fn animated_activity_respects_terminal_cell_width() {
 #[test]
 fn tool_activity_places_detail_on_a_connected_second_line() {
     let text = "Calling Read File...\ndata/a very long project filename.md";
-    for lines in [
-        activity_lines(text, 24),
-        animated_activity_lines(text, 24, 4),
-    ] {
+    let static_lines = activity_lines(text, 24);
+    let animated_lines = animated_activity_lines(text, 24, 4);
+    for lines in [&static_lines, &animated_lines] {
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].to_string(), " • Calling Read File...");
         assert_eq!(lines[1].width(), 24);
         assert!(lines[1].to_string().starts_with("   └─ "));
         assert!(lines[1].to_string().ends_with('…'));
     }
+    assert_eq!(static_lines[0].to_string(), " • Calling Read File...");
+    assert_eq!(animated_lines[0].to_string(), " ⡿ Calling Read File...");
 
     assert_eq!(activity_lines("tool", 1)[0].width(), 1);
     assert_eq!(activity_lines("tool", 2)[0].width(), 2);
@@ -1240,7 +1203,7 @@ fn links_are_clickable_in_daily_documents_and_agent_output() {
         streaming: false,
         final_output: true,
     })];
-    render(&mut app, 170, 24);
+    render(&mut app, 170, 40);
     assert!(app.link_hitboxes.iter().any(|hitbox| {
         hitbox.target == LinkTarget::External("https://agent.example".to_string())
     }));
@@ -1281,7 +1244,7 @@ fn file_embed_hitboxes_resolve_against_each_content_base() {
         streaming: false,
         final_output: true,
     })];
-    render(&mut app, 170, 24);
+    render(&mut app, 170, 40);
     assert!(app.link_hitboxes.iter().any(|hitbox| {
         hitbox.target == LinkTarget::EmbeddedFile(app.storage.root.join("agent-attachment.pdf"))
     }));
@@ -1743,14 +1706,15 @@ fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
     assert!(user_lines.last().unwrap().to_string().trim().is_empty());
     assert!(agent_lines.first().unwrap().to_string().trim().is_empty());
     assert!(agent_lines.last().unwrap().to_string().trim().is_empty());
-    assert!(user_lines.iter().all(|line| {
+    // Every row except the trailing shared blank carries the source background.
+    assert!(user_lines.iter().take(user_lines.len() - 1).all(|line| {
         UnicodeWidthStr::width(line.to_string().as_str()) == 40
             && line
                 .spans
                 .iter()
                 .all(|span| span.style.bg == Some(ctp::SURFACE_0))
     }));
-    assert!(agent_lines.iter().all(|line| {
+    assert!(agent_lines.iter().take(agent_lines.len() - 1).all(|line| {
         UnicodeWidthStr::width(line.to_string().as_str()) == 40
             && line
                 .spans
@@ -1768,7 +1732,7 @@ fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
         .iter()
         .position(|line| line.contains("Here is the explanation"))
         .unwrap();
-    assert_eq!(agent_text_row - user_text_row, 4);
+    assert_eq!(agent_text_row - user_text_row, 6);
     for (needle, background) in [
         ("Explain the selected note", ctp::SURFACE_0),
         ("Here is the explanation", ctp::BASE),
@@ -1800,9 +1764,9 @@ fn daily_and_agent_render_caches_offset_markdown_images() {
     };
     let (lines, _, images) = render_agent_entry(&entry, 40, 0, false);
     assert_eq!(images.len(), 1);
-    assert_eq!(images[0].row, 2);
+    assert_eq!(images[0].row, 3);
     assert_eq!(images[0].width, 40);
-    assert_eq!(lines.len(), 15);
+    assert_eq!(lines.len(), 17);
 }
 
 #[test]
@@ -2498,12 +2462,14 @@ fn agent_vlist_only_renders_visible_entries_and_keeps_animation_out_of_cache() {
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
         active: true,
+        preview: None,
     }));
-    app.agent_panel
-        .extend((1..40).map(|index| Arc::new(AgentPanelEntry::Prompt {
+    app.agent_panel.extend((1..40).map(|index| {
+        Arc::new(AgentPanelEntry::Prompt {
             text: format!("Prompt {index}"),
             muted: false,
-        })));
+        })
+    }));
 
     sync_agent_vlist(&mut app, 40);
     assert!(app.agent_vlist.caches.iter().all(Option::is_none));

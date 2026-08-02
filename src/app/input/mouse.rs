@@ -33,12 +33,7 @@ impl App {
         } else if in_area(column, row, self.layout.views) {
             self.move_workspace_view_selection(delta);
         } else if in_area(column, row, self.layout.agent) {
-            self.agent_scroll = if delta > 0 {
-                self.agent_scroll.saturating_add(delta as u16)
-            } else {
-                self.agent_scroll
-                    .saturating_sub(delta.unsigned_abs() as u16)
-            };
+            self.scroll_agent_by(delta);
         } else if in_area(column, row, self.layout.center) {
             match self.center_view {
                 CenterView::Daily => {
@@ -49,14 +44,7 @@ impl App {
                         self.scroll.saturating_sub(delta.unsigned_abs() as u16)
                     };
                 }
-                CenterView::Chat => {
-                    self.agent_scroll = if delta > 0 {
-                        self.agent_scroll.saturating_add(delta as u16)
-                    } else {
-                        self.agent_scroll
-                            .saturating_sub(delta.unsigned_abs() as u16)
-                    };
-                }
+                CenterView::Chat => self.scroll_agent_by(delta),
                 CenterView::Todo => self.move_todo_selection(delta),
                 CenterView::Document => self.scroll_document(delta),
                 CenterView::Search | CenterView::DocumentSearch => {
