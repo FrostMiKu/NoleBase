@@ -146,8 +146,8 @@
         assert_eq!(total.total_input(), 4_000);
         assert_eq!(total.output_tokens, 100);
         assert!(!total.is_empty());
-        assert!((total.cache_hit_percent().unwrap() - 71.428_571).abs() < 0.000_001);
-        assert_eq!(TokenUsage::default().cache_hit_percent(), None);
+        assert_eq!(total.cache_read_percent(), Some(62.5));
+        assert_eq!(TokenUsage::default().cache_read_percent(), None);
     }
 
     #[test]

@@ -365,11 +365,13 @@ or event stream, the complete provider request is replayed up to three bounded
 request attempts. The same policy covers the main Agent and isolated subagents.
 Partial streamed text and thinking are discarded before replay, while confirmed
 provider usage remains counted. The Agent header's `↑` and `↓` values are
-session-cumulative model input and output across the complete Agent tree.
-`Cache R/W/%` reports provider-confirmed cache reads, cache writes, and reads as
-a share of cacheable tokens (`read / (read + write)`). `t/s` covers only timed
-main-Agent streamed output, excluding retry waits and untimed subagent or
-non-streaming responses. `R`/`Retry` reports attempts that required a retry.
+session-cumulative input and output across the complete Agent tree. `Cache R`
+is provider-confirmed cache-read input; its percentage is the share of all input
+served from cache (`read / total input`). `W` appears only when the provider
+reports nonzero cache-write tokens—OpenAI-compatible usage normally reports
+cached reads but not writes. `t/s` covers only timed main-Agent streamed output,
+excluding retry waits and untimed subagent or non-streaming responses.
+`R`/`Retry` reports attempts that required a retry.
 To diagnose connection, DNS, TLS, timeout, or compatible-endpoint failures,
 start Nole with debug logging enabled and redirect standard error to a file:
 
@@ -395,13 +397,12 @@ the Agent does not know that web search is available.
 While the Agent is running, its panel border carries a moving color gradient
 and the current tool uses the same animated full-text color gradient. Messages
 API text is streamed into the current Agent entry and rendered as MBDown. The
-panel header shows request rounds, session-cumulative model input/output,
-timed main-stream throughput, and provider-confirmed cache reads, writes, and
-hit percentage. The statistics view labels model usage separately from visible
-conversation turns; only final replies count as Agent turns. Token and
-throughput statistics reset when the Agent session is cleared; the retry count
-covers the current application run. Multiple tool calls returned in one model
-response still count as one round.
+panel header shows request rounds, session-cumulative input/output, timed
+main-stream throughput, and provider-confirmed cache reads as a share of total
+input; cache writes appear when reported. Only final replies count as Agent
+turns. Token and throughput statistics reset when the Agent session is cleared;
+the retry count covers the current application run. Multiple tool calls returned
+in one model response still count as one round.
 Consecutive read-only calls in one response execute as a concurrent wave. This
 includes local reads and searches, web search/fetch, and multiple `explore` or
 `review` subagents. Mutation, approval, and TUI interaction tools are exclusive

@@ -41,11 +41,9 @@ impl TokenUsage {
             .saturating_add(self.cache_read_input_tokens)
     }
 
-    pub fn cache_hit_percent(self) -> Option<f64> {
-        let cacheable = self
-            .cache_read_input_tokens
-            .saturating_add(self.cache_creation_input_tokens);
-        (cacheable > 0).then(|| self.cache_read_input_tokens as f64 * 100.0 / cacheable as f64)
+    pub fn cache_read_percent(self) -> Option<f64> {
+        let total = self.total_input();
+        (total > 0).then(|| self.cache_read_input_tokens as f64 * 100.0 / total as f64)
     }
 
     pub fn add(&mut self, usage: Self) {

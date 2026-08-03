@@ -224,7 +224,7 @@ fn rendering_uses_colors_loaded_from_the_app_theme() {
 }
 
 #[test]
-fn agent_header_shows_rounds_model_usage_stream_speed_and_cache_hits() {
+fn agent_header_shows_rounds_usage_stream_speed_and_cache_reads() {
     assert_eq!(human_token_count(999), "999");
     assert_eq!(human_token_count(1_000), "1k");
     assert_eq!(human_token_count(12_400), "12.4k");
@@ -250,7 +250,7 @@ fn agent_header_shows_rounds_model_usage_stream_speed_and_cache_hits() {
     assert!(screen.contains("Ctx 6.8k/200k"));
     assert!(screen.contains("↑3.5k ↓1.2k"));
     assert!(screen.contains("617.0t/s"));
-    assert!(screen.contains("C2k/1k 67%"));
+    assert!(screen.contains("C2k/1k 57%"));
     assert!(screen.contains("R2"));
 }
 

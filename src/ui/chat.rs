@@ -804,9 +804,10 @@ mod tests {
         assert!(statistics.contains("Context"));
         assert!(statistics.contains("1k / 10k"));
         assert!(statistics.contains("20.0 t/s"));
-        assert!(statistics.contains("R 200 · W 0 · 100%"));
-        assert!(statistics.contains("Model in"));
-        assert!(statistics.contains("Model out"));
+        assert!(statistics.contains("R 200 · 20% input"));
+        assert!(!statistics.contains("W 0"));
+        assert!(statistics.contains("Input"));
+        assert!(statistics.contains("Output"));
         assert!(statistics.contains("Stream"));
         assert!(statistics.contains("1 user · 1 agent"));
         assert!(!statistics.contains("private prompt text"));

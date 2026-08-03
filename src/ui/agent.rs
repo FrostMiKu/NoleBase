@@ -61,7 +61,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     };
     let cache_read = app.agent_usage.cache_read_input_tokens;
     let cache_write = app.agent_usage.cache_creation_input_tokens;
-    let cache_rate = app.agent_usage.cache_hit_percent();
+    let cache_rate = app.agent_usage.cache_read_percent();
     let tps = if app.agent_response_duration.is_zero() {
         "--".to_string()
     } else {
@@ -84,20 +84,19 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let rows = [
         ("State", state.to_string()),
         ("Context", context),
-        ("Model in", human_token_count(app.agent_usage.total_input())),
-        (
-            "Model out",
-            human_token_count(app.agent_usage.output_tokens),
-        ),
+        ("Input", human_token_count(app.agent_usage.total_input())),
+        ("Output", human_token_count(app.agent_usage.output_tokens)),
         (
             "Cache",
             cache_rate.map_or_else(
                 || "--".to_string(),
                 |rate| {
+                    let write = (cache_write > 0)
+                        .then(|| format!(" · W {}", human_token_count(cache_write)));
                     format!(
-                        "R {} · W {} · {rate:.0}%",
+                        "R {}{} · {rate:.0}% input",
                         human_token_count(cache_read),
-                        human_token_count(cache_write)
+                        write.as_deref().unwrap_or("")
                     )
                 },
             ),
@@ -767,7 +766,7 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
     let cache_write_tokens = app.agent_usage.cache_creation_input_tokens;
     let cache_read = human_token_count(cache_read_tokens);
     let cache_write = human_token_count(cache_write_tokens);
-    let cache_rate = app.agent_usage.cache_hit_percent();
+    let cache_rate = app.agent_usage.cache_read_percent();
     let tps = if app.agent_response_duration.is_zero() {
         "--".to_string()
     } else {
@@ -779,11 +778,17 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
     let tokens = format!("↑{input} ↓{output}");
     let cache_full = cache_rate.map_or_else(
         || "Cache --".to_string(),
-        |rate| format!("Cache R{cache_read} W{cache_write} {rate:.0}%"),
+        |rate| match cache_write_tokens {
+            0 => format!("Cache R{cache_read} {rate:.0}%"),
+            _ => format!("Cache R{cache_read} W{cache_write} {rate:.0}%"),
+        },
     );
     let cache_compact = cache_rate.map_or_else(
         || "C--".to_string(),
-        |rate| format!("C{cache_read}/{cache_write} {rate:.0}%"),
+        |rate| match cache_write_tokens {
+            0 => format!("C{cache_read} {rate:.0}%"),
+            _ => format!("C{cache_read}/{cache_write} {rate:.0}%"),
+        },
     );
     let full = format!("{tokens} · {tps} t/s · {cache_full}");
     let compact = format!("{tokens} · {tps}t/s · {cache_compact}");
