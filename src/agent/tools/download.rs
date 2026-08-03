@@ -565,9 +565,17 @@ mod tests {
             .set_len(MAX_WORKSPACE_TOTAL_BYTES - headroom)
             .unwrap();
         let body = vec![0u8; 700 * 1024];
+        let rejected_length = body.len();
         let (url, handle) = server(vec![
-            ok_response(body.clone(), None),
             ok_response(body, None),
+            // The second request is rejected from Content-Length before its
+            // body is consumed. Omitting that body keeps the scripted server
+            // from blocking in write_all on macOS after the client drops it.
+            RawResponse {
+                status: 200,
+                headers: vec![("Content-Length".to_string(), rejected_length.to_string())],
+                body: Vec::new(),
+            },
         ]);
         let tool = download(&root);
         let first_input = json!({"url": url.clone(), "destination": "first.bin"});
