@@ -6,9 +6,9 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use super::util::{
-    display_path, fuzzy_match, limited_diff, optional_usize, required_string, truncate_chars,
-    DEFAULT_SEARCH_RESULTS, MAX_DIFF_BYTES, MAX_EDIT_FILE_BYTES, MAX_SEARCH_OFFSET,
-    MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
+    display_path, fuzzy_match, limited_diff, range_schema, required_string, truncate_chars,
+    RangeSelector, MAX_DIFF_BYTES, MAX_EDIT_FILE_BYTES, MAX_SEARCH_RESULTS,
+    MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::write_policy::{validate_write, WriteSource};
 use crate::agent::{
@@ -55,11 +55,7 @@ impl Tool for ListTags {
                     "default": "documents"
                 },
                 "order": { "type": "string", "enum": ["asc", "desc"], "default": "desc" },
-                "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": MAX_SEARCH_RESULTS, "default": DEFAULT_SEARCH_RESULTS
-                }
+                "range": range_schema(MAX_SEARCH_RESULTS)
             },
             "additionalProperties": false
         })
@@ -84,8 +80,7 @@ impl Tool for ListTags {
             "desc" => true,
             other => bail!("unsupported order: {other}"),
         };
-        let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
-        let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
+        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
         let mut tags = self
             .index
             .with_index(|index| index.tags_scoped(scope))
@@ -107,10 +102,8 @@ impl Tool for ListTags {
             };
             ordering.then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
-        let total = tags.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let entries = tags[start..end]
+        let page = selector.window(tags.len());
+        let items = tags[page.start_index..page.end_index]
             .iter()
             .map(|tag| {
                 json!({
@@ -120,18 +113,21 @@ impl Tool for ListTags {
                 })
             })
             .collect::<Vec<_>>();
-        serde_json::to_string_pretty(&json!({
+        let mut result = json!({
             "query": query,
             "scope": tag_scope_label(scope),
             "sort_by": sort_by,
             "order": if descending { "desc" } else { "asc" },
-            "offset": start,
-            "returned": end - start,
-            "total": total,
-            "has_more": end < total,
-            "entries": entries,
-        }))
-        .context("encoding tag list")
+            "range": selector.as_string(),
+            "returned": page.returned(),
+            "total": page.total,
+            "has_more": page.has_more(),
+            "items": items,
+        });
+        if let Some(next) = page.next() {
+            result["next"] = json!(next);
+        }
+        serde_json::to_string_pretty(&result).context("encoding tag list")
     }
 }
 
@@ -159,7 +155,7 @@ impl Tool for SearchTag {
     }
 
     fn description(&self) -> &'static str {
-        "Search one exact Hashtag across Markdown files. Returns paths, zero-based source line numbers, and source snippets with pagination."
+        "Search one exact Hashtag across Markdown files. Returns paths, one-based source line numbers, and source snippets with range pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -171,11 +167,7 @@ impl Tool for SearchTag {
                     "type": "string", "enum": ["all", "daily", "notes", "archives"],
                     "default": "all"
                 },
-                "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": MAX_SEARCH_RESULTS, "default": DEFAULT_SEARCH_RESULTS
-                }
+                "range": range_schema(MAX_SEARCH_RESULTS)
             },
             "required": ["tag"],
             "additionalProperties": false
@@ -188,16 +180,12 @@ impl Tool for SearchTag {
             bail!("tag must not be empty");
         }
         let scope = tag_scope(input)?;
-        let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
-        let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
+        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
         let hits = self
             .index
             .with_index(|index| index.exact_tag_hits(tag, scope))
             .context("workspace tag index is still building")?;
-        let total = hits.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let entries = hits[start..end]
+        let items = hits
             .iter()
             .filter_map(|hit| match hit {
                 SearchHit::FileLine {
@@ -206,22 +194,26 @@ impl Tool for SearchTag {
                     text,
                 } => Some(json!({
                     "path": display_path(&self.root, path),
-                    "line": line_no.saturating_sub(1),
+                    "line": line_no,
                     "snippet": truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS),
                 })),
                 SearchHit::DocumentLine { .. } => None,
             })
             .collect::<Vec<_>>();
-        serde_json::to_string_pretty(&json!({
+        let page = selector.window(items.len());
+        let mut result = json!({
             "tag": tag.trim_start_matches('#'),
             "scope": tag_scope_label(scope),
-            "offset": start,
-            "returned": end - start,
-            "total": total,
-            "has_more": end < total,
-            "entries": entries,
-        }))
-        .context("encoding tag search")
+            "range": selector.as_string(),
+            "returned": page.returned(),
+            "total": page.total,
+            "has_more": page.has_more(),
+            "items": &items[page.start_index..page.end_index],
+        });
+        if let Some(next) = page.next() {
+            result["next"] = json!(next);
+        }
+        serde_json::to_string_pretty(&result).context("encoding tag search")
     }
 }
 

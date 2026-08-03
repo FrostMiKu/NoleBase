@@ -11,6 +11,25 @@ pub mod messages;
 
 pub const DEFAULT_STREAM_BUFFER: usize = 1_024;
 
+#[derive(Debug)]
+struct TransientProviderError(String);
+
+impl std::fmt::Display for TransientProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TransientProviderError {}
+
+pub(crate) fn transient_provider_error(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(TransientProviderError(error.to_string()))
+}
+
+pub(crate) fn is_transient_provider_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TransientProviderError>().is_some()
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiFormat {

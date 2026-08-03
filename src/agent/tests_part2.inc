@@ -88,7 +88,8 @@
         };
         assert_eq!(result.tool_use_id, "bad-daily");
         assert!(result.is_error);
-        assert!(result.content.contains("missing string field content"));
+        assert!(result.content.contains("invalid input for tool add_daily_entry"));
+        assert!(result.content.contains("content"));
     }
 
     #[test]
@@ -632,6 +633,7 @@
             "notify",
             "add_daily_entry",
             "explore",
+            "review",
             "load_skill",
         ] {
             assert!(without_key.tools.contains_key(name), "missing tool {name}");
@@ -828,7 +830,7 @@
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["kind"], "web");
         assert_eq!(parsed["format"], "text");
-        assert_eq!(parsed["lines"], json!(["runtime-safe response"]));
+        assert_eq!(parsed["items"], json!(["runtime-safe response"]));
     }
 
     #[test]
@@ -1529,8 +1531,8 @@
         )
         .unwrap();
         assert_eq!(listed["total"], 2);
-        assert_eq!(listed["entries"][0]["tag"], "rust");
-        assert_eq!(listed["entries"][0]["mentions"], 2);
+        assert_eq!(listed["items"][0]["tag"], "rust");
+        assert_eq!(listed["items"][0]["mentions"], 2);
 
         let searched: Value = serde_json::from_str(
             &SearchTag::new(directory.path(), handle)
@@ -1540,8 +1542,8 @@
         )
         .unwrap();
         assert_eq!(searched["total"], 1);
-        assert_eq!(searched["entries"][0]["line"], 0);
-        assert!(searched["entries"][0]["snippet"]
+        assert_eq!(searched["items"][0]["line"], 1);
+        assert!(searched["items"][0]["snippet"]
             .as_str()
             .unwrap()
             .contains("#rust #rust"));
@@ -1587,4 +1589,37 @@
                 .unwrap(),
             1
         );
+    }
+
+
+    #[test]
+    fn registered_tools_enforce_their_json_schema_before_execution() {
+        let (events, mut receiver) = event_channel();
+        let tool = Notify { events };
+        let schema = tool.input_schema();
+        let registered = RegisteredTool::new(tool, &schema);
+        let runtime = test_runtime();
+
+        let error = runtime
+            .block_on(registered.execute(&json!({"message": 42})))
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid input for tool notify"));
+        assert!(receiver.try_recv().is_err());
+
+        let error = runtime
+            .block_on(registered.execute(&json!({"message": "ok", "extra": true})))
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid input for tool notify"));
+        assert!(receiver.try_recv().is_err());
+
+        assert_eq!(
+            runtime
+                .block_on(registered.execute(&json!({"message": "valid"})))
+                .unwrap(),
+            "notification shown"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AgentEvent::Notification(message)) if message == "valid"
+        ));
     }

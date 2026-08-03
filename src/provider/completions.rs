@@ -13,8 +13,9 @@ use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
 
 use super::{
-    parse_tool_input, AssistantMessage, Message, MessagePart, MessageRole, Provider, ProviderEvent,
-    ProviderRequest, StopReason, ToolCall, DEFAULT_STREAM_BUFFER,
+    parse_tool_input, transient_provider_error, AssistantMessage, Message, MessagePart,
+    MessageRole, Provider, ProviderEvent, ProviderRequest, StopReason, ToolCall,
+    DEFAULT_STREAM_BUFFER,
 };
 
 const MAX_HTTP_ATTEMPTS: usize = 3;
@@ -123,8 +124,13 @@ impl CompletionsProvider {
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
-                Err(error) if error.is_builder() || attempt + 1 == MAX_HTTP_ATTEMPTS => {
+                Err(error) if error.is_builder() => {
                     return Err(error).context("calling Completions API");
+                }
+                Err(error) if attempt + 1 == MAX_HTTP_ATTEMPTS => {
+                    return Err(transient_provider_error(format!(
+                        "calling Completions API: {error}"
+                    )));
                 }
                 Err(_) => {
                     if let Some(events) = events {
@@ -156,46 +162,64 @@ impl CompletionsProvider {
             let body = response
                 .text()
                 .await
-                .context("reading Completions error response")?;
-            bail!(
+                .unwrap_or_else(|error| format!("unable to read error response: {error}"));
+            let error = anyhow::anyhow!(
                 "Completions API returned {status}: {}",
                 error_message(&body)
             );
+            return if retryable(status) {
+                Err(transient_provider_error(error))
+            } else {
+                Err(error)
+            };
         }
         let is_stream = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("text/event-stream"));
-        if stream && is_stream {
-            decode_stream(response, events.expect("stream events"), cancel).await
+        let decoded = if stream && is_stream {
+            decode_stream(
+                response,
+                events.clone().expect("stream events"),
+                cancel.clone(),
+            )
+            .await
         } else {
-            let value: Value = response
-                .json()
-                .await
-                .context("decoding Completions response")?;
-            let answer = parse_response(value, started.elapsed())?;
-            if let Some(events) = events {
-                for part in &answer.message.parts {
-                    match part {
-                        MessagePart::Thinking { thinking, .. } if !thinking.is_empty() => {
-                            let _ = events.send(ProviderEvent::ThinkingDelta(thinking.clone()));
-                            let _ = events.send(ProviderEvent::ThinkingFinished);
+            let result = async {
+                let value: Value = response
+                    .json()
+                    .await
+                    .context("decoding Completions response")?;
+                let answer = parse_response(value, started.elapsed())?;
+                if let Some(events) = events {
+                    for part in &answer.message.parts {
+                        match part {
+                            MessagePart::Thinking { thinking, .. } if !thinking.is_empty() => {
+                                let _ = events.send(ProviderEvent::ThinkingDelta(thinking.clone()));
+                                let _ = events.send(ProviderEvent::ThinkingFinished);
+                            }
+                            MessagePart::Text { text } if !text.is_empty() => {
+                                let _ = events.send(ProviderEvent::TextDelta(text.clone()));
+                            }
+                            _ => {}
                         }
-                        MessagePart::Text { text } if !text.is_empty() => {
-                            let _ = events.send(ProviderEvent::TextDelta(text.clone()));
-                        }
-                        _ => {}
+                    }
+                    if !answer.token_usage.is_empty() {
+                        let _ = events.send(ProviderEvent::Usage {
+                            usage: answer.token_usage,
+                            generation_duration: answer.generation_duration,
+                        });
                     }
                 }
-                if !answer.token_usage.is_empty() {
-                    let _ = events.send(ProviderEvent::Usage {
-                        usage: answer.token_usage,
-                        generation_duration: answer.generation_duration,
-                    });
-                }
-            }
-            Ok(answer)
+                Ok(answer)
+            };
+            result.await
+        };
+        match decoded {
+            Err(error) if cancel.is_cancelled() => Err(error),
+            Err(error) => Err(transient_provider_error(error)),
+            result => result,
         }
     }
 }
@@ -248,6 +272,7 @@ async fn decode_stream(
     let mut tools = BTreeMap::<usize, PartialToolCall>::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason = StopReason::Unknown("unknown".to_string());
+    let mut stream_complete = false;
     let mut first_event = None::<Instant>;
 
     loop {
@@ -267,6 +292,7 @@ async fn decode_stream(
             continue;
         }
         if event.data == "[DONE]" {
+            stream_complete = true;
             break;
         }
         first_event.get_or_insert_with(Instant::now);
@@ -331,6 +357,9 @@ async fn decode_stream(
                 }
             }
         }
+    }
+    if !stream_complete && matches!(stop_reason, StopReason::Unknown(_)) {
+        bail!("Completions event stream ended before a finish reason or [DONE]");
     }
     if thinking_open {
         let _ = events.send(ProviderEvent::ThinkingFinished);

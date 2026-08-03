@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::util::required_string;
+use super::util::{display_path, required_string};
 use crate::agent::{
     canonical_root, recv_while_active, AgentEvent, AgentEventSender, AskUserKind, AskUserRequest,
     AskUserResponse, Tool,
@@ -63,7 +63,7 @@ impl Tool for Open {
         self.events
             .send(AgentEvent::OpenFile(path.clone()))
             .context("requesting document open")?;
-        Ok(format!("opened {}", path.display()))
+        Ok(format!("opened {}", display_path(&self.root, &path)))
     }
 }
 

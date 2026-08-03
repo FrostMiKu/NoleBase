@@ -11,6 +11,7 @@ mod file_ops;
 mod interactive;
 mod notes_tags;
 mod read;
+mod review;
 mod skills;
 mod util;
 mod web;
@@ -18,6 +19,6 @@ mod workspace_quota;
 mod write_policy;
 
 pub use self::{
-    attachment_ops::*, explore::*, file_ops::*, interactive::*, notes_tags::*, read::*, skills::*,
-    web::*,
+    attachment_ops::*, explore::*, file_ops::*, interactive::*, notes_tags::*, read::*, review::*,
+    skills::*, web::*,
 };

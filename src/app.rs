@@ -506,7 +506,7 @@ impl App {
             workspace_index,
             pending_tag_rename: None,
             attachment_store,
-            attachment_usage: AttachmentUsageHandle::new(),
+            attachment_usage,
             attachment_entries: Vec::new(),
             attachment_index: 0,
             attachment_list_start: 0,

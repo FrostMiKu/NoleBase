@@ -269,44 +269,46 @@
         let content = SearchContent::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(
             &content
-                .execute(&json!({"query": "rust", "limit": 1}))
+                .execute(&json!({"query": "rust", "range": "1-1"}))
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(result["range"], "1-1");
         assert_eq!(result["returned"], 1);
-        assert_eq!(result["total_matches"], 3);
+        assert_eq!(result["total"], 3);
         assert_eq!(result["has_more"], true);
-        assert!(result["matches"][0]["path"]
+        assert_eq!(result["next"], "2-2");
+        assert!(result["items"][0]["path"]
             .as_str()
             .is_some_and(|path| path.starts_with("daily/") && path.ends_with(".md")));
-        assert_eq!(result["matches"][0]["line"], 0);
+        assert_eq!(result["items"][0]["line"], 1);
 
         let remaining: Value = serde_json::from_str(
             &content
-                .execute(&json!({"query": "rust", "offset": 1, "limit": 10}))
+                .execute(&json!({"query": "rust", "range": "2-11"}))
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(remaining["matches"][0]["path"], "data/RustProject.md");
-        assert_eq!(remaining["matches"][1]["path"], "archives/RustHistory.md");
+        assert_eq!(remaining["items"][0]["path"], "data/RustProject.md");
+        assert_eq!(remaining["items"][1]["path"], "archives/RustHistory.md");
 
         let files = SearchFiles::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(
             &files
-                .execute(&json!({"query": "rsprj", "offset": 0, "limit": 10}))
+                .execute(&json!({"query": "rsprj", "range": "1-10"}))
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(result["total_matches"], 1);
-        assert_eq!(result["matches"][0]["path"], "data/RustProject.md");
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["items"][0]["path"], "data/RustProject.md");
         let archived: Value = serde_json::from_str(
             &files
-                .execute(&json!({"query": "history", "limit": 10}))
+                .execute(&json!({"query": "history", "range": "1-10"}))
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(archived["total_matches"], 1);
-        assert_eq!(archived["matches"][0]["path"], "archives/RustHistory.md");
+        assert_eq!(archived["total"], 1);
+        assert_eq!(archived["items"][0]["path"], "archives/RustHistory.md");
     }
 
     #[test]
@@ -414,22 +416,22 @@
         )
         .unwrap();
         assert_eq!(direct["total"], 2);
-        assert_eq!(direct["entries"][0]["path"], "data/Alpha.md");
-        assert_eq!(direct["entries"][0]["type"], "file");
-        assert_eq!(direct["entries"][0]["depth"], 1);
-        assert_eq!(direct["entries"][0]["extension"], "md");
-        assert_eq!(direct["entries"][0]["line_count"], 2);
-        assert_eq!(direct["entries"][0]["size"], 8);
-        assert!(direct["entries"][0].get("created_at").is_some());
-        assert!(direct["entries"][0]["modified_at"].is_string());
-        assert_eq!(direct["entries"][1]["type"], "directory");
-        assert!(direct["entries"][1]["line_count"].is_null());
+        assert_eq!(direct["items"][0]["path"], "data/Alpha.md");
+        assert_eq!(direct["items"][0]["type"], "file");
+        assert_eq!(direct["items"][0]["depth"], 1);
+        assert_eq!(direct["items"][0]["extension"], "md");
+        assert_eq!(direct["items"][0]["line_count"], 2);
+        assert_eq!(direct["items"][0]["size"], 8);
+        assert!(direct["items"][0].get("created_at").is_some());
+        assert!(direct["items"][0]["modified_at"].is_string());
+        assert_eq!(direct["items"][1]["type"], "directory");
+        assert!(direct["items"][1]["line_count"].is_null());
 
         let nested: Value = serde_json::from_str(
             &list
                 .execute(&json!({
                     "path": "data", "depth": 2, "sort_by": "depth",
-                    "order": "desc", "offset": 0, "limit": 1
+                    "order": "desc", "range": "1-1"
                 }))
                 .unwrap(),
         )
@@ -437,9 +439,9 @@
         assert_eq!(nested["total"], 3);
         assert_eq!(nested["returned"], 1);
         assert_eq!(nested["has_more"], true);
-        assert_eq!(nested["scan_truncated"], false);
-        assert_eq!(nested["entries"][0]["path"], "data/Nested/Beta.txt");
-        assert_eq!(nested["entries"][0]["depth"], 2);
+        assert_eq!(nested["next"], "2-2");
+        assert_eq!(nested["items"][0]["path"], "data/Nested/Beta.txt");
+        assert_eq!(nested["items"][0]["depth"], 2);
 
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("External.md"), "outside\n").unwrap();
@@ -450,7 +452,7 @@
         )
         .unwrap();
         assert_eq!(external["total"], 1);
-        assert!(external["entries"][0]["path"]
+        assert!(external["items"][0]["path"]
             .as_str()
             .unwrap()
             .ends_with("External.md"));
@@ -469,7 +471,7 @@
         let result: Value = serde_json::from_str(
             &list
                 .execute(&json!({
-                    "sort_by": "line_count", "order": "desc", "offset": 0, "limit": 1
+                    "sort_by": "line_count", "order": "desc", "range": "1-1"
                 }))
                 .unwrap(),
         )
@@ -477,11 +479,12 @@
         assert_eq!(result["total"], 2);
         assert_eq!(result["returned"], 1);
         assert_eq!(result["has_more"], true);
-        assert_eq!(result["entries"][0]["name"], "Alpha.md");
-        assert_eq!(result["entries"][0]["line_count"], 3);
-        assert!(result["entries"][0].get("created_at").is_some());
-        assert!(result["entries"][0]["modified_at"].is_string());
-        assert_eq!(result["entries"][0]["size"], 14);
+        assert_eq!(result["next"], "2-2");
+        assert_eq!(result["items"][0]["name"], "Alpha.md");
+        assert_eq!(result["items"][0]["line_count"], 3);
+        assert!(result["items"][0].get("created_at").is_some());
+        assert!(result["items"][0]["modified_at"].is_string());
+        assert_eq!(result["items"][0]["size"], 14);
 
         let by_name: Value = serde_json::from_str(
             &list
@@ -489,8 +492,8 @@
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(by_name["entries"][0]["name"], "Alpha.md");
-        assert_eq!(by_name["entries"][1]["name"], "Beta.mb");
+        assert_eq!(by_name["items"][0]["name"], "Alpha.md");
+        assert_eq!(by_name["items"][1]["name"], "Beta.mb");
     }
 
     #[test]
@@ -681,22 +684,44 @@
             "import_attachment",
             "list_attachments",
             "attachment_info",
-            "copy_attachment_to_workspace",
+            "checkout_attachment",
+            "update_attachment",
             "delete_attachment",
         ] {
             assert!(names.contains(&name), "missing registered tool {name}");
         }
+        assert!(!names.contains(&"copy_attachment_to_workspace"));
     }
 
     #[test]
     fn system_prompt_describes_the_attachment_publish_and_edit_workflow() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("import_attachment"));
-        assert!(prompt.contains("copy_attachment_to_workspace"));
+        assert!(prompt.contains("checkout_attachment"));
+        assert!(prompt.contains("update_attachment"));
+        assert!(prompt.contains("expected_content_token"));
         assert!(prompt.contains("workspace/main"));
         assert!(prompt.contains("nole://attachment/<uuid>"));
         assert!(prompt.contains("delete_attachment"));
         assert!(prompt.contains("importing the same content twice yields two distinct attachments"));
+    }
+
+    #[test]
+    fn system_prompt_assigns_review_scope_to_the_main_agent() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
+        let explore_bullet = prompt
+            .find("Delegate broad, multi-step exploration")
+            .unwrap();
+        let review_bullet = prompt
+            .find("Delegate independent critical evaluation")
+            .unwrap();
+        assert!(review_bullet > explore_bullet);
+        assert!(prompt[review_bullet..]
+            .contains("The main Agent defines the review scope"));
+        assert!(prompt[review_bullet..]
+            .contains("instead of imposing a preset domain checklist"));
+        assert!(prompt[review_bullet..].contains("never mutates anything"));
+        assert!(!prompt[explore_bullet..review_bullet].contains("review"));
     }
 
     #[test]
@@ -753,6 +778,15 @@
         assert_eq!(
             tool_start_activity(&explore),
             "Calling Explore...\nFind every note about context compaction"
+        );
+
+        let review = json!({
+            "name": "review",
+            "input": {"task": "Critique the draft migration plan"}
+        });
+        assert_eq!(
+            tool_start_activity(&review),
+            "Calling Review...\nCritique the draft migration plan"
         );
 
         assert_eq!(
@@ -1367,38 +1401,58 @@
     }
 
     #[test]
-    fn interrupted_stream_reports_confirmed_usage_without_success_timing() {
+    fn interrupted_stream_retries_and_recovers() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) =
+                        line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
                 }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse().unwrap();
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
+                if attempt == 0 {
+                    let body = concat!(
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13,\"cache_read_input_tokens\":9}}}\n\n",
+                        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+                    );
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len() + 50,
+                        body
+                    )
+                    .unwrap();
+                } else {
+                    let body = serde_json::to_vec(&json!({
+                        "content": [{"type": "text", "text": "Recovered"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 13, "output_tokens": 3}
+                    }))
+                    .unwrap();
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    reader.get_mut().write_all(&body).unwrap();
                 }
+                reader.get_mut().flush().unwrap();
             }
-            let mut request = vec![0; content_length];
-            reader.read_exact(&mut request).unwrap();
-            let body = concat!(
-                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13,\"cache_read_input_tokens\":9}}}\n\n",
-                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
-            );
-            write!(
-                reader.get_mut(),
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len() + 50,
-                body
-            )
-            .unwrap();
-            reader.get_mut().flush().unwrap();
         });
 
         let directory = tempfile::tempdir().unwrap();
@@ -1426,19 +1480,29 @@
         )
         .unwrap();
 
-        let error = run_agent(&agent, "Start", &mut AgentConversation::default()).unwrap_err();
-        assert!(error.to_string().contains("reading Messages event stream"));
+        assert_eq!(
+            run_agent(&agent, "Start", &mut AgentConversation::default()).unwrap(),
+            "Recovered"
+        );
         server.join().unwrap();
         let events = drain_events(&mut event_receiver);
         assert!(events.iter().any(
             |event| matches!(event, AgentEvent::Usage(usage) if usage.input_tokens == 13 && usage.cache_read_input_tokens == 9)
         ));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ResponseTiming { .. })));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::Retry)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ResponseTiming { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Retry))
+                .count(),
+            1
+        );
     }
 
     #[test]

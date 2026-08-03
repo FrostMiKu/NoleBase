@@ -765,7 +765,7 @@ impl Tool for MoveMany {
             .iter()
             .map(|(source, destination, bytes)| {
                 json!({
-                    "source": source.to_string_lossy(),
+                    "source": display_path(&self.root, source),
                     "destination": display_path(&self.root, destination),
                     "bytes": bytes,
                 })
@@ -1041,9 +1041,6 @@ impl Tool for Write {
     async fn execute(&self, input: &Value) -> Result<String> {
         let relative = required_string(input, "path")?;
         let content = required_string(input, "content")?;
-        if input.get("overwrite").is_some() {
-            bail!("write only creates new files; use read and edit for existing files");
-        }
         if content.len() as u64 > MAX_EDIT_FILE_BYTES {
             bail!("content exceeds 1 MB");
         }

@@ -112,13 +112,13 @@ short cooldown. Images reserve twelve terminal rows, scale proportionally, and
 are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
-Managed attachments use immutable, content-addressed objects referenced as
-`nole-attachment://sha256/<digest>`. The same URI works from Daily cards, notes,
-and Agent messages, so moving a note does not break its attachments. Open the
-**Attachment** workspace view, or run `Attachments: Browse`, to inspect type,
-size, and reference count; `Enter` opens an attachment and `d` moves an
-unreferenced attachment to trash after confirmation. Referenced attachments
-cannot be deleted.
+Managed attachments are mutable files with stable UUID identities, referenced as
+`nole://attachment/<uuid>`. The same URI works from Daily cards, notes, and Agent
+messages, so moving a note or updating an attachment does not break references.
+Open the **Attachment** workspace view, or run `Attachments: Browse`, to inspect
+type, size, and reference count; `Enter` opens the managed file for editing and
+`d` moves an unreferenced attachment to trash after confirmation. Referenced
+attachments cannot be deleted.
 
 Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
 with the system default application. Clicking `[[wikilink]]` searches `daily/`,
@@ -248,7 +248,7 @@ archives/      # flat storage for archived articles
 data/          # flat note storage
   <name>.md
   <name>.mb
-attachments/   # immutable, content-addressed managed attachments and trash
+attachments/   # mutable UUID-addressed managed attachments and trash
 workspace/
   main/         # Agent-owned scratch files; preserved across restarts
 ```
@@ -257,8 +257,11 @@ The Agent may create, edit, move, and delete files freely inside
 `workspace/main/`. Clearing the Agent session clears and recreates this
 directory. Moving a source from elsewhere remains approval-gated because it
 removes user-owned data. Generic file tools cannot access attachment internals;
-the Agent imports, reads, lists, copies, and deletes attachments through the
-dedicated attachment tools.
+the Agent uses dedicated tools to import, read, list, check out, update, and
+delete attachments. `checkout_attachment` creates an editable workspace copy and
+returns a content token; after editing, `update_attachment` uses that token to
+atomically update the same UUID after approval, refusing stale content. Importing
+the edited copy instead creates a new attachment.
 
 `.md` and `.mb` extensions are recognized case-insensitively. NoleBase shows
 direct, regular files from both `data/` and `archives/` as separate Notes and
@@ -338,12 +341,13 @@ meaning or adding facts. The lower two-thirds of the right
 sidebar shows a chronological Agent timeline: user prompts, tool activity,
 intermediate text, and final responses; Todo uses the upper third.
 `max_rounds` is the request-round budget for each user prompt and, independently,
-for each `explore` invocation; it is not a tool-call limit, and one response may
-call several tools. A user follow-up received while the Agent is running starts
-a fresh budget after the in-flight tool finishes. At the main Agent's limit,
-Nole rings the terminal bell and asks whether to continue or stop. An `explore`
-subagent instead stops gathering evidence and synthesizes its report. Stopping
-keeps the completed conversation and tool history, so a later prompt can continue it.
+for each `explore` and `review` invocation; it is not a tool-call limit, and one
+response may call several tools. A user follow-up received while the Agent is
+running starts a fresh budget after the in-flight tool finishes. At the main
+Agent's limit, Nole rings the terminal bell and asks whether to continue or
+stop. An `explore` or `review` subagent instead stops its work and finalizes
+its report. Stopping keeps the completed conversation and tool history, so a
+later prompt can continue it.
 `context_window_tokens` is the model's total context size. Nole reserves
 `max_tokens` for the next response and, before the remaining input budget is
 exhausted, uses provider token counting when available and replaces a safe prefix
@@ -353,13 +357,16 @@ The three `max_concurrent_*` settings bound local read/search calls, web
 search/fetch calls, and isolated subagents across the complete Agent tree.
 Compatible endpoints without token counting fall back to a conservative local
 estimate.
-Provider requests retry connection failures and HTTP 408, 425, 429, and 5xx
-responses up to three attempts with jittered exponential backoff (or a bounded
-`Retry-After`). A stream is never replayed after it has started. Confirmed
-stream usage is retained even when the stream later breaks. The Agent header's
-`↑` and `↓` values are confirmed input and output tokens, `Cache` is the
-provider-reported prompt-cache read count and ratio, `t/s` excludes retry
-waiting time, and `R`/`Retry` reports attempts that required a retry.
+Provider HTTP calls retry connection failures and HTTP 408, 425, 429, and 5xx
+responses up to three attempts with exponential backoff or a bounded
+`Retry-After`. If a successful HTTP response later fails while decoding its body
+or event stream, the complete provider request is replayed up to three bounded
+request attempts. The same policy covers the main Agent and isolated subagents.
+Partial streamed text and thinking are discarded before replay, while confirmed
+provider usage remains counted. The Agent header's `↑` and `↓` values are
+confirmed input and output tokens, `Cache` is the provider-reported prompt-cache
+read count and ratio, `t/s` excludes retry waiting time, and `R`/`Retry` reports
+attempts that required a retry.
 To diagnose connection, DNS, TLS, timeout, or compatible-endpoint failures,
 start Nole with debug logging enabled and redirect standard error to a file:
 
@@ -391,9 +398,10 @@ total input tokens. Token and throughput statistics reset when the Agent session
 is cleared; the retry count covers the current application run. Multiple tool
 calls returned in one model response still count as one round.
 Consecutive read-only calls in one response execute as a concurrent wave. This
-includes local reads and searches, web search/fetch, and multiple `explore`
-subagents. Mutation, approval, and TUI interaction tools are exclusive barriers:
-Nole finishes the preceding wave before running one, then starts a new wave.
+includes local reads and searches, web search/fetch, and multiple `explore` or
+`review` subagents. Mutation, approval, and TUI interaction tools are exclusive
+barriers: Nole finishes the preceding wave before running one, then starts a new
+wave.
 Filesystem-backed Agent reads use Tokio's asynchronous filesystem APIs rather
 than blocking the Agent runtime thread.
 By default, concurrency is bounded across the complete Agent tree to eight
@@ -437,14 +445,21 @@ Broad exploration, discovery, comparison, and research run through the
 web lookup tools, but no mutation, interaction, or recursive-agent tools. Its
 search calls, source excerpts, and intermediate reasoning stay in a private
 conversation; the main Agent session stores only the `explore` call and its
-concise evidence-based report. Targeted reads and lookups can still use the
-corresponding tools directly. Independent `explore` calls run concurrently, as
-do independent read, search, and fetch calls within each subagent, subject to
-the shared limits above. Isolated agents share a reusable task-scoped runtime;
-each profile supplies its own instructions, completion contract, and registered
-tool capabilities. `explore` is the built-in read-only profile rather than a
-special-purpose agent loop, and unregistered mutation, interaction, or
-recursive-agent capabilities are unavailable to it.
+concise evidence-based report. Independent critical evaluation runs through the
+`review` tool. It starts the same kind of isolated read-only agent with the same
+capabilities, while the main Agent's task supplies the artifact, intended goals
+and constraints, and the standards or concerns to evaluate. The reviewer does
+not impose a preset domain checklist: it follows that task, grounds findings in
+available evidence, prioritizes them by impact, and returns one self-contained
+review without modifying anything. Targeted reads and lookups can
+still use the corresponding tools directly. Independent `explore` and `review`
+calls run concurrently, as do independent read, search, and fetch calls within
+each subagent, subject to the shared limits above. Isolated agents share a
+reusable task-scoped runtime; each profile supplies its own instructions,
+completion contract, and registered tool capabilities. `explore` and `review`
+are the built-in read-only profiles rather than special-purpose agent loops,
+and unregistered mutation, interaction, or recursive-agent capabilities are
+unavailable to them.
 You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
 An in-flight concurrent wave is allowed to finish, while later unstarted calls
@@ -466,39 +481,43 @@ retained as scroll state rather than rendered.
 
 The Agent reads through a single unified `read` tool that dispatches on its
 target. A UTF-8 file returns hashline text: a `[path#TAG]` header, absolute
-one-based `N:text` rows, and a pagination footer. A directory returns a typed
-JSON listing, while an http(s) URL returns structured fetched content with HTML
-converted to Markdown. The reader is a parser registry, so additional formats
-can be added without changing dispatch logic. When configured, `search_web`
-queries Tavily with optional topic, depth, time range, answer, result-count, and
-included/excluded domain controls, then returns compact ranked results.
-Every user prompt sent to the Agent includes the current local date and time.
-File reads default to 200 lines and accept at most 2,000 lines per call;
-`offset` counts preceding source lines. Paths under the Nole root are returned
-in root-relative form so they can be passed directly to other file tools.
+one-based `N:text` rows, and a pagination footer. File, PDF, URL, and attachment
+line windows use an inclusive selector suffix such as `data/note.md:50-200`.
+A directory returns a typed JSON listing, while an http(s) URL returns structured
+fetched content with HTML converted to Markdown. The reader is a parser registry,
+so additional formats can be added without changing dispatch logic. When
+configured, `search_web` queries Tavily with optional topic, depth, time range,
+answer, result-count, and included/excluded domain controls, then returns compact
+ranked results. Every user prompt sent to the Agent includes the current local
+date and time. File reads default to 200 lines and accept at most 2,000 lines per
+call. Paths under the Nole root are returned in root-relative form so they can be
+passed directly to other file tools.
+
+Paginated local list and search tools use an inclusive one-based `range` such as
+`1-50`, not offset/limit. Structured pages consistently return `range`,
+`returned`, `total`, `has_more`, an optional `next`, and `items`; the next page is
+requested by passing the returned selector back as `range`. Tool inputs are
+validated against their advertised JSON Schema before execution, including
+required fields, types, bounds, enums, and unknown-property rejection.
 
 `read` on a directory lists any directory by absolute path or a path relative to
 the Nole root. `depth=1` returns direct children and values up to 16 include
-nested descendants without following symlinks. Each entry includes its type,
+nested descendants without following symlinks. Each item includes its type,
 depth, extension, byte size, line count for files up to 1 MB, and creation and
-modification timestamps. Results support metadata sorting and pagination; one
-call scans at most 10,000 entries.
+modification timestamps. Results support metadata sorting and range pagination.
 
 `list_notes` returns active `data/` notes with their line count, creation and
 modification timestamps, and byte size. Results can be sorted ascending or
-descending by name or any of those metadata fields and paginated with
-`offset`/`limit`.
+descending by name or any of those metadata fields and paginated with `range`.
 
 `search_content` performs case-insensitive full-text search across daily files,
 active notes, and archived notes, in that order, returning file paths and
-zero-based source line numbers. `search_files` uses the same case-insensitive fuzzy
-filename matching as the Files sidebar. Both search tools support result
-`offset`/`limit` pagination.
+one-based source line numbers. `search_files` uses the same case-insensitive fuzzy
+filename matching as the Files sidebar. Both search tools use range pagination.
 
-`write` writes a complete file. It refuses existing paths by default and only
-replaces an existing regular file when `overwrite` is explicitly true. The full
+`write` creates a complete new file and always refuses an existing path. The full
 candidate content passes the same MBDown or Skill parser validation before the
-file is created or replaced. `edit` accepts one or more line edits and preserves
+file is created. `edit` accepts one or more line edits and preserves
 the rest of the file internally, so large files do not need to be read or
 submitted in full. `replace` operations use inclusive one-based `start_line` and
 `end_line` values from the original `read` snapshot; `insert` operations use a

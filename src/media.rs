@@ -125,6 +125,16 @@ impl ImageService {
         self.order.clear();
     }
 
+    /// Invalidate rendered attachment images after a content change. The
+    /// cache is URI-keyed, while old loads may still be in flight; bumping
+    /// the generation makes their results use stale keys that can never be
+    /// requested again, and clearing the cache forces fresh decoding.
+    pub(crate) fn invalidate_attachment(&mut self, _uri: &AttachmentUri) {
+        self.picker_generation = self.picker_generation.wrapping_add(1);
+        self.states.clear();
+        self.order.clear();
+    }
+
     pub(crate) fn render(
         &mut self,
         frame: &mut Frame,
@@ -801,6 +811,30 @@ mod tests {
             .unwrap();
         assert_eq!(key.source, uri.to_string());
         assert!(matches!(source, ResolvedSource::Attachment(resolved) if resolved == uri));
+    }
+
+    #[test]
+    fn attachment_invalidation_changes_generation_and_drops_cached_render() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(root.path().join(ATTACHMENTS_DIR));
+        let uri = store
+            .import_bytes(b"not decoded", Some("photo.png"))
+            .unwrap()
+            .uri();
+        let mut service = ImageService::new(root.path());
+        let (old_key, _) = service
+            .resolve(&uri.to_string(), root.path(), 20, 10)
+            .unwrap();
+        service.states.insert(old_key.clone(), ImageState::Loading);
+        service.order.push_back(old_key.clone());
+
+        service.invalidate_attachment(&uri);
+        let (new_key, _) = service
+            .resolve(&uri.to_string(), root.path(), 20, 10)
+            .unwrap();
+        assert_ne!(new_key.picker_generation, old_key.picker_generation);
+        assert!(service.states.is_empty());
+        assert!(service.order.is_empty());
     }
 
     #[test]

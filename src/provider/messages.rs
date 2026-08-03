@@ -13,8 +13,9 @@ use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
 
 use super::{
-    parse_tool_input, AssistantMessage, Message, MessagePart, MessageRole, Provider, ProviderEvent,
-    ProviderRequest, StopReason, ToolCall, DEFAULT_STREAM_BUFFER,
+    parse_tool_input, transient_provider_error, AssistantMessage, Message, MessagePart,
+    MessageRole, Provider, ProviderEvent, ProviderRequest, StopReason, ToolCall,
+    DEFAULT_STREAM_BUFFER,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -115,8 +116,13 @@ impl MessagesProvider {
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
-                Err(error) if error.is_builder() || attempt + 1 == MAX_HTTP_ATTEMPTS => {
+                Err(error) if error.is_builder() => {
                     return Err(error).context("calling Messages API");
+                }
+                Err(error) if attempt + 1 == MAX_HTTP_ATTEMPTS => {
+                    return Err(transient_provider_error(format!(
+                        "calling Messages API: {error}"
+                    )));
                 }
                 Err(_) => {
                     if let Some(events) = events {
@@ -149,35 +155,53 @@ impl MessagesProvider {
             let body = response
                 .text()
                 .await
-                .context("reading Messages error response")?;
-            bail!("Messages API returned {status}: {}", error_message(&body));
+                .unwrap_or_else(|error| format!("unable to read error response: {error}"));
+            let error = anyhow::anyhow!("Messages API returned {status}: {}", error_message(&body));
+            return if retryable(status) {
+                Err(transient_provider_error(error))
+            } else {
+                Err(error)
+            };
         }
         let is_stream = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("text/event-stream"));
-        if stream && is_stream {
-            decode_stream(response, events.expect("stream events"), cancel).await
+        let decoded = if stream && is_stream {
+            decode_stream(
+                response,
+                events.clone().expect("stream events"),
+                cancel.clone(),
+            )
+            .await
         } else {
-            let value: Value = response
-                .json()
-                .await
-                .context("decoding Messages response")?;
-            let answer = parse_response(value, started.elapsed())?;
-            if let Some(events) = events {
-                let text = answer.text();
-                if !text.is_empty() {
-                    let _ = events.send(ProviderEvent::TextDelta(text));
+            let result = async {
+                let value: Value = response
+                    .json()
+                    .await
+                    .context("decoding Messages response")?;
+                let answer = parse_response(value, started.elapsed())?;
+                if let Some(events) = events {
+                    let text = answer.text();
+                    if !text.is_empty() {
+                        let _ = events.send(ProviderEvent::TextDelta(text));
+                    }
+                    if !answer.token_usage.is_empty() {
+                        let _ = events.send(ProviderEvent::Usage {
+                            usage: answer.token_usage,
+                            generation_duration: answer.generation_duration,
+                        });
+                    }
                 }
-                if !answer.token_usage.is_empty() {
-                    let _ = events.send(ProviderEvent::Usage {
-                        usage: answer.token_usage,
-                        generation_duration: answer.generation_duration,
-                    });
-                }
-            }
-            Ok(answer)
+                Ok(answer)
+            };
+            result.await
+        };
+        match decoded {
+            Err(error) if cancel.is_cancelled() => Err(error),
+            Err(error) => Err(transient_provider_error(error)),
+            result => result,
         }
     }
 }
@@ -250,6 +274,7 @@ async fn decode_stream(
     let mut stop_reason = StopReason::Unknown("unknown".to_string());
     let mut usage = TokenUsage::default();
     let mut first_event = None::<Instant>;
+    let mut stream_complete = false;
     let mut saw_text = false;
 
     loop {
@@ -267,8 +292,12 @@ async fn decode_stream(
                 return Err(anyhow::anyhow!("reading Messages event stream: {error}"));
             }
         };
-        if event.data.is_empty() || event.data == "[DONE]" {
+        if event.data.is_empty() {
             continue;
+        }
+        if event.data == "[DONE]" {
+            stream_complete = true;
+            break;
         }
         first_event.get_or_insert_with(Instant::now);
         let value: Value = serde_json::from_str(&event.data)
@@ -359,9 +388,13 @@ async fn decode_stream(
                 update_usage_snapshot(&mut usage, value.get("usage"));
                 emit_usage(&events, usage, first_event);
             }
+            Some("message_stop") => stream_complete = true,
             Some("error") => bail!("Messages stream error: {}", error_message(&event.data)),
             _ => {}
         }
+    }
+    if !stream_complete {
+        bail!("Messages event stream ended before message_stop");
     }
     for (index, partial) in partial_inputs {
         if let Some(block) = content.get_mut(index) {

@@ -228,6 +228,18 @@ impl App {
                 }
                 AgentEvent::Retry => {
                     self.agent_retry_count = self.agent_retry_count.saturating_add(1);
+                    self.agent_panel.retain(|entry| {
+                        !matches!(
+                            entry.as_ref(),
+                            AgentPanelEntry::Assistant {
+                                streaming: true,
+                                ..
+                            } | AgentPanelEntry::Thinking {
+                                streaming: true,
+                                ..
+                            }
+                        )
+                    });
                 }
                 AgentEvent::Round { current, limit } => {
                     self.agent_round = current;

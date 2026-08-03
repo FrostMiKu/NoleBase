@@ -24,21 +24,29 @@
 //! silently repaired. The store never verifies content digests: size is
 //! recomputed live from the content file, and content is mutable by design.
 //!
+//! Content tokens are computed on demand, never verified on every read:
+//! [`AttachmentStore::content_token`] hashes the live content and
+//! [`AttachmentStore::copy_to_with_token`] hashes the bytes it copies. They
+//! are deterministic `sha256:<hex>` optimistic-concurrency keys so an edited
+//! workspace copy can be published back in place with stale-content
+//! protection ([`AttachmentStore::replace_content`]).
+//!
 //! Attachment internals are application-managed: the app may open the real
 //! content file through [`AttachmentStore::open`], while agent tools only
-//! exchange ids, URIs, metadata, and bounded/streaming reads
-//! ([`AttachmentStore::read_limited`], [`AttachmentStore::copy_to`]).
+//! exchange ids, URIs, metadata, tokens, and bounded/streaming reads
+//! ([`AttachmentStore::read_limited`], [`AttachmentStore::copy_to_with_token`]).
 //! Copying an attachment into the agent workspace remains the explicit way to
-//! make a separate editable copy.
+//! make a separate editable copy; `update_attachment` publishes it back.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Stable opaque attachment identity: a random UUID v4 generated at import.
@@ -216,10 +224,11 @@ pub enum AttachmentSortOrder {
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
 
 /// List query for [`AttachmentStore::list`]: substring filter over display
-/// name and provenance, then sort and paginate. The serde shape is the agent
-/// tool's JSON contract (`query`/`offset`/`limit`/`sort_by`/`order`), so a
-/// tool input deserializes straight into this type.
+/// name and provenance, then sort and paginate. Offsets remain an internal
+/// store concern; the Agent tool translates its one-based inclusive `range`
+/// selector into this query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentQuery {
     /// Case-insensitive substring matched against `display_name` and
     /// `source`. Empty matches everything.
@@ -294,6 +303,10 @@ pub const MAX_ATTACHMENT_SIZE: u64 = 256 * 1024 * 1024;
 const MIME_SNIFF_BYTES: usize = 8192;
 /// Maximum byte length of a display name.
 pub const MAX_DISPLAY_NAME_BYTES: usize = 255;
+/// Prefix of every content token; the token is `sha256:<lowercase hex>` of
+/// the attachment bytes. Deterministic and stable: identical bytes always
+/// produce the identical token.
+pub const CONTENT_TOKEN_PREFIX: &str = "sha256:";
 
 impl AttachmentStore {
     /// Build a store rooted at `attachments_dir` (typically
@@ -510,14 +523,43 @@ impl AttachmentStore {
 
     /// Stream the content of `id` into `writer`, enforcing
     /// [`MAX_ATTACHMENT_SIZE`]. Returns the number of bytes copied.
+    #[cfg(test)]
     pub fn copy_to(&self, id: AttachmentId, writer: &mut impl Write) -> Result<u64> {
+        self.copy_to_with_token(id, writer).map(|(bytes, _)| bytes)
+    }
+
+    /// Stream the content of `id` into `writer`, enforcing
+    /// [`MAX_ATTACHMENT_SIZE`]. Returns the number of bytes copied and the
+    /// deterministic content token of exactly those bytes, so a caller that
+    /// materializes a workspace copy can later prove the attachment still
+    /// holds the same content before publishing an edit.
+    #[cfg(test)]
+    pub fn copy_to_with_token(
+        &self,
+        id: AttachmentId,
+        writer: &mut impl Write,
+    ) -> Result<(u64, String)> {
+        self.copy_to_with_token_limited(id, writer, MAX_ATTACHMENT_SIZE)
+    }
+
+    /// Stream the content of `id` into `writer`, enforcing both the
+    /// attachment cap and the caller-provided limit. Returns the number of
+    /// bytes copied and the token of exactly those bytes.
+    pub fn copy_to_with_token_limited(
+        &self,
+        id: AttachmentId,
+        writer: &mut impl Write,
+        limit: u64,
+    ) -> Result<(u64, String)> {
         // Validates existence, consistency, and the size limit up front.
         let _ = self.metadata(id)?;
         let path = self.content_path(id);
         let mut file =
             File::open(&path).with_context(|| format!("opening content {}", path.display()))?;
+        let mut hasher = Sha256::new();
         let mut buffer = [0u8; STREAM_BUFFER];
         let mut total = 0u64;
+        let limit = limit.min(MAX_ATTACHMENT_SIZE);
         loop {
             let read = file
                 .read(&mut buffer)
@@ -526,17 +568,102 @@ impl AttachmentStore {
                 break;
             }
             total += read as u64;
-            if total > MAX_ATTACHMENT_SIZE {
-                bail!(
-                    "attachment {id} exceeds the {} byte limit",
-                    MAX_ATTACHMENT_SIZE
-                );
+            if total > limit {
+                bail!("attachment {id} exceeds the {limit} byte limit");
             }
+            hasher.update(&buffer[..read]);
             writer
                 .write_all(&buffer[..read])
                 .with_context(|| format!("writing attachment {id} content"))?;
         }
-        Ok(total)
+        Ok((
+            total,
+            format!("{CONTENT_TOKEN_PREFIX}{}", hex_lower(&hasher.finalize())),
+        ))
+    }
+
+    /// Deterministic content token (`sha256:<hex>`) of the current live
+    /// content of `id`. Used as the optimistic-concurrency check before an
+    /// in-place update publishes: a token that no longer matches means the
+    /// content changed since it was checked out.
+    pub fn content_token(&self, id: AttachmentId) -> Result<String> {
+        let _ = self.metadata(id)?;
+        let path = self.content_path(id);
+        let mut file =
+            File::open(&path).with_context(|| format!("opening content {}", path.display()))?;
+        Ok(hash_stream(&mut file, MAX_ATTACHMENT_SIZE)?.1)
+    }
+
+    /// Stream `reader` in as the new content of `id`, atomically replacing
+    /// the live content file while preserving the attachment identity and
+    /// every piece of persisted provenance metadata (display name, original
+    /// source, import time). The new bytes are staged inside the attachment
+    /// directory, synced, checked against `expected_content_token`, and
+    /// atomically replaced over `content`; staging is removed on any failure.
+    /// The effective byte limit is the smaller of `limit` and
+    /// [`MAX_ATTACHMENT_SIZE`]. Size and MIME are re-derived from live
+    /// content. Returns updated metadata and the published content token.
+    pub fn replace_content(
+        &self,
+        id: AttachmentId,
+        expected_content_token: &str,
+        mut reader: impl Read,
+        limit: u64,
+    ) -> Result<(AttachmentMetadata, String)> {
+        // Validates existence, consistency, and the live size limit up front.
+        let _ = self.metadata(id)?;
+        let dir = self.attachment_dir(id);
+        let staged = dir.join(staging_name());
+        let publish = (|| {
+            let mut hasher = Sha256::new();
+            let mut content = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)
+                .with_context(|| format!("creating staging content {}", staged.display()))?;
+            let mut buffer = [0u8; STREAM_BUFFER];
+            let mut size = 0u64;
+            let limit = limit.min(MAX_ATTACHMENT_SIZE);
+            loop {
+                let read = reader.read(&mut buffer).context("reading update source")?;
+                if read == 0 {
+                    break;
+                }
+                if size + read as u64 > limit {
+                    bail!("attachment update exceeds the {limit} byte limit");
+                }
+                hasher.update(&buffer[..read]);
+                content
+                    .write_all(&buffer[..read])
+                    .with_context(|| format!("writing staging content {}", staged.display()))?;
+                size += read as u64;
+            }
+            content
+                .sync_all()
+                .with_context(|| format!("syncing staging content {}", staged.display()))?;
+            // Re-check after staging and syncing, immediately before the
+            // atomic publish, so changes while the source was streamed or
+            // while approval was pending cannot be overwritten.
+            let current_token = self.content_token(id)?;
+            if current_token != expected_content_token {
+                bail!(
+                    "attachment content changed since checkout: expected {expected_content_token}, found {current_token}"
+                );
+            }
+            atomic_replace(&staged, &self.content_path(id)).with_context(|| {
+                format!(
+                    "publishing content {} for attachment {id}",
+                    self.content_path(id).display()
+                )
+            })?;
+            let metadata = self.metadata(id)?;
+            let token = format!("{CONTENT_TOKEN_PREFIX}{}", hex_lower(&hasher.finalize()));
+            Ok((metadata, token))
+        })();
+        if publish.is_err() {
+            fs::remove_file(&staged).ok();
+        }
+        publish
     }
 
     /// Read at most `max_bytes` of content into memory, erroring when the
@@ -560,7 +687,7 @@ impl AttachmentStore {
     /// Read the full content into memory, capped at [`MAX_ATTACHMENT_SIZE`].
     /// Intended for whole-content consumers such as image decoding; the
     /// store's primary read interfaces are [`AttachmentStore::open`] and
-    /// [`AttachmentStore::copy_to`].
+    /// [`AttachmentStore::copy_to_with_token`].
     pub fn read_all(&self, id: AttachmentId) -> Result<Vec<u8>> {
         self.read_limited(id, MAX_ATTACHMENT_SIZE)
     }
@@ -778,6 +905,81 @@ impl AttachmentStore {
 /// attachment directories or `trash/`.
 fn staging_name() -> String {
     format!(".tmp-{}-{:016x}", std::process::id(), fastrand::u64(..))
+}
+
+/// Lowercase hex encoding used by content tokens.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Replace an existing file with a same-directory staged file. Unix rename
+/// atomically replaces the destination; Windows uses ReplaceFileW, the OS
+/// primitive specifically intended to replace an existing file atomically.
+fn atomic_replace(staged: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(staged, destination)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+        let replacement = staged
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let replaced = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let replaced = unsafe {
+            ReplaceFileW(
+                replaced.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if replaced == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+/// Stream `reader` through SHA-256, refusing once more than `limit` bytes
+/// would be read. Returns the byte count and the content token of those
+/// bytes.
+fn hash_stream(reader: &mut impl Read, limit: u64) -> Result<(u64, String)> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; STREAM_BUFFER];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer).context("reading content")?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > limit {
+            bail!("attachment exceeds the {limit} byte limit");
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((
+        total,
+        format!("{CONTENT_TOKEN_PREFIX}{}", hex_lower(&hasher.finalize())),
+    ))
 }
 
 /// Validate a display name: it must be a non-empty bare file name with no

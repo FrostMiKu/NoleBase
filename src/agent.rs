@@ -26,8 +26,8 @@ use crate::provider::messages::MessagesProvider;
 #[cfg(test)]
 use crate::provider::MessagePart;
 use crate::provider::{
-    ApiFormat, AssistantMessage, Message, Provider, ProviderEvent, ProviderRequest, StopReason,
-    SystemBlock, ToolCall, ToolResult, ToolSpec,
+    is_transient_provider_error, ApiFormat, AssistantMessage, Message, Provider, ProviderEvent,
+    ProviderRequest, StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
 };
 use crate::skill::{load_skill_catalog, SkillCatalog};
 #[cfg(test)]
@@ -53,6 +53,23 @@ pub(crate) use self::tracking::*;
 pub use self::types::*;
 
 use tools::*;
+
+const MAX_PROVIDER_REQUEST_ATTEMPTS: usize = 3;
+
+async fn wait_for_provider_retry(cancelled: &AtomicBool, attempt: usize) -> Result<()> {
+    let delay = Duration::from_millis(500u64.saturating_mul(1u64 << attempt.min(3)));
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("agent task cancelled");
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+}
 
 fn report_provider_metrics(
     events: &AgentEventSender,
@@ -207,10 +224,39 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: &Value) -> Result<String>;
 }
 
+/// A tool paired with its compiled model-facing input contract.
+pub(crate) struct RegisteredTool {
+    tool: Arc<dyn Tool>,
+    validator: jsonschema::Validator,
+}
+
+impl RegisteredTool {
+    pub(crate) fn new<T: Tool + 'static>(tool: T, schema: &Value) -> Self {
+        let name = tool.name();
+        let validator = jsonschema::validator_for(schema)
+            .unwrap_or_else(|error| panic!("invalid JSON schema for tool {name}: {error}"));
+        Self {
+            tool: Arc::new(tool),
+            validator,
+        }
+    }
+
+    pub(crate) fn execution_policy(&self) -> ToolExecutionPolicy {
+        self.tool.execution_policy()
+    }
+
+    pub(crate) async fn execute(&self, input: &Value) -> Result<String> {
+        self.validator.validate(input).map_err(|error| {
+            anyhow::anyhow!("invalid input for tool {}: {error}", self.tool.name())
+        })?;
+        self.tool.execute(input).await
+    }
+}
+
 pub struct Agent {
     config: AgentConfig,
     provider: Arc<dyn Provider>,
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: HashMap<String, Arc<RegisteredTool>>,
     definitions: Vec<ToolSpec>,
     system: Vec<SystemBlock>,
     events: AgentEventSender,
@@ -233,6 +279,18 @@ pub struct AgentWorker {
     cancelled: Arc<AtomicBool>,
     reads: Arc<ReadTracker>,
     events: AgentEventSender,
+    #[cfg(test)]
+    attachment_usage: AttachmentUsageHandle,
+}
+
+impl AgentWorker {
+    /// The shared attachment-usage state this worker's `delete_attachment`
+    /// tool observes. Test-only: lets a regression test verify the app and
+    /// the worker received the same handle.
+    #[cfg(test)]
+    pub(crate) fn attachment_usage(&self) -> &AttachmentUsageHandle {
+        &self.attachment_usage
+    }
 }
 
 struct AgentTask {
@@ -254,6 +312,7 @@ impl AgentWorker {
         let events = runtime.events.clone();
         let reads = Arc::new(ReadTracker::default());
         let worker_reads = reads.clone();
+        let worker_usage = attachment_usage.clone();
         std::thread::spawn(move || {
             let async_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -288,7 +347,7 @@ impl AgentWorker {
                             runtime.clone(),
                             http,
                             worker_reads.clone(),
-                            attachment_usage.clone(),
+                            worker_usage.clone(),
                         )?);
                         loaded_source = Some(source);
                     }
@@ -341,6 +400,8 @@ impl AgentWorker {
             cancelled,
             reads,
             events,
+            #[cfg(test)]
+            attachment_usage,
         }
     }
 
@@ -538,6 +599,14 @@ impl Agent {
         );
         agent.register(Explore::new(
             nole_root,
+            subagent_runtime.clone(),
+            workspace_index.clone(),
+            client.clone(),
+            tavily_api_key.clone(),
+            &skills,
+        )?);
+        agent.register(Review::new(
+            nole_root,
             subagent_runtime,
             workspace_index,
             client,
@@ -547,7 +616,8 @@ impl Agent {
         agent.register(ImportAttachment::new(nole_root)?);
         agent.register(ListAttachments::new(nole_root)?);
         agent.register(AttachmentInfo::new(nole_root)?);
-        agent.register(CopyAttachmentToWorkspace::new(nole_root)?);
+        agent.register(CheckoutAttachment::new(nole_root)?);
+        agent.register(UpdateAttachment::new(nole_root, gate.clone())?);
         agent.register(DeleteAttachment::new(
             nole_root,
             gate.clone(),
@@ -561,10 +631,11 @@ impl Agent {
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         let name = tool.name().to_string();
+        let schema = tool.input_schema();
         let definition = ToolSpec {
             name: name.clone(),
             description: tool.description().to_string(),
-            input_schema: tool.input_schema(),
+            input_schema: schema.clone(),
             cache: false,
         };
         if let Some(index) = self
@@ -576,7 +647,8 @@ impl Agent {
         } else {
             self.definitions.push(definition);
         }
-        self.tools.insert(name, Arc::new(tool));
+        self.tools
+            .insert(name, Arc::new(RegisteredTool::new(tool, &schema)));
     }
 
     async fn run(
@@ -758,6 +830,26 @@ impl Agent {
     }
 
     async fn request_message(
+        &self,
+        messages: &[Message],
+        definitions: &[ToolSpec],
+    ) -> Result<AssistantMessage> {
+        for attempt in 0..MAX_PROVIDER_REQUEST_ATTEMPTS {
+            match self.request_message_once(messages, definitions).await {
+                Err(error)
+                    if is_transient_provider_error(&error)
+                        && attempt + 1 < MAX_PROVIDER_REQUEST_ATTEMPTS =>
+                {
+                    let _ = self.events.send(AgentEvent::Retry);
+                    wait_for_provider_retry(&self.cancelled, attempt).await?;
+                }
+                result => return result,
+            }
+        }
+        unreachable!()
+    }
+
+    async fn request_message_once(
         &self,
         messages: &[Message],
         definitions: &[ToolSpec],

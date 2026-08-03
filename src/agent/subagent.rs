@@ -9,12 +9,14 @@ use anyhow::{bail, Context, Result};
 use futures_util::stream::{self, StreamExt};
 
 use super::{
-    prompt_with_datetime, AgentConfig, AgentEvent, AgentEventSender, Tool, ToolConcurrencyLimits,
-    ToolExecutionPolicy,
+    prompt_with_datetime, wait_for_provider_retry, AgentConfig, AgentEvent, AgentEventSender,
+    RegisteredTool, Tool, ToolConcurrencyLimits, ToolExecutionPolicy,
+    MAX_PROVIDER_REQUEST_ATTEMPTS,
 };
 use crate::agent_session::TokenUsage;
 use crate::provider::{
-    Message, Provider, ProviderRequest, StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
+    is_transient_provider_error, Message, Provider, ProviderRequest, StopReason, SystemBlock,
+    ToolCall, ToolResult, ToolSpec,
 };
 
 #[derive(Clone)]
@@ -77,7 +79,7 @@ impl SubagentProfile {
 pub(crate) struct SubagentRunner {
     runtime: SubagentRuntime,
     profile: SubagentProfile,
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: HashMap<String, Arc<RegisteredTool>>,
     definitions: Vec<ToolSpec>,
     system: Vec<SystemBlock>,
 }
@@ -100,10 +102,11 @@ impl SubagentRunner {
 
     pub(crate) fn register<T: Tool + 'static>(&mut self, tool: T) {
         let name = tool.name().to_string();
+        let schema = tool.input_schema();
         let definition = ToolSpec {
             name: name.clone(),
             description: tool.description().to_string(),
-            input_schema: tool.input_schema(),
+            input_schema: schema.clone(),
             cache: false,
         };
         if let Some(index) = self
@@ -115,7 +118,8 @@ impl SubagentRunner {
         } else {
             self.definitions.push(definition);
         }
-        self.tools.insert(name, Arc::new(tool));
+        self.tools
+            .insert(name, Arc::new(RegisteredTool::new(tool, &schema)));
     }
 
     pub(crate) async fn run(&self, task: &str) -> Result<String> {
@@ -166,19 +170,33 @@ impl SubagentRunner {
         if let Some(definition) = definitions.last_mut() {
             definition.cache = true;
         }
-        let mut request = self.runtime.provider.call(ProviderRequest {
+        let provider_request = ProviderRequest {
             model: self.runtime.model.clone(),
             max_tokens: self.runtime.max_tokens,
             system: self.system.clone(),
             messages: messages.to_vec(),
             tools: if final_round { Vec::new() } else { definitions },
-        });
-        loop {
-            tokio::select! {
-                response = &mut request => return response,
-                _ = tokio::time::sleep(Duration::from_millis(100)) => self.ensure_active()?,
+        };
+        for attempt in 0..MAX_PROVIDER_REQUEST_ATTEMPTS {
+            let mut request = self.runtime.provider.call(provider_request.clone());
+            let result = loop {
+                tokio::select! {
+                    response = &mut request => break response,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => self.ensure_active()?,
+                }
+            };
+            match result {
+                Err(error)
+                    if is_transient_provider_error(&error)
+                        && attempt + 1 < MAX_PROVIDER_REQUEST_ATTEMPTS =>
+                {
+                    let _ = self.runtime.events.send(AgentEvent::Retry);
+                    wait_for_provider_retry(&self.runtime.cancelled, attempt).await?;
+                }
+                result => return result,
             }
         }
+        unreachable!()
     }
 
     async fn execute_tool_batch(
@@ -291,7 +309,8 @@ mod tests {
     use super::*;
     use crate::observable::{BoxFuture, Observable};
     use crate::provider::{
-        ApiFormat, AssistantMessage, MessagePart, ProviderEvent, DEFAULT_STREAM_BUFFER,
+        transient_provider_error, ApiFormat, AssistantMessage, MessagePart, ProviderEvent,
+        DEFAULT_STREAM_BUFFER,
     };
 
     struct ScriptedProvider {
@@ -308,6 +327,45 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .context("missing scripted response")
+            })
+        }
+
+        fn call_streaming(
+            &self,
+            _request: ProviderRequest,
+        ) -> Observable<AssistantMessage, ProviderEvent> {
+            let (_events, receiver) = tokio::sync::broadcast::channel(DEFAULT_STREAM_BUFFER);
+            Observable {
+                output: Box::pin(async { bail!("streaming is not used by subagents") }),
+                events: receiver,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            }
+        }
+
+        fn count_tokens<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    struct FlakyProvider {
+        responses: Mutex<VecDeque<std::result::Result<AssistantMessage, String>>>,
+        requests: AtomicUsize,
+    }
+
+    impl Provider for FlakyProvider {
+        fn call<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
+            Box::pin(async move {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                match self
+                    .responses
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("flaky responses lock poisoned"))?
+                    .pop_front()
+                {
+                    Some(Ok(response)) => Ok(response),
+                    Some(Err(error)) => Err(transient_provider_error(error)),
+                    None => bail!("missing flaky response"),
+                }
             })
         }
 
@@ -402,6 +460,59 @@ mod tests {
         async fn execute(&self, input: &Value) -> Result<String> {
             Ok(input["value"].as_str().unwrap().to_string())
         }
+    }
+
+    #[test]
+    fn runner_retries_a_transient_provider_failure() {
+        let provider = Arc::new(FlakyProvider {
+            responses: Mutex::new(VecDeque::from([
+                Err("temporary network failure".to_string()),
+                Ok(response(
+                    vec![MessagePart::Text {
+                        text: "Recovered report.".to_string(),
+                    }],
+                    StopReason::End,
+                )),
+            ])),
+            requests: AtomicUsize::new(0),
+        });
+        let runner = SubagentRunner::new(
+            runtime(3, provider.clone(), Arc::new(AtomicBool::new(false))),
+            profile(),
+        );
+
+        assert_eq!(
+            crate::agent::test_support::test_runtime()
+                .block_on(runner.run("Review"))
+                .unwrap(),
+            "Recovered report."
+        );
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn runner_stops_after_bounded_transient_retries() {
+        let provider = Arc::new(FlakyProvider {
+            responses: Mutex::new(VecDeque::from([
+                Err("temporary failure one".to_string()),
+                Err("temporary failure two".to_string()),
+                Err("temporary failure three".to_string()),
+            ])),
+            requests: AtomicUsize::new(0),
+        });
+        let runner = SubagentRunner::new(
+            runtime(3, provider.clone(), Arc::new(AtomicBool::new(false))),
+            profile(),
+        );
+
+        let error = crate::agent::test_support::test_runtime()
+            .block_on(runner.run("Review"))
+            .unwrap_err();
+        assert!(error.to_string().contains("temporary failure three"));
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            MAX_PROVIDER_REQUEST_ATTEMPTS
+        );
     }
 
     #[test]

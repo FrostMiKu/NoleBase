@@ -12,7 +12,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::attachment::{
-    AttachmentMetadata, AttachmentQuery, AttachmentSortBy, AttachmentSortOrder, AttachmentUri,
+    AttachmentId, AttachmentMetadata, AttachmentQuery, AttachmentSortBy, AttachmentSortOrder,
+    AttachmentUri,
 };
 
 use super::super::*;
@@ -69,10 +70,32 @@ impl App {
             .min(self.attachment_entries.len().saturating_sub(1));
     }
 
-    /// Re-list the browser when attachment store files changed externally
-    /// (content/metadata edits under `attachments/<id>/`). The usage snapshot
-    /// is untouched: attachment store events never change note references.
-    pub(crate) fn attachment_paths_changed(&mut self, _paths: &[PathBuf]) {
+    /// Re-list the browser and drop stale image caches when attachment store
+    /// files changed externally (content/metadata edits under
+    /// `attachments/<id>/`, including an agent `update_attachment`). The
+    /// usage snapshot is untouched: attachment store events never change
+    /// note references.
+    pub(crate) fn attachment_paths_changed(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            // Watcher events arrive as attachments/<uuid>/... paths. Rendered
+            // attachment images are cached by URI alone, so drop the cache
+            // entry and let the next frame decode the changed bytes fresh.
+            let Some(relative) = path.strip_prefix(&self.storage.attachments_dir).ok() else {
+                continue;
+            };
+            let Some(component) = relative.components().next() else {
+                continue;
+            };
+            let Some(id) = component
+                .as_os_str()
+                .to_str()
+                .and_then(|name| AttachmentId::parse(name).ok())
+            else {
+                continue;
+            };
+            self.images
+                .invalidate_attachment(&AttachmentUri::from_id(id));
+        }
         if self.center_view == CenterView::Attachments {
             self.recompute_attachments();
         }

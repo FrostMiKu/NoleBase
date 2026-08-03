@@ -1135,15 +1135,31 @@ fn concurrent_tool_events_finish_the_matching_timeline_entries() {
 }
 
 #[test]
-fn agent_retry_events_accumulate_in_session_metrics() {
+fn agent_retry_events_clear_partial_output_and_accumulate_metrics() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
 
+    sender
+        .send(AgentEvent::AssistantDelta("partial".to_string()))
+        .unwrap();
+    sender
+        .send(AgentEvent::ThinkingDelta("partial thought".to_string()))
+        .unwrap();
     sender.send(AgentEvent::Retry).unwrap();
     sender.send(AgentEvent::Retry).unwrap();
     app.poll_agent();
 
     assert_eq!(app.agent_retry_count, 2);
+    assert!(app.agent_panel.iter().all(|entry| !matches!(
+        entry.as_ref(),
+        AgentPanelEntry::Assistant {
+            streaming: true,
+            ..
+        } | AgentPanelEntry::Thinking {
+            streaming: true,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -2902,6 +2918,23 @@ fn refresh_attachment_refs(app: &mut App) {
     app.apply_attachment_index(
         0,
         crate::attachment_index::AttachmentReferenceIndex::build(&app.storage),
+    );
+}
+
+#[test]
+fn app_index_publish_reaches_the_agent_delete_handles_shared_state() {
+    let (mut app, _directory) = make_app();
+    // The Agent worker's delete_attachment tool observes the same shared
+    // usage state the app publishes to: it starts unready and becomes ready
+    // the moment the app publishes its first attachment index. This fails if
+    // App::new stores a separate handle instead of the one it cloned into
+    // AgentWorker::spawn.
+    let worker_usage = app.agent_worker.attachment_usage().clone();
+    assert!(!worker_usage.is_ready());
+    refresh_attachment_refs(&mut app);
+    assert!(
+        worker_usage.is_ready(),
+        "apply_attachment_index must publish to the handle AgentWorker::spawn received"
     );
 }
 

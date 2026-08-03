@@ -19,9 +19,8 @@ use serde_json::{json, Value};
 use tokio::fs as async_fs;
 
 use super::util::{
-    display_path, fuzzy_match, optional_usize, required_string, truncate_chars,
-    DEFAULT_SEARCH_RESULTS, MAX_EDIT_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
-    MAX_SEARCH_SNIPPET_CHARS,
+    display_path, fuzzy_match, optional_usize, range_schema, required_string, truncate_chars,
+    RangeSelector, MAX_EDIT_FILE_BYTES, MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::web::{read_http_body_with_limit, web_fetch_content};
 use crate::agent::{canonical_root, ReadTracker, SnapshotTagHasher, Tool, ToolExecutionPolicy};
@@ -38,7 +37,6 @@ const MAX_WEB_READ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTED_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NOTE_RESULTS: usize = 2_000;
 const MAX_DIRECTORY_RESULTS: usize = 2_000;
-const MAX_DIRECTORY_SCAN: usize = 10_000;
 const MAX_DIRECTORY_DEPTH: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,15 +176,7 @@ impl Tool for Read {
                     "type": "string",
                     "description": "Local file/PDF path, http(s) URL/PDF URL, or attachment URI, optionally suffixed with inclusive lines `:start-end`; or a directory path"
                 },
-                "offset": {
-                    "type": "integer", "minimum": 0, "default": 0,
-                    "description": "Number of directory entries to skip (directory targets only)"
-                },
-                "limit": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": MAX_READ_LINES, "default": DEFAULT_READ_LINES,
-                    "description": "Maximum directory entries to return (directory targets only)"
-                },
+                "range": range_schema(MAX_DIRECTORY_RESULTS),
                 "depth": {
                     "type": "integer", "minimum": 1,
                     "maximum": MAX_DIRECTORY_DEPTH, "default": 1,
@@ -308,7 +298,7 @@ fn split_line_range(requested: &str) -> Result<(&str, Option<LineRange>)> {
 }
 
 fn line_window(range: Option<LineRange>, input: &Value) -> Result<(usize, usize)> {
-    if input.get("offset").is_some() || input.get("limit").is_some() {
+    if input.get("range").is_some() {
         bail!("file and attachment lines must use a `path:start-end` selector");
     }
     Ok(range
@@ -492,17 +482,21 @@ fn page_extracted_text(
     })
 }
 
-fn add_structured_page(payload: &mut Value, page: TextPage, target: &str, limit: usize) {
-    payload["offset"] = json!(page.start);
+fn add_structured_page(
+    payload: &mut Value,
+    page: TextPage,
+    target: &str,
+    offset: usize,
+    limit: usize,
+) {
+    payload["range"] = json!(format!("{}-{}", offset + 1, offset.saturating_add(limit)));
     payload["returned"] = json!(page.end - page.start);
+    payload["total"] = json!(page.total_lines);
     payload["has_more"] = json!(page.has_more);
     if page.has_more {
         payload["next"] = json!(continuation_selector(target, page.end, limit));
     }
-    if let Some(total_lines) = page.total_lines {
-        payload["total_lines"] = json!(total_lines);
-    }
-    payload["lines"] = json!(page.lines);
+    payload["items"] = json!(page.lines);
 }
 
 struct TextFileParser;
@@ -634,6 +628,7 @@ impl ReadParser for PdfFileParser {
             &mut payload,
             page,
             &target.display(_ctx.root.as_path()),
+            offset,
             limit,
         );
         Ok(ReadPayload::Structured(payload))
@@ -714,7 +709,7 @@ impl ReadParser for AttachmentParser {
             let page = page_extracted_text(&text, offset, limit, json_response_len)?;
             let mut payload = attachment_metadata_json(*uri, &metadata);
             payload["format"] = json!("pdf");
-            add_structured_page(&mut payload, page, &uri.to_string(), limit);
+            add_structured_page(&mut payload, page, &uri.to_string(), offset, limit);
             return Ok(ReadPayload::Structured(payload));
         }
         if !is_textual_mime(mime) {
@@ -738,16 +733,7 @@ impl ReadParser for AttachmentParser {
             )));
         };
         let mut payload = attachment_metadata_json(*uri, &metadata);
-        payload["offset"] = json!(page.start);
-        payload["returned"] = json!(page.end - page.start);
-        if page.has_more {
-            payload["next"] = json!(continuation_selector(&uri.to_string(), page.end, limit));
-        }
-        payload["has_more"] = json!(page.has_more);
-        if let Some(total_lines) = page.total_lines {
-            payload["total_lines"] = json!(total_lines);
-        }
-        payload["lines"] = json!(page.lines);
+        add_structured_page(&mut payload, page, &uri.to_string(), offset, limit);
         Ok(ReadPayload::Structured(payload))
     }
 }
@@ -843,9 +829,8 @@ impl ReadParser for DirectoryParser {
             "desc" => true,
             other => bail!("unsupported order: {other}"),
         };
-        let offset = optional_usize(input, "offset", 0, usize::MAX)?;
-        let limit = optional_usize(input, "limit", 200, MAX_DIRECTORY_RESULTS)?;
-        let (mut entries, truncated) = directory_entries(path, depth).await?;
+        let selector = RangeSelector::from_input(input, MAX_DIRECTORY_RESULTS)?;
+        let mut entries = directory_entries(path, depth).await?;
         entries.sort_by(|a, b| {
             let ordering = match sort_by {
                 "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -864,10 +849,8 @@ impl ReadParser for DirectoryParser {
             };
             ordering.then_with(|| a.path.cmp(&b.path))
         });
-        let total = entries.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let entries = entries[start..end]
+        let page = selector.window(entries.len());
+        let items = entries[page.start_index..page.end_index]
             .iter()
             .map(|entry| {
                 json!({
@@ -883,17 +866,20 @@ impl ReadParser for DirectoryParser {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(ReadPayload::Structured(json!({
+        let mut payload = json!({
             "depth": depth,
             "sort_by": sort_by,
             "order": if descending { "desc" } else { "asc" },
-            "offset": start,
-            "returned": end - start,
-            "total": total,
-            "has_more": end < total,
-            "scan_truncated": truncated,
-            "entries": entries,
-        })))
+            "range": selector.as_string(),
+            "returned": page.returned(),
+            "total": page.total,
+            "has_more": page.has_more(),
+            "items": items,
+        });
+        if let Some(next) = page.next() {
+            payload["next"] = json!(next);
+        }
+        Ok(ReadPayload::Structured(payload))
     }
 }
 
@@ -947,18 +933,14 @@ impl ReadParser for WebParser {
             "format": format,
             "content_type": content_type,
         });
-        add_structured_page(&mut payload, page, url, limit);
+        add_structured_page(&mut payload, page, url, offset, limit);
         Ok(ReadPayload::Structured(payload))
     }
 }
 
-async fn directory_entries(
-    root: &Path,
-    max_depth: usize,
-) -> Result<(Vec<DirectoryEntryMetadata>, bool)> {
+async fn directory_entries(root: &Path, max_depth: usize) -> Result<Vec<DirectoryEntryMetadata>> {
     let mut entries = Vec::new();
     let mut directories = vec![(root.to_path_buf(), 1usize)];
-    let mut truncated = false;
     while let Some((directory, depth)) = directories.pop() {
         let mut children = async_fs::read_dir(&directory)
             .await
@@ -1000,19 +982,12 @@ async fn directory_entries(
                 kind,
                 depth,
             });
-            if entries.len() >= MAX_DIRECTORY_SCAN {
-                truncated = true;
-                break;
-            }
             if file_type.is_dir() && depth < max_depth {
                 directories.push((path, depth + 1));
             }
         }
-        if truncated {
-            break;
-        }
     }
-    Ok((entries, truncated))
+    Ok(entries)
 }
 
 async fn count_file_lines(path: &Path) -> Result<u64> {
@@ -1075,11 +1050,7 @@ impl Tool for ListNotes {
                     "default": "modified_at"
                 },
                 "order": { "type": "string", "enum": ["asc", "desc"], "default": "desc" },
-                "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": MAX_NOTE_RESULTS, "default": 200
-                }
+                "range": range_schema(MAX_NOTE_RESULTS)
             },
             "additionalProperties": false
         })
@@ -1101,8 +1072,7 @@ impl Tool for ListNotes {
         ) {
             bail!("unsupported sort_by: {sort_by}");
         }
-        let offset = optional_usize(input, "offset", 0, usize::MAX)?;
-        let limit = optional_usize(input, "limit", 200, MAX_NOTE_RESULTS)?;
+        let selector = RangeSelector::from_input(input, MAX_NOTE_RESULTS)?;
         let listed = list_note_files_in(&self.data_dir).await?;
         let mut notes = Vec::with_capacity(listed.len());
         for note in listed {
@@ -1124,10 +1094,8 @@ impl Tool for ListNotes {
             };
             ordering.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        let total = notes.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let entries = notes[start..end]
+        let page = selector.window(notes.len());
+        let items = notes[page.start_index..page.end_index]
             .iter()
             .map(|note| json!({
                 "path": display_path(&self.root, &note.path),
@@ -1138,16 +1106,19 @@ impl Tool for ListNotes {
                 "size": note.size,
             }))
             .collect::<Vec<_>>();
-        serde_json::to_string_pretty(&json!({
+        let mut result = json!({
             "sort_by": sort_by,
             "order": if descending { "desc" } else { "asc" },
-            "offset": start,
-            "returned": end - start,
-            "total": total,
-            "has_more": end < total,
-            "entries": entries,
-        }))
-        .context("encoding note listing")
+            "range": selector.as_string(),
+            "returned": page.returned(),
+            "total": page.total,
+            "has_more": page.has_more(),
+            "items": items,
+        });
+        if let Some(next) = page.next() {
+            result["next"] = json!(next);
+        }
+        serde_json::to_string_pretty(&result).context("encoding note listing")
     }
 }
 
@@ -1195,7 +1166,7 @@ impl Tool for SearchContent {
     }
 
     fn description(&self) -> &'static str {
-        "Case-insensitive full-text search across managed Markdown files. Returns paths and matching zero-based source lines with result pagination."
+        "Case-insensitive full-text search across managed Markdown files. Returns paths and matching one-based source lines with range pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -1207,11 +1178,10 @@ impl Tool for SearchContent {
         if query.is_empty() {
             bail!("query must not be empty");
         }
-        let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
-        let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
+        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
         let mut matches = Vec::new();
         let lowercase_query = query.to_lowercase();
-        'directories: for directory in &self.directories {
+        for directory in &self.directories {
             for file in list_note_files_in(directory).await? {
                 let Ok(source) = async_fs::read_to_string(&file.path).await else {
                     continue;
@@ -1220,17 +1190,14 @@ impl Tool for SearchContent {
                     if text.to_lowercase().contains(&lowercase_query) {
                         matches.push(json!({
                             "path": display_path(&self.root, &file.path),
-                            "line": line,
+                            "line": line + 1,
                             "snippet": truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS),
                         }));
-                        if matches.len() >= 200 {
-                            break 'directories;
-                        }
                     }
                 }
             }
         }
-        paginated_search_result(query, offset, limit, matches)
+        paginated_search_result(query, selector, matches)
     }
 }
 
@@ -1271,8 +1238,7 @@ impl Tool for SearchFiles {
         if query.is_empty() {
             bail!("query must not be empty");
         }
-        let offset = optional_usize(input, "offset", 0, MAX_SEARCH_OFFSET)?;
-        let limit = optional_usize(input, "limit", DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
+        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
         let mut listed = Vec::new();
         for directory in &self.directories {
             listed.extend(list_note_files_in(directory).await?);
@@ -1292,7 +1258,7 @@ impl Tool for SearchFiles {
                 })
             })
             .collect();
-        paginated_search_result(query, offset, limit, matches)
+        paginated_search_result(query, selector, matches)
     }
 }
 
@@ -1354,14 +1320,7 @@ fn search_schema(query_description: &str) -> Value {
         "type": "object",
         "properties": {
             "query": { "type": "string", "description": query_description },
-            "offset": {
-                "type": "integer", "minimum": 0,
-                "maximum": MAX_SEARCH_OFFSET, "default": 0
-            },
-            "limit": {
-                "type": "integer", "minimum": 1,
-                "maximum": MAX_SEARCH_RESULTS, "default": DEFAULT_SEARCH_RESULTS
-            }
+            "range": range_schema(MAX_SEARCH_RESULTS)
         },
         "required": ["query"], "additionalProperties": false
     })
@@ -1369,22 +1328,22 @@ fn search_schema(query_description: &str) -> Value {
 
 fn paginated_search_result(
     query: &str,
-    offset: usize,
-    limit: usize,
+    selector: RangeSelector,
     matches: Vec<Value>,
 ) -> Result<String> {
-    let total = matches.len();
-    let start = offset.min(total);
-    let end = start.saturating_add(limit).min(total);
-    serde_json::to_string_pretty(&json!({
+    let page = selector.window(matches.len());
+    let mut result = json!({
         "query": query,
-        "offset": start,
-        "returned": end - start,
-        "total_matches": total,
-        "has_more": end < total,
-        "matches": &matches[start..end],
-    }))
-    .context("encoding search results")
+        "range": selector.as_string(),
+        "returned": page.returned(),
+        "total": page.total,
+        "has_more": page.has_more(),
+        "items": &matches[page.start_index..page.end_index],
+    });
+    if let Some(next) = page.next() {
+        result["next"] = json!(next);
+    }
+    serde_json::to_string_pretty(&result).context("encoding search results")
 }
 
 #[cfg(test)]
@@ -1532,7 +1491,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["kind"], "file");
         assert_eq!(parsed["format"], "pdf");
-        assert!(parsed["lines"]
+        assert!(parsed["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -1561,7 +1520,7 @@ mod tests {
             .unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["format"], "pdf");
-        assert!(parsed["lines"]
+        assert!(parsed["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -1583,7 +1542,7 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["lines"], json!(["second"]));
+        assert_eq!(parsed["items"], json!(["second"]));
         assert_eq!(parsed["next"], format!("{url}:3-3"));
     }
 
@@ -1603,7 +1562,7 @@ mod tests {
         server.join().unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["format"], "pdf");
-        assert!(parsed["lines"]
+        assert!(parsed["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -1723,7 +1682,7 @@ mod tests {
         assert!(split_line_range("data/note.md:0-2").is_err());
         assert!(split_line_range("data/note.md:4-3").is_err());
         assert!(split_line_range("data/note.md:1-2001").is_err());
-        assert!(line_window(None, &json!({"offset": 49, "limit": 151})).is_err());
+        assert!(line_window(None, &json!({"range": "1-2"})).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1757,11 +1716,11 @@ mod tests {
         assert_eq!(parsed["name"], "notes.txt");
         assert_eq!(parsed["mime_type"], "text/plain");
         assert_eq!(parsed["size"], content.len() as u64);
-        assert_eq!(parsed["offset"], 2);
+        assert_eq!(parsed["range"], "3-4");
         assert_eq!(parsed["returned"], 2);
-        assert!(parsed.get("total_lines").is_none());
+        assert!(parsed["total"].is_null());
         assert_eq!(parsed["has_more"], true);
-        assert_eq!(parsed["lines"], json!(["line 3", "line 4"]));
+        assert_eq!(parsed["items"], json!(["line 3", "line 4"]));
         assert_eq!(parsed["next"], format!("{uri}:5-6"));
         // Structured read-only content: no hashline `[path#TAG]` snapshot header
         // and no tag field, because attachment reads never gate edit.
@@ -1792,11 +1751,11 @@ mod tests {
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["offset"], 49_990);
+        assert_eq!(parsed["range"], "49991-49995");
         assert_eq!(parsed["returned"], 5);
         assert_eq!(parsed["next"], format!("{uri}:49996-50000"));
-        assert!(parsed.get("total_lines").is_none());
-        assert_eq!(parsed["lines"][0], "line 49990 xxxxxxxxxxxxxxxxxxxx");
+        assert!(parsed["total"].is_null());
+        assert_eq!(parsed["items"][0], "line 49990 xxxxxxxxxxxxxxxxxxxx");
     }
 
     #[tokio::test(flavor = "current_thread")]

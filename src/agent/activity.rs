@@ -96,6 +96,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
     };
     match name {
         "explore" => text("task"),
+        "review" => text("task"),
         "read" => text("path").map(|path| {
             if is_url(&path) {
                 web_base_url(&path)
@@ -110,9 +111,8 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
         "copy" | "move" => Some(format!("{} -> {}", text("source")?, text("destination")?)),
         "import_attachment" => text("source"),
         "attachment_info" | "delete_attachment" => text("uri"),
-        "copy_attachment_to_workspace" => {
-            Some(format!("{} -> {}", text("uri")?, text("destination")?))
-        }
+        "checkout_attachment" => Some(format!("{} -> {}", text("uri")?, text("destination")?)),
+        "update_attachment" => Some(format!("{} <- {}", text("uri")?, text("source")?)),
         "move_many" => {
             let count = input.get("sources").and_then(Value::as_array)?.len();
             Some(format!(

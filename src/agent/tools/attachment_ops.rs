@@ -1,33 +1,37 @@
-//! Attachment tools: import, list, info, copy-to-workspace, and delete.
+//! Attachment tools: import, list, info, checkout, update, and delete.
 //!
 //! Attachments are mutable, application-managed files stored by
 //! [`crate::attachment::AttachmentStore`] under `Storage.attachments_dir`.
 //! Each attachment is one directory with a stable UUID identity and the
 //! canonical URI `nole://attachment/<uuid>`; importing the same bytes twice
 //! produces two distinct attachments. Attachment internals are private to the
-//! store: every tool here exchanges ids, canonical URIs, metadata, and bounded
-//! reads only, and tool results never print physical object paths. Deletion
-//! funnels through the shared usage-checked service in
-//! [`crate::attachment_usage`], never raw store removal, so an attachment
-//! still referenced by a managed note can never be deleted.
+//! store: every tool here exchanges ids, canonical URIs, metadata, bounded
+//! reads, and deterministic content tokens only, and tool results never print
+//! physical object paths. Editing an existing attachment is checkout
+//! (materialize a separate workspace copy plus its `sha256:<hex>` content
+//! token) followed by update (publish the edited copy back to the same
+//! identity after approval, refusing stale content). Deletion funnels through
+//! the shared usage-checked service in [`crate::attachment_usage`], never raw
+//! store removal, so an attachment still referenced by a managed note can
+//! never be deleted.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::util::{display_path, required_string};
-use super::workspace_quota::check_workspace_write;
+use super::util::{display_path, range_schema, required_string, RangeSelector};
+use super::workspace_quota::{check_workspace_write, MAX_WORKSPACE_FILE_BYTES};
 use crate::agent::{canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool};
 use crate::attachment::{
     escape_markdown_label, validate_display_name, AttachmentId, AttachmentMetadata,
-    AttachmentQuery, AttachmentStore, AttachmentUri,
+    AttachmentQuery, AttachmentStore, AttachmentUri, MAX_ATTACHMENT_SIZE,
 };
 use crate::attachment_usage::{AttachmentUsageHandle, TrashError, TrashResult};
 use crate::storage::Storage;
 
-const MAX_LIST_LIMIT: u64 = 200;
+const MAX_LIST_LIMIT: usize = 200;
 
 /// Build a store rooted at the given Nole root's attachments directory.
 fn store_for(root: &Path) -> Result<AttachmentStore> {
@@ -158,6 +162,58 @@ fn workspace_destination(root: &Path, input: &str) -> Result<PathBuf> {
     }
 }
 
+/// Resolve an update source under `workspace/main`: an existing regular file
+/// whose path never follows a symlink and never escapes the sandbox. Every
+/// component must exist and be a real directory (the final one a regular
+/// file); each step is canonicalized and re-checked against the workspace
+/// root so a symlinked parent can never redirect the read outside it.
+fn workspace_source(root: &Path, input: &str) -> Result<PathBuf> {
+    let workspace_main = Storage::new(root)?.agent_workspace_dir();
+    match fs::symlink_metadata(&workspace_main) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+        Ok(_) => bail!("workspace/main must be a real directory, not a symlink"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("workspace/main does not exist; check the attachment out first")
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking {}", workspace_main.display()));
+        }
+    }
+    let workspace_canonical = fs::canonicalize(&workspace_main)
+        .with_context(|| format!("resolving {}", workspace_main.display()))?;
+    let relative = Path::new(input);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("source must stay within workspace/main");
+    }
+    let mut current = workspace_canonical.clone();
+    for component in relative.components() {
+        let candidate = current.join(component);
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("checking {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("source must not contain symlinks: {input}");
+        }
+        current = fs::canonicalize(&candidate)
+            .with_context(|| format!("resolving {}", candidate.display()))?;
+        if !current.starts_with(&workspace_canonical) {
+            bail!("source escapes workspace/main: {input}");
+        }
+    }
+    let metadata = fs::symlink_metadata(&current)
+        .with_context(|| format!("checking {}", current.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("source must be an existing regular file, not a symlink or directory");
+    }
+    Ok(current)
+}
+
 pub struct ImportAttachment {
     root: PathBuf,
     store: AttachmentStore,
@@ -266,14 +322,7 @@ impl Tool for ListAttachments {
                     "type": "string",
                     "description": "Optional case-insensitive substring filter on display name and import source"
                 },
-                "offset": {
-                    "type": "integer", "minimum": 0, "default": 0,
-                    "description": "Number of matching attachments to skip"
-                },
-                "limit": {
-                    "type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "default": 50,
-                    "description": "Maximum number of matching attachments to return"
-                },
+                "range": range_schema(MAX_LIST_LIMIT),
                 "sort_by": {
                     "type": "string",
                     "enum": ["imported_at", "name", "size", "type"],
@@ -292,21 +341,32 @@ impl Tool for ListAttachments {
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
+        let selector = RangeSelector::from_input(input, MAX_LIST_LIMIT)?;
+        let mut query_input = input.clone();
+        let object = query_input
+            .as_object_mut()
+            .context("list_attachments input must be an object")?;
+        object.remove("range");
+        object.insert("offset".to_string(), json!(selector.start - 1));
+        object.insert(
+            "limit".to_string(),
+            json!(selector.end - selector.start + 1),
+        );
         let query: AttachmentQuery =
-            serde_json::from_value(input.clone()).context("invalid list_attachments parameters")?;
-        if query.limit == 0 || query.limit > MAX_LIST_LIMIT {
-            bail!("limit must be between 1 and {MAX_LIST_LIMIT}");
+            serde_json::from_value(query_input).context("invalid list_attachments parameters")?;
+        let store_page = self.store.list(&query)?;
+        let page = selector.window(usize::try_from(store_page.total).unwrap_or(usize::MAX));
+        let mut result = json!({
+            "range": selector.as_string(),
+            "returned": store_page.items.len(),
+            "total": store_page.total,
+            "has_more": store_page.has_more,
+            "items": store_page.items.iter().map(attachment_metadata_json).collect::<Vec<_>>(),
+        });
+        if let Some(next) = page.next() {
+            result["next"] = json!(next);
         }
-        let page = self.store.list(&query)?;
-        serde_json::to_string_pretty(&json!({
-            "count": page.items.len(),
-            "total": page.total,
-            "offset": page.offset,
-            "limit": page.limit,
-            "has_more": page.has_more,
-            "items": page.items.iter().map(attachment_metadata_json).collect::<Vec<_>>(),
-        }))
-        .context("encoding attachment list")
+        serde_json::to_string_pretty(&result).context("encoding attachment list")
     }
 }
 
@@ -355,12 +415,12 @@ impl Tool for AttachmentInfo {
     }
 }
 
-pub struct CopyAttachmentToWorkspace {
+pub struct CheckoutAttachment {
     root: PathBuf,
     store: AttachmentStore,
 }
 
-impl CopyAttachmentToWorkspace {
+impl CheckoutAttachment {
     pub fn new(root: &Path) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
@@ -371,13 +431,13 @@ impl CopyAttachmentToWorkspace {
 }
 
 #[async_trait::async_trait]
-impl Tool for CopyAttachmentToWorkspace {
+impl Tool for CheckoutAttachment {
     fn name(&self) -> &'static str {
-        "copy_attachment_to_workspace"
+        "checkout_attachment"
     }
 
     fn description(&self) -> &'static str {
-        "Copy an attachment's bytes into a NEW file under workspace/main (the Agent workspace sandbox), where the generic file tools may edit it. The copy is a separate file: editing or deleting it later never changes the original attachment, and importing the edited copy creates a new attachment. The destination is relative to workspace/main, must not already exist, and must respect the workspace size limits."
+        "Copy an attachment's bytes into a NEW file under workspace/main (the Agent workspace sandbox) so the generic file tools can edit them. Returns the workspace path, byte count, canonical URI, and the sha256:<hex> content token of the bytes checked out; pass that exact token to update_attachment to publish the edited file back to the SAME attachment. The copy is a separate file: editing or deleting it never changes the attachment until update_attachment is called, and importing it instead creates a new attachment. The destination is relative to workspace/main, must not already exist, and must respect the workspace size limits."
     }
 
     fn input_schema(&self) -> Value {
@@ -409,8 +469,12 @@ impl Tool for CopyAttachmentToWorkspace {
             .create_new(true)
             .open(&destination)
             .with_context(|| format!("creating destination {}", destination.display()))?;
-        let copied = match self.store.copy_to(uri.id(), &mut output) {
-            Ok(bytes) => bytes,
+        let (copied, token) = match self.store.copy_to_with_token_limited(
+            uri.id(),
+            &mut output,
+            MAX_WORKSPACE_FILE_BYTES,
+        ) {
+            Ok(result) => result,
             Err(error) => {
                 drop(output);
                 let _ = fs::remove_file(&destination);
@@ -422,8 +486,108 @@ impl Tool for CopyAttachmentToWorkspace {
             "path": display_path(&self.root, &destination),
             "bytes": copied,
             "uri": uri.to_string(),
+            "content_token": token,
         }))
-        .context("encoding copy result")
+        .context("encoding checkout result")
+    }
+}
+
+pub struct UpdateAttachment {
+    root: PathBuf,
+    store: AttachmentStore,
+    gate: ApprovalGate,
+}
+
+impl UpdateAttachment {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
+        let root = canonical_root(root)?;
+        Ok(Self {
+            store: store_for(&root)?,
+            root,
+            gate,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for UpdateAttachment {
+    fn name(&self) -> &'static str {
+        "update_attachment"
+    }
+
+    fn description(&self) -> &'static str {
+        "Atomically replace the content of an EXISTING attachment in place, preserving its canonical nole://attachment/<uuid> URI, display name, import source, and import time. The new bytes come from an existing file relative to workspace/main, typically obtained by checkout_attachment and edited with the generic file tools. Requires the expected_content_token returned by checkout_attachment: if the attachment's content changed since that checkout, the update is refused rather than overwriting newer content. Every existing note reference to the attachment observes the new content. Size and media type are re-derived from the new content."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "Canonical attachment URI (nole://attachment/<uuid>) or bare lowercase hyphenated UUID"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Existing file path relative to workspace/main containing the new content"
+                },
+                "expected_content_token": {
+                    "type": "string",
+                    "description": "The sha256:<hex> content token returned by checkout_attachment; the update is refused when the attachment's current content no longer matches it"
+                }
+            },
+            "required": ["uri", "source", "expected_content_token"], "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: &Value) -> Result<String> {
+        let reference = required_string(input, "uri")?;
+        let source_text = required_string(input, "source")?;
+        let expected_token = required_string(input, "expected_content_token")?;
+        let uri = resolve_attachment_uri(reference)?;
+        // Source safety and workspace/attachment limits are validated before
+        // any approval request; a refusal never asks the user.
+        let source = workspace_source(&self.root, source_text)?;
+        let source_len = fs::metadata(&source)
+            .with_context(|| format!("reading metadata for {}", source.display()))?
+            .len();
+        if source_len > MAX_WORKSPACE_FILE_BYTES {
+            bail!(
+                "source {} exceeds the 64 MiB workspace per-file limit",
+                source.display()
+            );
+        }
+        if source_len > MAX_ATTACHMENT_SIZE {
+            bail!(
+                "source {} exceeds the attachment {} byte limit",
+                source.display(),
+                MAX_ATTACHMENT_SIZE
+            );
+        }
+        let metadata = self.store.metadata(uri.id())?;
+        self.gate
+            .request(ApprovalRequest {
+                title: "Update attachment content".to_string(),
+                message: format!(
+                    "Replace the content of attachment {uri} ({}), {} bytes, with the {} bytes \
+                     from workspace/main/{source_text}? The attachment keeps its URI and identity, \
+                     so every existing note reference observes the updated content.",
+                    metadata.display_name, metadata.size, source_len
+                ),
+                kind: ApprovalKind::Confirm,
+            })
+            .await?;
+        let reader =
+            File::open(&source).with_context(|| format!("opening source {}", source.display()))?;
+        let (updated, token) = self.store.replace_content(
+            uri.id(),
+            expected_token,
+            reader,
+            MAX_WORKSPACE_FILE_BYTES,
+        )?;
+        let mut result = attachment_metadata_json(&updated);
+        result["content_token"] = json!(token);
+        serde_json::to_string_pretty(&result).context("encoding attachment metadata")
     }
 }
 
@@ -612,7 +776,10 @@ mod tests {
 
         let list = ListAttachments::new(&root).unwrap();
         let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(listed["count"], 2, "each import stores its own attachment");
+        assert_eq!(
+            listed["returned"], 2,
+            "each import stores its own attachment"
+        );
         assert_eq!(listed["total"], 2);
     }
 
@@ -762,7 +929,7 @@ mod tests {
         let (_outside, source) = outside_file("plan.pdf", b"%PDF-1.4 plan bytes");
         let import = ImportAttachment::new(&root).unwrap();
         let uri = import_source(&import, &source);
-        let copy = CopyAttachmentToWorkspace::new(&root).unwrap();
+        let copy = CheckoutAttachment::new(&root).unwrap();
 
         let result: Value = serde_json::from_str(
             &copy
@@ -825,6 +992,119 @@ mod tests {
     }
 
     #[test]
+    fn checkout_edit_and_update_preserve_identity_and_refuse_stale_content() {
+        let (_directory, root) = fresh_root();
+        let (_outside, source) = outside_file("draft.txt", b"original");
+        let import = ImportAttachment::new(&root).unwrap();
+        let uri = import_source(&import, &source);
+        let id = AttachmentUri::parse(&uri).unwrap().id();
+        let store = store_for(&root).unwrap();
+        let original = store.metadata(id).unwrap();
+
+        let checkout = CheckoutAttachment::new(&root).unwrap();
+        let checked_out: Value = serde_json::from_str(
+            &checkout
+                .execute(&json!({"uri": uri, "destination": "draft.txt"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let token = checked_out["content_token"].as_str().unwrap();
+        assert_eq!(
+            token,
+            "sha256:0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5"
+        );
+        fs::write(root.join("workspace/main/draft.txt"), b"agent edit").unwrap();
+
+        let update = UpdateAttachment::new(&root, bypass_gate()).unwrap();
+        let updated: Value = serde_json::from_str(
+            &update
+                .execute(&json!({
+                    "uri": uri,
+                    "source": "draft.txt",
+                    "expected_content_token": token,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let after = store.metadata(id).unwrap();
+        assert_eq!(updated["uri"], uri);
+        assert_eq!(after.id, original.id);
+        assert_eq!(after.display_name, original.display_name);
+        assert_eq!(after.source, original.source);
+        assert_eq!(after.imported_at, original.imported_at);
+        assert_eq!(fs::read(store.open(id).unwrap()).unwrap(), b"agent edit");
+        assert_ne!(updated["content_token"], token);
+
+        let current_token = updated["content_token"].as_str().unwrap();
+        fs::write(root.join("workspace/main/draft.txt"), b"stale overwrite").unwrap();
+        fs::write(store.open(id).unwrap(), b"concurrent user edit").unwrap();
+        let error = update
+            .execute(&json!({
+                "uri": uri,
+                "source": "draft.txt",
+                "expected_content_token": current_token,
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed since checkout"));
+        assert_eq!(
+            fs::read(store.open(id).unwrap()).unwrap(),
+            b"concurrent user edit"
+        );
+    }
+
+    #[test]
+    fn update_attachment_waits_for_approval_and_denial_preserves_content() {
+        let (_directory, root) = fresh_root();
+        let (_outside, source) = outside_file("keep.txt", b"original");
+        let import = ImportAttachment::new(&root).unwrap();
+        let uri = import_source(&import, &source);
+        let id = AttachmentUri::parse(&uri).unwrap().id();
+        let store = store_for(&root).unwrap();
+        let token = store.content_token(id).unwrap();
+        fs::write(root.join("workspace/main/keep.txt"), b"unapproved edit").unwrap();
+
+        let unsafe_update = UpdateAttachment::new(&root, bypass_gate()).unwrap();
+        assert!(unsafe_update
+            .execute(&json!({
+                "uri": uri.clone(),
+                "source": "../keep.txt",
+                "expected_content_token": token.clone(),
+            }))
+            .returns_err());
+        assert_eq!(fs::read(store.open(id).unwrap()).unwrap(), b"original");
+
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender,
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let update = UpdateAttachment::new(&root, gate).unwrap();
+        let worker = std::thread::spawn(move || {
+            test_runtime().block_on(update.execute(&json!({
+                "uri": uri,
+                "source": "keep.txt",
+                "expected_content_token": token,
+            })))
+        });
+        let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        assert_eq!(request.title, "Update attachment content");
+        assert!(request.message.contains("every existing note reference"));
+        decision_sender.send(ApprovalDecision::Deny).unwrap();
+        assert!(worker
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("denied"));
+        assert_eq!(fs::read(store.open(id).unwrap()).unwrap(), b"original");
+    }
+
+    #[test]
     fn list_attachments_paginates_filters_and_sorts() {
         let (_directory, root) = fresh_root();
         let import = ImportAttachment::new(&root).unwrap();
@@ -838,29 +1118,29 @@ mod tests {
         }
         let list = ListAttachments::new(&root).unwrap();
 
-        // Defaults: limit 50, imported_at desc.
+        // Defaults: range 1-50, imported_at desc.
         let all: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(all["count"], 3);
+        assert_eq!(all["range"], "1-50");
+        assert_eq!(all["returned"], 3);
         assert_eq!(all["total"], 3);
-        assert_eq!(all["limit"], 50);
         assert_eq!(all["has_more"], false);
 
         // Case-insensitive substring filter on display name.
         let filtered: Value =
             serde_json::from_str(&list.execute(&json!({"query": "ALP"})).unwrap()).unwrap();
-        assert_eq!(filtered["count"], 1);
+        assert_eq!(filtered["returned"], 1);
         assert_eq!(filtered["items"][0]["display_name"], "alpha.md");
 
-        // Limit and offset paginate; the first page reports has_more.
+        // Inclusive ranges paginate and return the next selector.
         let first_page: Value =
-            serde_json::from_str(&list.execute(&json!({"limit": 2})).unwrap()).unwrap();
-        assert_eq!(first_page["count"], 2);
+            serde_json::from_str(&list.execute(&json!({"range": "1-2"})).unwrap()).unwrap();
+        assert_eq!(first_page["returned"], 2);
         assert_eq!(first_page["total"], 3);
         assert_eq!(first_page["has_more"], true);
+        assert_eq!(first_page["next"], "3-4");
         let second_page: Value =
-            serde_json::from_str(&list.execute(&json!({"limit": 2, "offset": 2})).unwrap())
-                .unwrap();
-        assert_eq!(second_page["count"], 1);
+            serde_json::from_str(&list.execute(&json!({"range": "3-4"})).unwrap()).unwrap();
+        assert_eq!(second_page["returned"], 1);
         assert_eq!(second_page["has_more"], false);
 
         // Sort by name ascending.
@@ -876,10 +1156,8 @@ mod tests {
         // Invalid sort keys are refused.
         assert!(list.execute(&json!({"sort_by": "bogus"})).returns_err());
         assert!(list.execute(&json!({"order": "sideways"})).returns_err());
-        assert!(list.execute(&json!({"limit": 0})).returns_err());
-        assert!(list
-            .execute(&json!({"limit": MAX_LIST_LIMIT + 1}))
-            .returns_err());
+        assert!(list.execute(&json!({"range": "0-1"})).returns_err());
+        assert!(list.execute(&json!({"range": "1-201"})).returns_err());
     }
 
     #[test]
@@ -957,7 +1235,7 @@ mod tests {
         let list = ListAttachments::new(&root).unwrap();
         let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
         assert_eq!(
-            listed["count"], 0,
+            listed["returned"], 0,
             "deleted attachment must leave the store"
         );
         let trash = root.join("attachments/trash");
@@ -987,7 +1265,7 @@ mod tests {
         // The attachment is untouched and still listed.
         let list = ListAttachments::new(&root).unwrap();
         let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["returned"], 1);
     }
 
     #[test]
@@ -1001,6 +1279,6 @@ mod tests {
         assert!(message.contains("moved to trash"));
         let list = ListAttachments::new(&root).unwrap();
         let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(listed["count"], 0);
+        assert_eq!(listed["returned"], 0);
     }
 }
