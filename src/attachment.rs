@@ -1371,6 +1371,7 @@ mod tests {
         assert_eq!(derived.display_name, "report.md");
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_sources_are_rejected() {
         use std::os::unix::fs::symlink;
@@ -1393,7 +1394,6 @@ mod tests {
 
     #[test]
     fn store_inconsistency_is_rejected() {
-        use std::os::unix::fs::symlink;
         let (dir, store) = fresh();
         let import = |name: &str, content: &[u8]| -> AttachmentMetadata {
             let source = dir.path().join(name);
@@ -1418,13 +1418,17 @@ mod tests {
         json["id"] = serde_json::json!(AttachmentId::new().to_string());
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(store.lookup(c.id).is_err());
-        // Symlinked content entry.
-        let d = import("d.txt", b"data-d");
-        let decoy = dir.path().join("decoy");
-        fs::write(&decoy, b"data").unwrap();
-        fs::remove_file(store.content_path(&d)).unwrap();
-        symlink(&decoy, store.content_path(&d)).unwrap();
-        assert!(store.lookup(d.id).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // Symlinked content entry.
+            let d = import("d.txt", b"data-d");
+            let decoy = dir.path().join("decoy");
+            fs::write(&decoy, b"data").unwrap();
+            fs::remove_file(store.content_path(&d)).unwrap();
+            symlink(&decoy, store.content_path(&d)).unwrap();
+            assert!(store.lookup(d.id).is_err());
+        }
         // Unknown metadata field is rejected on read.
         let e = import("e.txt", b"data-e");
         let path = store.metadata_path(e.id);

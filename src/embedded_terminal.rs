@@ -580,6 +580,7 @@ fn function_sequence(number: u8, modifiers: KeyModifiers) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     use super::*;
