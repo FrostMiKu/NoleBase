@@ -22,7 +22,9 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use super::util::{display_path, range_schema, required_string, RangeSelector};
-use super::workspace_quota::{check_workspace_write, MAX_WORKSPACE_FILE_BYTES};
+use super::workspace_quota::{
+    check_workspace_write, workspace_destination, MAX_WORKSPACE_FILE_BYTES,
+};
 use crate::agent::{canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool};
 use crate::attachment::{
     escape_markdown_label, validate_display_name, AttachmentId, AttachmentMetadata,
@@ -101,65 +103,6 @@ fn attachment_metadata_json(metadata: &AttachmentMetadata) -> Value {
         "mime_type": metadata.mime_type,
         "imported_at": metadata.imported_at.to_rfc3339(),
     })
-}
-
-/// Resolve a copy destination under `workspace/main`, creating missing
-/// intermediate directories without ever following a symlink or escaping the
-/// sandbox. The final file must not already exist.
-fn workspace_destination(root: &Path, input: &str) -> Result<PathBuf> {
-    let workspace_main = Storage::new(root)?.agent_workspace_dir();
-    fs::create_dir_all(&workspace_main)
-        .with_context(|| format!("creating {}", workspace_main.display()))?;
-    let workspace_canonical = fs::canonicalize(&workspace_main)
-        .with_context(|| format!("resolving {}", workspace_main.display()))?;
-    let relative = Path::new(input);
-    if relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!("destination must stay within workspace/main");
-    }
-    let file_name = relative
-        .file_name()
-        .context("destination must name a file")?;
-    let mut current = workspace_canonical.clone();
-    for component in relative
-        .parent()
-        .map(Path::components)
-        .into_iter()
-        .flatten()
-    {
-        let candidate = current.join(component);
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                    bail!("destination parent must be a real directory, not a symlink");
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&candidate)
-                    .with_context(|| format!("creating directory {}", candidate.display()))?;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("checking {}", candidate.display()));
-            }
-        }
-        current = fs::canonicalize(&candidate)
-            .with_context(|| format!("resolving {}", candidate.display()))?;
-        if !current.starts_with(&workspace_canonical) {
-            bail!("destination escapes workspace/main");
-        }
-    }
-    let destination = current.join(file_name);
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => bail!("destination already exists: {input}"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(destination),
-        Err(error) => Err(error).with_context(|| format!("checking destination {input}")),
-    }
 }
 
 /// Resolve an update source under `workspace/main`: an existing regular file

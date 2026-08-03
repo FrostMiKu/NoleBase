@@ -9,7 +9,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -23,6 +23,63 @@ pub(crate) const MAX_WORKSPACE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// The `workspace/main` sandbox directory for a Nole root.
 pub(crate) fn workspace_dir(root: &Path) -> PathBuf {
     root.join(WORKSPACE_DIR).join(AGENT_WORKSPACE_SUBDIR)
+}
+
+/// Resolve a new destination relative to `workspace/main`, creating safe
+/// missing parents without following symlinks or escaping the sandbox.
+pub(crate) fn workspace_destination(root: &Path, input: &str) -> Result<PathBuf> {
+    let workspace = workspace_dir(root);
+    fs::create_dir_all(&workspace).with_context(|| format!("creating {}", workspace.display()))?;
+    let workspace = fs::canonicalize(&workspace)
+        .with_context(|| format!("resolving {}", workspace.display()))?;
+    let relative = Path::new(input);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("destination must stay within workspace/main");
+    }
+    let file_name = relative
+        .file_name()
+        .context("destination must name a file")?;
+    let mut current = workspace.clone();
+    for component in relative
+        .parent()
+        .map(Path::components)
+        .into_iter()
+        .flatten()
+    {
+        let candidate = current.join(component);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    bail!("destination parent must be a real directory, not a symlink");
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&candidate)
+                    .with_context(|| format!("creating directory {}", candidate.display()))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", candidate.display()));
+            }
+        }
+        current = fs::canonicalize(&candidate)
+            .with_context(|| format!("resolving {}", candidate.display()))?;
+        if !current.starts_with(&workspace) {
+            bail!("destination escapes workspace/main");
+        }
+    }
+    let destination = current.join(file_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => bail!("destination already exists: {input}"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(destination),
+        Err(error) => Err(error).with_context(|| format!("checking destination {input}")),
+    }
 }
 
 /// Total bytes currently stored under `workspace`, walking the tree without

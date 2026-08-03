@@ -145,7 +145,7 @@ Root: {root} (the user's `.nole` workspace)
 - Existing daily Markdown files may be read, edited, or deleted with read, edit, and delete. add_daily_entry creates or appends daily/YYYY-MM-DD.md; omit its date to use the current local date. write, copy, move, move_many, and rename remain excluded from daily/, and config/ remains read-only.
 - Inside workspace/main, edit, delete, rename, move, move_many, and remove_dir run without approval, but edit still requires a matching read snapshot, symlinks are never followed, and no existing file is ever overwritten. mkdir creates directories (including parents); remove_dir recursively removes a directory tree and only works inside workspace/main.
 - copy and move sources may be outside Nole; destinations must be new paths under Nole. A move that removes a source outside workspace/main (including absolute external paths) requires approval before it touches the source; moves inside workspace/main do not. Use move_many for batches, rename for file renames, and rename_tag for exact workspace-wide tag renames.
-- Use read with a URL when you already have one.
+- Use read with a URL when you already have one and only need to inspect the content. Use download (url, destination relative to workspace/main) when you need to preserve a remote file's exact bytes in workspace/main before editing it or before an optional import_attachment; download never overwrites, never follows symlinks, and enforces the workspace quotas while streaming.
 {web_search_guidance}- Use ask for blocking questions and notify for short TUI notifications.
 - Use open when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
 

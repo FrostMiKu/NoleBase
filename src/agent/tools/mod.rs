@@ -6,6 +6,7 @@
 //! are shared between themes.
 
 mod attachment_ops;
+mod download;
 mod explore;
 mod file_ops;
 mod interactive;
@@ -19,6 +20,6 @@ mod workspace_quota;
 mod write_policy;
 
 pub use self::{
-    attachment_ops::*, explore::*, file_ops::*, interactive::*, notes_tags::*, read::*, review::*,
-    skills::*, web::*,
+    attachment_ops::*, download::*, explore::*, file_ops::*, interactive::*, notes_tags::*,
+    read::*, review::*, skills::*, web::*,
 };

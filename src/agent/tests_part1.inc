@@ -723,6 +723,58 @@
     }
 
     #[test]
+    fn download_tool_is_registered_only_for_the_main_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(&storage.ai_config_path, TEST_MESSAGES_CONFIG).unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let registered = agent.tools.get("download").expect("download is registered");
+        assert_eq!(registered.execution_policy(), ToolExecutionPolicy::Network);
+        let definition = agent
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "download")
+            .expect("download has a model-facing definition");
+        let schema = &definition.input_schema;
+        let required = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(required, ["url", "destination"]);
+        assert!(schema["properties"]["url"]["minLength"].as_u64() == Some(1));
+        assert!(schema["properties"]["destination"]["minLength"].as_u64() == Some(1));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn system_prompt_guides_download_before_import_attachment() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
+        let download_bullet = prompt.find("download (url, destination relative to workspace/main)").unwrap();
+        let import_bullet = prompt.find("import_attachment copies").unwrap();
+        assert!(download_bullet < import_bullet);
+        assert!(prompt[download_bullet..].contains("workspace/main"));
+        assert!(prompt[download_bullet..].contains("never overwrites"));
+    }
+
+    #[test]
     fn system_prompt_describes_the_attachment_publish_and_edit_workflow() {
         let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
         assert!(prompt.contains("import_attachment"));
@@ -821,6 +873,19 @@
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
             "Failed Read: file not found\ndata/project notes.md:101-300"
+        );
+
+        let download = json!({
+            "name": "download",
+            "input": {"url": "https://example.com/blob.bin", "destination": "binaries/blob.bin"}
+        });
+        assert_eq!(
+            tool_start_activity(&download),
+            "Downloading...\nhttps://example.com/blob.bin -> binaries/blob.bin"
+        );
+        assert_eq!(
+            tool_finish_activity(&download, None),
+            "Completed Download.\nhttps://example.com/blob.bin -> binaries/blob.bin"
         );
     }
 

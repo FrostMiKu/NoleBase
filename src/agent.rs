@@ -550,6 +550,7 @@ impl Agent {
         }
         agent.register(LoadSkill::new(&skills));
         agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
+        agent.register(Download::new(nole_root, client.clone())?);
         agent.register(ListNotes::new(nole_root)?);
         agent.register(SearchContent::new(nole_root)?);
         agent.register(SearchFiles::new(nole_root)?);
