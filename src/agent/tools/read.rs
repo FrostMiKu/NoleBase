@@ -165,7 +165,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, and attachment URIs. Text, reader-mode URL output, and extracted PDF text accept an inclusive one-based `:start-end` selector; examples: `data/note.md:50-200`, `https://example.com/article:50-200`, `report.pdf:50-200`, and `nole://attachment/<uuid>:50-200`. PDFs use their ordinary path, URL, or attachment URI—there is no `pdf://` scheme. Editable text files return hashline rows, larger text and extracted documents return read-only structured pages, and binary attachments return metadata. Responses are capped at 1 MB and individual lines at 256 KiB."
+        "Read local files, directories, URLs, PDFs, and attachment URIs. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options."
     }
 
     fn input_schema(&self) -> Value {

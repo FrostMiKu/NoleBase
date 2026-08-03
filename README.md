@@ -364,9 +364,11 @@ or event stream, the complete provider request is replayed up to three bounded
 request attempts. The same policy covers the main Agent and isolated subagents.
 Partial streamed text and thinking are discarded before replay, while confirmed
 provider usage remains counted. The Agent header's `↑` and `↓` values are
-confirmed input and output tokens, `Cache` is the provider-reported prompt-cache
-read count and ratio, `t/s` excludes retry waiting time, and `R`/`Retry` reports
-attempts that required a retry.
+session-cumulative model input and output across the complete Agent tree.
+`Cache R/W/%` reports provider-confirmed cache reads, cache writes, and reads as
+a share of cacheable tokens (`read / (read + write)`). `t/s` covers only timed
+main-Agent streamed output, excluding retry waits and untimed subagent or
+non-streaming responses. `R`/`Retry` reports attempts that required a retry.
 To diagnose connection, DNS, TLS, timeout, or compatible-endpoint failures,
 start Nole with debug logging enabled and redirect standard error to a file:
 
@@ -392,11 +394,13 @@ the Agent does not know that web search is available.
 While the Agent is running, its panel border carries a moving color gradient
 and the current tool uses the same animated full-text color gradient. Messages
 API text is streamed into the current Agent entry and rendered as MBDown. The
-panel header shows request rounds plus session-cumulative input/output tokens,
-observed output throughput in `t/s`, and cache-read tokens with their share of
-total input tokens. Token and throughput statistics reset when the Agent session
-is cleared; the retry count covers the current application run. Multiple tool
-calls returned in one model response still count as one round.
+panel header shows request rounds, session-cumulative model input/output,
+timed main-stream throughput, and provider-confirmed cache reads, writes, and
+hit percentage. The statistics view labels model usage separately from visible
+conversation turns; only final replies count as Agent turns. Token and
+throughput statistics reset when the Agent session is cleared; the retry count
+covers the current application run. Multiple tool calls returned in one model
+response still count as one round.
 Consecutive read-only calls in one response execute as a concurrent wave. This
 includes local reads and searches, web search/fetch, and multiple `explore` or
 `review` subagents. Mutation, approval, and TUI interaction tools are exclusive
@@ -433,10 +437,12 @@ file content is unchanged; editing consumes the relevant snapshot, workspace
 file events invalidate only affected paths, a final content comparison catches
 missed events, and clearing the Agent session clears all remaining read state.
 Tool definitions are emitted in fixed registration order instead of hash-map
-iteration order. For the Messages protocol, the final tool definition and the
-stable, project-instruction, and memory system sections carry cache breakpoints,
-keeping the longest unchanged tools/system/conversation prefix eligible for
-prompt-cache reuse while the current timestamp stays in the newest user message.
+iteration order. Messages requests use four explicit prompt-cache breakpoints:
+the final tool, the stable base system block, the skill catalog after project
+instructions, and the final message content block. The moving message
+breakpoint makes the unchanged conversation prefix reusable while edits to
+MEMORY.md, skills, or project instructions can still fall back to an earlier
+stable prefix. The current timestamp remains in the newest user message.
 The Agent can inspect the same shared tag index with `list_tags` and
 `search_tag`. Its `rename_tag` tool shows a multi-file diff and follows the
 normal approval/bypass policy before changing exact Hashtag source spans.

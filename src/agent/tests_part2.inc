@@ -535,8 +535,8 @@
         assert!(prompt.contains("absolute one-based `N:text` rows"));
         assert!(prompt.contains("read again after each successful edit"));
         assert!(!prompt.contains("prevalidated"));
-        assert!(prompt.contains("workspace/main/: your private working sandbox"));
-        assert!(prompt.contains("proceeds without approval"));
+        assert!(prompt.contains("workspace/main/: private working sandbox"));
+        assert!(prompt.contains("run without approval"));
         assert!(prompt.contains("requires approval"));
         assert!(prompt.contains("nole://attachment/<uuid>"));
         assert!(prompt.contains("Use read with a URL when you already have one"));
@@ -581,6 +581,10 @@
         assert_eq!(first.len(), 4);
         assert_eq!(first[..3], second[..3]);
         assert_ne!(first[3], second[3]);
+        assert_eq!(
+            first.iter().map(|block| block.cache).collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
     }
 
     #[test]
@@ -660,9 +664,16 @@
         ] {
             assert!(!without_key.tools.contains_key(removed));
         }
-        assert!(without_key.system.last().unwrap().cache);
+        assert!(!without_key.system.last().unwrap().cache);
         assert_eq!(without_key.system.len(), 4);
-        assert!(without_key.system.iter().all(|block| block.cache));
+        assert_eq!(
+            without_key
+                .system
+                .iter()
+                .map(|block| block.cache)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
         assert!(without_key.definitions.last().unwrap().cache);
         for definition in &without_key.definitions {
             for detail in ["approval", "bypass", "prevalidated", "source spans", "Tavily"] {

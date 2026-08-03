@@ -39,7 +39,7 @@ impl Tool for Edit {
     }
 
     fn description(&self) -> &'static str {
-        "Edit an existing UTF-8 file under the Nole root outside config/ and attachments/ using a `[path#TAG]` snapshot from read and one-based line anchors. The tag must match the latest read snapshot, and only displayed ranges or adjacent insertion anchors may change. Edits inside workspace/main proceed directly; elsewhere the user is asked to confirm."
+        "Apply one or more line-based replacements or insertions to an existing UTF-8 file using the path and snapshot tag returned by read."
     }
 
     fn input_schema(&self) -> Value {
@@ -561,7 +561,7 @@ impl Tool for Copy {
     }
 
     fn description(&self) -> &'static str {
-        "Copy a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/, daily/, and attachments/."
+        "Copy an existing regular file to a new destination under the Nole root without overwriting."
     }
 
     fn input_schema(&self) -> Value {
@@ -601,7 +601,7 @@ impl Tool for Move {
     }
 
     fn description(&self) -> &'static str {
-        "Move a regular file from an absolute or Nole-relative source to a new path under the Nole root outside config/, daily/, and attachments/. Moving a source outside workspace/main asks the user to confirm first; moves inside workspace/main proceed directly."
+        "Move an existing regular file to a new destination under the Nole root without overwriting."
     }
 
     fn input_schema(&self) -> Value {
@@ -658,7 +658,7 @@ impl Tool for MoveMany {
     }
 
     fn description(&self) -> &'static str {
-        "Move multiple regular files from absolute or Nole-relative sources into one existing directory under the Nole root outside config/, daily/, and attachments/, preserving each basename. Each destination must be new. Moving sources outside workspace/main asks the user to confirm first; moves inside workspace/main proceed directly."
+        "Move multiple regular files into an existing directory under the Nole root, preserving their basenames and never overwriting."
     }
 
     fn input_schema(&self) -> Value {
@@ -842,7 +842,7 @@ impl Tool for Rename {
     }
 
     fn description(&self) -> &'static str {
-        "Rename one regular file under the Nole root outside config/, daily/, and attachments/ without changing its directory. The new name must be a basename and the destination must be new. Renames inside workspace/main proceed directly; elsewhere the user is asked to confirm."
+        "Rename a regular file without changing its directory or overwriting another path."
     }
 
     fn input_schema(&self) -> Value {
@@ -954,7 +954,7 @@ impl Tool for Delete {
     }
 
     fn description(&self) -> &'static str {
-        "Delete a regular file under the Nole root outside config/ and attachments/. Deletions inside workspace/main proceed directly; elsewhere the user is asked to confirm."
+        "Delete an existing regular file under the Nole root."
     }
 
     fn input_schema(&self) -> Value {
@@ -1026,7 +1026,7 @@ impl Tool for Write {
         "write"
     }
     fn description(&self) -> &'static str {
-        "Create a complete new UTF-8 text file under the Nole root outside config/, daily/, and attachments/. Existing paths are always refused; use read and edit to change an existing file. The complete candidate is validated before creation."
+        "Create a complete new UTF-8 text file without overwriting; use read and edit for existing files."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1139,7 +1139,7 @@ impl Tool for Mkdir {
     }
 
     fn description(&self) -> &'static str {
-        "Create a new directory under the Nole root, including any missing parents, outside config/, daily/, and attachments/. Refuses existing paths and never creates through symlinks."
+        "Create a new directory and any missing parents under the Nole root without following symlinks."
     }
 
     fn input_schema(&self) -> Value {
@@ -1186,7 +1186,7 @@ impl Tool for RemoveDir {
     }
 
     fn description(&self) -> &'static str {
-        "Recursively remove a directory tree (files and subdirectories) inside workspace/main, without asking the user. Refuses paths outside the Agent workspace and never removes through symlinks."
+        "Recursively remove a directory tree inside workspace/main without following symlinks."
     }
 
     fn input_schema(&self) -> Value {

@@ -92,7 +92,7 @@ fn report_provider_metrics(
             capacity: context_window_capacity,
         });
     }
-    if usage.output_tokens > 0 && (output_delta > 0 || !duration_delta.is_zero()) {
+    if output_delta > 0 && !duration_delta.is_zero() {
         let _ = events.send(AgentEvent::ResponseTiming {
             output_tokens: output_delta,
             elapsed: duration_delta,
@@ -513,10 +513,7 @@ impl Agent {
             &agents_instructions,
             &skills,
             &memory,
-        )
-        .into_iter()
-        .map(|text| SystemBlock { text, cache: true })
-        .collect();
+        );
         let provider: Arc<dyn Provider> = match config.api_format {
             ApiFormat::Messages => Arc::new(MessagesProvider::new(
                 config.api_key.clone(),
@@ -866,6 +863,10 @@ impl Agent {
         let mut output = observable.output;
         let mut reported_usage = TokenUsage::default();
         let mut reported_duration = Duration::ZERO;
+        let context_input_capacity = self
+            .config
+            .context_window_tokens
+            .saturating_sub(u64::from(self.config.max_tokens));
         let mut events_open = true;
         loop {
             tokio::select! {
@@ -887,7 +888,7 @@ impl Agent {
                                 &mut reported_duration,
                                 usage,
                                 generation_duration,
-                                self.config.context_window_tokens,
+                                context_input_capacity,
                             );
                         }
                         Ok(ProviderEvent::Retry) => {
@@ -918,7 +919,7 @@ impl Agent {
                                     &mut reported_duration,
                                     usage,
                                     generation_duration,
-                                    self.config.context_window_tokens,
+                                    context_input_capacity,
                                 );
                             }
                             ProviderEvent::Retry => {
@@ -933,7 +934,7 @@ impl Agent {
                             &mut reported_duration,
                             answer.token_usage,
                             answer.generation_duration,
-                            self.config.context_window_tokens,
+                            context_input_capacity,
                         );
                     }
                     return result;

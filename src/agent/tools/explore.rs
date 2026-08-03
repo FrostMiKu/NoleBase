@@ -65,7 +65,7 @@ impl Tool for Explore {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate broad, multi-step exploration, search, or research to an isolated read-only agent. Its internal tool calls and intermediate context stay private; this tool returns only a concise evidence-based report. Provide a focused, self-contained task and the exact questions the report must answer."
+        "Delegate broad, multi-step investigation to an isolated read-only agent that returns one concise, evidence-based report."
     }
 
     fn input_schema(&self) -> Value {

@@ -146,6 +146,35 @@
         assert_eq!(total.total_input(), 4_000);
         assert_eq!(total.output_tokens, 100);
         assert!(!total.is_empty());
+        assert!((total.cache_hit_percent().unwrap() - 71.428_571).abs() < 0.000_001);
+        assert_eq!(TokenUsage::default().cache_hit_percent(), None);
+    }
+
+    #[test]
+    fn untimed_provider_output_does_not_inflate_stream_throughput() {
+        let (events, mut receiver) = event_channel();
+        let mut reported_usage = TokenUsage::default();
+        let mut reported_duration = Duration::ZERO;
+
+        report_provider_metrics(
+            &events,
+            &mut reported_usage,
+            &mut reported_duration,
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            Duration::ZERO,
+            100,
+        );
+
+        let events = drain_events(&mut receiver);
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Usage(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ResponseTiming { .. })));
     }
 
     #[test]
@@ -1133,7 +1162,7 @@
             .any(|event| matches!(event, AgentEvent::Usage(usage) if usage.input_tokens == 7)));
         assert!(events[..first_text]
             .iter()
-            .any(|event| matches!(event, AgentEvent::ContextWindow { tokens: 7, capacity: 200_000 })));
+            .any(|event| matches!(event, AgentEvent::ContextWindow { tokens: 7, capacity: 191_808 })));
         assert!(events
             .iter()
             .any(|event| matches!(event, AgentEvent::AssistantDelta(delta) if delta == "world")));
@@ -1489,13 +1518,9 @@
         assert!(events.iter().any(
             |event| matches!(event, AgentEvent::Usage(usage) if usage.input_tokens == 13 && usage.cache_read_input_tokens == 9)
         ));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, AgentEvent::ResponseTiming { .. }))
-                .count(),
-            1
-        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ResponseTiming { .. })));
         assert_eq!(
             events
                 .iter()

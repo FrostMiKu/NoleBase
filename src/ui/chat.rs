@@ -772,6 +772,11 @@ mod tests {
                 streaming: false,
                 final_output: true,
             }),
+            Arc::new(AgentPanelEntry::Assistant {
+                text: "private interim text".to_string(),
+                streaming: false,
+                final_output: false,
+            }),
             Arc::new(AgentPanelEntry::Tool {
                 text: "Read data/Note.md".to_string(),
                 active: false,
@@ -799,6 +804,10 @@ mod tests {
         assert!(statistics.contains("Context"));
         assert!(statistics.contains("1k / 10k"));
         assert!(statistics.contains("20.0 t/s"));
+        assert!(statistics.contains("R 200 · W 0 · 100%"));
+        assert!(statistics.contains("Model in"));
+        assert!(statistics.contains("Model out"));
+        assert!(statistics.contains("Stream"));
         assert!(statistics.contains("1 user · 1 agent"));
         assert!(!statistics.contains("private prompt text"));
         assert!(!statistics.contains("private reply text"));

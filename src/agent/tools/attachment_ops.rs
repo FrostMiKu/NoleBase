@@ -236,7 +236,7 @@ impl Tool for ImportAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Import an existing regular file (absolute or Nole-relative path) into the attachment store. The source is copied and never modified. Every import creates a NEW mutable attachment with its own stable UUID identity, so importing the same content twice yields two distinct attachments. Returns the canonical nole://attachment/<uuid> URI plus a Markdown embed (images) or link (other files) for notes."
+        "Create a new attachment by copying an existing regular file; returns its canonical URI and a Markdown embed or link."
     }
 
     fn input_schema(&self) -> Value {
@@ -311,7 +311,7 @@ impl Tool for ListAttachments {
     }
 
     fn description(&self) -> &'static str {
-        "List stored attachments with metadata (canonical URI, display name, size, media type, import time), paginated, filtered, and sorted. Defaults to the 50 most recently imported. Attachment object paths are never exposed."
+        "List attachment metadata with optional filtering, sorting, and pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -390,7 +390,7 @@ impl Tool for AttachmentInfo {
     }
 
     fn description(&self) -> &'static str {
-        "Show metadata for one attachment (canonical URI, display name, size, media type, import time). Attachment object paths are never exposed."
+        "Show metadata for one attachment without exposing its storage path."
     }
 
     fn input_schema(&self) -> Value {
@@ -437,7 +437,7 @@ impl Tool for CheckoutAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Copy an attachment's bytes into a NEW file under workspace/main (the Agent workspace sandbox) so the generic file tools can edit them. Returns the workspace path, byte count, canonical URI, and the sha256:<hex> content token of the bytes checked out; pass that exact token to update_attachment to publish the edited file back to the SAME attachment. The copy is a separate file: editing or deleting it never changes the attachment until update_attachment is called, and importing it instead creates a new attachment. The destination is relative to workspace/main, must not already exist, and must respect the workspace size limits."
+        "Materialize an attachment as a new editable file in workspace/main; returns the content token required to publish changes to the same attachment."
     }
 
     fn input_schema(&self) -> Value {
@@ -516,7 +516,7 @@ impl Tool for UpdateAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Atomically replace the content of an EXISTING attachment in place, preserving its canonical nole://attachment/<uuid> URI, display name, import source, and import time. The new bytes come from an existing file relative to workspace/main, typically obtained by checkout_attachment and edited with the generic file tools. Requires the expected_content_token returned by checkout_attachment: if the attachment's content changed since that checkout, the update is refused rather than overwriting newer content. Every existing note reference to the attachment observes the new content. Size and media type are re-derived from the new content."
+        "Publish a workspace/main file over the same attachment using its checkout content token; atomically refuses stale content."
     }
 
     fn input_schema(&self) -> Value {

@@ -65,7 +65,7 @@ impl Tool for Review {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate independent critical evaluation of any supplied artifact or output to an isolated read-only agent. The task defines the review goals, constraints, standards, and concerns; the reviewer does not impose a preset domain checklist. Its internal tool calls and intermediate context stay private, and it returns only a concise, self-contained, evidence-based review without changing anything."
+        "Delegate task-scoped critical evaluation to an isolated read-only agent that returns one concise, evidence-based review without changing anything."
     }
 
     fn input_schema(&self) -> Value {

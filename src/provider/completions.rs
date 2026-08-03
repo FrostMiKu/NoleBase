@@ -191,7 +191,12 @@ impl CompletionsProvider {
                     .json()
                     .await
                     .context("decoding Completions response")?;
-                let answer = parse_response(value, started.elapsed())?;
+                let duration = if stream {
+                    Duration::ZERO
+                } else {
+                    started.elapsed()
+                };
+                let answer = parse_response(value, duration)?;
                 if let Some(events) = events {
                     for part in &answer.message.parts {
                         match part {
@@ -783,13 +788,16 @@ mod tests {
         assert!(!headers.to_ascii_lowercase().contains("authorization:"));
         assert_eq!(answer.text(), "Fallback response");
         assert_eq!(answer.stop_reason, StopReason::End);
+        assert_eq!(answer.generation_duration, Duration::ZERO);
         assert!(
             matches!(events.try_recv(), Ok(ProviderEvent::TextDelta(text)) if text == "Fallback response")
         );
         assert!(matches!(
             events.try_recv(),
-            Ok(ProviderEvent::Usage { usage, .. })
-                if usage.input_tokens == 4 && usage.output_tokens == 2
+            Ok(ProviderEvent::Usage {
+                usage,
+                generation_duration: Duration::ZERO
+            }) if usage.input_tokens == 4 && usage.output_tokens == 2
         ));
     }
     #[tokio::test(flavor = "current_thread")]

@@ -37,7 +37,10 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
         .filter(|entry| {
             matches!(
                 entry.as_ref(),
-                crate::agent_session::AgentPanelEntry::Assistant { .. }
+                crate::agent_session::AgentPanelEntry::Assistant {
+                    final_output: true,
+                    ..
+                }
             )
         })
         .count();
@@ -56,12 +59,9 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.agent_context_window as f64 * 100.0 / app.agent_context_capacity as f64
     };
-    let cache_rate = if app.agent_usage.total_input() == 0 {
-        0.0
-    } else {
-        app.agent_usage.cache_read_input_tokens as f64 * 100.0
-            / app.agent_usage.total_input() as f64
-    };
+    let cache_read = app.agent_usage.cache_read_input_tokens;
+    let cache_write = app.agent_usage.cache_creation_input_tokens;
+    let cache_rate = app.agent_usage.cache_hit_percent();
     let tps = if app.agent_response_duration.is_zero() {
         "--".to_string()
     } else {
@@ -84,17 +84,25 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let rows = [
         ("State", state.to_string()),
         ("Context", context),
-        ("Input", human_token_count(app.agent_usage.total_input())),
-        ("Output", human_token_count(app.agent_usage.output_tokens)),
+        ("Model in", human_token_count(app.agent_usage.total_input())),
+        (
+            "Model out",
+            human_token_count(app.agent_usage.output_tokens),
+        ),
         (
             "Cache",
-            format!(
-                "{}  {:.0}%",
-                human_token_count(app.agent_usage.cache_read_input_tokens),
-                cache_rate
+            cache_rate.map_or_else(
+                || "--".to_string(),
+                |rate| {
+                    format!(
+                        "R {} · W {} · {rate:.0}%",
+                        human_token_count(cache_read),
+                        human_token_count(cache_write)
+                    )
+                },
             ),
         ),
-        ("Speed", format!("{tps} t/s")),
+        ("Stream", format!("{tps} t/s")),
         ("Turns", format!("{prompts} user · {replies} agent")),
         ("Tools", tools.to_string()),
         (
@@ -755,13 +763,11 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
     }
     let input = human_token_count(app.agent_usage.total_input());
     let output = human_token_count(app.agent_usage.output_tokens);
-    let cache_read = human_token_count(app.agent_usage.cache_read_input_tokens);
-    let cache_rate = if app.agent_usage.total_input() == 0 {
-        0.0
-    } else {
-        app.agent_usage.cache_read_input_tokens as f64 * 100.0
-            / app.agent_usage.total_input() as f64
-    };
+    let cache_read_tokens = app.agent_usage.cache_read_input_tokens;
+    let cache_write_tokens = app.agent_usage.cache_creation_input_tokens;
+    let cache_read = human_token_count(cache_read_tokens);
+    let cache_write = human_token_count(cache_write_tokens);
+    let cache_rate = app.agent_usage.cache_hit_percent();
     let tps = if app.agent_response_duration.is_zero() {
         "--".to_string()
     } else {
@@ -771,8 +777,16 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
         )
     };
     let tokens = format!("↑{input} ↓{output}");
-    let full = format!("{tokens} · {tps} t/s · Cache {cache_read} {cache_rate:.0}%");
-    let compact = format!("{tokens} · {tps}t/s · C{cache_read} {cache_rate:.0}%");
+    let cache_full = cache_rate.map_or_else(
+        || "Cache --".to_string(),
+        |rate| format!("Cache R{cache_read} W{cache_write} {rate:.0}%"),
+    );
+    let cache_compact = cache_rate.map_or_else(
+        || "C--".to_string(),
+        |rate| format!("C{cache_read}/{cache_write} {rate:.0}%"),
+    );
+    let full = format!("{tokens} · {tps} t/s · {cache_full}");
+    let compact = format!("{tokens} · {tps}t/s · {cache_compact}");
     let candidates = if app.agent_retry_count > 0 {
         vec![
             format!("{full} · Retry {}", app.agent_retry_count),

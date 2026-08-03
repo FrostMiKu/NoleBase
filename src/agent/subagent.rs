@@ -134,7 +134,7 @@ impl SubagentRunner {
                 messages.push(Message::user(self.profile.final_round_prompt.clone()));
             }
             let response = self.request(&messages, final_round).await?;
-            self.report_usage(response.token_usage, response.generation_duration);
+            self.report_usage(response.token_usage);
             let calls = response.message.tool_calls().cloned().collect::<Vec<_>>();
             let text = response.text();
             messages.push(response.message);
@@ -284,15 +284,9 @@ impl SubagentRunner {
         Ok(())
     }
 
-    fn report_usage(&self, usage: TokenUsage, generation_duration: Duration) {
+    fn report_usage(&self, usage: TokenUsage) {
         if !usage.is_empty() {
             let _ = self.runtime.events.send(AgentEvent::Usage(usage));
-        }
-        if usage.output_tokens > 0 {
-            let _ = self.runtime.events.send(AgentEvent::ResponseTiming {
-                output_tokens: usage.output_tokens,
-                elapsed: generation_duration,
-            });
         }
     }
 }

@@ -181,7 +181,12 @@ impl MessagesProvider {
                     .json()
                     .await
                     .context("decoding Messages response")?;
-                let answer = parse_response(value, started.elapsed())?;
+                let duration = if stream {
+                    Duration::ZERO
+                } else {
+                    started.elapsed()
+                };
+                let answer = parse_response(value, duration)?;
                 if let Some(events) = events {
                     let text = answer.text();
                     if !text.is_empty() {
@@ -546,6 +551,21 @@ fn messages_wire(messages: &[Message]) -> Vec<Value> {
             output.push(json!({"role": role, "content": blocks}));
         }
     }
+    if let Some(block) = output
+        .iter_mut()
+        .rev()
+        .filter_map(|message| message.get_mut("content")?.as_array_mut())
+        .find_map(|content| {
+            content.iter_mut().rev().find(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
     output
 }
 
@@ -633,4 +653,101 @@ fn retry_delay(attempt: usize, headers: &reqwest::header::HeaderMap) -> Duration
     }
     let base = 500u64.saturating_mul(1u64 << attempt.min(3));
     Duration::from_millis(base.min(5_000))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::provider::{
+        Message, MessagePart, ProviderRequest, SystemBlock, ToolResult, ToolSpec,
+    };
+
+    fn cache_control_count(value: &Value) -> usize {
+        match value {
+            Value::Array(values) => values.iter().map(cache_control_count).sum(),
+            Value::Object(values) => {
+                usize::from(values.contains_key("cache_control"))
+                    + values.values().map(cache_control_count).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn request_uses_four_cache_breakpoints_and_caches_the_conversation_tail() {
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            max_tokens: 512,
+            system: vec![
+                SystemBlock {
+                    text: "base".to_string(),
+                    cache: true,
+                },
+                SystemBlock {
+                    text: "project".to_string(),
+                    cache: false,
+                },
+                SystemBlock {
+                    text: "skills".to_string(),
+                    cache: true,
+                },
+                SystemBlock {
+                    text: "memory".to_string(),
+                    cache: false,
+                },
+            ],
+            messages: vec![Message::user("first"), Message::user("latest")],
+            tools: vec![ToolSpec {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                input_schema: json!({"type": "object"}),
+                cache: true,
+            }],
+        };
+
+        let body = MessagesProvider::body(&request, true);
+        assert_eq!(cache_control_count(&body), 4);
+        let messages = body["messages"].as_array().unwrap();
+        let content = messages.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content[0].get("cache_control").is_none());
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn merged_tool_results_cache_only_the_last_content_block() {
+        let messages = messages_wire(&[
+            Message::tool(ToolResult {
+                tool_use_id: "one".to_string(),
+                content: "first".to_string(),
+                is_error: false,
+            }),
+            Message::tool(ToolResult {
+                tool_use_id: "two".to_string(),
+                content: "second".to_string(),
+                is_error: false,
+            }),
+        ]);
+
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content[0].get("cache_control").is_none());
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn conversation_cache_skips_an_uncacheable_thinking_tail() {
+        let messages = messages_wire(&[
+            Message::user("stable request"),
+            Message::assistant(vec![MessagePart::Thinking {
+                thinking: "private reasoning".to_string(),
+                signature: Some("signature".to_string()),
+            }]),
+        ]);
+
+        let user = messages[0]["content"].as_array().unwrap();
+        let assistant = messages[1]["content"].as_array().unwrap();
+        assert_eq!(user[0]["cache_control"]["type"], "ephemeral");
+        assert!(assistant[0].get("cache_control").is_none());
+    }
 }

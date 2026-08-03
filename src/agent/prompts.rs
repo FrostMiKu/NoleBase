@@ -4,7 +4,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Local};
 
-use crate::provider::{Message, MessagePart, MessageRole};
+use crate::provider::{Message, MessagePart, MessageRole, SystemBlock};
 use crate::skill::Skill;
 
 pub(crate) fn format_buffered_prompts(prompts: Vec<String>) -> String {
@@ -37,7 +37,7 @@ pub(crate) fn system_prompt_sections(
     agents_instructions: &str,
     skills: &[Skill],
     memory: &str,
-) -> Vec<String> {
+) -> Vec<SystemBlock> {
     let project_marker = "## Project instructions (config/AGENTS.md)";
     let memory_marker = "## Agent memory (MEMORY.md)";
     let template = system_prompt_text(root, has_web_search, "", "");
@@ -45,10 +45,22 @@ pub(crate) fn system_prompt_sections(
         .split_once(project_marker)
         .expect("system prompt contains the project-instructions section");
     vec![
-        base.trim_end().to_string(),
-        format!("{project_marker}\n{agents_instructions}"),
-        skill_catalog_prompt(skills),
-        format!("{memory_marker}\n{memory}"),
+        SystemBlock {
+            text: base.trim_end().to_string(),
+            cache: true,
+        },
+        SystemBlock {
+            text: format!("{project_marker}\n{agents_instructions}"),
+            cache: false,
+        },
+        SystemBlock {
+            text: skill_catalog_prompt(skills),
+            cache: true,
+        },
+        SystemBlock {
+            text: format!("{memory_marker}\n{memory}"),
+            cache: false,
+        },
     ]
 }
 
@@ -74,7 +86,11 @@ pub(crate) fn system_prompt(
     agents_instructions: &str,
     memory: &str,
 ) -> String {
-    system_prompt_sections(root, has_web_search, agents_instructions, &[], memory).join("\n\n")
+    system_prompt_sections(root, has_web_search, agents_instructions, &[], memory)
+        .into_iter()
+        .map(|block| block.text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn system_prompt_text(
@@ -106,8 +122,8 @@ Root: {root} (the user's `.nole` workspace)
 - data/: ordinary .md/.mb articles and notes; create them here by default.
 - daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read, edit, and delete tools as other text files.
 - archives/: regular Markdown files archived from data/.
-- workspace/main/: your private working sandbox for the current Agent session. Every file mutation inside it (write, edit, copy, move, move_many, rename, delete, mkdir, remove_dir) proceeds without approval; it persists across restarts and is rebuilt whenever the Agent session is cleared. checkout_attachment materializes attachments here as new editable files, and update_attachment publishes an edited file back to its original attachment.
-- attachments/: application-managed mutable attachment files, each stored as one directory with a stable UUID identity and the canonical URI `nole://attachment/<uuid>`. Never read, write, edit, copy, move, rename, or delete attachment internals through generic tools; use the dedicated attachment tools.
+- workspace/main/: private working sandbox for the current Agent session; it persists across restarts and is rebuilt when the Agent session is cleared.
+- attachments/: application-managed mutable files identified by stable `nole://attachment/<uuid>` URIs; their physical storage is private.
 - themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
 - template.mb: editable content used only by Create note from template; ordinary New note does not use it.
 - config/: application-managed configuration. You may inspect it read-only except config/ai.toml; never modify, move, copy, rename, or delete anything here.
