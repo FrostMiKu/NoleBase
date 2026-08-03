@@ -32,8 +32,11 @@ use anyhow::{Context, Result};
 use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    Event, KeyEventKind, MouseEventKind,
+};
+#[cfg(not(windows))]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -74,18 +77,24 @@ fn enter_tui() -> Result<()> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
-        // Request the kitty keyboard protocol on supporting terminals so that
-        // Shift+Enter / modified keys are reported distinctly (ignored by
-        // terminals that don't implement it).
+    )?;
+    // Crossterm's Windows event backend always uses the legacy Windows API,
+    // where kitty keyboard progressive enhancement is unsupported. Windows
+    // still receives normal key events; only modified-key disambiguation is
+    // unavailable there.
+    #[cfg(not(windows))]
+    execute!(
+        io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
     Ok(())
 }
 
 fn leave_tui() -> Result<()> {
+    #[cfg(not(windows))]
+    execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
     execute!(
         io::stdout(),
-        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         Show,
