@@ -59,9 +59,6 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.agent_context_window as f64 * 100.0 / app.agent_context_capacity as f64
     };
-    let cache_read = app.agent_usage.cache_read_input_tokens;
-    let cache_write = app.agent_usage.cache_creation_input_tokens;
-    let cache_rate = app.agent_usage.cache_read_percent();
     let tps = if app.agent_response_duration.is_zero() {
         "--".to_string()
     } else {
@@ -86,21 +83,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
         ("Context", context),
         ("Input", human_token_count(app.agent_usage.total_input())),
         ("Output", human_token_count(app.agent_usage.output_tokens)),
-        (
-            "Cache",
-            cache_rate.map_or_else(
-                || "--".to_string(),
-                |rate| {
-                    let write = (cache_write > 0)
-                        .then(|| format!(" · W {}", human_token_count(cache_write)));
-                    format!(
-                        "R {}{} · {rate:.0}% input",
-                        human_token_count(cache_read),
-                        write.as_deref().unwrap_or("")
-                    )
-                },
-            ),
-        ),
+        ("Cache", cache_usage_summary(app.agent_usage)),
         ("Stream", format!("{tps} t/s")),
         ("Turns", format!("{prompts} user · {replies} agent")),
         ("Tools", tools.to_string()),
@@ -762,11 +745,7 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
     }
     let input = human_token_count(app.agent_usage.total_input());
     let output = human_token_count(app.agent_usage.output_tokens);
-    let cache_read_tokens = app.agent_usage.cache_read_input_tokens;
-    let cache_write_tokens = app.agent_usage.cache_creation_input_tokens;
-    let cache_read = human_token_count(cache_read_tokens);
-    let cache_write = human_token_count(cache_write_tokens);
-    let cache_rate = app.agent_usage.cache_read_percent();
+    let cache = cache_usage_summary(app.agent_usage);
     let tps = if app.agent_response_duration.is_zero() {
         "--".to_string()
     } else {
@@ -776,22 +755,9 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
         )
     };
     let tokens = format!("↑{input} ↓{output}");
-    let cache_full = cache_rate.map_or_else(
-        || "Cache --".to_string(),
-        |rate| match cache_write_tokens {
-            0 => format!("Cache R{cache_read} {rate:.0}%"),
-            _ => format!("Cache R{cache_read} W{cache_write} {rate:.0}%"),
-        },
-    );
-    let cache_compact = cache_rate.map_or_else(
-        || "C--".to_string(),
-        |rate| match cache_write_tokens {
-            0 => format!("C{cache_read} {rate:.0}%"),
-            _ => format!("C{cache_read}/{cache_write} {rate:.0}%"),
-        },
-    );
+    let cache_full = format!("Cache {cache}");
     let full = format!("{tokens} · {tps} t/s · {cache_full}");
-    let compact = format!("{tokens} · {tps}t/s · {cache_compact}");
+    let compact = format!("↑{input}↓{output}·{tps}t/s·{cache_full}");
     let candidates = if app.agent_retry_count > 0 {
         vec![
             format!("{full} · Retry {}", app.agent_retry_count),
@@ -810,6 +776,18 @@ pub(super) fn agent_stats_line(app: &App, width: u16) -> Option<Line<'static>> {
         text,
         Style::default().fg(app.theme.text_subtle),
     )))
+}
+
+fn cache_usage_summary(usage: crate::agent_session::TokenUsage) -> String {
+    usage.cache_read_percent().map_or_else(
+        || "--".to_string(),
+        |rate| {
+            format!(
+                "{}/{rate:.1}%",
+                human_token_count(usage.cache_read_input_tokens)
+            )
+        },
+    )
 }
 
 pub(super) fn human_token_count(tokens: u64) -> String {

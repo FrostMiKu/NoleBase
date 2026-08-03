@@ -7,6 +7,7 @@ mod attachment;
 mod attachment_index;
 mod attachment_usage;
 mod backend;
+mod document_index;
 mod embedded_terminal;
 mod markdown;
 mod media;
@@ -44,9 +45,8 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use app::{App, Command};
-use attachment_index::AttachmentIndexer;
 use backend::FrameBackend;
-use workspace_index::WorkspaceIndexer;
+use document_index::DocumentIndexer;
 
 type Tui = Terminal<FrameBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
@@ -193,7 +193,7 @@ fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
 ///   (settings.toml for the theme selection, and AGENTS.md for agent read
 ///   caches). The directory is registered rather than the settings file
 ///   alone so atomic-rename saves by external editors are still observed;
-/// - `attachments/` — per-attachment directories (`<uuid>/content` and
+/// - `attachments/` — per-attachment directories (`<uuid>/content.<ext>` and
 ///   `<uuid>/metadata.json`); events refresh mutable externally edited
 ///   attachment metadata in the browser.
 ///
@@ -329,19 +329,15 @@ fn run(
     terminal: &mut Tui,
     app: &mut App,
     workspace_events: &WatchEvents,
-    workspace_indexer: &WorkspaceIndexer,
-    attachment_indexer: &AttachmentIndexer,
+    document_indexer: &DocumentIndexer,
 ) -> Result<()> {
     let animation_epoch = Instant::now();
     loop {
         let indexed_paths = process_workspace_events(workspace_events, app);
-        workspace_indexer.paths_changed(indexed_paths.clone());
-        attachment_indexer.paths_changed(indexed_paths);
-        if let Some(index) = workspace_indexer.try_latest_update() {
-            app.apply_workspace_index(index);
-        }
-        if let Some((revision, index)) = attachment_indexer.try_latest_update() {
-            app.apply_attachment_index(revision, index);
+        document_indexer.paths_changed(indexed_paths);
+        if let Some(snapshot) = document_indexer.try_latest_update() {
+            app.apply_workspace_index(snapshot.workspace);
+            app.apply_attachment_index(snapshot.revision, snapshot.attachments);
         }
         app.poll_agent();
         app.poll_terminal();
@@ -458,8 +454,7 @@ fn main() -> Result<()> {
     let storage = resolve_storage()?;
     storage.ensure_files()?;
     let (_watcher, workspace_events) = watch_workspace(&storage)?;
-    let workspace_indexer = WorkspaceIndexer::spawn(storage.clone());
-    let attachment_indexer = AttachmentIndexer::spawn(storage.clone());
+    let document_indexer = DocumentIndexer::spawn(storage.clone());
     let mut app = App::new(storage)?;
 
     enter_tui()?;
@@ -476,8 +471,7 @@ fn main() -> Result<()> {
         &mut terminal,
         &mut app,
         &workspace_events,
-        &workspace_indexer,
-        &attachment_indexer,
+        &document_indexer,
     )
     .context("event loop failed")?;
     Ok(())
@@ -667,7 +661,7 @@ mod tests {
     #[test]
     fn watch_workspace_registers_managed_content_only() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = storage::Storage::new(directory.path()).unwrap();
+        let storage = storage::Storage::new(fs::canonicalize(directory.path()).unwrap()).unwrap();
         storage.ensure_files().unwrap();
 
         // One stored attachment in the per-attachment directory layout.

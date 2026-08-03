@@ -70,6 +70,8 @@ pub(in crate::ui) const SELECT_OPTION_HEIGHT: u16 = 2;
 /// Minimum rows reserved for the agent panel header so its statistics line
 /// stays visible when the workspace view list grows past the panel.
 pub(in crate::ui) const MIN_AGENT_HEADER_ROWS: u16 = 3;
+pub(in crate::ui) const WORKSPACE_VIEW_SPACED_HEIGHT: u16 = 3;
+pub(in crate::ui) const WORKSPACE_VIEW_COMPACT_HEIGHT: u16 = 2;
 
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
 /// position without changing the terminal's hardware cursor.
@@ -171,10 +173,25 @@ fn draw_wide_workspace(
     draw_right_sidebar(frame, app, sidebar, interactive);
 }
 
-fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
-    let views_height = selection_list_height(WorkspaceView::ALL.len() as u16, 3)
+fn workspace_views_height(area_height: u16) -> u16 {
+    let maximum = area_height.saturating_sub(MIN_AGENT_HEADER_ROWS);
+    let spacious = selection_list_height(
+        WorkspaceView::ALL.len() as u16,
+        WORKSPACE_VIEW_SPACED_HEIGHT,
+    )
+    .saturating_add(2);
+    let item_height = if spacious <= maximum {
+        WORKSPACE_VIEW_SPACED_HEIGHT
+    } else {
+        WORKSPACE_VIEW_COMPACT_HEIGHT
+    };
+    selection_list_height(WorkspaceView::ALL.len() as u16, item_height)
         .saturating_add(2)
-        .min(area.height.saturating_sub(MIN_AGENT_HEADER_ROWS));
+        .min(maximum)
+}
+
+fn draw_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect, interactive: bool) {
+    let views_height = workspace_views_height(area.height);
     let agent = Rect::new(
         area.x,
         area.y,

@@ -1826,7 +1826,7 @@ mod tests {
             .path()
             .join(ATTACHMENTS_DIR)
             .join(metadata.id.to_string())
-            .join("content");
+            .join("content.txt");
         assert!(object.exists());
         let read = Read::new(
             directory.path(),

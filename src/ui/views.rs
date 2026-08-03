@@ -24,12 +24,21 @@ pub(super) fn draw_workspace_views(
     let focused = app.focus == Focus::Views;
     let selection_visible =
         focused || app.center_view.sidebar_selection() == SidebarSelection::Views;
+    let item_height = if selection_list_height(
+        WorkspaceView::ALL.len() as u16,
+        WORKSPACE_VIEW_SPACED_HEIGHT,
+    ) <= inner.height
+    {
+        WORKSPACE_VIEW_SPACED_HEIGHT
+    } else {
+        WORKSPACE_VIEW_COMPACT_HEIGHT
+    };
     let mut y = inner.y.saturating_add(1);
     for (index, view) in WorkspaceView::ALL.iter().enumerate() {
         if y >= inner.y.saturating_add(inner.height) {
             break;
         }
-        let layout_height = 3.min(inner.y + inner.height - y);
+        let layout_height = item_height.min(inner.y + inner.height - y);
         let active = view.center_view == app.center_view;
         let item_selected = selection_visible && index == selected;
         let row_style = if item_selected {

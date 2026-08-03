@@ -11,11 +11,9 @@
 //! renderer itself does not turn them into attachment links.
 //!
 //! Per URI the index preserves the total occurrence count and the distinct
-//! set of referencing managed notes. The indexer rebuilds once at startup and
-//! refreshes incrementally from file watcher events via
-//! [`AttachmentIndexer::paths_changed`], publishing every snapshot together
-//! with the revision of the last applied change batch so consumers can detect
-//! stale snapshots (see [`AttachmentIndexer::try_latest_update`]).
+//! set of referencing managed notes. The shared document indexer rebuilds at
+//! startup (reusing its validated cache when possible), then refreshes from
+//! watcher events and publishes snapshots with the last applied revision.
 //!
 //! The index stores URIs as plain strings keyed on the canonical form produced
 //! by [`AttachmentUri`]'s `Display`: the attachment store owns the typed
@@ -23,16 +21,17 @@
 //! attachment abstraction while still giving the browser and delete guard
 //! exact canonical URIs to compare against.
 
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use mbdown::{Container, Event, InlineTag, Node, SpannedEvent};
 
 use crate::attachment::AttachmentUri;
+#[cfg(test)]
+use crate::document_index;
+use crate::document_index::DocumentIndex;
 use crate::storage::Storage;
 
 /// Aggregate reference data for one canonical attachment URI.
@@ -54,27 +53,27 @@ pub struct AttachmentReferenceIndex {
 }
 
 impl AttachmentReferenceIndex {
-    /// Scan every managed Markdown/MBDown file and index its attachment URIs.
-    pub fn build(storage: &Storage) -> Self {
-        let mut index = Self::default();
-        for directory in [&storage.daily_dir, &storage.data_dir, &storage.archives_dir] {
-            let Ok(entries) = fs::read_dir(directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some((path, uris)) = index_file(storage, &path) {
-                    index.files.insert(path, uris);
-                }
-            }
-        }
+    pub(crate) fn from_documents(documents: &DocumentIndex) -> Self {
+        let files = documents
+            .iter()
+            .map(|(path, document)| (path.clone(), document.attachment_uris.clone()))
+            .collect();
+        let mut index = Self {
+            files,
+            references: HashMap::new(),
+        };
         index.rebuild_references();
         index
+    }
+    /// Scan every managed Markdown/MBDown file and index its attachment URIs.
+    pub fn build(storage: &Storage) -> Self {
+        Self::from_documents(&DocumentIndex::build(storage))
     }
 
     /// Re-index the given paths (created, modified, or removed). Paths that are
     /// not managed Markdown files are ignored, so watcher events for the
     /// attachments and workspace directories never disturb the index.
+    #[cfg(test)]
     pub fn refresh_paths(&mut self, storage: &Storage, paths: &[PathBuf]) {
         let mut unique = paths.iter().cloned().collect::<HashSet<_>>();
         let mut changed = false;
@@ -82,8 +81,8 @@ impl AttachmentReferenceIndex {
             if self.files.remove(&path).is_some() {
                 changed = true;
             }
-            if let Some((path, uris)) = index_file(storage, &path) {
-                self.files.insert(path, uris);
+            if let Some(document) = document_index::index_file(storage, &path) {
+                self.files.insert(path, document.attachment_uris);
                 changed = true;
             }
         }
@@ -132,164 +131,23 @@ impl AttachmentReferenceIndex {
     }
 }
 
-/// Background worker that keeps an [`AttachmentReferenceIndex`] fresh from
-/// file watcher events, mirroring the workspace indexer's revision protocol.
-pub struct AttachmentIndexer {
-    commands: Sender<IndexCommand>,
-    updates: Receiver<(u64, AttachmentReferenceIndex)>,
-    requested_revision: Cell<u64>,
-}
-
-enum IndexCommand {
-    PathsChanged { revision: u64, paths: Vec<PathBuf> },
-    Stop,
-}
-
-impl AttachmentIndexer {
-    /// Spawn the worker and return immediately. The initial snapshot is
-    /// published on the update channel before any `paths_changed` call.
-    pub fn spawn(storage: Storage) -> Self {
-        let (command_sender, command_receiver) = mpsc::channel();
-        let (update_sender, update_receiver) = mpsc::channel();
-        thread::spawn(move || index_worker(storage, command_receiver, update_sender));
-        Self {
-            commands: command_sender,
-            updates: update_receiver,
-            requested_revision: Cell::new(0),
-        }
-    }
-
-    /// Queue changed paths for incremental re-indexing.
-    pub fn paths_changed(&self, paths: Vec<PathBuf>) {
-        if !paths.is_empty() {
-            let revision = self.requested_revision.get().saturating_add(1);
-            if self
-                .commands
-                .send(IndexCommand::PathsChanged { revision, paths })
-                .is_ok()
-            {
-                self.requested_revision.set(revision);
-            }
-        }
-    }
-
-    /// Drain the update channel and return the newest snapshot at or after the
-    /// last requested revision, paired with the revision of the last applied
-    /// change batch (0 for the initial build). Consumers use the revision to
-    /// reject actions based on stale index state.
-    pub fn try_latest_update(&self) -> Option<(u64, AttachmentReferenceIndex)> {
-        let requested = self.requested_revision.get();
-        self.updates
-            .try_iter()
-            .filter(|(revision, _)| *revision >= requested)
-            .last()
-    }
-}
-
-impl Drop for AttachmentIndexer {
-    fn drop(&mut self) {
-        let _ = self.commands.send(IndexCommand::Stop);
-    }
-}
-
-fn index_worker(
-    storage: Storage,
-    commands: Receiver<IndexCommand>,
-    updates: Sender<(u64, AttachmentReferenceIndex)>,
-) {
-    let mut index = AttachmentReferenceIndex::build(&storage);
-    let mut revision = 0;
-    if !apply_pending_commands(&storage, &commands, &mut index, &mut revision) {
-        return;
-    }
-    if updates.send((revision, index.clone())).is_err() {
-        return;
-    }
-
-    while let Ok(command) = commands.recv() {
-        match command {
-            IndexCommand::PathsChanged {
-                revision: changed_revision,
-                paths,
-            } => {
-                revision = revision.max(changed_revision);
-                index.refresh_paths(&storage, &paths);
-                if !apply_pending_commands(&storage, &commands, &mut index, &mut revision) {
-                    return;
-                }
-                if updates.send((revision, index.clone())).is_err() {
-                    return;
-                }
-            }
-            IndexCommand::Stop => return,
-        }
-    }
-}
-
-fn apply_pending_commands(
-    storage: &Storage,
-    commands: &Receiver<IndexCommand>,
-    index: &mut AttachmentReferenceIndex,
-    revision: &mut u64,
-) -> bool {
-    let mut paths = Vec::new();
-    for command in commands.try_iter() {
-        match command {
-            IndexCommand::PathsChanged {
-                revision: changed_revision,
-                paths: changed,
-            } => {
-                *revision = (*revision).max(changed_revision);
-                paths.extend(changed);
-            }
-            IndexCommand::Stop => return false,
-        }
-    }
-    index.refresh_paths(storage, &paths);
-    true
-}
-
-/// A managed Markdown/MBDown file inside daily/, data/, or archives/.
-fn index_file(storage: &Storage, path: &Path) -> Option<(PathBuf, Vec<String>)> {
-    if !is_managed_markdown(storage, path) {
-        return None;
-    }
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let source = fs::read_to_string(path).ok()?;
-    Some((path.to_path_buf(), find_attachment_uris(&source)))
-}
-
-fn is_managed_markdown(storage: &Storage, path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        return false;
-    };
-    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("mb") {
-        return false;
-    }
-    matches!(
-        path.parent(),
-        Some(parent)
-            if parent == storage.daily_dir
-                || parent == storage.data_dir
-                || parent == storage.archives_dir
-    )
-}
-
 /// Every canonical attachment URI in `text` that the MBDown renderer would
 /// render as an attachment reference, in source order, including duplicates:
 /// Markdown link destinations (including autolinks and reference-style links),
 /// image destinations, MBDown embeds, and `[link=...]` tag targets. URIs
 /// inside code, HTML comments, escaped text, or plain prose never produce
 /// those events and are therefore not references.
+#[cfg(test)]
 pub fn find_attachment_uris(text: &str) -> Vec<String> {
-    let mut uris = Vec::new();
     let Ok(document) = mbdown::parse(text) else {
-        return uris;
+        return Vec::new();
     };
-    collect_node_attachment_uris(document.nodes(), &mut uris);
+    collect_attachment_uris(document.nodes())
+}
+
+pub(crate) fn collect_attachment_uris(nodes: &[Node<'_>]) -> Vec<String> {
+    let mut uris = Vec::new();
+    collect_node_attachment_uris(nodes, &mut uris);
     uris
 }
 
@@ -340,6 +198,7 @@ fn push_canonical_attachment_uri(target: &str, uris: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn storage_with(directory: &tempfile::TempDir) -> Storage {
         let storage = Storage::new(directory.path()).unwrap();
@@ -529,75 +388,5 @@ mod tests {
             1,
             "attachments md must not count"
         );
-    }
-
-    #[test]
-    fn worker_publishes_incremental_updates_with_revisions() {
-        use std::time::Duration;
-
-        let directory = tempfile::tempdir().unwrap();
-        let storage = storage_with(&directory);
-        let indexer = AttachmentIndexer::spawn(storage.clone());
-        let (initial_revision, initial) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(initial_revision, 0, "initial build publishes revision 0");
-        let a = uri(1);
-        assert_eq!(initial.reference_count(&a), 0);
-
-        let note = storage.data_dir.join("Live.md");
-        fs::write(&note, format!("[a]({a})\n")).unwrap();
-        indexer.paths_changed(vec![note.clone()]);
-        let (revision, created) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(revision, 1);
-        assert_eq!(created.reference_count(&a), 1);
-
-        fs::write(&note, "cleared\n").unwrap();
-        indexer.paths_changed(vec![note.clone()]);
-        let (_, modified) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(modified.reference_count(&a), 0);
-
-        fs::remove_file(&note).unwrap();
-        indexer.paths_changed(vec![note]);
-        let (_, deleted) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert!(!deleted.is_referenced(&a));
-    }
-
-    #[test]
-    fn try_latest_update_returns_revisioned_snapshot_and_discards_stale() {
-        let (command_sender, _command_receiver) = mpsc::channel();
-        let (update_sender, update_receiver) = mpsc::channel();
-        let indexer = AttachmentIndexer {
-            commands: command_sender,
-            updates: update_receiver,
-            requested_revision: Cell::new(1),
-        };
-        let a = uri(1);
-        let mut fresh = AttachmentReferenceIndex::default();
-        fresh
-            .files
-            .insert(PathBuf::from("Note.md"), vec![a.clone()]);
-        fresh.rebuild_references();
-        assert_eq!(fresh.reference_count(&a), 1);
-
-        // A snapshot queued before the requested revision is discarded.
-        update_sender
-            .send((0, AttachmentReferenceIndex::default()))
-            .unwrap();
-        update_sender.send((1, fresh.clone())).unwrap();
-        let (revision, update) = indexer.try_latest_update().unwrap();
-        assert_eq!(revision, 1);
-        assert_eq!(update.reference_count(&a), fresh.reference_count(&a));
-        assert_eq!(update.locations(&a), fresh.locations(&a));
     }
 }

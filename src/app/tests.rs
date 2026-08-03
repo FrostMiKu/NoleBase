@@ -1040,6 +1040,39 @@ fn thinking_events_build_and_finish_thinking_entries() {
 }
 
 #[test]
+fn cancelling_agent_finishes_streaming_thinking_entry() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ThinkingDelta("Still reasoning".to_string()))
+        .unwrap();
+    app.poll_agent();
+    assert!(matches!(
+        app.agent_panel.last().map(|entry| entry.as_ref()),
+        Some(AgentPanelEntry::Thinking {
+            streaming: true,
+            ..
+        })
+    ));
+
+    app.cancel_agent();
+
+    assert!(!app.ai_running);
+    assert!(app.agent_panel.iter().all(|entry| !matches!(
+        entry.as_ref(),
+        AgentPanelEntry::Thinking {
+            streaming: true,
+            ..
+        }
+    )));
+    assert!(matches!(
+        app.agent_panel.last().map(|entry| entry.as_ref()),
+        Some(AgentPanelEntry::Error(text)) if text == "Cancelled"
+    ));
+}
+
+#[test]
 fn ordinary_text_stays_an_assistant_message() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
@@ -1682,10 +1715,10 @@ fn workspace_view_registry_drives_sidebar_selection() {
         [
             ("Agent", "AI conversation", CenterView::Chat),
             ("TODO", "Tasks", CenterView::Todo),
-            ("Tag", "Browse tags", CenterView::Tags),
             ("Search", "Find notes", CenterView::Search),
-            ("Daily", "Daily notes", CenterView::Daily),
+            ("Tag", "Browse tags", CenterView::Tags),
             ("Attachment", "Browse attachments", CenterView::Attachments),
+            ("Daily", "Daily notes", CenterView::Daily),
         ]
     );
 
@@ -2658,6 +2691,10 @@ fn attachment_link_clicks_open_the_real_managed_file() {
     // web opener.
     assert_eq!(fs::read(&path).unwrap(), b"attachment payload");
     assert!(path.starts_with(app.storage.attachments_dir));
+    assert_eq!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("pdf")
+    );
 }
 
 #[test]
@@ -3043,6 +3080,10 @@ fn opening_attachment_opens_the_real_managed_file() {
     // the attachment bytes live there, no workspace/cache copy is written.
     assert_eq!(fs::read(&path).unwrap(), b"pdf-bytes");
     assert!(path.starts_with(app.storage.attachments_dir));
+    assert_eq!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("pdf")
+    );
     assert_eq!(
         fs::canonicalize(&path).unwrap(),
         fs::canonicalize(app.attachment_store.open(id).unwrap()).unwrap()

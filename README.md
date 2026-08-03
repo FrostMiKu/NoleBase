@@ -249,6 +249,7 @@ data/          # flat note storage
   <name>.md
   <name>.mb
 attachments/   # mutable UUID-addressed managed attachments and trash
+cache/         # disposable validated index snapshots; safe to delete
 workspace/
   main/         # Agent-owned scratch files; preserved across restarts
 ```

@@ -307,24 +307,24 @@ impl WorkspaceView {
             description: "Tasks",
         },
         Self {
-            center_view: CenterView::Tags,
-            label: "Tag",
-            description: "Browse tags",
-        },
-        Self {
             center_view: CenterView::Search,
             label: "Search",
             description: "Find notes",
         },
         Self {
-            center_view: CenterView::Daily,
-            label: "Daily",
-            description: "Daily notes",
+            center_view: CenterView::Tags,
+            label: "Tag",
+            description: "Browse tags",
         },
         Self {
             center_view: CenterView::Attachments,
             label: "Attachment",
             description: "Browse attachments",
+        },
+        Self {
+            center_view: CenterView::Daily,
+            label: "Daily",
+            description: "Daily notes",
         },
     ];
 

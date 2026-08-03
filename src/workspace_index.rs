@@ -1,16 +1,16 @@
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use mbdown::{Event, Node};
 
+use crate::document_index::{
+    self, DocumentGroup as FileGroup, DocumentIndex, IndexedDocument, IndexedLine,
+};
 use crate::model::SearchHit;
 use crate::storage::Storage;
 
@@ -27,21 +27,6 @@ struct IndexedFile {
     group: FileGroup,
     modified: SystemTime,
     lines: Vec<IndexedLine>,
-}
-
-#[derive(Clone, Debug)]
-struct IndexedLine {
-    line_no: usize,
-    text: String,
-    lowercase: String,
-    tags: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum FileGroup {
-    Daily,
-    Notes,
-    Archives,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -142,6 +127,28 @@ impl WorkspaceIndex {
     #[cfg(test)]
     pub(crate) fn build(storage: &Storage) -> Self {
         build_index(storage)
+    }
+
+    pub(crate) fn from_documents(documents: &DocumentIndex) -> Self {
+        let files = documents
+            .iter()
+            .map(|(path, document)| {
+                (
+                    path.clone(),
+                    IndexedFile {
+                        group: document.group,
+                        modified: document.modified(),
+                        lines: document.lines.clone(),
+                    },
+                )
+            })
+            .collect();
+        let mut index = Self {
+            files,
+            tags: HashMap::new(),
+        };
+        index.rebuild_tags();
+        index
     }
 
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
@@ -434,119 +441,9 @@ impl TagRenamePlan {
     }
 }
 
-pub struct WorkspaceIndexer {
-    commands: Sender<IndexCommand>,
-    updates: Receiver<(u64, WorkspaceIndex)>,
-    requested_revision: Cell<u64>,
-}
-
-enum IndexCommand {
-    PathsChanged { revision: u64, paths: Vec<PathBuf> },
-    Stop,
-}
-
-impl WorkspaceIndexer {
-    pub fn spawn(storage: Storage) -> Self {
-        let (command_sender, command_receiver) = mpsc::channel();
-        let (update_sender, update_receiver) = mpsc::channel();
-        thread::spawn(move || index_worker(storage, command_receiver, update_sender));
-        Self {
-            commands: command_sender,
-            updates: update_receiver,
-            requested_revision: Cell::new(0),
-        }
-    }
-
-    pub fn paths_changed(&self, paths: Vec<PathBuf>) {
-        if !paths.is_empty() {
-            let revision = self.requested_revision.get().saturating_add(1);
-            if self
-                .commands
-                .send(IndexCommand::PathsChanged { revision, paths })
-                .is_ok()
-            {
-                self.requested_revision.set(revision);
-            }
-        }
-    }
-
-    pub fn try_latest_update(&self) -> Option<WorkspaceIndex> {
-        let requested = self.requested_revision.get();
-        self.updates
-            .try_iter()
-            .filter(|(revision, _)| *revision >= requested)
-            .map(|(_, index)| index)
-            .last()
-    }
-}
-
-impl Drop for WorkspaceIndexer {
-    fn drop(&mut self) {
-        let _ = self.commands.send(IndexCommand::Stop);
-    }
-}
-
-fn index_worker(
-    storage: Storage,
-    commands: Receiver<IndexCommand>,
-    updates: Sender<(u64, WorkspaceIndex)>,
-) {
-    let mut index = build_index(&storage);
-    let mut revision = 0;
-    if !apply_pending_commands(&storage, &commands, &mut index, &mut revision) {
-        return;
-    }
-    if updates.send((revision, index.clone())).is_err() {
-        return;
-    }
-
-    while let Ok(command) = commands.recv() {
-        match command {
-            IndexCommand::PathsChanged {
-                revision: changed_revision,
-                paths,
-            } => {
-                revision = revision.max(changed_revision);
-                apply_paths(&storage, &mut index, paths);
-                if !apply_pending_commands(&storage, &commands, &mut index, &mut revision) {
-                    return;
-                }
-                if updates.send((revision, index.clone())).is_err() {
-                    return;
-                }
-            }
-            IndexCommand::Stop => return,
-        }
-    }
-}
-
-fn apply_pending_commands(
-    storage: &Storage,
-    commands: &Receiver<IndexCommand>,
-    index: &mut WorkspaceIndex,
-    revision: &mut u64,
-) -> bool {
-    let mut paths = Vec::new();
-    for command in commands.try_iter() {
-        match command {
-            IndexCommand::PathsChanged {
-                revision: changed_revision,
-                paths: changed,
-            } => {
-                *revision = (*revision).max(changed_revision);
-                paths.extend(changed);
-            }
-            IndexCommand::Stop => return false,
-        }
-    }
-    apply_paths(storage, index, paths);
-    true
-}
-
 fn apply_paths(storage: &Storage, index: &mut WorkspaceIndex, paths: Vec<PathBuf>) {
-    let mut unique = paths.into_iter().collect::<HashSet<_>>();
     let mut changed = false;
-    for path in unique.drain() {
+    for path in paths.into_iter().collect::<HashSet<_>>() {
         if file_group(storage, &path).is_some() {
             index.replace_path(storage, &path);
             changed = true;
@@ -556,56 +453,24 @@ fn apply_paths(storage: &Storage, index: &mut WorkspaceIndex, paths: Vec<PathBuf
         index.rebuild_tags();
     }
 }
-
+#[cfg(test)]
 fn build_index(storage: &Storage) -> WorkspaceIndex {
-    let mut index = WorkspaceIndex::default();
-    for directory in [&storage.daily_dir, &storage.data_dir, &storage.archives_dir] {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(file) = index_file(storage, &path) {
-                index.files.insert(path, file);
-            }
-        }
-    }
-    index.rebuild_tags();
-    index
+    WorkspaceIndex::from_documents(&DocumentIndex::build(storage))
 }
 
 fn index_file(storage: &Storage, path: &Path) -> Option<IndexedFile> {
-    let group = file_group(storage, path)?;
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let source = fs::read_to_string(path).ok()?;
-    let mut tags_by_line: HashMap<usize, Vec<String>> = HashMap::new();
-    if let Ok(document) = mbdown::parse(&source) {
-        collect_document_tags(document.nodes(), &source, &mut tags_by_line);
-    }
-    let lines = source
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let text = line.trim();
-            (!text.is_empty()).then(|| IndexedLine {
-                line_no: index + 1,
-                text: text.to_string(),
-                lowercase: text.to_lowercase(),
-                tags: tags_by_line.remove(&(index + 1)).unwrap_or_default(),
-            })
-        })
-        .collect();
-    Some(IndexedFile {
-        group,
-        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
-        lines,
-    })
+    document_index::index_file(storage, path).map(indexed_file)
 }
 
-fn collect_document_tags(
+fn indexed_file(document: IndexedDocument) -> IndexedFile {
+    IndexedFile {
+        group: document.group,
+        modified: document.modified(),
+        lines: document.lines,
+    }
+}
+
+pub(crate) fn collect_document_tags(
     nodes: &[Node<'_>],
     source: &str,
     tags_by_line: &mut HashMap<usize, Vec<String>>,
@@ -696,16 +561,7 @@ fn replace_tag_spans(source: &str, spans: &[Range<usize>], tag: &str) -> String 
 }
 
 fn file_group(storage: &Storage, path: &Path) -> Option<FileGroup> {
-    let extension = path.extension()?.to_str()?;
-    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("mb") {
-        return None;
-    }
-    match path.parent() {
-        Some(parent) if parent == storage.daily_dir => Some(FileGroup::Daily),
-        Some(parent) if parent == storage.data_dir => Some(FileGroup::Notes),
-        Some(parent) if parent == storage.archives_dir => Some(FileGroup::Archives),
-        _ => None,
-    }
+    document_index::document_group(storage, path)
 }
 
 fn exact_tag_query(query: &str) -> Option<String> {
@@ -720,7 +576,7 @@ fn normalize_tag(tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn index_orders_groups_and_supports_exact_unicode_tags() {
@@ -799,71 +655,6 @@ mod tests {
             build_index(&storage).search("#layout").as_slice(),
             [SearchHit::FileLine { path: hit_path, line_no: 3, .. }] if hit_path == &path
         ));
-    }
-
-    #[test]
-    fn worker_publishes_incremental_create_modify_and_delete() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::new(directory.path()).unwrap();
-        storage.ensure_files().unwrap();
-        let indexer = WorkspaceIndexer::spawn(storage.clone());
-        let (_, initial) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert!(initial.search("needle").is_empty());
-
-        let path = storage.data_dir.join("Live.md");
-        fs::write(&path, "first needle #one\n").unwrap();
-        indexer.paths_changed(vec![path.clone()]);
-        let (_, created) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert_eq!(created.search("needle").len(), 1);
-        assert_eq!(created.tags()[0].name, "one");
-
-        fs::write(&path, "second value #two\n").unwrap();
-        indexer.paths_changed(vec![path.clone()]);
-        let (_, modified) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert!(modified.search("needle").is_empty());
-        assert_eq!(modified.tags()[0].name, "two");
-
-        fs::remove_file(&path).unwrap();
-        indexer.paths_changed(vec![path]);
-        let (_, deleted) = indexer
-            .updates
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert!(deleted.search("value").is_empty());
-        assert!(deleted.tags().is_empty());
-    }
-
-    #[test]
-    fn requested_revision_discards_a_queued_stale_snapshot() {
-        let (command_sender, _command_receiver) = mpsc::channel();
-        let (update_sender, update_receiver) = mpsc::channel();
-        let indexer = WorkspaceIndexer {
-            commands: command_sender,
-            updates: update_receiver,
-            requested_revision: Cell::new(1),
-        };
-        update_sender.send((0, WorkspaceIndex::default())).unwrap();
-        let mut fresh = WorkspaceIndex::default();
-        fresh.tags.insert(
-            "fresh".to_string(),
-            TagEntry {
-                display: "fresh".to_string(),
-                occurrences: Vec::new(),
-            },
-        );
-        update_sender.send((1, fresh)).unwrap();
-
-        let latest = indexer.try_latest_update().unwrap();
-        assert!(latest.tags.contains_key("fresh"));
     }
 
     #[test]

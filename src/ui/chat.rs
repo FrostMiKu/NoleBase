@@ -804,8 +804,9 @@ mod tests {
         assert!(statistics.contains("Context"));
         assert!(statistics.contains("1k / 10k"));
         assert!(statistics.contains("20.0 t/s"));
-        assert!(statistics.contains("R 200 · 20% input"));
-        assert!(!statistics.contains("W 0"));
+        assert!(statistics.contains("200/20.0%"));
+        assert!(!statistics.contains("R 200"));
+        assert!(!statistics.contains("W "));
         assert!(statistics.contains("Input"));
         assert!(statistics.contains("Output"));
         assert!(statistics.contains("Stream"));

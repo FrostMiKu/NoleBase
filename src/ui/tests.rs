@@ -248,9 +248,11 @@ fn agent_header_shows_rounds_usage_stream_speed_and_cache_reads() {
     let screen = buffer_string(&terminal);
     assert!(screen.contains("Agent · ↻3/25"));
     assert!(screen.contains("Ctx 6.8k/200k"));
-    assert!(screen.contains("↑3.5k ↓1.2k"));
+    assert!(screen.contains("↑3.5k↓1.2k"));
     assert!(screen.contains("617.0t/s"));
-    assert!(screen.contains("C2k/1k 57%"));
+    assert!(screen.contains("Cache 2k/57.1%"));
+    assert!(!screen.contains("Cache R"));
+    assert!(!screen.contains("Cache 2k/1k"));
     assert!(screen.contains("R2"));
 }
 
@@ -386,13 +388,7 @@ fn wide_layout_uses_terminal_edges_and_center_content_axis() {
         assert_eq!(files, Rect::new(0, 0, FILES_WIDTH, 23), "width {width}");
         assert_eq!(views.width, RIGHT_SIDEBAR_WIDTH, "width {width}");
         assert_eq!(views.x + views.width, width, "width {width}");
-        assert_eq!(
-            views.height,
-            selection_list_height(WorkspaceView::ALL.len() as u16, 3)
-                .saturating_add(2)
-                .min(23 - MIN_AGENT_HEADER_ROWS),
-            "width {width}"
-        );
+        assert_eq!(views.height, workspace_views_height(23), "width {width}");
         assert_eq!(agent.y, 0, "width {width}");
         assert_eq!(views.y, agent.y + agent.height, "width {width}");
         assert_eq!(agent.height, 23 - views.height, "width {width}");
@@ -417,28 +413,45 @@ fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
     let views = app.layout.views.expect("views panel");
 
     assert_eq!(app.workspace_view_hitboxes.len(), WorkspaceView::ALL.len());
-    for view in WorkspaceView::ALL {
-        assert!(screen.contains(view.label));
-    }
+    assert_eq!(
+        app.workspace_view_hitboxes
+            .iter()
+            .map(|hitbox| hitbox.index)
+            .collect::<Vec<_>>(),
+        (0..WorkspaceView::ALL.len()).collect::<Vec<_>>()
+    );
+    assert!(app
+        .workspace_view_hitboxes
+        .windows(2)
+        .all(|pair| pair[0].area.y < pair[1].area.y));
     assert!(app
         .workspace_view_hitboxes
         .iter()
         .all(|hitbox| contains(views, hitbox.area)));
     let daily_index = WorkspaceView::index_of(CenterView::Daily).unwrap();
-    let daily = app.workspace_view_hitboxes[daily_index].area;
+    let daily = app
+        .workspace_view_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == daily_index)
+        .unwrap()
+        .area;
     let buffer = terminal.backend().buffer();
-    for y in daily.y.saturating_sub(1)..=daily.y + daily.height {
+    for y in daily.y.saturating_sub(1)..daily.y + daily.height {
         assert_eq!(buffer[(daily.x, y)].symbol(), "▌");
         assert_eq!(buffer[(daily.x, y)].bg, app.theme.selection_background);
     }
     assert!(screen.contains("Daily notes"));
-    assert!(screen.contains("AI conversation"));
     assert!(screen.contains("Tasks"));
     assert!(screen.contains("Browse tags"));
     assert!(screen.contains("Find notes"));
 
     let todo_index = WorkspaceView::index_of(CenterView::Todo).unwrap();
-    let todo = app.workspace_view_hitboxes[todo_index].area;
+    let todo = app
+        .workspace_view_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == todo_index)
+        .unwrap()
+        .area;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: todo.x,
@@ -447,6 +460,13 @@ fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
     });
     assert_eq!(app.center_view, CenterView::Todo);
     assert_eq!(app.focus, Focus::Center);
+
+    app.focus = Focus::Views;
+    app.workspace_view_index = WorkspaceView::index_of(CenterView::Chat).unwrap();
+    let terminal = render(&mut app, 170, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Agent"));
+    assert!(screen.contains("AI conversation"));
 }
 
 #[test]
@@ -465,7 +485,12 @@ fn center_view_interface_assigns_the_visible_sidebar_cursor() {
         .expect("project file")
         .area;
     let daily_index = WorkspaceView::index_of(CenterView::Daily).unwrap();
-    let daily_view = app.workspace_view_hitboxes[daily_index].area;
+    let daily_view = app
+        .workspace_view_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == daily_index)
+        .unwrap()
+        .area;
     assert_ne!(
         daily.backend().buffer()[(daily_file.x, daily_file.y)].symbol(),
         "▌"
@@ -495,7 +520,7 @@ fn center_view_interface_assigns_the_visible_sidebar_cursor() {
         .find(|hitbox| hitbox.path == path)
         .expect("project file")
         .area;
-    let document_view = app.workspace_view_hitboxes[2].area;
+    let document_view = app.workspace_view_hitboxes.first().unwrap().area;
     assert_eq!(
         document.backend().buffer()[(document_file.x, document_file.y)].symbol(),
         "▌"

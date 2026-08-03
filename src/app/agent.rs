@@ -683,8 +683,10 @@ impl App {
             self.overlay = None;
         }
         for entry in &mut self.agent_panel {
-            if let AgentPanelEntry::Assistant { streaming, .. } = Arc::make_mut(entry) {
-                *streaming = false;
+            match Arc::make_mut(entry) {
+                AgentPanelEntry::Assistant { streaming, .. }
+                | AgentPanelEntry::Thinking { streaming, .. } => *streaming = false,
+                _ => {}
             }
         }
         self.deactivate_agent_tools();

@@ -11,9 +11,9 @@
 //! `Storage.attachments_dir`. Each attachment is exactly one directory so a
 //! trash operation is a single atomic directory rename:
 //!
-//! - `<uuid>/`              one directory per attachment
-//! - `<uuid>/content`       the attachment bytes (the real app-managed file)
-//! - `<uuid>/metadata.json` JSON metadata (display name, provenance, MIME)
+//! - `<uuid>/`                  one directory per attachment
+//! - `<uuid>/content.<ext>`     attachment bytes, retaining the display extension
+//! - `<uuid>/metadata.json`     JSON metadata (display name, provenance, MIME)
 //! - `trash/`               attachment directories moved by `remove`
 //!
 //! Imports stream the source into a uniquely named staging directory under
@@ -289,8 +289,11 @@ pub struct AttachmentStore {
     trash_dir: PathBuf,
 }
 
-/// Name of the content file inside each attachment directory.
-const CONTENT_FILE: &str = "content";
+/// Prefix of the content file inside each attachment directory. A safe,
+/// bounded display-name extension is appended so system openers select the
+/// expected application instead of treating every attachment as plain text.
+const CONTENT_FILE_PREFIX: &str = "content";
+const MAX_CONTENT_EXTENSION_BYTES: usize = 32;
 /// Name of the metadata file inside each attachment directory.
 const METADATA_FILE: &str = "metadata.json";
 /// Directory under the root that holds trashed attachment directories.
@@ -403,7 +406,7 @@ impl AttachmentStore {
             let mut content = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&staged.join(CONTENT_FILE))
+                .open(&staged.join(content_file_name(&display_name)))
                 .with_context(|| format!("creating staging content {}", staged.display()))?;
             let mut sniff = Vec::with_capacity(MIME_SNIFF_BYTES.min(4096));
             let mut buffer = [0u8; STREAM_BUFFER];
@@ -480,15 +483,7 @@ impl AttachmentStore {
         if !dir_present {
             return Ok(None);
         }
-        let content_present = match fs::symlink_metadata(&self.content_path(id)) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("checking {}", self.content_path(id).display()));
-            }
-        };
-        let metadata_present = match fs::symlink_metadata(&self.metadata_path(id)) {
+        let metadata_present = match fs::symlink_metadata(self.metadata_path(id)) {
             Ok(_) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => {
@@ -496,14 +491,21 @@ impl AttachmentStore {
                     .with_context(|| format!("checking {}", self.metadata_path(id).display()));
             }
         };
-        match (content_present, metadata_present) {
-            (false, false) => Ok(None),
-            (true, true) => Ok(Some(
+        if metadata_present {
+            return Ok(Some(
                 self.load_metadata(id)
                     .context("attachment store inconsistent")?,
-            )),
-            _ => bail!("attachment store inconsistent: content and metadata out of sync for {id}"),
+            ));
         }
+        let has_entries = fs::read_dir(&dir)
+            .with_context(|| format!("listing {}", dir.display()))?
+            .next()
+            .transpose()?
+            .is_some();
+        if has_entries {
+            bail!("attachment store inconsistent: content and metadata out of sync for {id}");
+        }
+        Ok(None)
     }
 
     /// Stored metadata for `id`, erroring when the attachment is absent.
@@ -517,8 +519,8 @@ impl AttachmentStore {
     /// Verifies consistency, regularity, and the size limit before returning
     /// the path.
     pub fn open(&self, id: AttachmentId) -> Result<PathBuf> {
-        let _ = self.metadata(id)?;
-        Ok(self.content_path(id))
+        let metadata = self.metadata(id)?;
+        Ok(self.content_path(&metadata))
     }
 
     /// Stream the content of `id` into `writer`, enforcing
@@ -552,8 +554,8 @@ impl AttachmentStore {
         limit: u64,
     ) -> Result<(u64, String)> {
         // Validates existence, consistency, and the size limit up front.
-        let _ = self.metadata(id)?;
-        let path = self.content_path(id);
+        let metadata = self.metadata(id)?;
+        let path = self.content_path(&metadata);
         let mut file =
             File::open(&path).with_context(|| format!("opening content {}", path.display()))?;
         let mut hasher = Sha256::new();
@@ -587,8 +589,8 @@ impl AttachmentStore {
     /// in-place update publishes: a token that no longer matches means the
     /// content changed since it was checked out.
     pub fn content_token(&self, id: AttachmentId) -> Result<String> {
-        let _ = self.metadata(id)?;
-        let path = self.content_path(id);
+        let metadata = self.metadata(id)?;
+        let path = self.content_path(&metadata);
         let mut file =
             File::open(&path).with_context(|| format!("opening content {}", path.display()))?;
         Ok(hash_stream(&mut file, MAX_ATTACHMENT_SIZE)?.1)
@@ -611,7 +613,8 @@ impl AttachmentStore {
         limit: u64,
     ) -> Result<(AttachmentMetadata, String)> {
         // Validates existence, consistency, and the live size limit up front.
-        let _ = self.metadata(id)?;
+        let metadata = self.metadata(id)?;
+        let content_path = self.content_path(&metadata);
         let dir = self.attachment_dir(id);
         let staged = dir.join(staging_name());
         let publish = (|| {
@@ -650,10 +653,10 @@ impl AttachmentStore {
                     "attachment content changed since checkout: expected {expected_content_token}, found {current_token}"
                 );
             }
-            atomic_replace(&staged, &self.content_path(id)).with_context(|| {
+            atomic_replace(&staged, &content_path).with_context(|| {
                 format!(
                     "publishing content {} for attachment {id}",
-                    self.content_path(id).display()
+                    content_path.display()
                 )
             })?;
             let metadata = self.metadata(id)?;
@@ -679,7 +682,7 @@ impl AttachmentStore {
                 max_bytes
             );
         }
-        let path = self.content_path(id);
+        let path = self.content_path(&metadata);
         fs::read(&path).with_context(|| format!("reading content {}", path.display()))
     }
 
@@ -858,7 +861,7 @@ impl AttachmentStore {
                 id
             );
         }
-        let content_path = self.content_path(id);
+        let content_path = self.content_path(&metadata);
         let content_meta = fs::symlink_metadata(&content_path)
             .with_context(|| format!("checking content {}", content_path.display()))?;
         if content_meta.file_type().is_symlink() || !content_meta.file_type().is_file() {
@@ -892,12 +895,29 @@ impl AttachmentStore {
         self.root.join(id.to_string())
     }
 
-    fn content_path(&self, id: AttachmentId) -> PathBuf {
-        self.attachment_dir(id).join(CONTENT_FILE)
+    fn content_path(&self, metadata: &AttachmentMetadata) -> PathBuf {
+        self.attachment_dir(metadata.id)
+            .join(content_file_name(&metadata.display_name))
     }
 
     fn metadata_path(&self, id: AttachmentId) -> PathBuf {
         self.attachment_dir(id).join(METADATA_FILE)
+    }
+}
+
+/// Stable private content filename that retains a normal display extension.
+/// Long or absent extensions fall back to `content`: they are unlikely to be
+/// meaningful file associations and must not exceed platform filename limits.
+fn content_file_name(display_name: &str) -> String {
+    let extension = Path::new(display_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty() && extension.len() <= MAX_CONTENT_EXTENSION_BYTES
+        });
+    match extension {
+        Some(extension) => format!("{CONTENT_FILE_PREFIX}.{extension}"),
+        None => CONTENT_FILE_PREFIX.to_string(),
     }
 }
 
@@ -1309,7 +1329,7 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries.len(), 2);
-        assert!(entries.contains(&"content".to_string()));
+        assert!(entries.contains(&"content.pdf".to_string()));
         assert!(entries.contains(&"metadata.json".to_string()));
         // Directory name is the canonical id.
         assert_eq!(
@@ -1382,7 +1402,7 @@ mod tests {
         };
         // Content without metadata.
         let a = import("a.txt", b"data-a");
-        fs::remove_file(store.content_path(a.id)).unwrap();
+        fs::remove_file(store.content_path(&a)).unwrap();
         assert!(store.lookup(a.id).is_err());
         assert!(store.metadata(a.id).is_err());
         assert!(store.read_all(a.id).is_err());
@@ -1402,8 +1422,8 @@ mod tests {
         let d = import("d.txt", b"data-d");
         let decoy = dir.path().join("decoy");
         fs::write(&decoy, b"data").unwrap();
-        fs::remove_file(store.content_path(d.id)).unwrap();
-        symlink(&decoy, store.content_path(d.id)).unwrap();
+        fs::remove_file(store.content_path(&d)).unwrap();
+        symlink(&decoy, store.content_path(&d)).unwrap();
         assert!(store.lookup(d.id).is_err());
         // Unknown metadata field is rejected on read.
         let e = import("e.txt", b"data-e");
@@ -1424,7 +1444,7 @@ mod tests {
         assert_eq!(store.read_all(imported.id).unwrap(), b"original");
         // External edits of the real content file update identity, size, and
         // content-derived media type without changing the URI.
-        fs::write(store.content_path(imported.id), b"\x89PNG\r\n\x1a\nrevised").unwrap();
+        fs::write(store.content_path(&imported), b"\x89PNG\r\n\x1a\nrevised").unwrap();
         let metadata = store.metadata(imported.id).unwrap();
         assert_eq!(metadata.size, 15);
         assert_eq!(metadata.mime_type.as_deref(), Some("image/png"));
@@ -1440,7 +1460,11 @@ mod tests {
         let (_dir, store) = fresh();
         let imported = store.import_bytes(b"open me", Some("open.txt")).unwrap();
         let opened = store.open(imported.id).unwrap();
-        assert_eq!(opened, store.content_path(imported.id));
+        assert_eq!(opened, store.content_path(&imported));
+        assert_eq!(
+            opened.file_name().and_then(|name| name.to_str()),
+            Some("content.txt")
+        );
         assert_eq!(fs::read(&opened).unwrap(), b"open me");
         // Mutating the opened file is visible through the store.
         fs::write(&opened, b"edited").unwrap();
