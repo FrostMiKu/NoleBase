@@ -305,7 +305,10 @@ impl App {
     pub(in crate::app) fn handle_tags(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc => {
-                if WorkspaceView::index_of(self.tags_return_view).is_some() {
+                if self.active_tag.is_some() {
+                    self.active_tag = None;
+                    self.recompute_tags();
+                } else if WorkspaceView::index_of(self.tags_return_view).is_some() {
                     self.activate_workspace_view(self.tags_return_view);
                 } else {
                     self.center_view = self.tags_return_view;
@@ -314,27 +317,39 @@ impl App {
                 None
             }
             KeyCode::Down => {
-                self.move_tag_selection(1);
+                if self.active_tag.is_some() {
+                    self.move_tag_note_selection(1);
+                } else {
+                    self.move_tag_selection(1);
+                }
                 None
             }
             KeyCode::Up => {
-                self.move_tag_selection(-1);
+                if self.active_tag.is_some() {
+                    self.move_tag_note_selection(-1);
+                } else {
+                    self.move_tag_selection(-1);
+                }
                 None
             }
             KeyCode::Enter => {
-                if let Some(name) = self
+                if self.active_tag.is_some() {
+                    self.open_tag_note_at(self.tag_note_index);
+                } else if let Some(name) = self
                     .tag_results
                     .get(self.tag_index)
                     .map(|tag| tag.name.clone())
                 {
-                    self.open_tag_search(&name);
+                    self.open_tag_documents(&name);
                 }
                 None
             }
             _ => {
-                let edit = edit_single_line(&mut self.tag_query, &mut self.tag_cursor, key);
-                if edit.changed() {
-                    self.recompute_tags();
+                if self.active_tag.is_none() {
+                    let edit = edit_single_line(&mut self.tag_query, &mut self.tag_cursor, key);
+                    if edit.changed() {
+                        self.recompute_tags();
+                    }
                 }
                 None
             }

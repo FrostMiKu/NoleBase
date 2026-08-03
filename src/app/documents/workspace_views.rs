@@ -45,6 +45,12 @@ impl App {
                 } else {
                     CenterView::Daily
                 };
+                self.active_tag = None;
+                self.tag_notes.clear();
+                self.tag_note_index = 0;
+                self.tag_note_scroll = 0;
+                self.reveal_selected_tag_note = false;
+                self.tag_note_vlist = TagNoteVirtualList::default();
                 self.tag_query.clear();
                 self.tag_cursor = 0;
                 self.tag_index = 0;

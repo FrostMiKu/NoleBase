@@ -224,7 +224,7 @@ pub(super) enum UndoOp {
 }
 
 /// One row of the attachment browser: store metadata joined with the number
-/// of managed notes that reference it.
+/// of distinct managed notes that reference it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentEntry {
     pub id: AttachmentId,
@@ -232,7 +232,8 @@ pub struct AttachmentEntry {
     /// Short display type: media type or file extension when unrecognized.
     pub kind: String,
     pub size: u64,
-    pub references: usize,
+    /// Distinct managed notes referencing the attachment (not occurrences).
+    pub locations: usize,
 }
 
 /// Keyboard focus is independent from the content shown in the center pane.

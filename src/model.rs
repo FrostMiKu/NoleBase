@@ -62,9 +62,8 @@ pub enum LinkTarget {
     External(String),
     WikiLink(String),
     EmbeddedFile(PathBuf),
-    /// A content-addressed attachment URI
-    /// (`nole-attachment://sha256/<64 lowercase hex>`), resolved through the
-    /// attachment store only when activated.
+    /// A mutable attachment URI (`nole://attachment/<lowercase-hyphenated-uuid>`),
+    /// resolved through the attachment store only when activated.
     Attachment(String),
 }
 
@@ -107,6 +106,22 @@ pub struct LinkHitbox {
 #[derive(Debug, Clone)]
 pub struct TagHitbox {
     pub name: String,
+    pub area: Rect,
+}
+
+/// One distinct managed note shown as a full-body card in the tag card stream.
+#[derive(Debug, Clone)]
+pub struct TagNote {
+    pub path: PathBuf,
+    pub title: String,
+    pub body: String,
+    pub modified: SystemTime,
+}
+
+/// A recorded screen rectangle for one tag-note card, rebuilt each frame.
+#[derive(Debug, Clone)]
+pub struct TagNoteHitbox {
+    pub index: usize,
     pub area: Rect,
 }
 

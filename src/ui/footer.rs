@@ -133,7 +133,10 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
                     "e edit · a archive · r rename · d delete"
                 }
             }
-            (Focus::Center, CenterView::Tags) => "type filter · ↑↓ select · Enter search",
+            (Focus::Center, CenterView::Tags) if app.active_tag.is_some() => {
+                "↑↓ select · Enter open · Esc tags"
+            }
+            (Focus::Center, CenterView::Tags) => "type filter · ↑↓ select · Enter cards",
             (Focus::Center, CenterView::Chat) => "i message · ↑↓ scroll · C clear",
             (Focus::Center, CenterView::Todo) => "type filter · ↑↓ select · Enter toggle",
             (Focus::Center, _) => "# tags · Ctrl+P commands",
@@ -183,7 +186,10 @@ pub(super) fn footer_hint(app: &App, width: u16) -> &'static str {
         (_, CenterView::Document) => "↑↓ scroll · e edit DailyNote · / find · Esc back",
         (_, CenterView::Search) => "type query · ↑↓ select · Enter open · Esc back",
         (_, CenterView::DocumentSearch) => "type query · ↑↓ select · Enter jump · Esc article",
-        (_, CenterView::Tags) => "type filter · ↑↓ select · Enter search · Esc back",
+        (_, CenterView::Tags) if app.active_tag.is_some() => {
+            "↑↓ select note · Enter open · Esc tag list"
+        }
+        (_, CenterView::Tags) => "type filter · ↑↓ select · Enter cards · Esc back",
         (_, CenterView::Chat) if app.ai_running => {
             "i message · ↑↓ scroll · c cancel · C clear · ← files · → views"
         }

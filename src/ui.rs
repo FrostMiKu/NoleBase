@@ -54,6 +54,7 @@ use crate::model::{
 use crate::theme::Theme;
 
 pub(in crate::ui) const DATE_FMT: &str = "%Y-%m-%d";
+pub(in crate::ui) const DAILY_DATE_LABEL_WIDTH: usize = 10;
 pub(in crate::ui) const WIDE_BREAKPOINT: u16 = 170;
 pub(in crate::ui) const FILES_WIDTH: u16 = 33;
 pub(in crate::ui) const RIGHT_SIDEBAR_WIDTH: u16 = 48;
@@ -127,6 +128,7 @@ fn clear_hitboxes(app: &mut App) {
     app.workspace_view_hitboxes.clear();
     app.search_hitboxes.clear();
     app.attachment_hitboxes.clear();
+    app.tag_note_hitboxes.clear();
 }
 
 fn body_and_footer(area: Rect) -> (Rect, Rect) {

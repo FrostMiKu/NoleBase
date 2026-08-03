@@ -19,6 +19,7 @@ use serde_json::json;
 use serde_json::Value;
 
 use crate::agent_session::{AgentConversation, TokenUsage};
+use crate::attachment_usage::AttachmentUsageHandle;
 use crate::observable::Observable;
 use crate::provider::completions::CompletionsProvider;
 use crate::provider::messages::MessagesProvider;
@@ -242,7 +243,12 @@ struct AgentTask {
 }
 
 impl AgentWorker {
-    pub fn spawn(config_path: PathBuf, nole_root: PathBuf, runtime: AgentRuntime) -> Self {
+    pub fn spawn(
+        config_path: PathBuf,
+        nole_root: PathBuf,
+        runtime: AgentRuntime,
+        attachment_usage: AttachmentUsageHandle,
+    ) -> Self {
         let (tasks, receiver) = mpsc::channel::<AgentTask>();
         let cancelled = runtime.cancelled.clone();
         let events = runtime.events.clone();
@@ -282,6 +288,7 @@ impl AgentWorker {
                             runtime.clone(),
                             http,
                             worker_reads.clone(),
+                            attachment_usage.clone(),
                         )?);
                         loaded_source = Some(source);
                     }
@@ -409,6 +416,7 @@ impl Agent {
             runtime,
             client,
             Arc::new(ReadTracker::default()),
+            AttachmentUsageHandle::default(),
         )
     }
 
@@ -418,6 +426,7 @@ impl Agent {
         runtime: AgentRuntime,
         client: Client,
         reads: Arc<ReadTracker>,
+        attachment_usage: AttachmentUsageHandle,
     ) -> Result<Self> {
         let AgentRuntime {
             events,
@@ -539,7 +548,11 @@ impl Agent {
         agent.register(ListAttachments::new(nole_root)?);
         agent.register(AttachmentInfo::new(nole_root)?);
         agent.register(CopyAttachmentToWorkspace::new(nole_root)?);
-        agent.register(DeleteAttachment::new(nole_root, gate.clone())?);
+        agent.register(DeleteAttachment::new(
+            nole_root,
+            gate.clone(),
+            attachment_usage,
+        )?);
         if let Some(definition) = agent.definitions.last_mut() {
             definition.cache = true;
         }

@@ -84,10 +84,14 @@ pub(super) fn draw_attachments(
         }
 
         let row_area = inset_horizontal(Rect::new(item_area.x, item_area.y, item_area.width, 1), 2);
-        let references = if entry.references == 1 {
-            "1 ref".to_string()
+        // Distinct managed notes, not occurrence counts; unknown while the
+        // shared usage index has not delivered its first snapshot.
+        let references = if !app.attachment_usage.is_ready() {
+            "…".to_string()
+        } else if entry.locations == 1 {
+            "1 note".to_string()
         } else {
-            format!("{} refs", entry.references)
+            format!("{} notes", entry.locations)
         };
         let metadata = format!(
             "{} · {} · {}",

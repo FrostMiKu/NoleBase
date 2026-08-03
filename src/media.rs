@@ -47,7 +47,7 @@ struct ImageKey {
 enum ResolvedSource {
     Local(PathBuf),
     Remote(String),
-    /// A content-addressed attachment; bytes are read through the store, so
+    /// A mutable attachment; bytes are read through the store, so
     /// physical object paths never leave [`AttachmentStore`].
     Attachment(AttachmentUri),
 }
@@ -343,7 +343,7 @@ fn load_protocol(
         ResolvedSource::Remote(url) => remote_image_bytes(remote_sources, url)?,
         ResolvedSource::Attachment(uri) => Arc::<[u8]>::from(
             attachments
-                .read_object(uri.id())
+                .read_limited(uri.id(), MAX_IMAGE_BYTES)
                 .with_context(|| format!("reading attachment {uri}"))?,
         ),
     };
@@ -831,9 +831,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let service = ImageService::new(root.path());
         assert!(service
-            .resolve("nole-attachment://sha256/not-hex", root.path(), 20, 10)
+            .resolve("nole://attachment/not-a-uuid", root.path(), 20, 10)
             .is_err());
-        let missing = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        let missing = format!(
+            "nole://attachment/{}",
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
         assert!(service.resolve(&missing, root.path(), 20, 10).is_err());
     }
 

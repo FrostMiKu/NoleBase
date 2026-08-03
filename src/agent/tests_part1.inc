@@ -196,11 +196,13 @@
         let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
 
         let first = read
-            .execute(&json!({"path": "data/large.md", "offset": 0, "limit": 200}))
+            .execute(&json!({"path": "data/large.md:1-200"}))
             .unwrap();
         assert!(first.starts_with("[data/large.md#"));
         assert!(first.contains("\n1:line 0\n"));
-        assert!(first.ends_with("[Showing lines 1-200 of 450. Use offset 200 to continue]"));
+        assert!(first.ends_with(
+            "[Showing lines 1-200 of 450. Continue with data/large.md:201-400]"
+        ));
         assert!(edit
             .execute(&json!({
                 "path": "data/large.md",
@@ -210,7 +212,7 @@
             .returns_err());
 
         let last = read
-            .execute(&json!({"path": "data/large.md", "offset": 400, "limit": 50}))
+            .execute(&json!({"path": "data/large.md:401-450"}))
             .unwrap();
         assert_eq!(first.lines().next(), last.lines().next());
         assert!(last.ends_with("[Showing lines 401-450 of 450]"));
@@ -692,9 +694,9 @@
         assert!(prompt.contains("import_attachment"));
         assert!(prompt.contains("copy_attachment_to_workspace"));
         assert!(prompt.contains("workspace/main"));
-        assert!(prompt.contains("nole-attachment://sha256"));
+        assert!(prompt.contains("nole://attachment/<uuid>"));
         assert!(prompt.contains("delete_attachment"));
-        assert!(prompt.contains("Attachments cannot be edited in place"));
+        assert!(prompt.contains("importing the same content twice yields two distinct attachments"));
     }
 
     #[test]
@@ -732,15 +734,15 @@
 
         let read = json!({
             "name": "read",
-            "input": {"path": "data/project notes.md", "offset": 100}
+            "input": {"path": "data/project notes.md:101-300"}
         });
         assert_eq!(
             tool_start_activity(&read),
-            "Calling Read...\ndata/project notes.md"
+            "Calling Read...\ndata/project notes.md:101-300"
         );
         assert_eq!(
             tool_finish_activity(&read, None),
-            "Completed Read.\ndata/project notes.md"
+            "Completed Read.\ndata/project notes.md:101-300"
         );
         assert_eq!(tool_display_name("add_daily_entry"), "Add Daily Entry");
 
@@ -755,7 +757,7 @@
 
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
-            "Failed Read: file not found\ndata/project notes.md"
+            "Failed Read: file not found\ndata/project notes.md:101-300"
         );
     }
 

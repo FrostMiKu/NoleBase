@@ -1,16 +1,27 @@
 //! Derived index of canonical attachment URIs referenced by managed notes.
 //!
-//! The index scans the managed Markdown/MBDown files (daily/, data/, archives/)
-//! for canonical attachment URIs (`nole-attachment://sha256/<64 lowercase hex>`)
-//! and tracks, per URI, how many times it is referenced and which files do so.
-//! It is rebuilt once at startup and then refreshed incrementally from file
-//! watcher events via [`AttachmentIndexer::paths_changed`].
+//! The index parses each managed Markdown/MBDown file (daily/, data/,
+//! archives/) with the same MBDown parser the renderer uses and records the
+//! canonical attachment URIs (`nole://attachment/<id>`) that appear as
+//! clickable/renderable reference targets: Markdown link destinations
+//! (including autolinks and reference-style links), image destinations,
+//! MBDown embeds (`![[...]]`), and `[link=...]` tag targets. Raw URI strings
+//! in prose, fenced or inline code, HTML comments, escaped text, and wiki-link
+//! bodies never produce those events and are therefore not references: the
+//! renderer itself does not turn them into attachment links.
 //!
-//! The index stores URIs as plain strings: the canonical form is defined by the
-//! URI scheme itself, and the attachment store (src/attachment.rs) owns the
-//! typed URI/metadata. Keeping this module string-keyed avoids a second
-//! attachment abstraction while still giving the browser and delete guard exact
-//! canonical URIs to compare against (see [`AttachmentUri`]'s `Display`).
+//! Per URI the index preserves the total occurrence count and the distinct
+//! set of referencing managed notes. The indexer rebuilds once at startup and
+//! refreshes incrementally from file watcher events via
+//! [`AttachmentIndexer::paths_changed`], publishing every snapshot together
+//! with the revision of the last applied change batch so consumers can detect
+//! stale snapshots (see [`AttachmentIndexer::try_latest_update`]).
+//!
+//! The index stores URIs as plain strings keyed on the canonical form produced
+//! by [`AttachmentUri`]'s `Display`: the attachment store owns the typed
+//! URI/identity, and keeping this module string-keyed avoids a second
+//! attachment abstraction while still giving the browser and delete guard
+//! exact canonical URIs to compare against.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -19,13 +30,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use mbdown::{Container, Event, InlineTag, Node, SpannedEvent};
+
+use crate::attachment::AttachmentUri;
 use crate::storage::Storage;
-
-/// The canonical scheme prefix of every attachment URI.
-pub const ATTACHMENT_URI_PREFIX: &str = "nole-attachment://sha256/";
-
-/// The canonical digest length: 256 bits as 64 lowercase hex digits.
-const DIGEST_LEN: usize = 64;
 
 /// Aggregate reference data for one canonical attachment URI.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -84,6 +92,7 @@ impl AttachmentReferenceIndex {
         }
     }
 
+    #[cfg(test)]
     /// Total occurrences of the canonical URI across all managed files.
     pub fn reference_count(&self, uri: &str) -> usize {
         self.references
@@ -100,6 +109,7 @@ impl AttachmentReferenceIndex {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     /// Whether any managed file references the canonical URI.
     pub fn is_referenced(&self, uri: &str) -> bool {
         self.references.contains_key(uri)
@@ -164,13 +174,14 @@ impl AttachmentIndexer {
     }
 
     /// Drain the update channel and return the newest snapshot at or after the
-    /// last requested revision.
-    pub fn try_latest_update(&self) -> Option<AttachmentReferenceIndex> {
+    /// last requested revision, paired with the revision of the last applied
+    /// change batch (0 for the initial build). Consumers use the revision to
+    /// reject actions based on stale index state.
+    pub fn try_latest_update(&self) -> Option<(u64, AttachmentReferenceIndex)> {
         let requested = self.requested_revision.get();
         self.updates
             .try_iter()
             .filter(|(revision, _)| *revision >= requested)
-            .map(|(_, index)| index)
             .last()
     }
 }
@@ -267,38 +278,63 @@ fn is_managed_markdown(storage: &Storage, path: &Path) -> bool {
     )
 }
 
-/// Every canonical attachment URI found in `text`, in source order, including
-/// duplicates. The URI scheme is self-delimiting, so this covers link targets,
-/// image embeds, and bare URIs in prose alike.
+/// Every canonical attachment URI in `text` that the MBDown renderer would
+/// render as an attachment reference, in source order, including duplicates:
+/// Markdown link destinations (including autolinks and reference-style links),
+/// image destinations, MBDown embeds, and `[link=...]` tag targets. URIs
+/// inside code, HTML comments, escaped text, or plain prose never produce
+/// those events and are therefore not references.
 pub fn find_attachment_uris(text: &str) -> Vec<String> {
     let mut uris = Vec::new();
-    let mut rest = text;
-    while let Some(index) = rest.find(ATTACHMENT_URI_PREFIX) {
-        let after = &rest[index + ATTACHMENT_URI_PREFIX.len()..];
-        match after.get(..DIGEST_LEN) {
-            Some(digest) if is_lowercase_hex(digest) => {
-                let next = after.as_bytes().get(DIGEST_LEN);
-                if next.is_none_or(|byte| !is_lowercase_hex_byte(*byte)) {
-                    uris.push(format!("{ATTACHMENT_URI_PREFIX}{digest}"));
-                    rest = &after[DIGEST_LEN..];
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        // Not a canonical digest here; advance past this prefix so the scan
-        // cannot loop on the same match.
-        rest = after;
-    }
+    let Ok(document) = mbdown::parse(text) else {
+        return uris;
+    };
+    collect_node_attachment_uris(document.nodes(), &mut uris);
     uris
 }
 
-fn is_lowercase_hex(value: &str) -> bool {
-    value.bytes().all(is_lowercase_hex_byte)
+fn collect_node_attachment_uris(nodes: &[Node<'_>], uris: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            Node::Markdown(markdown) => collect_event_attachment_uris(markdown.events(), uris),
+            Node::Box { children, .. }
+            | Node::Center { children }
+            | Node::Right { children }
+            | Node::Indent { children, .. }
+            | Node::Columns { children, .. }
+            | Node::Column { children, .. } => collect_node_attachment_uris(children, uris),
+        }
+    }
 }
 
-fn is_lowercase_hex_byte(byte: u8) -> bool {
-    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+fn collect_event_attachment_uris(events: &[SpannedEvent<'_>], uris: &mut Vec<String>) {
+    for item in events {
+        match &item.event {
+            Event::Start(Container::Link { target, .. })
+            | Event::Start(Container::Image { target, .. }) => {
+                push_canonical_attachment_uri(target, uris);
+            }
+            Event::Embed(target) => push_canonical_attachment_uri(target, uris),
+            Event::InlineTag(InlineTag {
+                name,
+                value: Some(target),
+                closing: false,
+                ..
+            }) if name == "link" => push_canonical_attachment_uri(target, uris),
+            _ => {}
+        }
+    }
+}
+
+/// Push `target` when it strictly parses as a canonical attachment URI.
+/// Strict parsing keeps the index free of id-format and digest assumptions
+/// and guarantees every key is the canonical `nole://attachment/<id>` form
+/// [`AttachmentUri`]'s `Display` produces, so lookups from typed attachment
+/// ids always match.
+fn push_canonical_attachment_uri(target: &str, uris: &mut Vec<String>) {
+    if let Ok(uri) = AttachmentUri::parse(target) {
+        uris.push(uri.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -311,43 +347,59 @@ mod tests {
         storage
     }
 
-    fn uri(digest: &str) -> String {
-        format!("{ATTACHMENT_URI_PREFIX}{digest}")
-    }
-
-    fn digest(seed: u8) -> String {
-        format!("{:064x}", seed)
+    /// A distinct, strictly canonical `nole://attachment/<uuid>` per seed.
+    fn uri(seed: u8) -> String {
+        format!("nole://attachment/{seed:08x}-0000-4000-8000-000000000000")
     }
 
     #[test]
-    fn scanner_finds_links_embeds_and_prose_uris_with_boundaries() {
-        let a = digest(1);
-        let b = digest(2);
+    fn scanner_indexes_links_images_embeds_and_link_tags_only() {
+        let a = uri(1);
+        let b = uri(2);
         let text = format!(
-            "see [report]({a}) and ![]({b}) or bare {a} \n",
-            a = uri(&a),
-            b = uri(&b)
+            "see [report]({a}) and ![img]({b}) or ![[{a}]] and [link={b}]tag[/link]\n\
+             autolink <{a}>\n\
+             ref [ref][refdef]\n\
+             \n\
+             [refdef]: {b}\n\
+             \n\
+             ```text\n\
+             {a} in a fence\n\
+             ```\n\
+             \n\
+             inline `{a}` and <!-- {b} --> comment\n\
+             escaped \\[x]({b})\n\
+             bare {a} in prose\n\
+             wikilink [[{b}]]\n"
         );
         let found = find_attachment_uris(&text);
-        assert_eq!(found, vec![uri(&a), uri(&b), uri(&a)]);
+        assert_eq!(
+            found,
+            vec![a.clone(), b.clone(), a.clone(), b.clone(), a, b]
+        );
+    }
 
-        // An over-long digest must not match; the trailing hex digit keeps the
-        // first 64 from being a canonical URI on its own.
-        let long = format!("{ATTACHMENT_URI_PREFIX}{}abc", "a".repeat(DIGEST_LEN));
-        assert!(find_attachment_uris(&long).is_empty());
-
-        // Uppercase hex and wrong schemes are not canonical.
-        let upper = format!("{ATTACHMENT_URI_PREFIX}{}", "A".repeat(DIGEST_LEN));
-        assert!(find_attachment_uris(&upper).is_empty());
-        assert!(find_attachment_uris("nole-attachment://md5/aaaa").is_empty());
+    #[test]
+    fn scanner_rejects_non_canonical_uris() {
+        // Not a valid attachment id (not a UUID).
+        let not_uuid = "nole://attachment/0000000000000000000000000000000000000000";
+        assert!(find_attachment_uris(&format!("[x]({not_uuid})")).is_empty());
+        // Uppercase ids are not canonical.
+        let upper = "nole://attachment/123e4567-e89b-42d3-a456-426614174000".to_uppercase();
+        assert!(find_attachment_uris(&format!("[x]({upper})")).is_empty());
+        // The legacy digest scheme is not canonical.
+        assert!(
+            find_attachment_uris(&format!("[x](nole-attachment://sha256/{})", "a".repeat(64)))
+                .is_empty()
+        );
     }
 
     #[test]
     fn index_counts_shared_references_across_managed_groups() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
-        let a = uri(&digest(1));
-        let b = uri(&digest(2));
+        let a = uri(1);
+        let b = uri(2);
         fs::write(
             storage.daily_dir.join("2026-07-28.md"),
             format!("[a]({a})\n"),
@@ -370,14 +422,65 @@ mod tests {
         assert_eq!(index.reference_count(&b), 2);
         assert_eq!(index.locations(&b).len(), 2);
         assert!(index.is_referenced(&a));
-        assert!(!index.is_referenced(&uri(&digest(3))));
+        assert!(!index.is_referenced(&uri(3)));
+    }
+
+    #[test]
+    fn count_tracks_occurrences_and_locations_track_distinct_notes() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let a = uri(1);
+        fs::write(
+            storage.data_dir.join("Note.md"),
+            format!("[a]({a}) twice [a]({a})\n"),
+        )
+        .unwrap();
+        fs::write(
+            storage.daily_dir.join("2026-07-28.md"),
+            format!("[a]({a})\n"),
+        )
+        .unwrap();
+
+        let index = AttachmentReferenceIndex::build(&storage);
+        assert_eq!(index.reference_count(&a), 3, "occurrences, not notes");
+        assert_eq!(index.locations(&a).len(), 2, "distinct notes");
+    }
+
+    #[test]
+    fn code_samples_comments_and_escaped_text_are_not_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let a = uri(1);
+        fs::write(
+            storage.data_dir.join("Note.md"),
+            format!("```text\n{a}\n```\n<!-- {a} -->\n`{a}`\n\\[{a}](x)\nbare {a}\n"),
+        )
+        .unwrap();
+        let index = AttachmentReferenceIndex::build(&storage);
+        assert!(!index.is_referenced(&a));
+        assert_eq!(index.reference_count(&a), 0);
+    }
+
+    #[test]
+    fn references_inside_mbdown_containers_are_indexed() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let a = uri(1);
+        fs::write(
+            storage.data_dir.join("Note.mb"),
+            format!("[box]\n[link={a}]open[/link]\n[/box]\n"),
+        )
+        .unwrap();
+        let index = AttachmentReferenceIndex::build(&storage);
+        assert_eq!(index.reference_count(&a), 1);
+        assert_eq!(index.locations(&a).len(), 1);
     }
 
     #[test]
     fn refresh_removes_references_and_drops_deleted_files() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
-        let a = uri(&digest(1));
+        let a = uri(1);
         let note = storage.data_dir.join("Note.md");
         fs::write(&note, format!("[a]({a}) twice [a]({a})\n")).unwrap();
 
@@ -405,7 +508,7 @@ mod tests {
     fn refresh_ignores_attachments_and_workspace_paths() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
-        let a = uri(&digest(1));
+        let a = uri(1);
         fs::write(
             storage.daily_dir.join("2026-07-28.md"),
             format!("[a]({a})\n"),
@@ -429,26 +532,28 @@ mod tests {
     }
 
     #[test]
-    fn worker_publishes_incremental_updates() {
+    fn worker_publishes_incremental_updates_with_revisions() {
         use std::time::Duration;
 
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
         let indexer = AttachmentIndexer::spawn(storage.clone());
-        let (_, initial) = indexer
+        let (initial_revision, initial) = indexer
             .updates
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
-        let a = uri(&digest(1));
+        assert_eq!(initial_revision, 0, "initial build publishes revision 0");
+        let a = uri(1);
         assert_eq!(initial.reference_count(&a), 0);
 
         let note = storage.data_dir.join("Live.md");
         fs::write(&note, format!("[a]({a})\n")).unwrap();
         indexer.paths_changed(vec![note.clone()]);
-        let (_, created) = indexer
+        let (revision, created) = indexer
             .updates
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
+        assert_eq!(revision, 1);
         assert_eq!(created.reference_count(&a), 1);
 
         fs::write(&note, "cleared\n").unwrap();
@@ -466,5 +571,33 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         assert!(!deleted.is_referenced(&a));
+    }
+
+    #[test]
+    fn try_latest_update_returns_revisioned_snapshot_and_discards_stale() {
+        let (command_sender, _command_receiver) = mpsc::channel();
+        let (update_sender, update_receiver) = mpsc::channel();
+        let indexer = AttachmentIndexer {
+            commands: command_sender,
+            updates: update_receiver,
+            requested_revision: Cell::new(1),
+        };
+        let a = uri(1);
+        let mut fresh = AttachmentReferenceIndex::default();
+        fresh
+            .files
+            .insert(PathBuf::from("Note.md"), vec![a.clone()]);
+        fresh.rebuild_references();
+        assert_eq!(fresh.reference_count(&a), 1);
+
+        // A snapshot queued before the requested revision is discarded.
+        update_sender
+            .send((0, AttachmentReferenceIndex::default()))
+            .unwrap();
+        update_sender.send((1, fresh.clone())).unwrap();
+        let (revision, update) = indexer.try_latest_update().unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(update.reference_count(&a), fresh.reference_count(&a));
+        assert_eq!(update.locations(&a), fresh.locations(&a));
     }
 }

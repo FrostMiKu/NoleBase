@@ -64,6 +64,14 @@ pub struct TagSummary {
     pub mentions: usize,
 }
 
+/// One distinct managed document containing an exact tag, as reported by
+/// [`WorkspaceIndex::tag_documents`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagDocument {
+    pub path: PathBuf,
+    pub modified: SystemTime,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TagScope {
     Daily,
@@ -212,6 +220,36 @@ impl WorkspaceIndex {
     pub fn exact_tag_hits(&self, tag: &str, scope: Option<TagScope>) -> Vec<SearchHit> {
         let normalized = normalize_tag(tag.trim().strip_prefix('#').unwrap_or(tag.trim()));
         self.search_tag(&normalized, scope)
+    }
+
+    /// Every distinct managed document containing the exact tag, ordered
+    /// oldest-to-newest by filesystem modified time with the path as the
+    /// tie-breaker (matching Daily's chronological direction).
+    pub fn tag_documents(&self, tag: &str) -> Vec<TagDocument> {
+        let normalized = normalize_tag(tag.trim().strip_prefix('#').unwrap_or(tag.trim()));
+        let Some(entry) = self.tags.get(&normalized) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut documents = Vec::new();
+        for occurrence in &entry.occurrences {
+            if !seen.insert(&occurrence.path) {
+                continue;
+            }
+            let Some(file) = self.files.get(&occurrence.path) else {
+                continue;
+            };
+            documents.push(TagDocument {
+                path: occurrence.path.clone(),
+                modified: file.modified,
+            });
+        }
+        documents.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        documents
     }
 
     pub fn tag_paths(&self, tag: &str) -> Vec<PathBuf> {
@@ -872,6 +910,63 @@ mod tests {
         );
         assert!(fs::read_to_string(note).unwrap().contains("#语言/rust"));
         assert!(fs::read_to_string(archive).unwrap().contains("#语言/rust"));
+    }
+
+    #[test]
+    fn tag_documents_are_distinct_oldest_first_and_exact() {
+        fn set_modified(path: &Path, seconds: u64) {
+            let file = fs::File::open(path).unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let daily = storage.daily_dir.join("2026-07-28.md");
+        let note = storage.data_dir.join("Note.md");
+        let other = storage.data_dir.join("Other.md");
+        let archive = storage.archives_dir.join("Old.md");
+        fs::write(&daily, "daily #rust twice #rust\n").unwrap();
+        fs::write(&note, "note #RUST\n").unwrap();
+        fs::write(&other, "note #rustlang\n").unwrap();
+        fs::write(&archive, "archive #rust\n").unwrap();
+        set_modified(&daily, 100);
+        set_modified(&note, 300);
+        set_modified(&other, 200);
+        set_modified(&archive, 100);
+        let index = build_index(&storage);
+
+        let documents = index.tag_documents("#rust");
+        // The daily note (two mentions, one document) and archive share the
+        // oldest mtime; the lexical path tie-breaker puts archives first.
+        // Note.md is newest; Other.md only carries #rustlang and must not match.
+        assert_eq!(
+            documents,
+            vec![
+                TagDocument {
+                    path: archive.clone(),
+                    modified: UNIX_EPOCH + std::time::Duration::from_secs(100),
+                },
+                TagDocument {
+                    path: daily.clone(),
+                    modified: UNIX_EPOCH + std::time::Duration::from_secs(100),
+                },
+                TagDocument {
+                    path: note.clone(),
+                    modified: UNIX_EPOCH + std::time::Duration::from_secs(300),
+                },
+            ]
+        );
+        assert_eq!(index.tag_documents("rust").len(), 3);
+        assert!(index
+            .tag_documents("#rustlang")
+            .iter()
+            .all(|doc| doc.path == other));
+        assert!(index.tag_documents("#missing").is_empty());
     }
 
     #[test]

@@ -232,18 +232,26 @@ pub(crate) async fn read_limited_http_body(
     response: reqwest::Response,
     label: &str,
 ) -> Result<Vec<u8>> {
+    read_http_body_with_limit(response, label, MAX_FETCH_BYTES).await
+}
+
+pub(crate) async fn read_http_body_with_limit(
+    response: reqwest::Response,
+    label: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_FETCH_BYTES)
+        .is_some_and(|length| length > max_bytes)
     {
-        bail!("{label} exceeds 1 MB");
+        bail!("{label} exceeds the {max_bytes} byte limit");
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("reading {label}"))?;
-        if bytes.len().saturating_add(chunk.len()) as u64 > MAX_FETCH_BYTES {
-            bail!("{label} exceeds 1 MB");
+        if bytes.len().saturating_add(chunk.len()) as u64 > max_bytes {
+            bail!("{label} exceeds the {max_bytes} byte limit");
         }
         bytes.extend_from_slice(&chunk);
     }

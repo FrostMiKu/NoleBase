@@ -390,9 +390,10 @@ impl App {
 
     pub fn apply_attachment_index(
         &mut self,
+        revision: u64,
         index: crate::attachment_index::AttachmentReferenceIndex,
     ) {
-        self.attachment_refs = index;
+        self.attachment_usage.publish_snapshot(revision, index);
         if self.center_view == CenterView::Attachments {
             self.recompute_attachments();
         }

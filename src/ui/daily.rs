@@ -334,7 +334,7 @@ pub(super) fn render_daily_note(
 ) -> crate::app::DailyCardRenderCache {
     let card_style = Style::default().bg(theme.surface_panel);
     let horizontal_padding = DAILY_PADDING_X.min(width.saturating_sub(1) / 2);
-    let body_start = horizontal_padding + UnicodeWidthStr::width(date_label.as_str()) + 2;
+    let body_start = horizontal_padding + DAILY_DATE_LABEL_WIDTH + 2;
     let (body_start, body_width) = centered_daily_body_axis(width, body_start);
     let mut lines = vec![
         line_with_background(Vec::new(), width, card_style),

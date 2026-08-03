@@ -1056,6 +1056,113 @@ fn narrow_center_renders_each_center_view_in_place() {
 }
 
 #[test]
+fn active_tag_renders_full_notes_as_chronological_cards() {
+    let (mut app, directory) = make_app();
+    let older = directory.path().join("data/Older.md");
+    let newer = directory.path().join("archives/Newer.md");
+    app.center_view = CenterView::Tags;
+    app.active_tag = Some("rust".to_string());
+    app.tag_notes = vec![
+        crate::model::TagNote {
+            path: older,
+            title: "Older".to_string(),
+            body: "# Older body\n\nComplete first note with #nested.".to_string(),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        },
+        crate::model::TagNote {
+            path: newer,
+            title: "Newer".to_string(),
+            body: "# Newer body\n\nComplete second note.".to_string(),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(2),
+        },
+    ];
+
+    let terminal = render(&mut app, 120, 40);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("#rust · 2 notes"));
+    assert!(screen.contains("Complete first note"));
+    assert!(screen.contains("Complete second note"));
+    assert!(screen.find("Older").unwrap() < screen.find("Newer").unwrap());
+    assert!(!screen.contains("Older.md"));
+    assert_eq!(app.tag_note_hitboxes.len(), 2);
+    assert!(app
+        .tag_hitboxes
+        .iter()
+        .any(|hitbox| hitbox.name == "nested"));
+    assert!(app
+        .tag_note_vlist
+        .items
+        .iter()
+        .all(|item| item.cache.is_some()));
+}
+
+#[test]
+fn tag_card_matches_daily_card_except_for_buttons() {
+    let title = "2026-07-01";
+    let body = "# Heading\n\nThe [same body](https://example.com) and spacing.";
+    let daily = crate::model::DailyNote {
+        date: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        body: body.to_string(),
+    };
+    let tag = crate::model::TagNote {
+        path: PathBuf::from("data/Note.md"),
+        title: title.to_string(),
+        body: body.to_string(),
+        modified: std::time::UNIX_EPOCH,
+    };
+    let daily_card = render_daily_note(&daily, title.to_string(), 80);
+    let tag_card = render_tag_note_card(&tag, 80, Theme::default());
+    assert_eq!(tag_card.lines.len(), daily_card.lines.len());
+    for (index, (tag_line, daily_line)) in tag_card.lines.iter().zip(&daily_card.lines).enumerate()
+    {
+        if index != daily_card.button_line {
+            assert_eq!(tag_line, daily_line, "layout differs on row {index}");
+        }
+    }
+    assert!(tag_card.lines[daily_card.button_line]
+        .spans
+        .iter()
+        .all(|span| span.content.trim().is_empty()));
+    let mut long_title = tag.clone();
+    long_title.title = "A very long note title that must not move the body".to_string();
+    let long_card = render_tag_note_card(&long_title, 80, Theme::default());
+    assert_eq!(
+        tag_card.links[0].column, long_card.links[0].column,
+        "note title width must not change card margins"
+    );
+}
+#[test]
+fn tag_note_vlist_only_materializes_visible_cards() {
+    let (mut app, directory) = make_app();
+    app.active_tag = Some("many".to_string());
+    app.tag_notes = (0..40)
+        .map(|index| crate::model::TagNote {
+            path: directory.path().join(format!("data/Note-{index}.md")),
+            title: format!("Note-{index}"),
+            body: format!("# Note {index}\n\nFull body for #many."),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(index as u64),
+        })
+        .collect();
+
+    sync_tag_note_vlist(&mut app, 72);
+    assert!(app
+        .tag_note_vlist
+        .items
+        .iter()
+        .all(|item| item.cache.is_none()));
+    let scroll = measure_visible_tag_note_cards(&mut app, 0, 8);
+    assert_eq!(scroll, 0);
+    let rendered = app
+        .tag_note_vlist
+        .items
+        .iter()
+        .filter(|item| item.cache.is_some())
+        .count();
+    assert!(rendered > 0 && rendered < app.tag_notes.len());
+    assert!(app.tag_note_vlist.items[20].cache.is_none());
+}
+
+#[test]
 fn attachments_browser_keeps_blank_row_and_full_area_selection_invariants() {
     let (mut app, _directory) = make_app();
     for (name, bytes) in [
@@ -1067,15 +1174,22 @@ fn attachments_browser_keeps_blank_row_and_full_area_selection_invariants() {
             .import_bytes(bytes, Some(name))
             .unwrap();
     }
-    let uri = app.attachment_store.list().unwrap()[0].uri().to_string();
+    let uri = app
+        .attachment_store
+        .list(&crate::attachment::AttachmentQuery::default())
+        .unwrap()
+        .items[0]
+        .uri()
+        .to_string();
     fs::write(
         app.storage.data_dir.join("Note.md"),
         format!("[a]({uri})\n"),
     )
     .unwrap();
-    app.apply_attachment_index(crate::attachment_index::AttachmentReferenceIndex::build(
-        &app.storage,
-    ));
+    app.apply_attachment_index(
+        0,
+        crate::attachment_index::AttachmentReferenceIndex::build(&app.storage),
+    );
     app.open_attachments();
 
     let terminal = render(&mut app, 80, 18);
@@ -1084,7 +1198,7 @@ fn attachments_browser_keeps_blank_row_and_full_area_selection_invariants() {
     assert!(screen.contains("Attachments · 3"), "{screen}");
     assert!(screen.contains("report.pdf"), "{screen}");
     assert!(screen.contains("photo.png"), "{screen}");
-    assert!(screen.contains("1 ref"), "{screen}");
+    assert!(screen.contains("1 note"), "{screen}");
     assert_eq!(app.attachment_hitboxes.len(), 3);
 
     let first = app.attachment_hitboxes[0].area;
@@ -1321,8 +1435,8 @@ fn hashtags_are_clickable_in_daily_and_document_views() {
         row: daily.y,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(app.center_view, CenterView::Search);
-    assert_eq!(app.search_query, "#rust");
+    assert_eq!(app.center_view, CenterView::Tags);
+    assert_eq!(app.active_tag.as_deref(), Some("rust"));
 
     app.document = Some(Document {
         kind: DocumentKind::Daily(NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()),

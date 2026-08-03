@@ -20,17 +20,34 @@ pub(crate) struct FileReadState {
     total_lines: usize,
 }
 
-pub(crate) fn snapshot_tag(content: &str) -> String {
-    // Stable FNV-1a folded to the four hexadecimal digits used by hashline
-    // anchors. Exact snapshot equality remains the authoritative stale-write
-    // check; the compact tag is the model-facing handle.
-    let hash = content
-        .as_bytes()
-        .iter()
-        .fold(0x811c_9dc5_u32, |hash, byte| {
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotTagHasher(u32);
+
+impl Default for SnapshotTagHasher {
+    fn default() -> Self {
+        Self(0x811c_9dc5)
+    }
+}
+
+impl SnapshotTagHasher {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.0 = bytes.iter().fold(self.0, |hash, byte| {
             (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
         });
-    format!("{:04X}", (hash ^ (hash >> 16)) & 0xffff)
+    }
+
+    pub(crate) fn finish(self) -> String {
+        format!("{:04X}", (self.0 ^ (self.0 >> 16)) & 0xffff)
+    }
+}
+
+pub(crate) fn snapshot_tag(content: &str) -> String {
+    // Stable incremental FNV-1a folded to the four hexadecimal digits used by
+    // hashline anchors. Exact snapshot equality remains the authoritative
+    // stale-write check; the compact tag is the model-facing handle.
+    let mut hasher = SnapshotTagHasher::default();
+    hasher.update(content.as_bytes());
+    hasher.finish()
 }
 
 impl ReadTracker {
@@ -141,5 +158,18 @@ impl FileReadState {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_snapshot_tag_matches_whole_content() {
+        let mut hasher = SnapshotTagHasher::default();
+        hasher.update(b"first line\n");
+        hasher.update(b"second line\n");
+        assert_eq!(hasher.finish(), snapshot_tag("first line\nsecond line\n"));
     }
 }

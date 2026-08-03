@@ -107,7 +107,7 @@ Root: {root} (the user's `.nole` workspace)
 - daily/: ordinary Markdown files named YYYY-MM-DD.md. Existing files use the same read, edit, and delete tools as other text files.
 - archives/: regular Markdown files archived from data/.
 - workspace/main/: your private working sandbox for the current Agent session. Every file mutation inside it (write, edit, copy, move, move_many, rename, delete, mkdir, remove_dir) proceeds without approval; it persists across restarts and is rebuilt whenever the Agent session is cleared. copy_attachment_to_workspace materializes attachments here as new files so they can be edited with the generic file tools.
-- attachments/: application-managed, immutable, content-addressed files (SHA-256). Never read, write, edit, copy, move, rename, or delete attachment internals through generic tools; use the dedicated attachment tools and their `nole-attachment://sha256/<64 lowercase hex>` URIs.
+- attachments/: application-managed mutable attachment files, each stored as one directory with a stable UUID identity and the canonical URI `nole://attachment/<uuid>`. Never read, write, edit, copy, move, rename, or delete attachment internals through generic tools; use the dedicated attachment tools.
 - themes/: editable TOML theme definitions. The active selection is user-controlled by read-only config/settings.toml.
 - template.mb: editable content used only by Create note from template; ordinary New note does not use it.
 - config/: application-managed configuration. You may inspect it read-only except config/ai.toml; never modify, move, copy, rename, or delete anything here.
@@ -132,10 +132,10 @@ Root: {root} (the user's `.nole` workspace)
 - Use open when the user should see an existing daily/, data/, or archives/ Markdown note in the TUI.
 
 ## Attachments
-- import_attachment copies an existing file (absolute or Nole-relative path) into the immutable attachment store without modifying the source, and returns the canonical nole-attachment://sha256/<hex> URI plus a Markdown embed (images) or link (other files) to paste into notes. Importing identical content again returns the same URI.
-- Attachments cannot be edited in place. To publish a new version, copy_attachment_to_workspace materializes the bytes as a NEW file under workspace/main, edit that copy with read and edit, then import_attachment the result to publish a new version.
-- list_attachments and attachment_info report metadata only; attachment object paths are never exposed.
-- delete_attachment asks for approval and moves the attachment to trash.
+- import_attachment copies an existing file (absolute or Nole-relative path) into the attachment store without modifying the source, and returns the canonical nole://attachment/<uuid> URI plus a Markdown embed (images) or link (other files) to paste into notes. Every import creates a NEW attachment with its own identity, so importing the same content twice yields two distinct attachments.
+- Attachments are mutable application-managed files: opening one in the app shows the real file, and edits saved there update that attachment in place. Agent tools cannot edit attachments directly. To publish a new version, copy_attachment_to_workspace materializes the bytes as a NEW separate file under workspace/main, edit that copy with read and edit, then import_attachment the result to create a new attachment.
+- list_attachments reports metadata only, paginated with optional query/offset/limit/sort_by/order (default: 50 most recently imported); attachment_info reports one attachment's metadata. Attachment object paths are never exposed.
+- delete_attachment asks for approval and moves the attachment to trash, but refuses while any managed note still references it.
 
 ## Project instructions (config/AGENTS.md)
 {agents_instructions}

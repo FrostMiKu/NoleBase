@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 use super::util::{
     display_path, fuzzy_match, limited_diff, optional_usize, required_string, truncate_chars,
-    DEFAULT_SEARCH_RESULTS, MAX_DIFF_BYTES, MAX_FILE_BYTES, MAX_SEARCH_OFFSET, MAX_SEARCH_RESULTS,
-    MAX_SEARCH_SNIPPET_CHARS,
+    DEFAULT_SEARCH_RESULTS, MAX_DIFF_BYTES, MAX_EDIT_FILE_BYTES, MAX_SEARCH_OFFSET,
+    MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::write_policy::{validate_write, WriteSource};
 use crate::agent::{
@@ -356,7 +356,7 @@ impl Tool for AddDailyEntry {
 
     async fn execute(&self, input: &Value) -> Result<String> {
         let content = required_string(input, "content")?;
-        if content.len() as u64 > MAX_FILE_BYTES {
+        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
             bail!("daily entry content exceeds 1 MB");
         }
         let requested_date = input

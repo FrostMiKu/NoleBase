@@ -5,6 +5,7 @@ mod agent_session;
 mod app;
 mod attachment;
 mod attachment_index;
+mod attachment_usage;
 mod backend;
 mod embedded_terminal;
 mod markdown;
@@ -20,6 +21,7 @@ mod ui;
 mod vlist;
 mod workspace_index;
 
+use std::fs;
 use std::io::{self, Stdout, Write};
 use std::process::Command as ProcCommand;
 use std::sync::mpsc::{self, Receiver};
@@ -177,26 +179,65 @@ fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
     }
 }
 
-fn watch_workspace(path: &std::path::Path) -> Result<(RecommendedWatcher, WatchEvents)> {
+/// Register the file watcher for application-managed content only.
+///
+/// The whole Nole root is deliberately never watched: the agent workspace
+/// (`workspace/`) churns constantly while a task runs, and its events must
+/// not enter the notify queue at all. Only locations whose changes require
+/// refresh are registered, each individually:
+///
+/// - `daily/`, `data/`, `archives/` — managed notes (workspace reload and
+///   the note/attachment reference indexes);
+/// - `themes/` — theme TOMLs (theme reload);
+/// - `config/` — the specific config files that refresh reactively
+///   (settings.toml for the theme selection, and AGENTS.md for agent read
+///   caches). The directory is registered rather than the settings file
+///   alone so atomic-rename saves by external editors are still observed;
+/// - `attachments/` — per-attachment directories (`<uuid>/content` and
+///   `<uuid>/metadata.json`); events refresh mutable externally edited
+///   attachment metadata in the browser.
+///
+/// Missing optional directories simply have nothing to watch, matching the
+/// previous root-recursive watcher, which silently produced no events for
+/// directories it had never seen.
+fn watch_workspace(storage: &storage::Storage) -> Result<(RecommendedWatcher, WatchEvents)> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
     })
     .context("creating Nole directory watcher")?;
-    watcher
-        .watch(path, RecursiveMode::Recursive)
-        .with_context(|| format!("watching {}", path.display()))?;
+    for directory in [
+        &storage.daily_dir,
+        &storage.data_dir,
+        &storage.archives_dir,
+        &storage.themes_dir,
+        &storage.attachments_dir,
+    ] {
+        if fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir()) {
+            watcher
+                .watch(directory, RecursiveMode::Recursive)
+                .with_context(|| format!("watching {}", directory.display()))?;
+        }
+    }
+    if fs::metadata(&storage.config_dir).is_ok_and(|metadata| metadata.is_dir()) {
+        watcher
+            .watch(&storage.config_dir, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watching {}", storage.config_dir.display()))?;
+    }
     Ok((watcher, receiver))
 }
 
 fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::path::PathBuf> {
     // The agent workspace sandbox (workspace/main) churns constantly while an
-    // Agent task runs. Its events must never reload the workspace UI or feed
-    // the note/attachment indexes; session file handling is the workspace
-    // policy's job.
+    // Agent task runs. It is never registered with the watcher, so its events
+    // never enter this queue; the check below is defense in depth. Workspace
+    // events must never reload the workspace UI or feed the note/attachment
+    // indexes; session file handling is the workspace policy's job.
     let workspace_dir = app.storage.workspace_dir.clone();
+    let attachments_dir = app.storage.attachments_dir.clone();
     let mut changed = false;
     let mut indexed_paths = Vec::new();
+    let mut attachment_paths = Vec::new();
     let mut watcher_error = None;
     for event in events.try_iter() {
         if let Ok(event) = &event {
@@ -209,6 +250,13 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::pat
                 continue;
             }
             app.invalidate_agent_reads(&event.paths);
+            if event
+                .paths
+                .iter()
+                .any(|path| path.starts_with(&attachments_dir))
+            {
+                attachment_paths.extend(event.paths.iter().cloned());
+            }
         }
         match event {
             Ok(event)
@@ -251,6 +299,13 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::pat
             Err(error) => watcher_error = Some(error),
         }
     }
+    if !attachment_paths.is_empty() {
+        // Attachment events refresh the browser only: mutable metadata (e.g.
+        // display_name) can be edited externally. They never reload the
+        // workspace UI or feed the note/attachment reference indexes, which
+        // track managed Markdown files only.
+        app.attachment_paths_changed(&attachment_paths);
+    }
     if changed {
         app.reload_workspace();
     }
@@ -285,8 +340,8 @@ fn run(
         if let Some(index) = workspace_indexer.try_latest_update() {
             app.apply_workspace_index(index);
         }
-        if let Some(index) = attachment_indexer.try_latest_update() {
-            app.apply_attachment_index(index);
+        if let Some((revision, index)) = attachment_indexer.try_latest_update() {
+            app.apply_attachment_index(revision, index);
         }
         app.poll_agent();
         app.poll_terminal();
@@ -402,7 +457,7 @@ fn main() -> Result<()> {
     }
     let storage = resolve_storage()?;
     storage.ensure_files()?;
-    let (_watcher, workspace_events) = watch_workspace(&storage.root)?;
+    let (_watcher, workspace_events) = watch_workspace(&storage)?;
     let workspace_indexer = WorkspaceIndexer::spawn(storage.clone());
     let attachment_indexer = AttachmentIndexer::spawn(storage.clone());
     let mut app = App::new(storage)?;
@@ -606,6 +661,86 @@ mod tests {
             app.daily_notes.len(),
             1,
             "workspace events must not reload the workspace UI"
+        );
+    }
+
+    #[test]
+    fn watch_workspace_registers_managed_content_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+
+        // One stored attachment in the per-attachment directory layout.
+        let attachment_dir = storage
+            .attachments_dir
+            .join("00000000-0000-4000-8000-000000000001");
+        fs::create_dir_all(&attachment_dir).unwrap();
+        let metadata_path = attachment_dir.join("metadata.json");
+        fs::write(&metadata_path, "{}").unwrap();
+
+        let (_watcher, events) = watch_workspace(&storage).unwrap();
+
+        // Agent workspace churn must never enter the notify queue: the
+        // workspace is not registered, so even a settle window yields nothing.
+        let workspace = storage.agent_workspace_dir();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("session.json"), "{}").unwrap();
+        fs::write(workspace.join("scratch.md"), "# scratch").unwrap();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let mut workspace_events = Vec::new();
+        while Instant::now() < deadline {
+            for event in events.try_iter().flatten() {
+                workspace_events.extend(
+                    event
+                        .paths
+                        .into_iter()
+                        .filter(|path| path.starts_with(&workspace)),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            workspace_events.is_empty(),
+            "workspace activity must not enter notify queues: {workspace_events:?}"
+        );
+
+        // Application-managed content that requires refresh is still watched:
+        // a managed note, a theme file, the settings config file, and mutable
+        // attachment metadata.
+        let daily = storage.daily_dir.join("2026-08-03.md");
+        fs::write(&daily, "note").unwrap();
+        let theme = storage.themes_dir.join("custom.toml");
+        fs::write(&theme, "panel = \"#010203\"\n").unwrap();
+        fs::write(&storage.settings_path, "theme = \"custom\"\n").unwrap();
+        fs::write(&metadata_path, "{\"display_name\":\"renamed\"}").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            for event in events.try_iter() {
+                if let Ok(event) = event {
+                    seen.extend(event.paths.iter().cloned());
+                }
+            }
+            let observed = [&daily, &theme, &storage.settings_path, &metadata_path]
+                .iter()
+                .all(|path| seen.iter().any(|seen| seen == *path));
+            if observed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for expected in [&daily, &theme, &storage.settings_path, &metadata_path] {
+            assert!(
+                seen.iter().any(|seen| seen == expected),
+                "managed content must be observed by the watcher: {} (seen: {seen:?})",
+                expected.display()
+            );
+        }
+        assert!(
+            seen.iter()
+                .all(|path| !path.starts_with(&storage.workspace_dir)),
+            "no watcher event may come from the agent workspace: {seen:?}"
         );
     }
 

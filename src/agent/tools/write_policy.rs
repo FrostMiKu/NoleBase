@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::util::MAX_FILE_BYTES;
+use super::util::MAX_EDIT_FILE_BYTES;
 
 pub(super) enum WriteSource<'a> {
     Text(&'a str),
@@ -59,7 +59,7 @@ impl<'a> WriteSource<'a> {
     fn read_text(self) -> Result<std::borrow::Cow<'a, str>> {
         match self {
             Self::Text(content) => {
-                if content.len() as u64 > MAX_FILE_BYTES {
+                if content.len() as u64 > MAX_EDIT_FILE_BYTES {
                     bail!("Skill content exceeds 1 MB");
                 }
                 Ok(std::borrow::Cow::Borrowed(content))
@@ -67,7 +67,7 @@ impl<'a> WriteSource<'a> {
             Self::File(path) => {
                 let metadata = fs::metadata(path)
                     .with_context(|| format!("reading metadata for {}", path.display()))?;
-                if metadata.len() > MAX_FILE_BYTES {
+                if metadata.len() > MAX_EDIT_FILE_BYTES {
                     bail!("Skill content exceeds 1 MB");
                 }
                 let content = fs::read_to_string(path)

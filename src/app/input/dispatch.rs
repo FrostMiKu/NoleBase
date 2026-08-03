@@ -135,7 +135,7 @@ impl App {
                 self.ensure_visible_todo_selection();
                 self.todo_list_start = 0;
             }
-            (Focus::Center, CenterView::Tags, _) => {
+            (Focus::Center, CenterView::Tags, _) if self.active_tag.is_none() => {
                 paste_into(
                     &mut self.tag_query,
                     &mut self.tag_cursor,
@@ -218,9 +218,11 @@ impl App {
                     CenterView::Todo
                         | CenterView::Search
                         | CenterView::DocumentSearch
-                        | CenterView::Tags
                         | CenterView::Attachments
                 ))
+            || (self.focus == Focus::Center
+                && self.center_view == CenterView::Tags
+                && self.active_tag.is_none())
             || (self.focus == Focus::Files
                 && matches!(
                     self.files_context,

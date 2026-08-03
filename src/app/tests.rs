@@ -566,14 +566,35 @@ fn command_palette_and_hash_shortcut_open_centered_tag_browser() {
     assert_eq!((rust.documents, rust.mentions), (2, 3));
 
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.center_view, CenterView::Search);
-    assert_eq!(app.search_query, "#rust");
-    assert_eq!(app.search_results.len(), 2);
-    assert!(app.search_results.iter().all(|hit| match hit {
-        SearchHit::FileLine { text, .. } | SearchHit::DocumentLine { text, .. } => {
-            !text.contains("#rustlang")
-        }
-    }));
+    assert_eq!(app.center_view, CenterView::Tags);
+    assert_eq!(app.active_tag.as_deref(), Some("rust"));
+    assert_eq!(app.tag_notes.len(), 2, "one card per distinct note");
+    assert!(app
+        .tag_notes
+        .iter()
+        .any(|note| note.body.contains("daily #rust")));
+    assert!(app.tag_notes.iter().all(|note| note
+        .path
+        .file_stem()
+        .is_some_and(|stem| stem.to_string_lossy() == note.title)));
+    assert!(app
+        .tag_notes
+        .iter()
+        .any(|note| note.body.contains("note #rust")));
+    assert!(app
+        .tag_notes
+        .iter()
+        .all(|note| !note.body.contains("#rustlang") || note.body.contains("daily #rust")));
+
+    app.tag_note_index = 1;
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.center_view, CenterView::Document);
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.center_view, CenterView::Tags);
+    assert_eq!(app.active_tag.as_deref(), Some("rust"));
+    assert_eq!(app.tag_note_index, 1);
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.active_tag, None);
 
     app.center_view = CenterView::Daily;
     app.handle_key(key(KeyCode::Char('#')));
@@ -2595,7 +2616,7 @@ fn file_embed_clicks_open_existing_files_from_any_location() {
 }
 
 #[test]
-fn attachment_link_clicks_open_a_materialized_workspace_file() {
+fn attachment_link_clicks_open_the_real_managed_file() {
     let (mut app, _directory) = make_app();
     let store = AttachmentStore::new(app.storage.attachments_dir.clone());
     store.ensure_layout().unwrap();
@@ -2616,17 +2637,18 @@ fn attachment_link_clicks_open_a_materialized_workspace_file() {
     let Some(Command::OpenPath(path)) = command else {
         panic!("expected an OpenPath command");
     };
-    // The opened file is a materialized copy under workspace/main containing
-    // the attachment bytes; the custom URI is never sent to a web opener.
+    // The opened file is the store's real application-managed content file;
+    // nothing is copied to the workspace and the custom URI never reaches a
+    // web opener.
     assert_eq!(fs::read(&path).unwrap(), b"attachment payload");
-    assert!(path.starts_with(app.storage.agent_workspace_dir()));
+    assert!(path.starts_with(app.storage.attachments_dir));
 }
 
 #[test]
 fn malformed_attachment_links_error_without_opening() {
     let (mut app, _directory) = make_app();
     app.link_hitboxes.push(LinkHitbox {
-        target: LinkTarget::Attachment("nole-attachment://sha256/nothex".to_string()),
+        target: LinkTarget::Attachment("nole://attachment/not-a-uuid".to_string()),
         area: Rect::new(4, 3, 7, 1),
     });
     assert!(app
@@ -2877,15 +2899,16 @@ fn import_attachment(app: &mut App, name: &str, bytes: &[u8]) -> AttachmentId {
 }
 
 fn refresh_attachment_refs(app: &mut App) {
-    app.apply_attachment_index(crate::attachment_index::AttachmentReferenceIndex::build(
-        &app.storage,
-    ));
+    app.apply_attachment_index(
+        0,
+        crate::attachment_index::AttachmentReferenceIndex::build(&app.storage),
+    );
 }
 
 #[test]
-fn attachments_view_lists_name_kind_size_and_reference_count() {
+fn attachments_view_lists_name_kind_size_and_distinct_locations() {
     let (mut app, _directory) = make_app();
-    let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
+    let id = import_attachment(&mut app, "report.pdf", b"%PDF-1.4x");
     let uri = crate::attachment::AttachmentUri::from_id(id).to_string();
     fs::write(
         app.storage.data_dir.join("Note.md"),
@@ -2908,7 +2931,10 @@ fn attachments_view_lists_name_kind_size_and_reference_count() {
     assert_eq!(entry.name, "report.pdf");
     assert_eq!(entry.kind, "pdf");
     assert_eq!(entry.size, 9);
-    assert_eq!(entry.references, 3, "shared references across two files");
+    assert_eq!(
+        entry.locations, 2,
+        "distinct notes, not occurrences, across two files"
+    );
 }
 
 #[test]
@@ -2970,7 +2996,7 @@ fn cancel_keeps_unreferenced_attachment() {
 }
 
 #[test]
-fn opening_attachment_writes_a_workspace_copy_and_opens_it() {
+fn opening_attachment_opens_the_real_managed_file() {
     let (mut app, _directory) = make_app();
     let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
     refresh_attachment_refs(&mut app);
@@ -2980,8 +3006,12 @@ fn opening_attachment_writes_a_workspace_copy_and_opens_it() {
     let Some(Command::OpenPath(path)) = command else {
         panic!("expected OpenPath command, got {command:?}");
     };
+    // The opened path is the store's real application-managed content file:
+    // the attachment bytes live there, no workspace/cache copy is written.
     assert_eq!(fs::read(&path).unwrap(), b"pdf-bytes");
-    assert!(path.starts_with(app.storage.root.join("workspace").join("main")));
-    let name = path.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(name.ends_with("report.pdf"), "{name}");
+    assert!(path.starts_with(app.storage.attachments_dir));
+    assert_eq!(
+        fs::canonicalize(&path).unwrap(),
+        fs::canonicalize(app.attachment_store.open(id).unwrap()).unwrap()
+    );
 }

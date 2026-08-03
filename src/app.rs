@@ -18,19 +18,21 @@ use crate::agent::{
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::attachment::{AttachmentId, AttachmentStore};
-use crate::attachment_index::AttachmentReferenceIndex;
+use crate::attachment_usage::AttachmentUsageHandle;
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
 use crate::model::{
     Action, AttachmentHitbox, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup,
     FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit,
-    SearchHitbox, TagHitbox, TodoHitbox, TodoItem, WikiLinkCandidate, WikiLinkHitbox,
-    WikiLinkLocation, WorkspaceViewHitbox,
+    SearchHitbox, TagHitbox, TagNote, TagNoteHitbox, TodoHitbox, TodoItem, WikiLinkCandidate,
+    WikiLinkHitbox, WikiLinkLocation, WorkspaceViewHitbox,
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
 use crate::skill::Skill;
 use crate::storage::{LoadedTheme, Storage};
-use crate::workspace_index::{TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle};
+use crate::workspace_index::{
+    TagDocument, TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle,
+};
 
 pub(in crate::app) const FORMAT_DAILY_NOTE_PROMPT: &str = "Read this daily note, then edit it in place to improve its Markdown formatting and readability. Preserve every fact, idea, task, link, and the author's meaning. Only improve structure and presentation, such as headings, paragraphs, lists, spacing, and emphasis. Do not add new factual content, and do not merely describe the changes.";
 
@@ -285,18 +287,30 @@ pub struct App {
     pub tag_index: usize,
     pub tag_list_start: usize,
     tags_return_view: CenterView,
+    /// The exact tag whose full-body card stream fills the Tags view. `None`
+    /// shows the tag picker; `Some` shows its chronological card stream.
+    pub active_tag: Option<String>,
+    /// Distinct managed notes containing `active_tag`, oldest-first.
+    pub tag_notes: Vec<TagNote>,
+    pub tag_note_index: usize,
+    pub tag_note_scroll: u16,
+    pub(crate) reveal_selected_tag_note: bool,
+    pub(crate) tag_note_vlist: TagNoteVirtualList,
+    /// Rebuilt every frame by the renderer: one entry per visible card.
+    pub tag_note_hitboxes: Vec<TagNoteHitbox>,
     workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
 
     pub attachment_store: AttachmentStore,
-    pub attachment_refs: AttachmentReferenceIndex,
+    pub attachment_usage: AttachmentUsageHandle,
     pub attachment_entries: Vec<AttachmentEntry>,
     pub attachment_index: usize,
     pub attachment_list_start: usize,
     pub attachment_query: String,
     pub attachment_cursor: usize,
-    /// Attachment awaiting trash confirmation.
-    pending_attachment: Option<AttachmentId>,
+    /// Attachment awaiting trash confirmation, with the usage-index revision
+    /// its "unreferenced" decision was based on.
+    pending_attachment: Option<(AttachmentId, u64)>,
     pub skill_entries: Vec<Skill>,
     pub skill_index: usize,
     skill_browser_return: Option<SkillBrowserReturn>,
@@ -405,6 +419,7 @@ impl App {
         let todo_items = storage.load_todo_tasks();
         let images = crate::media::ImageService::new(&storage.root);
         let attachment_store = AttachmentStore::new(storage.attachments_dir.clone());
+        let attachment_usage = AttachmentUsageHandle::new();
         let workspace_index = WorkspaceIndexHandle::default();
         let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
         let permission_bypass = Arc::new(AtomicBool::new(false));
@@ -424,6 +439,7 @@ impl App {
                 cancelled.clone(),
             )
             .with_workspace_index(workspace_index.clone()),
+            attachment_usage.clone(),
         );
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
         Ok(Self {
@@ -480,10 +496,17 @@ impl App {
             tag_index: 0,
             tag_list_start: 0,
             tags_return_view: CenterView::Daily,
+            active_tag: None,
+            tag_notes: Vec::new(),
+            tag_note_index: 0,
+            tag_note_scroll: 0,
+            reveal_selected_tag_note: false,
+            tag_note_vlist: TagNoteVirtualList::default(),
+            tag_note_hitboxes: Vec::new(),
             workspace_index,
             pending_tag_rename: None,
             attachment_store,
-            attachment_refs: AttachmentReferenceIndex::default(),
+            attachment_usage: AttachmentUsageHandle::new(),
             attachment_entries: Vec::new(),
             attachment_index: 0,
             attachment_list_start: 0,

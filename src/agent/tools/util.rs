@@ -9,8 +9,8 @@ use similar::TextDiff;
 
 /// Largest rendered diff the model should receive before truncation.
 pub(super) const MAX_DIFF_BYTES: usize = 200_000;
-/// Largest UTF-8 file the tools will read or accept (1 MB).
-pub(super) const MAX_FILE_BYTES: u64 = 1_000_000;
+/// Largest UTF-8 document accepted by whole-file mutation tools (1 MB).
+pub(super) const MAX_EDIT_FILE_BYTES: u64 = 1_000_000;
 pub(super) const DEFAULT_SEARCH_RESULTS: usize = 50;
 pub(super) const MAX_SEARCH_RESULTS: usize = 200;
 pub(super) const MAX_SEARCH_OFFSET: usize = 10_000;

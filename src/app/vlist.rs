@@ -1,6 +1,8 @@
-//! Virtual-list and per-card render caches for the daily and agent panels.
+//! Virtual-list and per-card render caches for daily, tag, and agent panels.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use chrono::NaiveDate;
 
@@ -52,6 +54,42 @@ pub(crate) struct DailyVirtualList {
 }
 
 impl Default for DailyVirtualList {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            geometry: crate::vlist::VList::new(12),
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TagNoteCardRenderCache {
+    pub width: usize,
+    pub path: PathBuf,
+    pub title: String,
+    pub body: String,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub links: Vec<crate::markdown::RenderedLink>,
+    pub tags: Vec<crate::markdown::RenderedTag>,
+    pub images: Vec<mbtui::ImagePlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TagNoteVirtualItem {
+    pub path: PathBuf,
+    pub modified: SystemTime,
+    pub cache: Option<TagNoteCardRenderCache>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TagNoteVirtualList {
+    pub width: usize,
+    pub geometry: crate::vlist::VList,
+    pub items: Vec<TagNoteVirtualItem>,
+}
+
+impl Default for TagNoteVirtualList {
     fn default() -> Self {
         Self {
             width: 0,

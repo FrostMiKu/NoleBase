@@ -8,13 +8,16 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::util::{display_path, limited_diff, required_string, MAX_FILE_BYTES};
+use super::util::{display_path, limited_diff, required_string, MAX_EDIT_FILE_BYTES};
+use super::workspace_quota::{
+    check_workspace_write, check_workspace_writes, copy_with_workspace_limits, workspace_dir,
+};
 use super::write_policy::{validate_write, WriteSource};
 use crate::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
     ReadTracker, Tool,
 };
-use crate::storage::{AGENT_WORKSPACE_SUBDIR, ATTACHMENTS_DIR, WORKSPACE_DIR};
+use crate::storage::ATTACHMENTS_DIR;
 
 pub struct Edit {
     root: PathBuf,
@@ -121,7 +124,7 @@ impl Tool for Edit {
             _ => {}
         }
         let metadata = fs::metadata(&path)?;
-        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        if !metadata.is_file() || metadata.len() > MAX_EDIT_FILE_BYTES {
             bail!("target must be a regular UTF-8 file no larger than 1 MB");
         }
         let old = fs::read_to_string(&path)
@@ -156,7 +159,7 @@ impl Tool for Edit {
             state.ensure_edit_read(edit.start_line, edit.end_line_exclusive)?;
         }
         let content = apply_line_edits(&old, &offsets, &edits);
-        if content.len() as u64 > MAX_FILE_BYTES {
+        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
             bail!("edited content exceeds 1 MB");
         }
         if old == content {
@@ -178,6 +181,7 @@ impl Tool for Edit {
             self.reads.consume_file(&path)?;
             bail!("file changed before editing; read it again and retry");
         }
+        check_workspace_write(&self.root, &path, content.len() as u64)?;
         fs::write(&path, &content).with_context(|| format!("editing {}", path.display()))?;
         self.reads.consume_file(&path)?;
         Ok(format!("edited {relative}"))
@@ -383,8 +387,8 @@ pub(crate) enum PathZone {
     Config,
     /// `daily/`: calendar notes with their own tools; several generic tools are excluded.
     Daily,
-    /// `attachments/`: content-addressed attachment internals; generic tools must
-    /// never read or mutate these paths. Use the dedicated attachment tools instead.
+    /// `attachments/`: application-managed attachment internals; generic tools
+    /// must never read or mutate these paths. Use dedicated attachment tools instead.
     Attachments,
     /// `workspace/main`: the current persisted main Agent session's sandbox.
     /// Mutations here proceed without approval.
@@ -401,7 +405,7 @@ pub(crate) fn path_zone(root: &Path, path: &Path) -> PathZone {
         PathZone::Daily
     } else if path.starts_with(root.join(ATTACHMENTS_DIR)) {
         PathZone::Attachments
-    } else if path.starts_with(root.join(WORKSPACE_DIR).join(AGENT_WORKSPACE_SUBDIR)) {
+    } else if path.starts_with(workspace_dir(root)) {
         PathZone::Workspace
     } else {
         PathZone::Normal
@@ -441,8 +445,88 @@ fn copy_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
     }
 }
 
+/// Identity of a move source captured before approval and re-verified after,
+/// so a file that changes while the user is deciding is never moved.
+struct SourceIdentity {
+    canonical: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// Snapshot the identity of a move source: canonical path, size, and
+/// modification time, after confirming it is a regular file.
+fn capture_source_identity(path: &Path) -> Result<SourceIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("rechecking source {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("source must be a regular file and cannot be a symlink");
+    }
+    let canonical =
+        fs::canonicalize(path).with_context(|| format!("resolving source {}", path.display()))?;
+    Ok(SourceIdentity {
+        canonical,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// Re-check a captured source identity before mutating: the canonical path
+/// must be unchanged and still hold a regular file of the same size and
+/// modification time.
+fn revalidate_source(identity: &SourceIdentity) -> Result<()> {
+    let path = &identity.canonical;
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("rechecking source {}", path.display()))?;
+    if current.file_type().is_symlink()
+        || !current.file_type().is_file()
+        || current.len() != identity.len
+        || current.modified().ok() != identity.modified
+        || fs::canonicalize(path)
+            .with_context(|| format!("rechecking source {}", path.display()))?
+            != *path
+    {
+        bail!("source changed before move; inspect it again and retry");
+    }
+    Ok(())
+}
+
+/// Move a file to a new path. Same-filesystem moves use an atomic `rename`;
+/// only a cross-device error (EXDEV) falls back to a durable copy, sync, and
+/// remove of the source.
 fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
+    match fs::rename(source, destination) {
+        Ok(()) => {
+            let bytes = fs::metadata(destination)
+                .with_context(|| format!("stat after rename {}", destination.display()))?
+                .len();
+            Ok(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            move_across_devices(source, destination)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("renaming {} to {}", source.display(), destination.display())),
+    }
+}
+
+/// Cross-device fallback for a move: copy into a freshly created destination
+/// (never clobbering an existing path), make the copy durable by syncing the
+/// file and its parent directory, then remove the source. A failure before
+/// the source is removed rolls back the destination copy.
+fn move_across_devices(source: &Path, destination: &Path) -> Result<u64> {
     let bytes = copy_to_new_file(source, destination)?;
+    if let Err(error) = fs::File::open(destination).and_then(|file| file.sync_all()) {
+        let _ = fs::remove_file(destination);
+        return Err(error)
+            .with_context(|| format!("syncing copied file {}", destination.display()));
+    }
+    if let Some(parent) = destination.parent() {
+        if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            let _ = fs::remove_file(destination);
+            return Err(error)
+                .with_context(|| format!("syncing destination directory {}", parent.display()));
+        }
+    }
     if let Err(error) = fs::remove_file(source) {
         let rollback = fs::remove_file(destination);
         bail!(
@@ -489,7 +573,7 @@ impl Tool for Copy {
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
         validate_write(&self.root, &destination, WriteSource::File(&source))?;
-        let bytes = copy_to_new_file(&source, &destination)?;
+        let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
         Ok(format!("copied {bytes} bytes to {destination_text}"))
     }
 }
@@ -526,9 +610,11 @@ impl Tool for Move {
 
     async fn execute(&self, input: &Value) -> Result<String> {
         let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
+        let identity = capture_source_identity(&source)?;
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
         validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        check_workspace_write(&self.root, &destination, identity.len)?;
         if outside_agent_workspace(&self.root, &source) {
             self.gate
                 .request(ApprovalRequest {
@@ -542,6 +628,7 @@ impl Tool for Move {
                 })
                 .await?;
         }
+        revalidate_source(&identity)?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!("moved {bytes} bytes to {destination_text}"))
@@ -608,6 +695,7 @@ impl Tool for MoveMany {
         for value in source_values {
             let source_text = value.as_str().context("each source must be a string")?;
             let source = resolve_transfer_source(&self.root, source_text)?;
+            let identity = capture_source_identity(&source)?;
             if !sources.insert(source.clone()) {
                 bail!("duplicate source: {source_text}");
             }
@@ -626,12 +714,18 @@ impl Tool for MoveMany {
                 Err(error) => return Err(error).context("checking batch destination"),
             }
             validate_write(&self.root, &destination, WriteSource::File(&source))?;
-            transfers.push((source, destination));
+            transfers.push((source, destination, identity));
         }
+        check_workspace_writes(
+            &self.root,
+            transfers
+                .iter()
+                .map(|(_, destination, identity)| (destination.as_path(), identity.len)),
+        )?;
 
         if transfers
             .iter()
-            .any(|(source, _)| outside_agent_workspace(&self.root, source))
+            .any(|(source, _, _)| outside_agent_workspace(&self.root, source))
         {
             self.gate
                 .request(ApprovalRequest {
@@ -647,8 +741,12 @@ impl Tool for MoveMany {
                 .await?;
         }
 
+        for (_, _, identity) in &transfers {
+            revalidate_source(identity)?;
+        }
+
         let mut completed = Vec::with_capacity(transfers.len());
-        for (source, destination) in &transfers {
+        for (source, destination, _) in &transfers {
             match move_to_new_file(source, destination) {
                 Ok(bytes) => completed.push((source.clone(), destination.clone(), bytes)),
                 Err(error) => {
@@ -764,6 +862,7 @@ impl Tool for Rename {
             bail!("rename path must be relative to the Nole root");
         }
         let source = resolve_transfer_source(&self.root, path_text)?;
+        let identity = capture_source_identity(&source)?;
         if !source.starts_with(&self.root) {
             bail!("rename source must be under the Nole root");
         }
@@ -787,6 +886,7 @@ impl Tool for Rename {
             Err(error) => return Err(error).context("checking rename destination"),
         }
         validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        check_workspace_write(&self.root, &destination, identity.len)?;
         if outside_agent_workspace(&self.root, &source) {
             self.gate
                 .request(ApprovalRequest {
@@ -800,6 +900,7 @@ impl Tool for Rename {
                 })
                 .await?;
         }
+        revalidate_source(&identity)?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
         Ok(format!(
@@ -943,7 +1044,7 @@ impl Tool for Write {
         if input.get("overwrite").is_some() {
             bail!("write only creates new files; use read and edit for existing files");
         }
-        if content.len() as u64 > MAX_FILE_BYTES {
+        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
             bail!("content exceeds 1 MB");
         }
         let path = safe_relative(&self.root, relative)?;
@@ -962,6 +1063,7 @@ impl Tool for Write {
             Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
         }
         validate_write(&self.root, &path, WriteSource::Text(content))?;
+        check_workspace_write(&self.root, &path, content.len() as u64)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let mut file = options
@@ -1416,6 +1518,79 @@ mod tests {
         assert!(alpha.exists());
         assert!(beta.exists());
         assert!(!root.join("data/collected/alpha.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_filesystem_move_is_an_atomic_rename() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("a.txt");
+        fs::write(&source, "rename me").unwrap();
+        let before = fs::metadata(&source).unwrap();
+
+        let bytes = move_to_new_file(&source, &root.join("b.txt")).unwrap();
+        assert_eq!(bytes, 9);
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "rename me");
+        // rename preserves the inode; a copy/remove fallback would not.
+        let after = fs::metadata(root.join("b.txt")).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    }
+
+    #[test]
+    fn cross_device_fallback_copies_syncs_and_removes_source() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("a.txt");
+        fs::write(&source, "durable copy").unwrap();
+
+        let bytes = move_across_devices(&source, &root.join("b.txt")).unwrap();
+        assert_eq!(bytes, "durable copy".len() as u64);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(root.join("b.txt")).unwrap(),
+            "durable copy"
+        );
+    }
+
+    #[test]
+    fn move_revalidates_the_source_after_approval() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(root.join("data")).unwrap();
+        let outside = tempdir().unwrap();
+        let move_source = outside.path().join("move.txt");
+        fs::write(&move_source, "move me").unwrap();
+
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender.clone(),
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let mover = Move::new(&root, event_sender, gate).unwrap();
+        let input = json!({
+            "source": move_source,
+            "destination": "data/moved.md"
+        });
+        let worker = std::thread::spawn(move || test_runtime().block_on(mover.execute(&input)));
+        let AgentEvent::Approval(_) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        // The file changes while the user is deciding; approving must not move it.
+        fs::write(&move_source, "changed while deciding").unwrap();
+        decision_sender.send(ApprovalDecision::Approve).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("source changed before move"));
+        assert!(move_source.exists());
+        assert!(!root.join("data/moved.md").exists());
     }
 
     #[test]

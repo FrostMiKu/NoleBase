@@ -680,7 +680,10 @@ mod tests {
 
     #[test]
     fn attachment_links_are_clickable_and_never_external() {
-        let uri = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        let uri = format!(
+            "nole://attachment/{}",
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
         let rendered = render_at_width(&format!("[report]({uri})"), WIDTH);
         assert!(rendered
             .links
@@ -689,10 +692,10 @@ mod tests {
 
         // A malformed attachment URI still classifies as an attachment link so
         // it can never reach a web opener; activation reports the parse error.
-        let rendered = render_at_width("[bad](nole-attachment://sha256/nothex)", WIDTH);
+        let rendered = render_at_width("[bad](nole://attachment/not-a-uuid)", WIDTH);
         assert!(rendered.links.iter().any(|link| {
             matches!(&link.target, LinkTarget::Attachment(target)
-                if target == "nole-attachment://sha256/nothex")
+                if target == "nole://attachment/not-a-uuid")
         }));
 
         let rendered = render_at_width(&format!("[link={uri}]open[/link]"), WIDTH);
@@ -704,7 +707,10 @@ mod tests {
 
     #[test]
     fn attachment_embeds_become_attachment_links() {
-        let uri = format!("nole-attachment://sha256/{}", "ab".repeat(32));
+        let uri = format!(
+            "nole://attachment/{}",
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
         let rendered = render_at_width(&format!("![[{uri}]]"), WIDTH);
         assert!(rendered.images.is_empty());
         assert!(rendered

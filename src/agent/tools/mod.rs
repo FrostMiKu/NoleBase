@@ -2,7 +2,8 @@
 //!
 //! Each submodule groups tools by theme. The tool structs are re-exported here so
 //! the runtime (in [`crate::agent`]) can register them by name; private helpers stay
-//! hidden inside their theme module, and only [`util`] is shared between themes.
+//! hidden inside their theme module, and only [`util`] and [`workspace_quota`]
+//! are shared between themes.
 
 mod attachment_ops;
 mod explore;
@@ -13,6 +14,7 @@ mod read;
 mod skills;
 mod util;
 mod web;
+mod workspace_quota;
 mod write_policy;
 
 pub use self::{

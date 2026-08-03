@@ -20,6 +20,7 @@ pub enum DocumentReturn {
     Daily,
     Search,
     Skills,
+    Tags,
 }
 
 /// A regular or daily note rendered as Markdown in the center pane.

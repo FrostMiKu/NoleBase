@@ -119,6 +119,10 @@ impl App {
                 self.focus = Focus::Center;
             }
             DocumentReturn::Skills => self.return_to_skill_browser(),
+            DocumentReturn::Tags => {
+                self.center_view = CenterView::Tags;
+                self.focus = Focus::Center;
+            }
         }
     }
 

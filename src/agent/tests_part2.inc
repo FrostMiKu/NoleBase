@@ -537,7 +537,7 @@
         assert!(prompt.contains("workspace/main/: your private working sandbox"));
         assert!(prompt.contains("proceeds without approval"));
         assert!(prompt.contains("requires approval"));
-        assert!(prompt.contains("nole-attachment://sha256/<64 lowercase hex>"));
+        assert!(prompt.contains("nole://attachment/<uuid>"));
         assert!(prompt.contains("Use read with a URL when you already have one"));
         assert!(prompt.contains("Delegate broad, multi-step exploration"));
         assert!(prompt.contains("internal work stays out of this conversation"));
@@ -827,7 +827,8 @@
         server.join().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["kind"], "web");
-        assert_eq!(parsed["content"], "runtime-safe response");
+        assert_eq!(parsed["format"], "text");
+        assert_eq!(parsed["lines"], json!(["runtime-safe response"]));
     }
 
     #[test]
@@ -1192,7 +1193,7 @@
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
-        read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
+        read.execute(&json!({"path": "data/large.md:11-11"}))
             .unwrap();
         edit.execute(&json!({
             "path": "data/large.md",
@@ -1205,7 +1206,7 @@
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
-        read.execute(&json!({"path": "data/large.md", "offset": 10, "limit": 1}))
+        read.execute(&json!({"path": "data/large.md:11-11"}))
             .unwrap();
         let error = edit
             .execute(&json!({
@@ -1221,7 +1222,7 @@
         let reads = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
-        read.execute(&json!({"path": "data/large.md", "offset": 1, "limit": 1}))
+        read.execute(&json!({"path": "data/large.md:2-2"}))
             .unwrap();
         let error = edit
             .execute(&json!({

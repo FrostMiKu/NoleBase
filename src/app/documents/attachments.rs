@@ -1,21 +1,21 @@
 //! Document browsing and actions: attachments.
 //!
-//! The attachment browser lists store metadata (name, kind, size) joined with
-//! the derived reference index (how many managed notes reference each
-//! attachment). Opening an attachment materializes a copy under the agent
-//! workspace and opens that with the system application, so physical object
-//! paths never leave the store. Deletion is confirmed and refuses attachments
-//! that are still referenced, reporting the referencing notes.
+//! The attachment browser lists store metadata (display name, kind, size)
+//! joined with the shared usage snapshot (how many distinct managed notes
+//! reference each attachment), ordered by `imported_at` descending through the
+//! store's list API. Opening an attachment opens the real application-managed
+//! content file in place — no copy is ever materialized into the workspace.
+//! Deletion is confirmed, refuses while the usage index is not ready or stale,
+//! and always ends in the shared authoritative reference scan before the
+//! atomic store trash.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::attachment::AttachmentMetadata;
+use crate::attachment::{
+    AttachmentMetadata, AttachmentQuery, AttachmentSortBy, AttachmentSortOrder, AttachmentUri,
+};
 
 use super::super::*;
-
-/// Where system-app open copies live, under the agent workspace root.
-const OPEN_COPY_SUBDIR: &str = ".nole-open";
 
 impl App {
     pub fn open_attachments(&mut self) {
@@ -23,11 +23,19 @@ impl App {
         self.activate_workspace_view(CenterView::Attachments);
     }
 
-    /// Rebuild the browser rows from the store and the reference index.
+    /// Rebuild the browser rows from the store (query + imported_at descending)
+    /// joined with the shared usage snapshot.
     pub(in crate::app) fn recompute_attachments(&mut self) {
-        let query = self.attachment_query.trim().to_lowercase();
-        let listed = match self.attachment_store.list() {
-            Ok(listed) => listed,
+        let query = AttachmentQuery {
+            query: self.attachment_query.trim().to_string(),
+            offset: 0,
+            limit: u64::MAX,
+            sort_by: AttachmentSortBy::ImportedAt,
+            order: AttachmentSortOrder::Desc,
+            ..AttachmentQuery::default()
+        };
+        let page = match self.attachment_store.list(&query) {
+            Ok(page) => page,
             Err(error) => {
                 self.attachment_entries.clear();
                 self.attachment_index = 0;
@@ -35,7 +43,9 @@ impl App {
                 return;
             }
         };
-        self.attachment_entries = listed
+        let snapshot = self.attachment_usage.snapshot();
+        self.attachment_entries = page
+            .items
             .into_iter()
             .map(|metadata| {
                 let name = attachment_display_name(&metadata);
@@ -44,12 +54,12 @@ impl App {
                     kind: attachment_kind(&metadata, &name),
                     name: name.clone(),
                     size: metadata.size,
-                    references: self
-                        .attachment_refs
-                        .reference_count(&metadata.uri().to_string()),
+                    locations: snapshot
+                        .references
+                        .locations(&metadata.uri().to_string())
+                        .len(),
                 }
             })
-            .filter(|entry| query.is_empty() || entry.name.to_lowercase().contains(&query))
             .collect();
         self.attachment_index = self
             .attachment_index
@@ -59,6 +69,15 @@ impl App {
             .min(self.attachment_entries.len().saturating_sub(1));
     }
 
+    /// Re-list the browser when attachment store files changed externally
+    /// (content/metadata edits under `attachments/<id>/`). The usage snapshot
+    /// is untouched: attachment store events never change note references.
+    pub(crate) fn attachment_paths_changed(&mut self, _paths: &[PathBuf]) {
+        if self.center_view == CenterView::Attachments {
+            self.recompute_attachments();
+        }
+    }
+
     pub(in crate::app) fn move_attachment_selection(&mut self, delta: i32) {
         if !self.attachment_entries.is_empty() {
             self.attachment_index =
@@ -66,44 +85,48 @@ impl App {
         }
     }
 
-    /// Open the selected attachment with the system application. Returns the
-    /// open command; the resolved copy lives under the agent workspace so it
-    /// never exposes the store's physical object path.
+    /// Open the selected attachment with the system application. The returned
+    /// path is the store's real application-managed content file, so external
+    /// saves update the attachment in place; nothing is copied to the
+    /// workspace or the cache.
     pub(in crate::app) fn open_attachment_at(&mut self, index: usize) -> Option<Command> {
         let entry = self.attachment_entries.get(index).cloned()?;
-        match self.attachment_store.read_object(entry.id) {
-            Ok(bytes) => match self.write_open_copy(&entry, &bytes) {
-                Ok(path) => Some(Command::OpenPath(path)),
-                Err(error) => {
-                    self.set_error(format!("Attachment open error: {error}"));
-                    None
-                }
-            },
+        match self.attachment_store.open(entry.id) {
+            Ok(path) => Some(Command::OpenPath(path)),
             Err(error) => {
-                self.set_error(format!("Attachment read error: {error}"));
+                self.set_error(format!("Attachment open error: {error}"));
                 None
             }
         }
     }
 
-    /// Begin the confirmed trash flow for the selected attachment. Referenced
-    /// attachments are refused up front and their locations are reported.
+    /// Begin the confirmed trash flow for the selected attachment. Refused
+    /// before the usage index is ready, and refused up front when managed
+    /// notes still reference the attachment, reporting the distinct locations.
     pub(in crate::app) fn request_delete_attachment(&mut self) {
         let Some(entry) = self.attachment_entries.get(self.attachment_index).cloned() else {
             self.set_status("No attachment selected");
             return;
         };
-        let uri = crate::attachment::AttachmentUri::from_id(entry.id).to_string();
-        if let Some(locations) = self.referenced_locations(&uri) {
+        let snapshot = self.attachment_usage.snapshot();
+        if !snapshot.ready {
+            self.set_status("Attachment index is still loading; try again");
+            return;
+        }
+        let uri = AttachmentUri::from_id(entry.id).to_string();
+        let locations = snapshot.references.locations(&uri);
+        if !locations.is_empty() {
             self.set_error(format!(
                 "{} is referenced by {} and cannot be moved to trash: {}",
                 entry.name,
-                locations,
-                self.reference_names(&uri)
+                locations_label(&locations),
+                self.reference_names(&locations)
             ));
             return;
         }
-        self.pending_attachment = Some(entry.id);
+        // Remember which usage snapshot the "unreferenced" decision came from;
+        // the confirm handler refuses if it rotated in the meantime.
+        self.pending_attachment = Some((entry.id, snapshot.revision));
         self.open_dialog(DialogState::new(
             "Move attachment to trash",
             format!(
@@ -117,32 +140,9 @@ impl App {
         ));
     }
 
-    /// Materialize a new file under `workspace/main/.nole-open/` holding the
-    /// object bytes, for the system application to open. Overwriting the same
-    /// attachment reuses its stable file name.
-    fn write_open_copy(&self, entry: &AttachmentEntry, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-        let directory = self.storage.agent_workspace_dir().join(OPEN_COPY_SUBDIR);
-        fs::create_dir_all(&directory)?;
-        let name = sanitize_open_name(&entry.name);
-        let path = directory.join(format!("{}-{name}", &entry.id.to_hex()[..12]));
-        fs::write(&path, bytes)?;
-        Ok(path)
-    }
-
-    /// The distinct managed notes referencing the URI as "N note(s)", or None
-    /// when nothing references it.
-    fn referenced_locations(&self, uri: &str) -> Option<String> {
-        let count = self.attachment_refs.reference_count(uri);
-        (count > 0).then(|| match count {
-            1 => "1 note".to_string(),
-            n => format!("{n} notes"),
-        })
-    }
-
     /// The referencing note paths as relative paths, comma separated.
-    fn reference_names(&self, uri: &str) -> String {
-        self.attachment_refs
-            .locations(uri)
+    fn reference_names(&self, locations: &[PathBuf]) -> String {
+        locations
             .iter()
             .map(|path| self.relative_note_path(path))
             .collect::<Vec<_>>()
@@ -157,14 +157,18 @@ impl App {
     }
 }
 
-/// The display name of an attachment: the file portion of its import source,
-/// falling back to the raw source string.
+/// "1 note" / "N notes" for the distinct managed notes in `locations`.
+fn locations_label(locations: &[PathBuf]) -> String {
+    match locations.len() {
+        1 => "1 note".to_string(),
+        count => format!("{count} notes"),
+    }
+}
+
+/// The display name of an attachment: the application-managed display name
+/// stored in metadata (never derived from the store path).
 pub(in crate::app) fn attachment_display_name(metadata: &AttachmentMetadata) -> String {
-    Path::new(&metadata.source)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| metadata.source.clone())
+    metadata.display_name.clone()
 }
 
 /// A short display type: the recognizable media type (for example `pdf` or
@@ -203,50 +207,6 @@ pub(crate) fn human_size(bytes: u64) -> String {
     }
 }
 
-/// File names usable in the open-copy directory: keep the extension and the
-/// stem, dropping characters that are unsafe in file names.
-fn sanitize_open_name(name: &str) -> String {
-    let name = name.trim();
-    if name.is_empty() || name == "." || name == ".." {
-        return "attachment".to_string();
-    }
-    let (stem, extension) = match name.rsplit_once('.') {
-        Some((stem, extension))
-            if !stem.is_empty()
-                && !extension.is_empty()
-                && extension
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric()) =>
-        {
-            (stem, Some(extension))
-        }
-        _ => (name, None),
-    };
-    let clean = |part: &str| {
-        let cleaned = part
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ' ' | '.') {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        cleaned.trim().trim_end_matches('.').to_string()
-    };
-    let stem = clean(stem);
-    let stem = if stem.is_empty() {
-        "attachment".to_string()
-    } else {
-        stem
-    };
-    match extension {
-        Some(extension) => format!("{stem}.{extension}"),
-        None => stem,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,8 +214,10 @@ mod tests {
     #[test]
     fn display_name_and_kind_fall_back_gracefully() {
         let metadata = AttachmentMetadata {
-            id: crate::attachment::AttachmentId::from_hex(&"a".repeat(64)).unwrap(),
+            id: crate::attachment::AttachmentId::parse(&"550e8400-e29b-41d4-a716-446655440000")
+                .unwrap(),
             size: 12,
+            display_name: "report.pdf".to_string(),
             source: "archives/report.pdf".to_string(),
             mime_type: Some("application/pdf".to_string()),
             imported_at: chrono::Utc::now(),
@@ -266,6 +228,7 @@ mod tests {
         let plain = AttachmentMetadata {
             id: metadata.id,
             size: 3,
+            display_name: "notes".to_string(),
             source: "notes".to_string(),
             mime_type: None,
             imported_at: metadata.imported_at,
@@ -282,10 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn open_copy_names_are_safe_and_stable() {
-        assert_eq!(sanitize_open_name("report.pdf"), "report.pdf");
-        assert_eq!(sanitize_open_name("a/b:report v2.pdf"), "a_b_report v2.pdf");
-        assert_eq!(sanitize_open_name(""), "attachment");
-        assert_eq!(sanitize_open_name(".."), "attachment");
+    fn locations_label_reports_distinct_notes() {
+        assert_eq!(locations_label(&[]), "0 notes");
+        assert_eq!(locations_label(&[PathBuf::from("a")]), "1 note");
+        assert_eq!(
+            locations_label(&[PathBuf::from("a"), PathBuf::from("b")]),
+            "2 notes"
+        );
     }
 }

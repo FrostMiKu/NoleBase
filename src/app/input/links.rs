@@ -1,13 +1,6 @@
 //! Keyboard and mouse input: links.
 
-use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
-
-use anyhow::Context;
-
-use crate::attachment::{AttachmentStore, AttachmentUri};
-use crate::storage::Storage;
+use crate::attachment::AttachmentUri;
 
 use super::super::*;
 
@@ -23,7 +16,10 @@ impl App {
                         return None;
                     }
                 };
-                match materialize_attachment(&self.storage, uri) {
+                // Open the store's real application-managed content file in
+                // place; external saves update the attachment itself. No copy
+                // is written to the workspace or the cache.
+                match self.attachment_store.open(uri.id()) {
                     Ok(path) => Some(Command::OpenPath(path)),
                     Err(error) => {
                         self.set_error(format!("Attachment error: {error}"));
@@ -126,44 +122,5 @@ impl App {
             }
             Err(error) => self.set_error(format!("Wiki note error: {error}")),
         }
-    }
-}
-
-/// Materialize an attachment as a file the system application can open,
-/// writing the bytes under the Agent workspace (`workspace/main`). The digest
-/// in the file name makes it content-addressed, so opening the same attachment
-/// again reuses the existing file instead of churning the workspace. Physical
-/// object paths never leave the attachment store.
-fn materialize_attachment(storage: &Storage, uri: AttachmentUri) -> anyhow::Result<PathBuf> {
-    let store = AttachmentStore::new(storage.attachments_dir.clone());
-    let metadata = store.metadata(uri.id())?;
-    let bytes = store.read_object(uri.id())?;
-    let workspace = storage.agent_workspace_dir();
-    fs::create_dir_all(&workspace).with_context(|| format!("creating {}", workspace.display()))?;
-    let path = workspace.join(attachment_open_name(&metadata.source, uri));
-    if fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
-        fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(path)
-}
-
-/// A stable, content-addressed file name for opening an attachment with the
-/// system application. The original extension is preserved so the OS picks the
-/// right application; the digest prefix keeps names unique per attachment.
-fn attachment_open_name(source: &str, uri: AttachmentUri) -> String {
-    let path = Path::new(source);
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("attachment");
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| !extension.is_empty());
-    let id = &uri.id().to_hex()[..12];
-    match extension {
-        Some(extension) => format!("{stem}-{id}.{extension}"),
-        None => format!("{stem}-{id}"),
     }
 }

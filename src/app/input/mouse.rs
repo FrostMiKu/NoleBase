@@ -50,7 +50,13 @@ impl App {
                 CenterView::Search | CenterView::DocumentSearch => {
                     self.move_search_selection(delta)
                 }
-                CenterView::Tags => self.move_tag_selection(delta),
+                CenterView::Tags => {
+                    if self.active_tag.is_some() {
+                        self.scroll_tag_notes(delta);
+                    } else {
+                        self.move_tag_selection(delta);
+                    }
+                }
                 CenterView::Attachments => self.move_attachment_selection(delta),
             }
         }
@@ -115,8 +121,21 @@ impl App {
             .find(|hitbox| point_in_rect(column, row, hitbox.area))
             .map(|hitbox| hitbox.name.clone())
         {
-            self.open_tag_search(&name);
+            self.open_tag_documents(&name);
             return None;
+        }
+
+        if self.center_view == CenterView::Tags && self.active_tag.is_some() {
+            if let Some(index) = self
+                .tag_note_hitboxes
+                .iter()
+                .find(|hitbox| point_in_rect(column, row, hitbox.area))
+                .map(|hitbox| hitbox.index)
+            {
+                self.tag_note_index = index;
+                self.open_tag_note_at(index);
+                return None;
+            }
         }
 
         if matches!(
