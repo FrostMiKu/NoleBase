@@ -232,6 +232,7 @@ impl DocumentIndex {
                 .with_context(|| format!("writing index cache {}", temporary.display()))?;
             file.sync_all()
                 .with_context(|| format!("syncing index cache {}", temporary.display()))?;
+            drop(file);
             replace_cache_file(&temporary, &destination).with_context(|| {
                 format!(
                     "publishing index cache {} to {}",

@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn tag_documents_are_distinct_oldest_first_and_exact() {
         fn set_modified(path: &Path, seconds: u64) {
-            let file = fs::File::open(path).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
             file.set_times(
                 fs::FileTimes::new()
                     .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds)),

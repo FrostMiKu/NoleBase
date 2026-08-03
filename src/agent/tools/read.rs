@@ -19,8 +19,9 @@ use serde_json::{json, Value};
 use tokio::fs as async_fs;
 
 use super::util::{
-    display_path, fuzzy_match, optional_usize, range_schema, required_string, truncate_chars,
-    RangeSelector, MAX_EDIT_FILE_BYTES, MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
+    display_path, fuzzy_match, optional_usize, portable_path, range_schema, required_string,
+    truncate_chars, RangeSelector, MAX_EDIT_FILE_BYTES, MAX_SEARCH_RESULTS,
+    MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::web::{read_http_body_with_limit, web_fetch_content};
 use crate::agent::{canonical_root, ReadTracker, SnapshotTagHasher, Tool, ToolExecutionPolicy};
@@ -997,10 +998,7 @@ async fn count_file_lines(path: &Path) -> Result<u64> {
 }
 
 fn listed_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    portable_path(path.strip_prefix(root).unwrap_or(path))
 }
 
 struct NoteMetadata {

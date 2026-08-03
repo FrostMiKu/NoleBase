@@ -119,11 +119,19 @@ pub(super) fn range_schema(max_span: usize) -> Value {
 
 pub(super) fn display_path(root: &Path, path: &Path) -> String {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    canonical
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    portable_path(canonical.strip_prefix(root).unwrap_or(path))
+}
+
+pub(super) fn portable_path(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        text.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        text
+    }
 }
 
 pub(super) fn fuzzy_match(haystack: &str, needle: &str) -> bool {

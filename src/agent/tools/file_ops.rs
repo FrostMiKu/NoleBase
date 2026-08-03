@@ -515,11 +515,16 @@ fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
 /// the source is removed rolls back the destination copy.
 fn move_across_devices(source: &Path, destination: &Path) -> Result<u64> {
     let bytes = copy_to_new_file(source, destination)?;
-    if let Err(error) = fs::File::open(destination).and_then(|file| file.sync_all()) {
+    if let Err(error) = OpenOptions::new()
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.sync_all())
+    {
         let _ = fs::remove_file(destination);
         return Err(error)
             .with_context(|| format!("syncing copied file {}", destination.display()));
     }
+    #[cfg(not(windows))]
     if let Some(parent) = destination.parent() {
         if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
             let _ = fs::remove_file(destination);

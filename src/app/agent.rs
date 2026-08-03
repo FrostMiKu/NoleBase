@@ -589,7 +589,10 @@ impl App {
             let display = path
                 .strip_prefix(&self.storage.root)
                 .unwrap_or(&path)
-                .to_string_lossy();
+                .to_string_lossy()
+                .into_owned();
+            #[cfg(windows)]
+            let display = display.replace('\\', "/");
             format!("The user is currently viewing {kind}: {display}\n\n{content}")
         } else {
             content.to_string()

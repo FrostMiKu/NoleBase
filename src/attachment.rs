@@ -435,6 +435,7 @@ impl AttachmentStore {
             content
                 .sync_all()
                 .with_context(|| format!("syncing staging content {}", staged.display()))?;
+            drop(content);
             // Publish metadata inside the same staging directory.
             let metadata = AttachmentMetadata {
                 id,
@@ -456,6 +457,7 @@ impl AttachmentStore {
                 .with_context(|| format!("writing staging metadata {}", staged.display()))?;
             file.sync_all()
                 .with_context(|| format!("syncing staging metadata {}", staged.display()))?;
+            drop(file);
             // One atomic rename makes the whole attachment visible.
             fs::rename(&staged, &self.attachment_dir(id)).with_context(|| {
                 format!(
@@ -644,6 +646,7 @@ impl AttachmentStore {
             content
                 .sync_all()
                 .with_context(|| format!("syncing staging content {}", staged.display()))?;
+            drop(content);
             // Re-check after staging and syncing, immediately before the
             // atomic publish, so changes while the source was streamed or
             // while approval was pending cannot be overwritten.
