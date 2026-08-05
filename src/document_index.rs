@@ -216,7 +216,7 @@ impl DocumentIndex {
                         })
                 })
                 .collect::<Vec<_>>();
-            files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            files.sort_by(|left, right| left.relative_path.cmp(right.relative_path));
             let snapshot = CacheSnapshotRef {
                 format_version: CACHE_FORMAT_VERSION,
                 files,
@@ -317,7 +317,7 @@ fn index_worker(
     if !apply_pending_commands(&storage, &commands, &mut documents, &mut revision) {
         return;
     }
-    if publish_snapshot(&updates, revision, &documents).is_err() {
+    if !publish_snapshot(&updates, revision, &documents) {
         return;
     }
 
@@ -332,7 +332,7 @@ fn index_worker(
                 if !apply_pending_commands(&storage, &commands, &mut documents, &mut revision) {
                     return;
                 }
-                if publish_snapshot(&updates, revision, &documents).is_err() {
+                if !publish_snapshot(&updates, revision, &documents) {
                     return;
                 }
             }
@@ -368,12 +368,14 @@ fn publish_snapshot(
     updates: &Sender<IndexSnapshot>,
     revision: u64,
     documents: &DocumentIndex,
-) -> std::result::Result<(), mpsc::SendError<IndexSnapshot>> {
-    updates.send(IndexSnapshot {
-        revision,
-        workspace: WorkspaceIndex::from_documents(documents),
-        attachments: AttachmentReferenceIndex::from_documents(documents),
-    })
+) -> bool {
+    updates
+        .send(IndexSnapshot {
+            revision,
+            workspace: WorkspaceIndex::from_documents(documents),
+            attachments: AttachmentReferenceIndex::from_documents(documents),
+        })
+        .is_ok()
 }
 
 fn replace_cache_file(staged: &Path, destination: &Path) -> io::Result<()> {

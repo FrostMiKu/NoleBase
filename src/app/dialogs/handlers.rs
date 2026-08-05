@@ -2,6 +2,8 @@
 
 use super::super::*;
 
+use crate::export::ExportDiagnostic;
+
 impl App {
     pub(crate) fn handle_overlay(&mut self, key: KeyEvent) -> Option<Command> {
         self.handle_dialog_key(key)
@@ -75,10 +77,12 @@ impl App {
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
             DialogPurpose::TagRenameSource => return self.handle_tag_rename_source(key),
+            DialogPurpose::ExportFormat => return self.handle_export_format(key),
             DialogPurpose::AgentPrompt
             | DialogPurpose::NewFile
             | DialogPurpose::RenameFile
-            | DialogPurpose::TagRenameTarget => return self.handle_text_dialog(key),
+            | DialogPurpose::TagRenameTarget
+            | DialogPurpose::ExportDestination => return self.handle_text_dialog(key),
             DialogPurpose::Custom => {}
         }
 
@@ -167,6 +171,116 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    pub(crate) fn handle_export_format(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            code if is_up_key(code) => self.move_dialog_selection(-1),
+            code if is_down_key(code) => self.move_dialog_selection(1),
+            KeyCode::Enter => {
+                let selected = self.dialog_selected();
+                if let Some(format) = ExportFormat::ALL.get(selected).copied() {
+                    self.pending_export_format = Some(format);
+                    self.open_export_destination_dialog();
+                }
+            }
+            code if is_cancel_key(code) => self.close_dialog(),
+            _ => {}
+        }
+        None
+    }
+
+    fn submit_export(&mut self) {
+        if self.export_in_progress {
+            self.set_status("Export is already in progress");
+            return;
+        }
+        let Some(source) = self.pending_export_source.clone() else {
+            self.set_error("Export source is no longer available");
+            return;
+        };
+        let Some(format) = self.pending_export_format else {
+            self.set_error("Export format is no longer available");
+            return;
+        };
+        let destination = self
+            .dialog
+            .as_ref()
+            .map(|dialog| dialog.input.clone())
+            .unwrap_or_default();
+        let prepared = match self
+            .storage
+            .prepare_export(&source, Path::new(&destination), format)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Keep the dialog open with the typed destination so the
+                // user can fix the input.
+                self.set_error(error.to_string());
+                return;
+            }
+        };
+        let resolved = prepared.destination().display().to_string();
+        let storage = self.storage.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("nole-export".to_string())
+            .spawn(move || {
+                let outcome = storage
+                    .publish_export(&prepared)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(ExportJobResult { format, outcome });
+            });
+        if let Err(error) = worker {
+            self.set_error(format!("starting export worker: {error}"));
+            return;
+        }
+        self.pending_export_destination = Some(destination);
+        self.export_job = Some(receiver);
+        self.export_job_format = Some(format);
+        self.export_in_progress = true;
+        // Dismiss the dialog while keeping the pending export state, so a
+        // background failure can restore it for a direct retry.
+        self.overlay = None;
+        self.dialog = None;
+        self.set_status(format!("Exporting as {} to {resolved}", format.label()));
+    }
+
+    pub fn poll_export(&mut self) {
+        let result = match self.export_job.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Some(ExportJobResult {
+                format: self.export_job_format.unwrap_or(ExportFormat::Original),
+                outcome: Err("export worker disconnected".to_string()),
+            }),
+            Some(Err(mpsc::TryRecvError::Empty)) | None => None,
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.export_job = None;
+        self.export_job_format = None;
+        self.export_in_progress = false;
+        match result.outcome {
+            Ok(outcome) => {
+                let message = export_success_message(&outcome, result.format, &outcome.diagnostics);
+                self.pending_export_source = None;
+                self.pending_export_format = None;
+                self.pending_export_destination = None;
+                self.notifications.notify(message.clone());
+                self.set_status(message);
+            }
+            Err(error) => {
+                self.set_error(error);
+                if self.dialog.is_none()
+                    && self.pending_export_source.is_some()
+                    && self.pending_export_format.is_some()
+                {
+                    let destination = self.pending_export_destination.clone();
+                    self.open_export_destination_dialog_with_input(destination.as_deref());
+                }
+            }
+        }
     }
 
     pub(crate) fn handle_tag_rename_source(&mut self, key: KeyEvent) -> Option<Command> {
@@ -499,6 +613,7 @@ impl App {
                         }
                     }
                     Some(DialogPurpose::TagRenameTarget) => self.submit_tag_rename(),
+                    Some(DialogPurpose::ExportDestination) => self.submit_export(),
                     _ => {
                         let text = self
                             .dialog
@@ -524,6 +639,7 @@ impl App {
                     Some(DialogPurpose::TagRenameTarget) => {
                         self.pending_tag_rename = None;
                     }
+                    Some(DialogPurpose::ExportDestination) => {}
                     _ => self.dialog_result = Some(DialogResult::Cancelled),
                 }
                 self.close_dialog();
@@ -629,12 +745,101 @@ impl App {
             DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
             DialogPurpose::Help => self.help_scroll = dialog.scroll,
             DialogPurpose::WikiLinkChoice => self.wiki_link_index = dialog.selected,
+            DialogPurpose::ExportDestination => {}
             _ => {}
         }
     }
 
     pub(crate) fn close_dialog(&mut self) {
+        let purpose = self.dialog.as_ref().map(|dialog| dialog.purpose);
         self.overlay = None;
         self.dialog = None;
+        if matches!(
+            purpose,
+            Some(DialogPurpose::ExportFormat | DialogPurpose::ExportDestination)
+        ) {
+            self.pending_export_source = None;
+            self.pending_export_format = None;
+            self.pending_export_destination = None;
+            return;
+        }
+        if !self.export_in_progress
+            && self.pending_export_source.is_some()
+            && self.pending_export_format.is_some()
+        {
+            let destination = self.pending_export_destination.clone();
+            self.open_export_destination_dialog_with_input(destination.as_deref());
+        }
+    }
+}
+
+/// One-line success notification for a finished export: the resolved target
+/// plus a compact summary of any renderer diagnostics.
+fn export_success_message(
+    outcome: &ExportOutcome,
+    format: ExportFormat,
+    diagnostics: &[ExportDiagnostic],
+) -> String {
+    let mut message = format!(
+        "Exported {} bytes as {} to {}",
+        outcome.bytes,
+        format.label(),
+        outcome.destination.display()
+    );
+    if let Some(summary) = diagnostics_summary(diagnostics) {
+        message.push(' ');
+        message.push_str(&summary);
+    }
+    message
+}
+
+/// Compact summary of renderer diagnostics: `None` when there is nothing to
+/// report, otherwise the first item plus the count of remaining items.
+fn diagnostics_summary(diagnostics: &[ExportDiagnostic]) -> Option<String> {
+    match diagnostics.split_first() {
+        None => None,
+        Some((first, rest)) => {
+            if rest.is_empty() {
+                Some(format!("· {first}"))
+            } else {
+                Some(format!("· {first} (+{} more)", rest.len()))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(bytes: u64) -> ExportOutcome {
+        ExportOutcome {
+            destination: std::path::PathBuf::from("/tmp/out.html"),
+            bytes,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn success_message_reports_target_and_summary() {
+        let message = export_success_message(&outcome(42), ExportFormat::Html, &[]);
+        assert_eq!(message, "Exported 42 bytes as HTML to /tmp/out.html");
+    }
+
+    #[test]
+    fn diagnostics_summary_shows_first_item_and_remaining_count() {
+        assert_eq!(diagnostics_summary(&[]), None);
+        assert_eq!(
+            diagnostics_summary(&[ExportDiagnostic::warning("image missing.png skipped")]),
+            Some("· warning: image missing.png skipped".to_string())
+        );
+        assert_eq!(
+            diagnostics_summary(&[
+                ExportDiagnostic::warning("image a.png skipped"),
+                ExportDiagnostic::warning("b"),
+                ExportDiagnostic::warning("c"),
+            ]),
+            Some("· warning: image a.png skipped (+2 more)".to_string())
+        );
     }
 }

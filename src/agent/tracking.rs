@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{bail, Result};
+use sha2::{Digest, Sha256};
 
 #[derive(Default)]
 pub(crate) struct ReadTracker {
@@ -14,7 +15,7 @@ pub(crate) struct ReadTracker {
 
 #[derive(Clone)]
 pub(crate) struct FileReadState {
-    pub(crate) snapshot: String,
+    pub(crate) identity: [u8; 32],
     pub(crate) tag: String,
     ranges: Vec<(usize, usize)>,
     total_lines: usize,
@@ -41,11 +42,32 @@ impl SnapshotTagHasher {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct SnapshotIdentityHasher(Sha256);
+
+impl SnapshotIdentityHasher {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub(crate) fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn snapshot_tag(content: &str) -> String {
     // Stable incremental FNV-1a folded to the four hexadecimal digits used by
-    // hashline anchors. Exact snapshot equality remains the authoritative
-    // stale-write check; the compact tag is the model-facing handle.
+    // hashline anchors. A full SHA-256 identity remains the authoritative
+    // stale-write check; the compact tag is only the model-facing handle.
     let mut hasher = SnapshotTagHasher::default();
+    hasher.update(content.as_bytes());
+    hasher.finish()
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_identity(content: &str) -> [u8; 32] {
+    let mut hasher = SnapshotIdentityHasher::default();
     hasher.update(content.as_bytes());
     hasher.finish()
 }
@@ -71,25 +93,25 @@ impl ReadTracker {
     pub(crate) fn mark_file(
         &self,
         path: PathBuf,
-        content: String,
+        identity: [u8; 32],
+        tag: String,
         start: usize,
         end: usize,
         total_lines: usize,
     ) -> Result<String> {
-        let tag = snapshot_tag(&content);
         let mut files = self
             .files
             .lock()
             .map_err(|_| anyhow::anyhow!("file read tracker lock poisoned"))?;
         let state = files.entry(path).or_insert_with(|| FileReadState {
-            snapshot: content.clone(),
+            identity,
             tag: tag.clone(),
             ranges: Vec::new(),
             total_lines,
         });
-        if state.snapshot != content || state.total_lines != total_lines {
+        if state.identity != identity || state.total_lines != total_lines {
             *state = FileReadState {
-                snapshot: content,
+                identity,
                 tag: tag.clone(),
                 ranges: Vec::new(),
                 total_lines,
@@ -171,5 +193,16 @@ mod tests {
         hasher.update(b"first line\n");
         hasher.update(b"second line\n");
         assert_eq!(hasher.finish(), snapshot_tag("first line\nsecond line\n"));
+    }
+
+    #[test]
+    fn incremental_snapshot_identity_matches_whole_content() {
+        let mut hasher = SnapshotIdentityHasher::default();
+        hasher.update(b"first line\n");
+        hasher.update(b"second line\n");
+        assert_eq!(
+            hasher.finish(),
+            snapshot_identity("first line\nsecond line\n")
+        );
     }
 }

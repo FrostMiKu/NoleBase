@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use crate::attachment::AttachmentStore;
 
@@ -35,6 +35,16 @@ fn add_daily_note(app: &mut App, body: &str) {
 
 fn refresh_test_index(app: &mut App) {
     app.apply_workspace_index(WorkspaceIndex::build(&app.storage));
+}
+
+fn wait_for_export(app: &mut App) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while app.export_in_progress && std::time::Instant::now() < deadline {
+        app.poll_export();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    app.poll_export();
+    assert!(!app.export_in_progress, "export worker did not finish");
 }
 
 #[test]
@@ -368,6 +378,7 @@ fn command_palette_adds_contextual_note_and_agent_output_commands() {
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
 
     assert!(app.command_matches.contains(&AppCommand::EditCurrentNote));
+    assert!(app.command_matches.contains(&AppCommand::ExportCurrentFile));
     assert!(app.command_matches.contains(&AppCommand::RenameCurrentNote));
     assert!(app.command_matches.contains(&AppCommand::DeleteCurrentNote));
     assert!(app
@@ -387,6 +398,307 @@ fn command_palette_adds_contextual_note_and_agent_output_commands() {
         Some(DialogPurpose::RenameFile)
     );
 }
+
+#[test]
+fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let current = app.storage.data_dir.join("Export me.md");
+    fs::write(&current, b"# Export me\n\nExact bytes.\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    let dialog = app.dialog.as_ref().unwrap();
+    assert_eq!(dialog.purpose, DialogPurpose::ExportFormat);
+    assert_eq!(dialog.selected, 0);
+    assert_eq!(
+        dialog
+            .options
+            .iter()
+            .map(|option| (option.label.as_str(), option.hint.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Original", Some("Exact source bytes")),
+            ("HTML", Some("Safe standalone .html")),
+        ]
+    );
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.pending_export_source.is_none());
+    assert!(app.pending_export_format.is_none());
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.pending_export_format, Some(ExportFormat::Html));
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::ExportDestination)
+    );
+    assert_eq!(app.dialog.as_ref().unwrap().message, "Destination path  ");
+    assert_eq!(app.dialog.as_ref().unwrap().input, "Export me.html");
+    assert_eq!(
+        app.dialog.as_ref().unwrap().cursor,
+        app.dialog.as_ref().unwrap().input.chars().count()
+    );
+    app.dialog.as_mut().unwrap().input = output
+        .path()
+        .join("wrong.txt")
+        .to_string_lossy()
+        .into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    let cursor = app.dialog.as_ref().unwrap().cursor;
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.dialog.as_ref().unwrap().cursor, cursor - 1);
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.dialog.as_ref().unwrap().cursor, cursor);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::ExportDestination)
+    );
+    assert!(app.status.contains("must end in .html"));
+    assert!(app.dialog.as_ref().unwrap().input.ends_with("wrong.txt"));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.pending_export_source.is_none());
+    assert!(app.pending_export_format.is_none());
+    assert!(app.pending_export_destination.is_none());
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.dialog.as_ref().unwrap().input, "Export me.md");
+    let destination = output.path().join("exact.md");
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    assert!(app.dialog.is_none());
+    assert!(app.status.starts_with("Exporting as Original to "));
+    wait_for_export(&mut app);
+    assert_eq!(fs::read(&destination).unwrap(), fs::read(&current).unwrap());
+    assert!(app.status.starts_with(&format!(
+        "Exported {} bytes as Original to ",
+        fs::metadata(&current).unwrap().len()
+    )));
+    assert!(app.notifications.visible().is_some());
+    assert!(app.dialog.is_none());
+}
+
+#[test]
+fn export_format_switch_changes_default_destination_extension() {
+    let (mut app, _directory) = make_app();
+    let current = app.storage.data_dir.join("Quarterly Report.mb");
+    fs::write(&current, b"# Quarterly\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+
+    for (index, (expected, format)) in [
+        ("Quarterly Report.mb", ExportFormat::Original),
+        ("Quarterly Report.html", ExportFormat::Html),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        app.execute_app_command(AppCommand::ExportCurrentFile);
+        for _ in 0..index {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.pending_export_format, Some(format));
+        assert_eq!(
+            app.dialog.as_ref().unwrap().input,
+            expected,
+            "default destination for {}",
+            format.label()
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.pending_export_source.is_none());
+        assert!(app.pending_export_format.is_none());
+    }
+}
+
+#[test]
+fn daily_note_export_is_available_and_publishes_the_daily_file() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let note = app
+        .storage
+        .append_daily("2026-08-05", "Daily body\n")
+        .unwrap();
+    app.reload();
+    app.open_daily_document(note.date, DocumentReturn::Daily);
+    assert_eq!(
+        app.current_export_path(),
+        Some(app.storage.daily_file_path("2026-08-05").unwrap())
+    );
+    assert!(app.command_available(AppCommand::ExportCurrentFile));
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.dialog.as_ref().unwrap().input, "2026-08-05.html");
+    let destination = output.path().join("daily.html");
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    wait_for_export(&mut app);
+    let html = fs::read_to_string(&destination).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("Daily body"));
+    assert!(app.status.starts_with("Exported "));
+    assert!(app.dialog.is_none());
+}
+
+#[test]
+fn skill_document_can_be_exported() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let skill_path = app.storage.skills_dir.join("guide.md");
+    fs::create_dir_all(&app.storage.skills_dir).unwrap();
+    fs::write(&skill_path, "# Guide\n\nStep one.\n").unwrap();
+    app.show_document(
+        DocumentKind::Skill(skill_path.clone()),
+        "Skill guide".to_string(),
+        "# Guide\n\nStep one.\n".to_string(),
+        DocumentReturn::Skills,
+    );
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    assert!(app.command_available(AppCommand::ExportCurrentFile));
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.dialog.as_ref().unwrap().input, "guide.html");
+    let destination = output.path().join("guide.html");
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    wait_for_export(&mut app);
+    let html = fs::read_to_string(&destination).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("Step one."));
+}
+
+#[test]
+fn html_export_surfaces_renderer_diagnostics_in_success_status() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let current = app.storage.data_dir.join("Broken image.md");
+    fs::write(&current, "# Broken image\n\n![missing](missing.png)\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+    let destination = output.path().join("broken.html");
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    wait_for_export(&mut app);
+    let html = fs::read_to_string(&destination).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(app.status.starts_with("Exported "));
+    assert!(app
+        .status
+        .contains("· warning: image 'missing.png' could not be embedded"));
+}
+
+#[test]
+fn failed_background_export_restores_destination_for_direct_retry() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let current = app.storage.data_dir.join("Retry me.md");
+    fs::write(&current, "# Retry me\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    let destination = output.path().join("retry.md");
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+
+    // Simulate a background failure instead of spawning the worker: the
+    // submitted source, format, and destination stay in pending state.
+    let (sender, receiver) = mpsc::channel();
+    sender
+        .send(ExportJobResult {
+            format: ExportFormat::Original,
+            outcome: Err("simulated publish failure".to_string()),
+        })
+        .unwrap();
+    drop(sender);
+    app.pending_export_destination = Some(app.dialog.as_ref().unwrap().input.clone());
+    app.export_job = Some(receiver);
+    app.export_job_format = Some(ExportFormat::Original);
+    app.export_in_progress = true;
+    app.overlay = None;
+    app.dialog = None;
+
+    app.poll_export();
+    assert!(!app.export_in_progress);
+    assert!(app.status.contains("simulated publish failure"));
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::ExportDestination)
+    );
+    assert_eq!(
+        app.dialog.as_ref().unwrap().input,
+        destination.to_string_lossy().as_ref()
+    );
+    assert!(app.pending_export_source.is_some());
+    assert_eq!(app.pending_export_format, Some(ExportFormat::Original));
+
+    // A direct retry with the restored destination succeeds.
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    wait_for_export(&mut app);
+    assert_eq!(fs::read(&destination).unwrap(), fs::read(&current).unwrap());
+    assert!(app.status.starts_with("Exported "));
+    assert!(app.pending_export_destination.is_none());
+}
+
+#[test]
+fn failed_export_retry_survives_an_unrelated_dialog() {
+    let (mut app, _directory) = make_app();
+    let source = app.storage.data_dir.join("Retry after help.md");
+    fs::write(&source, "content").unwrap();
+    app.pending_export_source = Some(source);
+    app.pending_export_format = Some(ExportFormat::Original);
+    app.pending_export_destination = Some("retry-after-help.md".to_string());
+    let (sender, receiver) = mpsc::channel();
+    sender
+        .send(ExportJobResult {
+            format: ExportFormat::Original,
+            outcome: Err("simulated failure behind help".to_string()),
+        })
+        .unwrap();
+    app.export_job = Some(receiver);
+    app.export_job_format = Some(ExportFormat::Original);
+    app.export_in_progress = true;
+    app.open_dialog(DialogState::new(
+        "Help",
+        String::new(),
+        DialogMode::Informational,
+        DialogPurpose::Help,
+        Vec::new(),
+    ));
+
+    app.poll_export();
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::Help)
+    );
+    assert!(app.pending_export_source.is_some());
+    app.close_dialog();
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::ExportDestination)
+    );
+    assert_eq!(app.dialog.as_ref().unwrap().input, "retry-after-help.md");
+}
+
 
 #[test]
 fn archived_note_gets_restore_instead_of_archive_command() {
@@ -2614,12 +2926,12 @@ fn link_clicks_open_external_targets_or_internal_wiki_notes() {
 }
 
 #[test]
-fn file_embed_clicks_open_existing_files_from_any_location() {
+fn local_file_clicks_open_existing_files_from_any_location() {
     let (mut app, _directory) = make_app();
     let attachment = app.storage.data_dir.join("report.pdf");
     fs::write(&attachment, b"report").unwrap();
     app.link_hitboxes.push(LinkHitbox {
-        target: LinkTarget::EmbeddedFile(attachment.clone()),
+        target: LinkTarget::LocalFile(attachment.clone()),
         area: Rect::new(4, 3, 7, 1),
     });
     assert_eq!(
@@ -2634,7 +2946,7 @@ fn file_embed_clicks_open_existing_files_from_any_location() {
 
     app.link_hitboxes.clear();
     app.link_hitboxes.push(LinkHitbox {
-        target: LinkTarget::EmbeddedFile(app.storage.data_dir.join("missing.pdf")),
+        target: LinkTarget::LocalFile(app.storage.data_dir.join("missing.pdf")),
         area: Rect::new(4, 3, 7, 1),
     });
     assert!(app
@@ -2645,12 +2957,12 @@ fn file_embed_clicks_open_existing_files_from_any_location() {
             modifiers: KeyModifiers::NONE,
         })
         .is_none());
-    assert!(app.status.starts_with("Embed error:"));
+    assert!(app.status.starts_with("File error:"));
 
     let outside = tempfile::NamedTempFile::new().unwrap();
     app.link_hitboxes.clear();
     app.link_hitboxes.push(LinkHitbox {
-        target: LinkTarget::EmbeddedFile(outside.path().to_path_buf()),
+        target: LinkTarget::LocalFile(outside.path().to_path_buf()),
         area: Rect::new(4, 3, 7, 1),
     });
     assert_eq!(

@@ -513,6 +513,7 @@
         assert!(prompt.contains("public or private-network hosts"));
         assert!(prompt.contains("relative to the containing note"));
         assert!(prompt.contains("Nole root when emitted in the Agent panel"));
+        assert!(prompt.contains("grep for local file contents"));
         assert!(prompt.contains("absolute paths may point outside Nole"));
         assert!(prompt.contains("A box border only accepts `single` or `none`"));
         assert!(prompt.contains("regular Markdown files archived from data/"));
@@ -544,6 +545,8 @@
         assert!(prompt.contains("internal work stays out of this conversation"));
         assert!(prompt.contains("Use direct read/search tools only for narrow lookups"));
         assert!(prompt.contains("Use open"));
+        assert!(prompt.contains("export_file is the sole destination-policy exception"));
+        assert!(prompt.contains("never overwrites, and renders HTML/PDF safely and offline"));
         assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
     }
 
@@ -628,6 +631,7 @@
             "write",
             "edit",
             "copy",
+            "export_file",
             "move",
             "move_many",
             "rename",

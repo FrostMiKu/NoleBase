@@ -77,6 +77,19 @@ impl App {
             })
     }
 
+    /// Source path for exporting the current preview. Daily notes are real
+    /// managed files too, so unlike [`Self::current_note_path`] they resolve
+    /// to their physical `daily/YYYY-MM-DD.md` path.
+    pub(in crate::app) fn current_export_path(&self) -> Option<PathBuf> {
+        self.document
+            .as_ref()
+            .filter(|_| self.center_view == CenterView::Document)
+            .and_then(|document| match &document.kind {
+                DocumentKind::File(path) | DocumentKind::Skill(path) => Some(path.clone()),
+                DocumentKind::Daily(date) => self.storage.daily_file_path(&date.to_string()).ok(),
+            })
+    }
+
     pub(in crate::app) fn rename_current_note(&mut self) {
         let Some(path) = self.current_note_path() else {
             self.set_status("No note is open");

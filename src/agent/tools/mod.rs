@@ -8,7 +8,9 @@
 mod attachment_ops;
 mod download;
 mod explore;
+mod file_edit;
 mod file_ops;
+mod grep;
 mod interactive;
 mod notes_tags;
 mod read;
@@ -20,6 +22,6 @@ mod workspace_quota;
 mod write_policy;
 
 pub use self::{
-    attachment_ops::*, download::*, explore::*, file_ops::*, interactive::*, notes_tags::*,
-    read::*, review::*, skills::*, web::*,
+    attachment_ops::*, download::*, explore::*, file_ops::*, grep::*, interactive::*,
+    notes_tags::*, read::*, review::*, skills::*, web::*,
 };

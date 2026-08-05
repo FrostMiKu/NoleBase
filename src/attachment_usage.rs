@@ -106,21 +106,11 @@ pub struct AttachmentUsageHandle {
     inner: Arc<Mutex<UsageInner>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct UsageInner {
     ready: bool,
     revision: u64,
     references: AttachmentReferenceIndex,
-}
-
-impl Default for UsageInner {
-    fn default() -> Self {
-        Self {
-            ready: false,
-            revision: 0,
-            references: AttachmentReferenceIndex::default(),
-        }
-    }
 }
 
 impl AttachmentUsageHandle {

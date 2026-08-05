@@ -552,7 +552,7 @@ impl Agent {
         agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
         agent.register(Download::new(nole_root, client.clone())?);
         agent.register(ListNotes::new(nole_root)?);
-        agent.register(SearchContent::new(nole_root)?);
+        agent.register(Grep::new(nole_root)?);
         agent.register(SearchFiles::new(nole_root)?);
         agent.register(ListTags::new(workspace_index.clone()));
         agent.register(SearchTag::new(nole_root, workspace_index.clone())?);
@@ -563,6 +563,7 @@ impl Agent {
         )?);
         agent.register(Write::new(nole_root)?);
         agent.register(Copy::new(nole_root)?);
+        agent.register(ExportFile::new(nole_root, gate.clone())?);
         agent.register(Mkdir::new(nole_root)?);
         agent.register(RemoveDir::new(nole_root)?);
         let file_events = agent.events.clone();

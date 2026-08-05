@@ -129,6 +129,53 @@ pub(crate) fn check_workspace_write(root: &Path, destination: &Path, new_bytes: 
     check_workspace_writes(root, std::iter::once((destination, new_bytes)))
 }
 
+/// Maximum candidate bytes an atomic edit may stage while the original file
+/// still occupies its workspace quota.
+pub(crate) fn workspace_edit_budget(root: &Path, destination: &Path) -> Result<u64> {
+    let workspace = workspace_dir(root);
+    if !destination.starts_with(&workspace) {
+        return Ok(u64::MAX);
+    }
+    let used = workspace_used_bytes(&workspace)?;
+    Ok(MAX_WORKSPACE_FILE_BYTES.min(MAX_WORKSPACE_TOTAL_BYTES.saturating_sub(used)))
+}
+
+/// Recheck an atomic edit after its candidate has been staged. The staging
+/// file is already included in `used`, so subtract it before charging the same
+/// candidate as the prospective destination.
+pub(crate) fn check_workspace_staged_write(
+    root: &Path,
+    destination: &Path,
+    staging: &Path,
+    new_bytes: u64,
+) -> Result<()> {
+    let workspace = workspace_dir(root);
+    if !destination.starts_with(&workspace) {
+        return Ok(());
+    }
+    if new_bytes > MAX_WORKSPACE_FILE_BYTES {
+        bail!(
+            "{} exceeds the 64 MiB workspace per-file limit",
+            destination.display()
+        );
+    }
+    let used = workspace_used_bytes(&workspace)?;
+    let staged = if staging.starts_with(&workspace) {
+        fs::metadata(staging)
+            .with_context(|| format!("checking staged edit {}", staging.display()))?
+            .len()
+    } else {
+        0
+    };
+    if used.saturating_sub(staged).saturating_add(new_bytes) > MAX_WORKSPACE_TOTAL_BYTES {
+        bail!(
+            "edit would exceed the 512 MiB workspace total limit ({} bytes already in use)",
+            used.saturating_sub(staged)
+        );
+    }
+    Ok(())
+}
+
 /// Enforce workspace limits for a batch that will publish every destination.
 /// The total check charges the complete batch against one usage snapshot so
 /// individually valid moves cannot collectively exceed the workspace quota.

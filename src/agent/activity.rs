@@ -105,7 +105,8 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
                 path
             }
         }),
-        "search_web" | "search_content" | "search_files" | "list_tags" => text("query"),
+        "grep" => text("pattern"),
+        "search_web" | "search_files" | "list_tags" => text("query"),
         "search_tag" => text("tag"),
         "rename_tag" => Some(format!("{} -> {}", text("from")?, text("to")?)),
         "add_daily_entry" => Some(text("date").unwrap_or_else(|| "Today".to_string())),

@@ -406,7 +406,7 @@ impl AttachmentStore {
             let mut content = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&staged.join(content_file_name(&display_name)))
+                .open(staged.join(content_file_name(&display_name)))
                 .with_context(|| format!("creating staging content {}", staged.display()))?;
             let mut sniff = Vec::with_capacity(MIME_SNIFF_BYTES.min(4096));
             let mut buffer = [0u8; STREAM_BUFFER];
@@ -459,7 +459,7 @@ impl AttachmentStore {
                 .with_context(|| format!("syncing staging metadata {}", staged.display()))?;
             drop(file);
             // One atomic rename makes the whole attachment visible.
-            fs::rename(&staged, &self.attachment_dir(id)).with_context(|| {
+            fs::rename(&staged, self.attachment_dir(id)).with_context(|| {
                 format!(
                     "publishing attachment {}",
                     self.attachment_dir(id).display()
@@ -781,11 +781,10 @@ impl AttachmentStore {
                     ),
                 }
             };
-            let order = match query.order {
+            match query.order {
                 AttachmentSortOrder::Asc => key(a).cmp(&key(b)),
                 AttachmentSortOrder::Desc => key(a).cmp(&key(b)).reverse(),
-            };
-            order
+            }
         });
         let total = matched.len() as u64;
         let start = usize::try_from(query.offset).unwrap_or(usize::MAX);
@@ -831,7 +830,7 @@ impl AttachmentStore {
     /// Read and validate the metadata for `id`, filling `size` from the live
     /// content file. Errors on any inconsistent or hostile state.
     fn load_metadata(&self, id: AttachmentId) -> Result<AttachmentMetadata> {
-        let dir_meta = fs::symlink_metadata(&self.attachment_dir(id)).with_context(|| {
+        let dir_meta = fs::symlink_metadata(self.attachment_dir(id)).with_context(|| {
             format!(
                 "checking attachment directory {}",
                 self.attachment_dir(id).display()
@@ -1270,7 +1269,7 @@ mod tests {
             format!("{URI_SCHEME}{text}extra"),
             format!("{URI_SCHEME}{}&", &text[..35]),
             format!("{URI_SCHEME}{text}/extra"),
-            format!("{URI_SCHEME}"),
+            URI_SCHEME.to_string(),
             format!("{URI_SCHEME}{}", "z".repeat(36)),
             format!("attachment://{text}"),
             "".to_string(),

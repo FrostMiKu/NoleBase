@@ -331,6 +331,62 @@ fn command_palette_is_fixed_width_and_renders_query_and_commands() {
 }
 
 #[test]
+fn export_format_picker_reserves_and_selects_the_shared_blank_row() {
+    let (mut app, _directory) = make_app();
+    let options = crate::export::ExportFormat::ALL
+        .into_iter()
+        .map(|format| crate::app::DialogOption::with_hint(format.label(), format.hint()))
+        .collect();
+    app.open_dialog(DialogState::new(
+        "Export file · Select format",
+        String::new(),
+        DialogMode::SingleSelect,
+        DialogPurpose::ExportFormat,
+        options,
+    ));
+
+    let terminal = render(&mut app, 100, 20);
+    assert_eq!(app.dialog_hitboxes.len(), 2);
+    let first = app.dialog_hitboxes[0].area;
+    let second = app.dialog_hitboxes[1].area;
+    assert_eq!(first.height, SELECT_OPTION_HEIGHT);
+    assert_eq!(second.y, first.y + SELECT_OPTION_HEIGHT);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(first.x + 2, first.y - 1)].symbol(),
+        " ",
+        "the export picker needs a blank row above its first format"
+    );
+    for y in first.y - 1..first.y + first.height {
+        assert_eq!(buffer[(first.x, y)].symbol(), "▌");
+        assert_eq!(buffer[(first.x, y)].fg, app.theme.selection_indicator);
+        assert_eq!(
+            buffer[(first.x + first.width - 1, y)].bg,
+            app.theme.selection_background,
+            "the export selection must cover the complete shared row"
+        );
+    }
+}
+
+#[test]
+fn export_destination_uses_spaced_shared_single_line_input() {
+    let (mut app, _directory) = make_app();
+    let mut dialog = DialogState::new(
+        "Export file · Enter destination",
+        "Destination path  ",
+        DialogMode::SingleLine,
+        DialogPurpose::ExportDestination,
+        Vec::new(),
+    );
+    dialog.input = "out.pdf".to_string();
+    dialog.cursor = 3;
+    app.open_dialog(dialog);
+
+    let terminal = render(&mut app, 100, 12);
+    assert!(buffer_string(&terminal).contains("Destination path  out.pdf"));
+}
+
+#[test]
 fn command_palette_keeps_its_query_field_position_when_filtering() {
     let (mut app, _directory) = make_app();
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
@@ -552,6 +608,29 @@ fn footer_uses_full_terminal_width() {
         terminal.backend().buffer()[(0, 11)].bg,
         app.theme.ui_warning
     );
+}
+
+#[test]
+fn footer_animates_background_export_status() {
+    let (mut app, _directory) = make_app();
+    app.export_in_progress = true;
+    app.status = "Exporting as PDF to /tmp/out.pdf".to_string();
+    app.animation_tick = 0;
+    let first = render(&mut app, 170, 12);
+    let first_footer = buffer_string(&first).lines().last().unwrap().to_string();
+    assert!(first_footer.contains(&format!(
+        "{} Exporting as PDF",
+        crate::ui::agent::spinner_frame(0)
+    )));
+
+    app.animation_tick = 1;
+    let second = render(&mut app, 170, 12);
+    let second_footer = buffer_string(&second).lines().last().unwrap().to_string();
+    assert!(second_footer.contains(&format!(
+        "{} Exporting as PDF",
+        crate::ui::agent::spinner_frame(1)
+    )));
+    assert_ne!(first_footer, second_footer);
 }
 
 #[test]
@@ -1402,23 +1481,24 @@ fn links_are_clickable_in_daily_documents_and_agent_output() {
 }
 
 #[test]
-fn file_embed_hitboxes_resolve_against_each_content_base() {
+fn local_link_hitboxes_resolve_against_each_content_base() {
     let (mut app, _directory) = make_app();
     app.storage
-        .append_to_today("Open ![[daily-attachment.pdf]]")
+        .append_to_today("[Daily report](daily-report.pdf) and ![[daily-attachment.pdf]]")
         .unwrap();
     app.reload();
     render(&mut app, 170, 24);
-    assert!(app.link_hitboxes.iter().any(|hitbox| {
-        hitbox.target
-            == LinkTarget::EmbeddedFile(app.storage.daily_dir.join("daily-attachment.pdf"))
-    }));
+    for filename in ["daily-report.pdf", "daily-attachment.pdf"] {
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target == LinkTarget::LocalFile(app.storage.daily_dir.join(filename))
+        }));
+    }
 
     let note = app.storage.data_dir.join("Article.md");
     app.document = Some(Document {
         kind: DocumentKind::File(note),
         title: "Preview".to_string(),
-        source: "Open ![[article-attachment.pdf]]".to_string(),
+        source: "[Article report](article-report.pdf) and ![[article-attachment.pdf]]".to_string(),
         scroll: 0,
         target_line: None,
         return_to: DocumentReturn::Daily,
@@ -1426,20 +1506,23 @@ fn file_embed_hitboxes_resolve_against_each_content_base() {
     });
     app.center_view = CenterView::Document;
     render(&mut app, 170, 24);
-    assert!(app.link_hitboxes.iter().any(|hitbox| {
-        hitbox.target
-            == LinkTarget::EmbeddedFile(app.storage.data_dir.join("article-attachment.pdf"))
-    }));
+    for filename in ["article-report.pdf", "article-attachment.pdf"] {
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target == LinkTarget::LocalFile(app.storage.data_dir.join(filename))
+        }));
+    }
 
     app.agent_panel = vec![Arc::new(AgentPanelEntry::Assistant {
-        text: "Open ![[agent-attachment.pdf]]".to_string(),
+        text: "[Agent report](agent-report.pdf) and ![[agent-attachment.pdf]]".to_string(),
         streaming: false,
         final_output: true,
     })];
     render(&mut app, 170, 40);
-    assert!(app.link_hitboxes.iter().any(|hitbox| {
-        hitbox.target == LinkTarget::EmbeddedFile(app.storage.root.join("agent-attachment.pdf"))
-    }));
+    for filename in ["agent-report.pdf", "agent-attachment.pdf"] {
+        assert!(app.link_hitboxes.iter().any(|hitbox| {
+            hitbox.target == LinkTarget::LocalFile(app.storage.root.join(filename))
+        }));
+    }
 }
 
 #[test]

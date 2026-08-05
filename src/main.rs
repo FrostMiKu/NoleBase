@@ -9,6 +9,7 @@ mod attachment_usage;
 mod backend;
 mod document_index;
 mod embedded_terminal;
+mod export;
 mod markdown;
 mod media;
 mod model;
@@ -134,8 +135,17 @@ fn run_editor(path: &std::path::Path, editor: &str, terminal: &mut Tui) -> Resul
     }
 }
 
+fn defer_quit_for_export(app: &mut App) -> bool {
+    if !app.export_in_progress {
+        return false;
+    }
+    app.set_status("Wait for the export to finish before quitting");
+    true
+}
+
 fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Result<bool> {
     match cmd {
+        Some(Command::Quit) if defer_quit_for_export(app) => Ok(false),
         Some(Command::Quit) => Ok(true),
         Some(Command::Edit(path)) => {
             // run_editor re-enters the TUI itself; the outer guard in main
@@ -350,6 +360,7 @@ fn run(
         }
         app.poll_agent();
         app.poll_terminal();
+        app.poll_export();
         let pending_bells = app.notifications.take_bells();
         if pending_bells > 0 {
             let mut output = io::stdout();
@@ -509,6 +520,17 @@ mod tests {
         assert!(!wants_version(args(&[]).into_iter()));
         assert!(!wants_version(args(&["--verbose"]).into_iter()));
         assert!(!wants_version(args(&["-vv"]).into_iter()));
+    }
+    #[test]
+    fn quit_is_deferred_while_export_is_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+        assert!(!defer_quit_for_export(&mut app));
+        app.export_in_progress = true;
+        assert!(defer_quit_for_export(&mut app));
+        assert_eq!(app.status, "Wait for the export to finish before quitting");
     }
 
     #[test]
@@ -720,10 +742,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut seen = Vec::new();
         while Instant::now() < deadline {
-            for event in events.try_iter() {
-                if let Ok(event) = event {
-                    seen.extend(event.paths.iter().cloned());
-                }
+            for event in events.try_iter().flatten() {
+                seen.extend(event.paths.iter().cloned());
             }
             let observed = [&daily, &theme, &storage.settings_path, &metadata_path]
                 .iter()

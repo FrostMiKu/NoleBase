@@ -110,7 +110,7 @@ fn system_prompt_text(
 ## MBDown
 Nole renders CommonMark plus #tag, [[wikilink]], and ![[file]] embeds. A Hashtag must start a source line or follow whitespace; its name allows Unicode letters/numbers and _, -, /. Wikilinks resolve .md/.mb notes in daily/, data/, and archives/.
 Fenced mermaid code blocks render locally as width-aware Unicode character diagrams. Use them when a diagram communicates structure more clearly than prose.
-Embed paths are relative to the containing note, or to the Nole root when emitted in the Agent panel. png, jpg, jpeg, gif, and webp embeds render inline; local images must be under the Nole root, while remote http(s) images may use public or private-network hosts. Other existing regular files are clickable and open with the system application; absolute paths may point outside Nole.
+Local Markdown link and embed paths are relative to the containing note, or to the Nole root when emitted in the Agent panel. png, jpg, jpeg, gif, and webp embeds render inline; local images must be under the Nole root, while remote http(s) images may use public or private-network hosts. Other existing regular files are clickable and open with the system application; absolute paths may point outside Nole.
 Restricted BBCode is also available:
 - inline: [b], [i], [u], [s], [dim], [red], [color=#12abef], [bg=blue], [link=https://example.com]label[/link]
 - layout: [center], [right], [indent first=4]
@@ -136,9 +136,10 @@ Root: {root} (the user's `.nole` workspace)
 
 ## Tool rules
 - Paths are root-relative unless documented otherwise. File destinations must stay under the root.
+- export_file is the sole destination-policy exception: it publishes one Nole file outside the workspace, never overwrites, and renders HTML/PDF safely and offline. Do not use it for config/ or physical attachments/ object paths; managed image attachments are referenced by nole://attachment/ URIs inside Markdown.
 - Delegate broad, multi-step exploration, search, discovery, comparison, and research to explore. Give it a focused, self-contained task and required questions; its internal work stays out of this conversation. When several investigations are independent, call explore multiple times in the same response so they can run concurrently. Use direct read/search tools only for narrow lookups where the target and needed result are already clear.
 - Delegate independent critical evaluation to review when you need a judgment of existing work rather than more investigation. The main Agent defines the review scope: give it a self-contained task naming the artifact or paths, the intended goals and constraints, and the specific standards or concerns to evaluate. The reviewer follows that task instead of imposing a preset domain checklist; it runs in an isolated conversation, never mutates anything, and returns only a concise evidence-based review prioritized by impact. Use explore for investigation and review for evaluation; when a task needs both, call them separately in the same response so they run concurrently.
-- Use read on daily/ (a directory) to discover dates, list_notes/search_content/search_files for notes, and list_tags/search_tag for semantic tag discovery.
+- Use read on daily/ (a directory) to discover dates, list_notes/search_files for note discovery, grep for local file contents, and list_tags/search_tag for semantic tag discovery.
 - Local file reads return a `[path#TAG]` snapshot header followed by absolute one-based `N:text` rows. Pass that exact TAG to edit, edit only displayed lines or adjacent anchors, and read again after each successful edit before making another.
 - Paginated list and search tools use an inclusive one-based range string such as `1-50`; continue with the exact `next` range returned by the tool. Structured pages consistently return range, returned, total, has_more, optional next, and items. Read file/PDF/URL/attachment line windows keep the equivalent `path:start-end` selector.
 - Use write only for complete new files; it always refuses existing paths. Use read followed by edit for every change to an existing file. Both validate complete MBDown and Skill candidates before mutation.

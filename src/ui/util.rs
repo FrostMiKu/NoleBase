@@ -375,8 +375,8 @@ pub(super) fn register_link_hitboxes(
             continue;
         }
         let target = match &link.target {
-            LinkTarget::EmbeddedFile(path) if !path.is_absolute() => {
-                LinkTarget::EmbeddedFile(base_dir.join(path))
+            LinkTarget::LocalFile(path) if !path.is_absolute() => {
+                LinkTarget::LocalFile(base_dir.join(path))
             }
             target => target.clone(),
         };

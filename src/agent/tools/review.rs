@@ -6,9 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::{
-    ListNotes, ListTags, LoadSkill, Read, SearchContent, SearchFiles, SearchTag, SearchWeb,
-};
+use super::{Grep, ListNotes, ListTags, LoadSkill, Read, SearchFiles, SearchTag, SearchWeb};
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
@@ -39,7 +37,7 @@ impl Review {
         let reads = Arc::new(ReadTracker::default());
         review.register(Read::new(root, reads, client.clone())?);
         review.register(ListNotes::new(root)?);
-        review.register(SearchContent::new(root)?);
+        review.register(Grep::new(root)?);
         review.register(SearchFiles::new(root)?);
         review.register(ListTags::new(workspace_index.clone()));
         review.register(SearchTag::new(root, workspace_index)?);
@@ -374,7 +372,7 @@ mod tests {
         for name in [
             "read",
             "list_notes",
-            "search_content",
+            "grep",
             "search_files",
             "list_tags",
             "search_tag",

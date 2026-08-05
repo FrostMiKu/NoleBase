@@ -349,14 +349,14 @@ mod tests {
 
         // Editing the note to drop the reference refreshes the count to zero.
         fs::write(&note, "no attachments here\n").unwrap();
-        index.refresh_paths(&storage, &[note.clone()]);
+        index.refresh_paths(&storage, std::slice::from_ref(&note));
         assert_eq!(index.reference_count(&a), 0);
         assert!(index.locations(&a).is_empty());
         assert!(!index.is_referenced(&a));
 
         // Re-adding, then deleting the file entirely, refreshes to zero again.
         fs::write(&note, format!("[a]({a})\n")).unwrap();
-        index.refresh_paths(&storage, &[note.clone()]);
+        index.refresh_paths(&storage, std::slice::from_ref(&note));
         assert_eq!(index.reference_count(&a), 1);
         fs::remove_file(&note).unwrap();
         index.refresh_paths(&storage, &[note]);
@@ -380,7 +380,7 @@ mod tests {
         fs::create_dir_all(&attachments).unwrap();
         let blob = attachments.join("blob.md");
         fs::write(&blob, format!("[a]({a})\n")).unwrap();
-        index.refresh_paths(&storage, &[blob.clone()]);
+        index.refresh_paths(&storage, std::slice::from_ref(&blob));
         fs::remove_file(&blob).unwrap();
         index.refresh_paths(&storage, &[blob]);
         assert_eq!(

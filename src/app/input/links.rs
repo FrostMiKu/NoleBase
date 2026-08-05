@@ -27,15 +27,13 @@ impl App {
                     }
                 }
             }
-            LinkTarget::EmbeddedFile(target) => {
-                match self.storage.validate_embedded_file(&target) {
-                    Ok(path) => Some(Command::OpenPath(path)),
-                    Err(error) => {
-                        self.set_error(format!("Embed error: {error}"));
-                        None
-                    }
+            LinkTarget::LocalFile(target) => match self.storage.validate_local_file(&target) {
+                Ok(path) => Some(Command::OpenPath(path)),
+                Err(error) => {
+                    self.set_error(format!("File error: {error}"));
+                    None
                 }
-            }
+            },
             LinkTarget::WikiLink(target) => {
                 let requested = target.trim().to_string();
                 let mut candidates = self

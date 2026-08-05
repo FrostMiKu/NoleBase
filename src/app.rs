@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -20,6 +20,7 @@ use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, Tok
 use crate::attachment::{AttachmentId, AttachmentStore};
 use crate::attachment_usage::AttachmentUsageHandle;
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
+use crate::export::ExportFormat;
 use crate::model::{
     Action, AttachmentHitbox, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup,
     FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit,
@@ -29,7 +30,7 @@ use crate::model::{
 use crate::notification::NotificationService;
 use crate::observable::Observable;
 use crate::skill::Skill;
-use crate::storage::{LoadedTheme, Storage};
+use crate::storage::{ExportOutcome, LoadedTheme, Storage};
 use crate::workspace_index::{
     TagDocument, TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle,
 };
@@ -268,6 +269,14 @@ pub struct App {
     new_note_from_template: bool,
     /// File awaiting rename or delete confirmation.
     pub pending_file: Option<PathBuf>,
+    pub pending_export_source: Option<PathBuf>,
+    pub pending_export_format: Option<ExportFormat>,
+    /// Destination input the user submitted; kept across the background job
+    /// so a failed export can restore the dialog for a direct retry.
+    pub pending_export_destination: Option<String>,
+    export_job: Option<mpsc::Receiver<ExportJobResult>>,
+    export_job_format: Option<ExportFormat>,
+    pub export_in_progress: bool,
 
     pub todo_items: Vec<TodoItem>,
     pub todo_query: String,
@@ -394,6 +403,11 @@ struct SkillBrowserReturn {
     document: Option<Document>,
 }
 
+struct ExportJobResult {
+    format: ExportFormat,
+    outcome: Result<ExportOutcome, String>,
+}
+
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
         let loaded_theme = storage.load_theme(None)?;
@@ -478,6 +492,12 @@ impl App {
             pending_daily_date: None,
             new_note_from_template: false,
             pending_file: None,
+            pending_export_source: None,
+            pending_export_format: None,
+            pending_export_destination: None,
+            export_job: None,
+            export_job_format: None,
+            export_in_progress: false,
             todo_items,
             todo_query: String::new(),
             todo_cursor: 0,

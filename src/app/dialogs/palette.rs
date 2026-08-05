@@ -82,6 +82,7 @@ impl App {
             AppCommand::EditCurrentNote => {
                 return self.current_note_path().map(Command::Edit);
             }
+            AppCommand::ExportCurrentFile => self.open_export_dialog(),
             AppCommand::RenameCurrentNote => self.rename_current_note(),
             AppCommand::DeleteCurrentNote => self.delete_current_note(),
             AppCommand::ArchiveCurrentNote => self.manage_current_note(false),
@@ -116,6 +117,7 @@ impl App {
             AppCommand::EditCurrentNote
             | AppCommand::RenameCurrentNote
             | AppCommand::DeleteCurrentNote => self.current_note_path().is_some(),
+            AppCommand::ExportCurrentFile => self.current_export_path().is_some(),
             AppCommand::ArchiveCurrentNote => self.current_note_archived() == Some(false),
             AppCommand::RestoreCurrentNote => self.current_note_archived() == Some(true),
             AppCommand::EditAiConfig

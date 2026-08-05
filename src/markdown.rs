@@ -3,6 +3,7 @@
 //! MBDown owns the language and syntax tree. MBTUI owns Nole's Ratatui layout.
 
 use std::borrow::Cow;
+use std::path::Path;
 
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
 use mbtui::Renderer;
@@ -127,25 +128,32 @@ struct LinkSpec {
     target: LinkTarget,
 }
 
-/// Classify a raw link target. Anything with the attachment scheme stays an
-/// attachment target — even a malformed URI — so it is never handed to a web
-/// opener; strict parsing happens only at activation, where the error can be
-/// shown to the user.
+/// Classify a raw Markdown or BBCode link target. Managed attachment URIs stay
+/// attachment targets even when malformed, absolute and relative file paths
+/// become local files, and URI-like targets remain external. Relative local
+/// files are rebased against the containing document by the UI.
 fn link_target(raw: &str) -> LinkTarget {
     if AttachmentUri::is_attachment_uri(raw) {
         LinkTarget::Attachment(raw.to_string())
-    } else {
+    } else if raw.is_empty()
+        || raw.starts_with('#')
+        || raw.starts_with('?')
+        || raw.starts_with("//")
+        || (!Path::new(raw).is_absolute() && reqwest::Url::parse(raw).is_ok())
+    {
         LinkTarget::External(raw.to_string())
+    } else {
+        LinkTarget::LocalFile(raw.into())
     }
 }
 
 /// Classify an embed (`![[...]]`) target: attachment URIs become attachment
-/// links, everything else an embedded file.
+/// links, everything else a local file.
 fn embed_link_target(raw: &str) -> LinkTarget {
     if AttachmentUri::is_attachment_uri(raw) {
         LinkTarget::Attachment(raw.to_string())
     } else {
-        LinkTarget::EmbeddedFile(raw.into())
+        LinkTarget::LocalFile(raw.into())
     }
 }
 
@@ -189,7 +197,7 @@ fn collect_event_links(events: &[mbdown::SpannedEvent<'_>], links: &mut Vec<Link
                     .map_or(events.len(), |offset| index + 1 + offset);
                 links.push(LinkSpec {
                     label: visible_event_text(&events[index + 1..end]),
-                    target: link_target(&target),
+                    target: link_target(target),
                 });
                 index = end.saturating_add(1);
                 continue;
@@ -672,10 +680,34 @@ mod tests {
 
         let file = render_at_width("Open ![[attachments/report.pdf]]", 40);
         assert!(file.images.is_empty());
-        assert!(file.links.iter().any(|link| {
-            link.target == LinkTarget::EmbeddedFile("attachments/report.pdf".into())
-        }));
+        assert!(file
+            .links
+            .iter()
+            .any(|link| { link.target == LinkTarget::LocalFile("attachments/report.pdf".into()) }));
         assert!(text(&file.lines).contains("![[attachments/report.pdf]]"));
+    }
+
+    #[test]
+    fn classifies_relative_files_and_uri_links_by_markdown_semantics() {
+        let rendered = render_at_width(
+            "[report](reports/result.pdf) [parent](../shared.pdf) [site](https://example.test) [mail](mailto:a@example.test) [heading](#details)",
+            120,
+        );
+
+        assert!(rendered
+            .links
+            .iter()
+            .any(|link| { link.target == LinkTarget::LocalFile("reports/result.pdf".into()) }));
+        assert!(rendered
+            .links
+            .iter()
+            .any(|link| { link.target == LinkTarget::LocalFile("../shared.pdf".into()) }));
+        for target in ["https://example.test", "mailto:a@example.test", "#details"] {
+            assert!(rendered
+                .links
+                .iter()
+                .any(|link| { link.target == LinkTarget::External(target.to_string()) }));
+        }
     }
 
     #[test]

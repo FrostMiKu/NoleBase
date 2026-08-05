@@ -61,7 +61,8 @@ pub struct ButtonHitbox {
 pub enum LinkTarget {
     External(String),
     WikiLink(String),
-    EmbeddedFile(PathBuf),
+    /// A local link or file embed, resolved against its containing document.
+    LocalFile(PathBuf),
     /// A mutable attachment URI (`nole://attachment/<lowercase-hyphenated-uuid>`),
     /// resolved through the attachment store only when activated.
     Attachment(String),

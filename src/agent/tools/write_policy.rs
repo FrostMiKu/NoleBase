@@ -5,8 +5,6 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::util::MAX_EDIT_FILE_BYTES;
-
 pub(super) enum WriteSource<'a> {
     Text(&'a str),
     File(&'a Path),
@@ -21,7 +19,7 @@ pub(super) fn validate_write(
     let skills = root.join("skills");
     if destination.starts_with(&skills) {
         validate_skill_destination(&skills, destination)?;
-        let content = source.read_text()?;
+        let content = source.read_skill_text()?;
         if let Err(error) = crate::skill::validate_skill_source(content.as_ref()) {
             bail!(
                 "invalid Skill document for {}: {error:#}",
@@ -31,8 +29,14 @@ pub(super) fn validate_write(
         return Ok(());
     }
 
-    if let WriteSource::Text(content) = source {
-        validate_mbdown(destination, content)?;
+    match source {
+        WriteSource::Text(content) => validate_mbdown(destination, content)?,
+        WriteSource::File(path) if is_mbdown_path(destination) => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("reading Markdown candidate {}", path.display()))?;
+            validate_mbdown(destination, &content)?;
+        }
+        WriteSource::File(_) => {}
     }
     Ok(())
 }
@@ -56,10 +60,10 @@ fn validate_skill_destination(skills: &Path, destination: &Path) -> Result<()> {
 }
 
 impl<'a> WriteSource<'a> {
-    fn read_text(self) -> Result<std::borrow::Cow<'a, str>> {
+    fn read_skill_text(self) -> Result<std::borrow::Cow<'a, str>> {
         match self {
             Self::Text(content) => {
-                if content.len() as u64 > MAX_EDIT_FILE_BYTES {
+                if content.len() as u64 > crate::skill::MAX_SKILL_BYTES {
                     bail!("Skill content exceeds 1 MB");
                 }
                 Ok(std::borrow::Cow::Borrowed(content))
@@ -67,7 +71,7 @@ impl<'a> WriteSource<'a> {
             Self::File(path) => {
                 let metadata = fs::metadata(path)
                     .with_context(|| format!("reading metadata for {}", path.display()))?;
-                if metadata.len() > MAX_EDIT_FILE_BYTES {
+                if metadata.len() > crate::skill::MAX_SKILL_BYTES {
                     bail!("Skill content exceeds 1 MB");
                 }
                 let content = fs::read_to_string(path)
@@ -78,14 +82,16 @@ impl<'a> WriteSource<'a> {
     }
 }
 
-fn validate_mbdown(path: &Path, content: &str) -> Result<()> {
-    let is_mbdown = path
-        .extension()
+fn is_mbdown_path(path: &Path) -> bool {
+    path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
-        });
-    if !is_mbdown {
+        })
+}
+
+fn validate_mbdown(path: &Path, content: &str) -> Result<()> {
+    if !is_mbdown_path(path) {
         return Ok(());
     }
     if let Err(error) = mbdown::validate(content) {
@@ -128,6 +134,22 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("direct files"));
+    }
+
+    #[test]
+    fn skills_keep_their_context_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir(root.join("skills")).unwrap();
+        let oversized = "x".repeat(crate::skill::MAX_SKILL_BYTES as usize + 1);
+
+        let error = validate_write(
+            root,
+            &root.join("skills/oversized.md"),
+            WriteSource::Text(&oversized),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Skill content exceeds 1 MB"));
     }
 
     #[test]

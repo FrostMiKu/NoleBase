@@ -88,6 +88,7 @@ impl App {
                         | DialogPurpose::AskUser
                         | DialogPurpose::NewFile
                         | DialogPurpose::RenameFile
+                        | DialogPurpose::ExportDestination
                         | DialogPurpose::TagRenameTarget
                         | DialogPurpose::CommandPalette
                 )

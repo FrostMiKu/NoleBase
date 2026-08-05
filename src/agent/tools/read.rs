@@ -17,14 +17,17 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use serde_json::{json, Value};
 use tokio::fs as async_fs;
+use tokio::io::AsyncReadExt as _;
 
 use super::util::{
     display_path, fuzzy_match, optional_usize, portable_path, range_schema, required_string,
-    truncate_chars, RangeSelector, MAX_EDIT_FILE_BYTES, MAX_SEARCH_RESULTS,
-    MAX_SEARCH_SNIPPET_CHARS,
+    RangeSelector, MAX_SEARCH_RESULTS,
 };
 use super::web::{read_http_body_with_limit, web_fetch_content};
-use crate::agent::{canonical_root, ReadTracker, SnapshotTagHasher, Tool, ToolExecutionPolicy};
+use crate::agent::{
+    canonical_root, ReadTracker, SnapshotIdentityHasher, SnapshotTagHasher, Tool,
+    ToolExecutionPolicy,
+};
 use crate::attachment::{AttachmentId, AttachmentStore, AttachmentUri};
 use crate::storage::ATTACHMENTS_DIR;
 
@@ -228,7 +231,7 @@ impl Tool for Read {
 /// AI configuration and attachment internals before any parser sees them.
 async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     let requested_input = required_string(input, "path")?;
-    let (requested, range) = split_line_range(&requested_input)?;
+    let (requested, range) = split_line_range(requested_input)?;
     if requested.starts_with("https://") || requested.starts_with("http://") {
         return Ok(Target::Web {
             url: requested.to_string(),
@@ -323,30 +326,27 @@ struct TextPage {
     total_lines: Option<usize>,
     has_more: bool,
     tag: Option<String>,
-    full_content: Option<String>,
+    identity: Option<[u8; 32]>,
 }
 
-/// Read one UTF-8 line window with bounded memory. Editable files are scanned
-/// completely to retain their exact snapshot and tag. Read-only files stop
-/// after one look-ahead line once the requested window is full.
+/// Read one UTF-8 line window with bounded response memory while scanning the
+/// complete file to retain a strong edit identity and exact line count.
 fn read_utf8_page(
     path: &Path,
     offset: usize,
     limit: usize,
-    retain_snapshot: bool,
     encoded_len: fn(&str) -> usize,
 ) -> Result<Option<TextPage>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let mut hasher = retain_snapshot.then(SnapshotTagHasher::default);
-    let mut full_content = retain_snapshot.then(String::new);
+    let mut tag_hasher = SnapshotTagHasher::default();
+    let mut identity_hasher = SnapshotIdentityHasher::default();
     let mut selected = Vec::with_capacity(limit.min(DEFAULT_READ_LINES));
     let mut line = Vec::new();
     let mut lines_seen = 0usize;
     let mut response_bytes = 0usize;
     let response_budget = MAX_READ_RESPONSE_BYTES.saturating_sub(READ_RESPONSE_OVERHEAD);
     let mut response_full = false;
-    let mut has_more = false;
     loop {
         line.clear();
         let read = reader
@@ -366,20 +366,8 @@ fn read_utf8_page(
         if text.len() > MAX_READ_LINE_BYTES {
             bail!("line {} exceeds the 256 KiB read limit", lines_seen + 1);
         }
-        if let Some(hasher) = &mut hasher {
-            hasher.update(&line);
-        }
-        if let Some(content) = &mut full_content {
-            if content.len().saturating_add(raw.len()) <= MAX_EDIT_FILE_BYTES as usize {
-                content.push_str(raw);
-            } else {
-                full_content = None;
-            }
-        }
-        if !retain_snapshot && lines_seen >= offset && (selected.len() >= limit || response_full) {
-            has_more = true;
-            break;
-        }
+        tag_hasher.update(&line);
+        identity_hasher.update(&line);
         if lines_seen >= offset && selected.len() < limit && !response_full {
             let cost = encoded_len(text).saturating_add(32);
             if response_bytes.saturating_add(cost) <= response_budget {
@@ -390,28 +378,22 @@ fn read_utf8_page(
                     "line {} cannot fit within the 1 MB read response limit",
                     lines_seen + 1
                 );
-            } else if retain_snapshot {
-                response_full = true;
             } else {
-                has_more = true;
-                break;
+                response_full = true;
             }
         }
         lines_seen += 1;
     }
     let start = offset.min(lines_seen);
     let end = start.saturating_add(selected.len());
-    if retain_snapshot {
-        has_more = end < lines_seen;
-    }
     Ok(Some(TextPage {
         lines: selected,
         start,
         end,
-        total_lines: (retain_snapshot || !has_more).then_some(lines_seen),
-        has_more,
-        tag: hasher.map(SnapshotTagHasher::finish),
-        full_content,
+        total_lines: Some(lines_seen),
+        has_more: end < lines_seen,
+        tag: Some(tag_hasher.finish()),
+        identity: Some(identity_hasher.finish()),
     }))
 }
 
@@ -479,7 +461,7 @@ fn page_extracted_text(
         total_lines: (!has_more).then_some(lines_seen),
         has_more,
         tag: None,
-        full_content: None,
+        identity: None,
     })
 }
 
@@ -528,21 +510,13 @@ impl ReadParser for TextFileParser {
             bail!("path is not a regular file: {}", path.display());
         }
         let (offset, limit) = line_window(*range, input)?;
-        let retain_snapshot = metadata.len() <= MAX_EDIT_FILE_BYTES;
         let page_path = path.clone();
         let page = tokio::task::spawn_blocking(move || {
-            read_utf8_page(
-                &page_path,
-                offset,
-                limit,
-                retain_snapshot,
-                plain_response_len,
-            )
+            read_utf8_page(&page_path, offset, limit, plain_response_len)
         })
         .await
         .context("joining paginated file read")??
         .with_context(|| format!("file is not valid UTF-8: {}", path.display()))?;
-        let editable_snapshot = page.full_content.is_some();
         let target = listed_path(&ctx.root, path);
         let mut output = match &page.tag {
             Some(tag) => format!("[{target}#{tag}]"),
@@ -571,18 +545,20 @@ impl ReadParser for TextFileParser {
                 continuation_selector(&target, page.end, limit)
             )?;
         }
-        if !editable_snapshot {
-            output.push_str(". Read-only: file exceeds the 1 MB edit limit");
-        }
         output.push(']');
-        if let Some(content) = page.full_content {
+        if let (Some(identity), Some(tag)) = (page.identity, page.tag) {
             let total_lines = page
                 .total_lines
-                .expect("editable snapshots always scan the complete file");
-            let tracked_tag =
-                ctx.reads
-                    .mark_file(path.clone(), content, page.start, page.end, total_lines)?;
-            debug_assert_eq!(page.tag.as_deref(), Some(tracked_tag.as_str()));
+                .expect("local text reads always scan the complete file");
+            let tracked_tag = ctx.reads.mark_file(
+                path.clone(),
+                identity,
+                tag.clone(),
+                page.start,
+                page.end,
+                total_lines,
+            )?;
+            debug_assert_eq!(tag, tracked_tag);
         }
         Ok(ReadPayload::Text(output))
     }
@@ -724,7 +700,7 @@ impl ReadParser for AttachmentParser {
             .open(uri.id())
             .with_context(|| format!("opening attachment {uri}"))?;
         let page = tokio::task::spawn_blocking(move || {
-            read_utf8_page(&page_path, offset, limit, false, json_response_len)
+            read_utf8_page(&page_path, offset, limit, json_response_len)
         })
         .await
         .context("joining paginated attachment read")??;
@@ -965,7 +941,7 @@ async fn directory_entries(root: &Path, max_depth: usize) -> Result<Vec<Director
             } else {
                 "other"
             };
-            let line_count = if file_type.is_file() && metadata.len() <= MAX_EDIT_FILE_BYTES {
+            let line_count = if file_type.is_file() {
                 count_file_lines(&path).await.ok()
             } else {
                 None
@@ -992,11 +968,23 @@ async fn directory_entries(root: &Path, max_depth: usize) -> Result<Vec<Director
 }
 
 async fn count_file_lines(path: &Path) -> Result<u64> {
-    let content = async_fs::read(path).await?;
-    let newlines = content.iter().filter(|byte| **byte == b'\n').count() as u64;
-    Ok(newlines + u64::from(!content.is_empty() && !content.ends_with(b"\n")))
+    let mut file = async_fs::File::open(path).await?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut newlines = 0u64;
+    let mut saw_bytes = false;
+    let mut ends_with_newline = false;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        saw_bytes = true;
+        ends_with_newline = buffer[read - 1] == b'\n';
+        newlines = newlines
+            .saturating_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count() as u64);
+    }
+    Ok(newlines + u64::from(saw_bytes && !ends_with_newline))
 }
-
 fn listed_path(root: &Path, path: &Path) -> String {
     portable_path(path.strip_prefix(root).unwrap_or(path))
 }
@@ -1137,66 +1125,6 @@ async fn note_metadata(path: PathBuf) -> Result<NoteMetadata> {
         modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
         size: metadata.len(),
     })
-}
-
-pub struct SearchContent {
-    directories: [PathBuf; 3],
-    root: PathBuf,
-}
-
-impl SearchContent {
-    pub fn new(root: &Path) -> Result<Self> {
-        let root = canonical_root(root)?;
-        Ok(Self {
-            directories: [root.join("daily"), root.join("data"), root.join("archives")],
-            root,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for SearchContent {
-    fn name(&self) -> &'static str {
-        "search_content"
-    }
-    fn execution_policy(&self) -> ToolExecutionPolicy {
-        ToolExecutionPolicy::LocalRead
-    }
-
-    fn description(&self) -> &'static str {
-        "Case-insensitive full-text search across managed Markdown files. Returns paths and matching one-based source lines with range pagination."
-    }
-
-    fn input_schema(&self) -> Value {
-        search_schema("Text to find in managed Markdown file contents")
-    }
-
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let query = required_string(input, "query")?.trim();
-        if query.is_empty() {
-            bail!("query must not be empty");
-        }
-        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
-        let mut matches = Vec::new();
-        let lowercase_query = query.to_lowercase();
-        for directory in &self.directories {
-            for file in list_note_files_in(directory).await? {
-                let Ok(source) = async_fs::read_to_string(&file.path).await else {
-                    continue;
-                };
-                for (line, text) in source.lines().enumerate() {
-                    if text.to_lowercase().contains(&lowercase_query) {
-                        matches.push(json!({
-                            "path": display_path(&self.root, &file.path),
-                            "line": line + 1,
-                            "snippet": truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS),
-                        }));
-                    }
-                }
-            }
-        }
-        paginated_search_result(query, selector, matches)
-    }
 }
 
 pub struct SearchFiles {
@@ -1572,7 +1500,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("large.txt");
         let content = large_text(50_000);
-        assert!(content.len() as u64 > MAX_EDIT_FILE_BYTES);
+        assert!(content.len() > 1_000_000);
         fs::write(&path, &content).unwrap();
         let tracker = Arc::new(ReadTracker::default());
         let read = Read::new(directory.path(), tracker.clone(), reqwest::Client::new()).unwrap();
@@ -1584,11 +1512,10 @@ mod tests {
         assert!(output.contains("49991:line 49990"));
         assert!(output.contains("[Showing lines 49991-49995"));
         assert!(output.contains("Continue with large.txt:49996-50000"));
-        assert!(output.contains("Read-only: file exceeds the 1 MB edit limit"));
         assert!(tracker
             .file_state(&fs::canonicalize(path).unwrap())
             .unwrap()
-            .is_none());
+            .is_some());
         let final_page = read
             .execute(&json!({"path": "large.txt:49999-50003"}))
             .await
@@ -1603,10 +1530,10 @@ mod tests {
         let path = directory.path().join("wide.txt");
         let line = "x".repeat(250 * 1024);
         fs::write(&path, vec![line; 5].join("\n")).unwrap();
-        let page = read_utf8_page(&path, 0, 5, false, plain_response_len)
+        let page = read_utf8_page(&path, 0, 5, plain_response_len)
             .unwrap()
             .unwrap();
-        assert_eq!(page.total_lines, None);
+        assert_eq!(page.total_lines, Some(5));
         assert!(page.end > 0 && page.end < 5);
         assert_eq!(page.start, 0);
         assert_eq!(page.lines.len(), page.end);
@@ -1617,7 +1544,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("one-line.txt");
         fs::write(&path, vec![b'x'; MAX_READ_LINE_BYTES + 1]).unwrap();
-        let error = read_utf8_page(&path, 0, 1, false, plain_response_len).unwrap_err();
+        let error = read_utf8_page(&path, 0, 1, plain_response_len).unwrap_err();
         assert!(error.to_string().contains("line 1"));
         assert!(error.to_string().contains("256 KiB"));
     }
@@ -1716,14 +1643,14 @@ mod tests {
         assert_eq!(parsed["size"], content.len() as u64);
         assert_eq!(parsed["range"], "3-4");
         assert_eq!(parsed["returned"], 2);
-        assert!(parsed["total"].is_null());
+        assert_eq!(parsed["total"], 5);
         assert_eq!(parsed["has_more"], true);
         assert_eq!(parsed["items"], json!(["line 3", "line 4"]));
         assert_eq!(parsed["next"], format!("{uri}:5-6"));
         // Structured read-only content: no hashline `[path#TAG]` snapshot header
         // and no tag field, because attachment reads never gate edit.
         assert!(parsed.get("tag").is_none());
-        assert!(!output.contains(&format!("[notes.txt#")));
+        assert!(!output.contains("[notes.txt#"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1752,7 +1679,7 @@ mod tests {
         assert_eq!(parsed["range"], "49991-49995");
         assert_eq!(parsed["returned"], 5);
         assert_eq!(parsed["next"], format!("{uri}:49996-50000"));
-        assert!(parsed["total"].is_null());
+        assert_eq!(parsed["total"], 50_000);
         assert_eq!(parsed["items"][0], "line 49990 xxxxxxxxxxxxxxxxxxxx");
     }
 

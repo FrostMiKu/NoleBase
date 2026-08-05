@@ -6,9 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::{
-    ListNotes, ListTags, LoadSkill, Read, SearchContent, SearchFiles, SearchTag, SearchWeb,
-};
+use super::{Grep, ListNotes, ListTags, LoadSkill, Read, SearchFiles, SearchTag, SearchWeb};
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
@@ -39,7 +37,7 @@ impl Explore {
         let reads = Arc::new(ReadTracker::default());
         explore.register(Read::new(root, reads, client.clone())?);
         explore.register(ListNotes::new(root)?);
-        explore.register(SearchContent::new(root)?);
+        explore.register(Grep::new(root)?);
         explore.register(SearchFiles::new(root)?);
         explore.register(ListTags::new(workspace_index.clone()));
         explore.register(SearchTag::new(root, workspace_index)?);

@@ -33,7 +33,6 @@ impl App {
             limit: u64::MAX,
             sort_by: AttachmentSortBy::ImportedAt,
             order: AttachmentSortOrder::Desc,
-            ..AttachmentQuery::default()
         };
         let page = match self.attachment_store.list(&query) {
             Ok(page) => page,
@@ -237,7 +236,7 @@ mod tests {
     #[test]
     fn display_name_and_kind_fall_back_gracefully() {
         let metadata = AttachmentMetadata {
-            id: crate::attachment::AttachmentId::parse(&"550e8400-e29b-41d4-a716-446655440000")
+            id: crate::attachment::AttachmentId::parse("550e8400-e29b-41d4-a716-446655440000")
                 .unwrap(),
             size: 12,
             display_name: "report.pdf".to_string(),

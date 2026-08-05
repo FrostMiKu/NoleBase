@@ -4,15 +4,18 @@
 //! The first entry of a day creates `YYYY-MM-DD.md`; later entries append to it.
 //! `archives/` is flat storage for articles moved from `data/`.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDate};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::agent_session::AgentSession;
+use crate::export::{ExportDiagnostic, ExportFormat};
 use crate::model::{DailyNote, NoteFile, TodoItem};
 use crate::theme::Theme;
 
@@ -98,6 +101,44 @@ fn resolve_editor_command(
         .unwrap_or("vi")
         .to_string()
 }
+#[derive(Debug, Clone)]
+struct ExportSourceIdentity {
+    canonical_path: PathBuf,
+    length: u64,
+    modified: SystemTime,
+    content_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedExport {
+    source: PathBuf,
+    destination: PathBuf,
+    format: ExportFormat,
+    identity: ExportSourceIdentity,
+    /// UTF-8 source captured once at prepare time for rendered formats, so
+    /// publishing renders from the validated snapshot instead of re-reading
+    /// the file. `None` for `ExportFormat::Original`, which streams bytes.
+    rendered_source: Option<String>,
+}
+
+impl PreparedExport {
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportOutcome {
+    pub destination: PathBuf,
+    pub bytes: u64,
+    /// Non-fatal degradations surfaced by the renderer (engine warnings,
+    /// missing/broken images). Empty for `ExportFormat::Original`.
+    pub diagnostics: Vec<ExportDiagnostic>,
+}
 
 /// Filesystem locations backing the notes.
 #[derive(Debug, Clone)]
@@ -147,6 +188,251 @@ impl Storage {
             template_path: root.join(TEMPLATE_FILE),
             root,
         })
+    }
+    pub fn prepare_export(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        format: ExportFormat,
+    ) -> Result<PreparedExport> {
+        let canonical_root = fs::canonicalize(&self.root).context("canonicalizing Nole root")?;
+        let source_input = source.as_ref();
+        let source_candidate = if source_input.is_absolute() {
+            normalize_lexical(source_input.to_path_buf())?
+        } else {
+            normalize_lexical(self.root.join(source_input))?
+        };
+        reject_symlink_components_below(&self.root, &source_candidate)?;
+        let canonical_source = fs::canonicalize(&source_candidate)
+            .with_context(|| format!("resolving export source {}", source_candidate.display()))?;
+        if !canonical_source.starts_with(&canonical_root) {
+            bail!("export source must be inside the Nole root");
+        }
+        let relative = canonical_source.strip_prefix(&canonical_root)?;
+        if relative.starts_with(CONFIG_DIR) || relative.starts_with(ATTACHMENTS_DIR) {
+            bail!("config and attachment internals cannot be exported");
+        }
+        let metadata = fs::metadata(&canonical_source)?;
+        if !metadata.is_file() {
+            bail!("export source must be a regular file");
+        }
+        let (rendered_source, content_sha256) = if format != ExportFormat::Original {
+            let extension = canonical_source
+                .extension()
+                .and_then(|value| value.to_str());
+            if !extension.is_some_and(|value| {
+                value.eq_ignore_ascii_case("md") || value.eq_ignore_ascii_case("mb")
+            }) {
+                bail!(
+                    "{} export requires a UTF-8 .md or .mb source",
+                    format.label()
+                );
+            }
+            let bytes = fs::read(&canonical_source)
+                .with_context(|| format!("reading {}", canonical_source.display()))?;
+            let size = u64::try_from(bytes.len()).context("export source is too large")?;
+            if size > crate::export::MAX_RENDER_SOURCE_BYTES {
+                bail!(
+                    "{} export source exceeds the {}-byte limit",
+                    format.label(),
+                    crate::export::MAX_RENDER_SOURCE_BYTES
+                );
+            }
+            let content_sha256 = sha256_bytes(&bytes);
+            (
+                Some(String::from_utf8(bytes).context("rendered export source is not UTF-8")?),
+                content_sha256,
+            )
+        } else {
+            (None, sha256_file(&canonical_source)?)
+        };
+        let destination = self.resolve_export_destination(destination.as_ref(), &canonical_root)?;
+        format.validate_destination(&destination)?;
+        if destination.exists() {
+            bail!(
+                "export destination already exists: {}",
+                destination.display()
+            );
+        }
+        Ok(PreparedExport {
+            source: canonical_source.clone(),
+            destination,
+            format,
+            identity: ExportSourceIdentity {
+                canonical_path: canonical_source,
+                length: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .context("reading export source modification time")?,
+                content_sha256,
+            },
+            rendered_source,
+        })
+    }
+
+    pub fn publish_export(&self, prepared: &PreparedExport) -> Result<ExportOutcome> {
+        self.revalidate_export(prepared)?;
+        let (rendered_bytes, rendered_diagnostics) = match prepared.format {
+            ExportFormat::Original => (None, Vec::new()),
+            ExportFormat::Html => {
+                let source = prepared
+                    .rendered_source
+                    .as_deref()
+                    .context("rendered export is missing its prepared source")?;
+                let title = prepared
+                    .source
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("Nole export");
+                let attachments =
+                    crate::attachment::AttachmentStore::new(self.attachments_dir.clone());
+                let rendered = crate::export::render_html(
+                    source,
+                    title,
+                    &self.root,
+                    &prepared.source,
+                    &attachments,
+                )?;
+                (Some(rendered.bytes), rendered.diagnostics)
+            }
+        };
+        let mut original_source = if prepared.format == ExportFormat::Original {
+            let source = File::open(&prepared.source)
+                .with_context(|| format!("opening {}", prepared.source.display()))?;
+            validate_open_export_source(&source, prepared)?;
+            Some(BufReader::with_capacity(64 * 1024, source))
+        } else {
+            None
+        };
+        // Write into a same-directory temp file and publish atomically, so a
+        // failed write, flush, render, or race never leaves a partial final
+        // target behind. The temp file is removed on every failure path.
+        let (mut temp_file, temp_path) = create_export_temp(&prepared.destination)?;
+        let publication = (|| -> Result<u64> {
+            let bytes = if let Some(bytes) = &rendered_bytes {
+                temp_file.write_all(bytes)?;
+                u64::try_from(bytes.len()).context("export is too large")?
+            } else {
+                let source = original_source
+                    .as_mut()
+                    .context("missing Original source handle")?;
+                let (bytes, copied_sha256) = copy_and_hash(source, &mut temp_file)?;
+                if copied_sha256 != prepared.identity.content_sha256 {
+                    bail!("export source content changed after preparation");
+                }
+                bytes
+            };
+            temp_file.flush()?;
+            // Re-check the source and destination after the write, so a
+            // change racing the export is caught before anything is linked
+            // into place.
+            if let Some(source) = original_source.as_ref() {
+                validate_open_export_source(source.get_ref(), prepared)?;
+            }
+            self.revalidate_export_source(prepared)?;
+            verify_export_source_content(prepared)?;
+            if prepared.destination.exists() {
+                bail!(
+                    "export destination already exists: {}",
+                    prepared.destination.display()
+                );
+            }
+            publish_no_overwrite(&temp_path, &prepared.destination)?;
+            Ok(bytes)
+        })();
+        drop(temp_file);
+        match publication {
+            Ok(bytes) => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(ExportOutcome {
+                    destination: prepared.destination.clone(),
+                    bytes,
+                    diagnostics: rendered_diagnostics,
+                })
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(error).context("publishing export")
+            }
+        }
+    }
+
+    fn resolve_export_destination(&self, input: &Path, canonical_root: &Path) -> Result<PathBuf> {
+        let text = input.to_string_lossy();
+        let expanded = if text == "~" || text.starts_with("~/") {
+            let home = dirs::home_dir().context("could not determine home directory")?;
+            if text == "~" {
+                home
+            } else {
+                home.join(&text[2..])
+            }
+        } else if input.is_absolute() {
+            input.to_path_buf()
+        } else {
+            self.root
+                .parent()
+                .context("Nole root has no parent directory")?
+                .join(input)
+        };
+        let normalized = normalize_lexical(expanded)?;
+        if normalized.starts_with(canonical_root) {
+            bail!("export destination must be outside the Nole root");
+        }
+        let parent = normalized
+            .parent()
+            .context("export destination has no parent")?;
+        if let Some(base) = self.root.parent().filter(|base| parent.starts_with(base)) {
+            reject_symlink_components_below(base, parent)?;
+        } else {
+            reject_existing_symlink_components(parent)?;
+        }
+        let canonical_parent = fs::canonicalize(parent).with_context(|| {
+            format!(
+                "export destination parent does not exist: {}",
+                parent.display()
+            )
+        })?;
+        if !fs::metadata(&canonical_parent)?.is_dir() {
+            bail!("export destination parent is not a directory");
+        }
+        if canonical_parent.starts_with(canonical_root) {
+            bail!("export destination must be outside the Nole root");
+        }
+        let name = normalized
+            .file_name()
+            .context("export destination needs a file name")?;
+        Ok(canonical_parent.join(name))
+    }
+
+    fn revalidate_export_source(&self, prepared: &PreparedExport) -> Result<()> {
+        let canonical_root = fs::canonicalize(&self.root)?;
+        reject_symlink_components_below(&canonical_root, &prepared.source)?;
+        let canonical = fs::canonicalize(&prepared.source)?;
+        let metadata = fs::metadata(&canonical)?;
+        if canonical != prepared.identity.canonical_path
+            || !metadata.is_file()
+            || metadata.len() != prepared.identity.length
+            || metadata.modified()? != prepared.identity.modified
+        {
+            bail!("export source changed after preparation");
+        }
+        Ok(())
+    }
+
+    fn revalidate_export(&self, prepared: &PreparedExport) -> Result<()> {
+        self.revalidate_export_source(prepared)?;
+        let canonical_root = fs::canonicalize(&self.root)?;
+        let resolved = self.resolve_export_destination(&prepared.destination, &canonical_root)?;
+        if resolved != prepared.destination {
+            bail!("export destination changed after preparation");
+        }
+        if prepared.destination.exists() {
+            bail!(
+                "export destination already exists: {}",
+                prepared.destination.display()
+            );
+        }
+        Ok(())
     }
 
     /// Create the storage layout and default configuration.
@@ -847,15 +1133,14 @@ impl Storage {
         fs::read_to_string(canonical).context("reading document")
     }
 
-    /// Resolve an existing regular file embedded by a document.
-    pub fn validate_embedded_file(&self, path: &Path) -> Result<PathBuf> {
+    /// Resolve an existing regular file referenced by a local Markdown link.
+    pub fn validate_local_file(&self, path: &Path) -> Result<PathBuf> {
         let metadata = fs::metadata(path)
-            .with_context(|| format!("checking embedded file {}", path.display()))?;
+            .with_context(|| format!("checking local file {}", path.display()))?;
         if !metadata.is_file() {
-            bail!("embedded target must be a regular file: {}", path.display());
+            bail!("local target must be a regular file: {}", path.display());
         }
-        fs::canonicalize(path)
-            .with_context(|| format!("resolving embedded file {}", path.display()))
+        fs::canonicalize(path).with_context(|| format!("resolving local file {}", path.display()))
     }
 
     /// Ensure a target is a flat data note.
@@ -913,6 +1198,192 @@ impl Storage {
             }
         }
     }
+}
+
+/// Create a unique hidden temp file in the destination's directory. The temp
+/// lives next to the final target so the atomic publish below stays on one
+/// filesystem; `create_new` guarantees no two publishers collide.
+fn create_export_temp(destination: &Path) -> Result<(File, PathBuf)> {
+    let parent = destination
+        .parent()
+        .context("export destination has no parent directory")?;
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("export");
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16u32 {
+        let temp = parent.join(format!(
+            ".{name}.nole-export-{}-{nonce}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((file, temp)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating export temp file {}", temp.display()))
+            }
+        }
+    }
+    bail!(
+        "could not allocate a unique export temp file in {}",
+        parent.display()
+    )
+}
+
+/// Publish `temp` as `destination` without ever overwriting an existing file.
+///
+/// A hard link is atomic and fails when the destination already exists, which
+/// preserves the no-overwrite guarantee across the final publication race.
+/// Filesystems that cannot create hard links fail explicitly; an
+/// exists-then-rename fallback would be racy because rename may overwrite a
+/// destination created between the check and the rename.
+fn publish_no_overwrite(temp: &Path, destination: &Path) -> Result<()> {
+    match fs::hard_link(temp, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "export destination already exists: {}",
+                destination.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "atomically publishing export {}; the destination filesystem must support hard links",
+                destination.display()
+            )
+        }),
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+    let file =
+        File::open(path).with_context(|| format!("opening {} for hashing", path.display()))?;
+    sha256_reader(BufReader::with_capacity(64 * 1024, file))
+}
+
+fn sha256_reader(mut reader: impl Read) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn copy_and_hash(reader: &mut impl Read, writer: &mut impl Write) -> Result<(u64, [u8; 32])> {
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        total = total
+            .checked_add(u64::try_from(read).context("export is too large")?)
+            .context("export is too large")?;
+    }
+    Ok((total, hasher.finalize().into()))
+}
+
+fn verify_export_source_content(prepared: &PreparedExport) -> Result<()> {
+    if sha256_file(&prepared.source)? != prepared.identity.content_sha256 {
+        bail!("export source content changed after preparation");
+    }
+    Ok(())
+}
+
+fn validate_open_export_source(source: &File, prepared: &PreparedExport) -> Result<()> {
+    let metadata = source
+        .metadata()
+        .context("reading opened export source metadata")?;
+    if !metadata.is_file()
+        || metadata.len() != prepared.identity.length
+        || metadata.modified()? != prepared.identity.modified
+    {
+        bail!("export source changed after preparation");
+    }
+    Ok(())
+}
+
+fn normalize_lexical(path: PathBuf) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path escapes its base");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+fn reject_existing_symlink_components(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("symlink traversal is not allowed: {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!("path component does not exist: {}", current.display());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", current.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_symlink_components_below(base: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(base)
+        .with_context(|| format!("{} is outside {}", path.display(), base.display()))?;
+    let mut current =
+        fs::canonicalize(base).with_context(|| format!("canonicalizing {}", base.display()))?;
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            bail!("invalid path component");
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("symlink traversal is not allowed: {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!("path component does not exist: {}", current.display());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", current.display()))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn create_empty_file(path: &Path) -> Result<()> {
@@ -1264,30 +1735,30 @@ mod tests {
     }
 
     #[test]
-    fn embedded_files_must_exist_but_may_be_outside_the_workspace() {
+    fn local_files_must_exist_but_may_be_outside_the_workspace() {
         let (_directory, st) = fresh();
         let file = st.root.join("attachment.pdf");
         fs::write(&file, b"attachment").unwrap();
         assert_eq!(
-            st.validate_embedded_file(&file).unwrap(),
+            st.validate_local_file(&file).unwrap(),
             fs::canonicalize(&file).unwrap()
         );
         assert!(st
-            .validate_embedded_file(&st.root.join("missing.pdf"))
+            .validate_local_file(&st.root.join("missing.pdf"))
             .is_err());
 
         let outside = tempdir().unwrap();
         let outside_file = outside.path().join("outside.pdf");
         fs::write(&outside_file, b"outside").unwrap();
         assert_eq!(
-            st.validate_embedded_file(&outside_file).unwrap(),
+            st.validate_local_file(&outside_file).unwrap(),
             fs::canonicalize(&outside_file).unwrap()
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn embedded_files_follow_symlinks_to_regular_files() {
+    fn local_files_follow_symlinks_to_regular_files() {
         use std::os::unix::fs::symlink;
 
         let (_directory, st) = fresh();
@@ -1296,7 +1767,7 @@ mod tests {
         fs::write(&file, b"attachment").unwrap();
         symlink(&file, &link).unwrap();
         assert_eq!(
-            st.validate_embedded_file(&link).unwrap(),
+            st.validate_local_file(&link).unwrap(),
             fs::canonicalize(&file).unwrap()
         );
     }
@@ -1928,5 +2399,197 @@ mod tests {
         assert!(!st.data_dir.join("Legacy.md").exists());
         assert!(fs::read_dir(&st.daily_dir).unwrap().next().is_none());
         assert!(!st.config_dir.join("legacy").exists());
+    }
+
+    fn export_storage() -> (tempfile::TempDir, Storage) {
+        let directory = tempdir().unwrap();
+        let storage = Storage::new(directory.path().canonicalize().unwrap().join(".nole")).unwrap();
+        storage.ensure_files().unwrap();
+        (directory, storage)
+    }
+
+    fn assert_no_export_temp_residue(directory: &Path) {
+        let names: Vec<String> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.contains(".nole-export-")),
+            "export temp residue: {names:?}"
+        );
+    }
+
+    #[test]
+    fn export_temp_files_are_unique_siblings() {
+        let (_directory, storage) = export_storage();
+        let destination = storage.root.parent().unwrap().join("unique.md");
+        let (first, first_path) = create_export_temp(&destination).unwrap();
+        let (second, second_path) = create_export_temp(&destination).unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(first_path.parent().unwrap(), destination.parent().unwrap());
+        assert!(first_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".unique.md.nole-export-"));
+        drop(first);
+        drop(second);
+        fs::remove_file(&first_path).unwrap();
+        fs::remove_file(&second_path).unwrap();
+    }
+
+    #[test]
+    fn atomic_publish_never_clobbers_an_existing_destination() {
+        let (_directory, storage) = export_storage();
+        let parent = storage.root.parent().unwrap();
+        let temp = parent.join(".target.md.nole-export-test.tmp");
+        let destination = parent.join("target.md");
+        fs::write(&temp, "complete").unwrap();
+        fs::write(&destination, "winner").unwrap();
+        let error = publish_no_overwrite(&temp, &destination).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "winner");
+        assert!(temp.exists(), "caller still owns the temp file");
+        fs::remove_file(&temp).unwrap();
+        fs::remove_file(&destination).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_failure_leaves_no_destination_or_temp_fragment() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("write-fail.md");
+        fs::write(&source, "content").unwrap();
+        let prepared = storage
+            .prepare_export(&source, Path::new("out.md"), ExportFormat::Original)
+            .unwrap();
+        let parent = storage.root.parent().unwrap();
+        // A read-only parent makes the write path fail after preparation.
+        let locked = fs::metadata(parent).unwrap().permissions();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = storage.publish_export(&prepared);
+        fs::set_permissions(parent, locked).unwrap();
+        assert!(result.is_err());
+        assert!(!parent.join("out.md").exists());
+        assert_no_export_temp_residue(parent);
+    }
+
+    #[test]
+    fn original_export_preserves_binary_bytes_and_never_overwrites() {
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("binary.dat");
+        let bytes = b"\0\xffexact\r\n";
+        fs::write(&source, bytes).unwrap();
+        let prepared = storage
+            .prepare_export(&source, Path::new("published.dat"), ExportFormat::Original)
+            .unwrap();
+        let outcome = storage.publish_export(&prepared).unwrap();
+        assert_eq!(
+            outcome.destination,
+            storage.root.parent().unwrap().join("published.dat")
+        );
+        assert_eq!(outcome.bytes, bytes.len() as u64);
+        assert!(outcome.diagnostics.is_empty());
+        assert_eq!(fs::read(&outcome.destination).unwrap(), bytes);
+        assert_no_export_temp_residue(storage.root.parent().unwrap());
+        assert!(storage
+            .prepare_export(&source, Path::new("published.dat"), ExportFormat::Original)
+            .is_err());
+    }
+
+    #[test]
+    fn html_export_is_complete_and_inert() {
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("unsafe.md");
+        fs::write(
+            &source,
+            "# Title\n\n<script>alert(1)</script> [bad](javascript:alert(1))",
+        )
+        .unwrap();
+        let prepared = storage
+            .prepare_export(&source, Path::new("safe.html"), ExportFormat::Html)
+            .unwrap();
+        let outcome = storage.publish_export(&prepared).unwrap();
+        assert!(outcome.diagnostics.is_empty());
+        assert_eq!(
+            outcome.bytes,
+            fs::metadata(storage.root.parent().unwrap().join("safe.html"))
+                .unwrap()
+                .len()
+        );
+        assert_no_export_temp_residue(storage.root.parent().unwrap());
+        let html = fs::read_to_string(storage.root.parent().unwrap().join("safe.html")).unwrap();
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("Content-Security-Policy"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("href=\"javascript:"));
+    }
+
+    #[test]
+    fn publication_rejects_source_and_destination_races() {
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("source.md");
+        fs::write(&source, "before").unwrap();
+        let stale = storage
+            .prepare_export(&source, Path::new("stale.md"), ExportFormat::Original)
+            .unwrap();
+        fs::write(&source, "changed length").unwrap();
+        assert!(storage.publish_export(&stale).is_err());
+        assert!(!storage.root.parent().unwrap().join("stale.md").exists());
+        assert_no_export_temp_residue(storage.root.parent().unwrap());
+
+        let raced = storage
+            .prepare_export(&source, Path::new("race.md"), ExportFormat::Original)
+            .unwrap();
+        fs::write(storage.root.parent().unwrap().join("race.md"), "winner").unwrap();
+        assert!(storage.publish_export(&raced).is_err());
+        assert_eq!(
+            fs::read_to_string(storage.root.parent().unwrap().join("race.md")).unwrap(),
+            "winner"
+        );
+        assert_no_export_temp_residue(storage.root.parent().unwrap());
+    }
+
+    #[test]
+    fn publication_rejects_same_length_content_with_matching_metadata() {
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("same-length.md");
+        fs::write(&source, "before").unwrap();
+        let mut prepared = storage
+            .prepare_export(
+                &source,
+                Path::new("same-length-out.md"),
+                ExportFormat::Original,
+            )
+            .unwrap();
+        fs::write(&source, "differ").unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        prepared.identity.length = metadata.len();
+        prepared.identity.modified = metadata.modified().unwrap();
+
+        let error = storage.publish_export(&prepared).unwrap_err();
+        assert!(format!("{error:#}").contains("content changed"));
+        assert!(!storage
+            .root
+            .parent()
+            .unwrap()
+            .join("same-length-out.md")
+            .exists());
+        assert_no_export_temp_residue(storage.root.parent().unwrap());
+    }
+
+    #[test]
+    fn opened_original_source_detects_in_place_changes() {
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("changing.bin");
+        fs::write(&source, b"approved").unwrap();
+        let prepared = storage
+            .prepare_export(&source, Path::new("changing.bin"), ExportFormat::Original)
+            .unwrap();
+        let opened = File::open(&source).unwrap();
+        validate_open_export_source(&opened, &prepared).unwrap();
+        fs::write(&source, b"changed after approval").unwrap();
+        assert!(validate_open_export_source(&opened, &prepared).is_err());
     }
 }

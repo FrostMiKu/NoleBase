@@ -8,16 +8,19 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::util::{display_path, limited_diff, required_string, MAX_EDIT_FILE_BYTES};
+use super::file_edit::{inspect_text_file, prepare_edit};
+use super::util::{display_path, required_string};
 use super::workspace_quota::{
-    check_workspace_write, check_workspace_writes, copy_with_workspace_limits, workspace_dir,
+    check_workspace_staged_write, check_workspace_write, check_workspace_writes,
+    copy_with_workspace_limits, workspace_dir, workspace_edit_budget,
 };
 use super::write_policy::{validate_write, WriteSource};
 use crate::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
     ReadTracker, Tool,
 };
-use crate::storage::ATTACHMENTS_DIR;
+use crate::export::ExportFormat;
+use crate::storage::{ExportOutcome, Storage, ATTACHMENTS_DIR};
 
 pub struct Edit {
     root: PathBuf,
@@ -123,12 +126,6 @@ impl Tool for Edit {
             }
             _ => {}
         }
-        let metadata = fs::metadata(&path)?;
-        if !metadata.is_file() || metadata.len() > MAX_EDIT_FILE_BYTES {
-            bail!("target must be a regular UTF-8 file no larger than 1 MB");
-        }
-        let old = fs::read_to_string(&path)
-            .with_context(|| format!("reading current file {}", path.display()))?;
         let state = self
             .reads
             .file_state(&path)?
@@ -136,12 +133,12 @@ impl Tool for Edit {
         if !state.tag.eq_ignore_ascii_case(tag) {
             bail!("snapshot tag mismatch for {relative}; read the file again before editing");
         }
-        if state.snapshot != old {
+        let inspection = inspect_text_file(&path)?;
+        if state.identity != inspection.identity {
             self.reads.consume_file(&path)?;
             bail!("file changed since read; read it again before editing");
         }
-        let offsets = line_byte_offsets(&old);
-        let total_lines = offsets.len().saturating_sub(1);
+        let total_lines = inspection.total_lines;
         for edit in &edits {
             if edit.end_line_exclusive > total_lines {
                 if edit.insertion {
@@ -158,31 +155,35 @@ impl Tool for Edit {
             }
             state.ensure_edit_read(edit.start_line, edit.end_line_exclusive)?;
         }
-        let content = apply_line_edits(&old, &offsets, &edits);
-        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
-            bail!("edited content exceeds 1 MB");
-        }
-        if old == content {
+
+        let budget = workspace_edit_budget(&self.root, &path)?;
+        let prepared = match prepare_edit(&path, relative, &edits, &inspection, budget) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.reads.consume_file(&path)?;
+                return Err(error);
+            }
+        };
+        if prepared.candidate_identity == prepared.original_identity {
             return Ok(format!("no changes needed for {relative}"));
         }
-        validate_write(&self.root, &path, WriteSource::Text(&content))?;
+        validate_write(&self.root, &path, WriteSource::File(prepared.path()))?;
         if outside_agent_workspace(&self.root, &path) {
             self.gate
                 .request(ApprovalRequest {
                     title: format!("Edit {relative}"),
-                    message: limited_diff(&old, &content, relative, relative),
+                    message: prepared.diff.clone(),
                     kind: ApprovalKind::Diff,
                 })
                 .await?;
         }
-        let current =
-            fs::read_to_string(&path).with_context(|| format!("rechecking {}", path.display()))?;
-        if current != old {
+        let current = inspect_text_file(&path)?;
+        if current.identity != prepared.original_identity {
             self.reads.consume_file(&path)?;
             bail!("file changed before editing; read it again and retry");
         }
-        check_workspace_write(&self.root, &path, content.len() as u64)?;
-        fs::write(&path, &content).with_context(|| format!("editing {}", path.display()))?;
+        check_workspace_staged_write(&self.root, &path, prepared.path(), prepared.candidate_len)?;
+        prepared.publish(&path)?;
         self.reads.consume_file(&path)?;
         Ok(format!("edited {relative}"))
     }
@@ -190,11 +191,11 @@ impl Tool for Edit {
 
 #[derive(Debug)]
 pub struct LineEdit {
-    start_line: usize,
-    end_line_exclusive: usize,
-    lines: Vec<String>,
-    insertion: bool,
-    anchor_line: usize,
+    pub(super) start_line: usize,
+    pub(super) end_line_exclusive: usize,
+    pub(super) lines: Vec<String>,
+    pub(super) insertion: bool,
+    pub(super) anchor_line: usize,
 }
 
 pub fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
@@ -287,44 +288,6 @@ fn parse_edit_lines(value: &Value) -> Result<Vec<String>> {
             Ok(line.to_string())
         })
         .collect()
-}
-
-fn line_byte_offsets(content: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
-    for (index, byte) in content.bytes().enumerate() {
-        if byte == b'\n' {
-            offsets.push(index + 1);
-        }
-    }
-    if offsets.last().copied() != Some(content.len()) {
-        offsets.push(content.len());
-    }
-    offsets
-}
-
-fn apply_line_edits(old: &str, offsets: &[usize], edits: &[LineEdit]) -> String {
-    let mut content = old.to_string();
-    let line_ending = if old.contains("\r\n") { "\r\n" } else { "\n" };
-    for edit in edits.iter().rev() {
-        let mut replacement = if edit.lines.is_empty() {
-            String::new()
-        } else {
-            format!("{}{}", edit.lines.join(line_ending), line_ending)
-        };
-        if edit.insertion
-            && edit.start_line == offsets.len().saturating_sub(1)
-            && !old.is_empty()
-            && !old.ends_with('\n')
-            && !replacement.is_empty()
-        {
-            replacement.insert_str(0, line_ending);
-        }
-        content.replace_range(
-            offsets[edit.start_line]..offsets[edit.end_line_exclusive],
-            &replacement,
-        );
-    }
-    content
 }
 
 fn safe_relative(root: &Path, input: &str) -> Result<PathBuf> {
@@ -581,6 +544,107 @@ impl Tool for Copy {
         let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
         Ok(format!("copied {bytes} bytes to {destination_text}"))
     }
+}
+
+pub struct ExportFile {
+    storage: Storage,
+    gate: ApprovalGate,
+}
+
+impl ExportFile {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
+        Ok(Self {
+            storage: Storage::new(canonical_root(root)?)?,
+            gate,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ExportFile {
+    fn name(&self) -> &'static str {
+        "export_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Publish one Nole file to a new destination outside Nole as exact original bytes, safe standalone HTML, or A4 PDF."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Nole-root-relative path, or an absolute path within Nole"
+                },
+                "destination": {
+                    "type": "string",
+                    "description": "Absolute, ~/..., or relative to the parent of Nole; must be outside Nole and not exist"
+                },
+                "format": {
+                    "enum": ["original", "html"],
+                    "description": "HTML requires a UTF-8 .md or .mb source and a matching destination suffix"
+                }
+            },
+            "required": ["source", "destination", "format"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: &Value) -> Result<String> {
+        let source = required_string(input, "source")?.to_string();
+        let destination = required_string(input, "destination")?.to_string();
+        let format = required_string(input, "format")?.parse::<ExportFormat>()?;
+        let storage = self.storage.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            storage.prepare_export(source, destination, format)
+        })
+        .await
+        .context("joining export preparation")??;
+        self.gate
+            .request(ApprovalRequest {
+                title: "Export file".to_string(),
+                message: format!(
+                    "Export {} as {} to {}?",
+                    prepared.source().display(),
+                    format.label(),
+                    prepared.destination().display()
+                ),
+                kind: ApprovalKind::Confirm,
+            })
+            .await?;
+        // Rendering HTML is CPU-bound, so publish on the blocking pool.
+        let storage = self.storage.clone();
+        let outcome = tokio::task::spawn_blocking(move || storage.publish_export(&prepared))
+            .await
+            .context("joining export publication")??;
+        Ok(describe_export_outcome(&outcome, format))
+    }
+}
+
+/// Format the tool result for a finished export: target path, byte count, and
+/// a summary of any renderer diagnostics (downgraded assets) instead of
+/// dropping them silently.
+fn describe_export_outcome(outcome: &ExportOutcome, format: ExportFormat) -> String {
+    let mut summary = format!(
+        "exported {} bytes as {} to {}",
+        outcome.bytes,
+        format.agent_value(),
+        outcome.destination.display()
+    );
+    if !outcome.diagnostics.is_empty() {
+        summary.push_str(&format!(
+            "; {} warning(s): first: {}",
+            outcome.diagnostics.len(),
+            outcome
+                .diagnostics
+                .first()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        ));
+    }
+    summary
 }
 
 pub struct Move {
@@ -1046,9 +1110,6 @@ impl Tool for Write {
     async fn execute(&self, input: &Value) -> Result<String> {
         let relative = required_string(input, "path")?;
         let content = required_string(input, "content")?;
-        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
-            bail!("content exceeds 1 MB");
-        }
         let path = safe_relative(&self.root, relative)?;
         match path_zone(&self.root, &path) {
             PathZone::Config | PathZone::Daily => {
@@ -1232,11 +1293,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::agent::snapshot_tag;
     use crate::agent::test_support::{
         drain_events, event_channel, test_runtime, TestFutureResultExt,
     };
     use crate::agent::ApprovalDecision;
+    use crate::agent::{snapshot_identity, snapshot_tag};
+    use crate::export::{ExportDiagnostic, ExportDiagnosticSeverity};
 
     fn gate_without_decisions() -> (ApprovalGate, tokio::sync::broadcast::Receiver<AgentEvent>) {
         let (event_sender, event_receiver) = event_channel();
@@ -1323,7 +1385,14 @@ mod tests {
         let content = fs::read_to_string(&draft).unwrap();
         let canonical_draft = fs::canonicalize(&draft).unwrap();
         reads
-            .mark_file(canonical_draft, content.clone(), 0, 1, 1)
+            .mark_file(
+                canonical_draft,
+                snapshot_identity(&content),
+                snapshot_tag(&content),
+                0,
+                1,
+                1,
+            )
             .unwrap();
         let (gate, mut events) = gate_without_decisions();
         let edit = Edit::new(&root, gate, reads).unwrap();
@@ -1342,7 +1411,14 @@ mod tests {
         let content = fs::read_to_string(&draft).unwrap();
         let canonical_draft = fs::canonicalize(&draft).unwrap();
         reads
-            .mark_file(canonical_draft, content.clone(), 0, 1, 1)
+            .mark_file(
+                canonical_draft,
+                snapshot_identity(&content),
+                snapshot_tag(&content),
+                0,
+                1,
+                1,
+            )
             .unwrap();
         let (gate, _) = gate_without_decisions();
         let edit = Edit::new(&root, gate, reads).unwrap();
@@ -1706,5 +1782,107 @@ mod tests {
             .unwrap()
             .execute(&json!({"source": "workspace/main/escape.md", "destination": "workspace/main/copy.md"}))
             .returns_err());
+    }
+
+    #[test]
+    fn export_file_is_strict_approval_gated_and_never_overwrites() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("root");
+        fs::create_dir_all(root.join("data")).unwrap();
+        let source = root.join("data/note.md");
+        fs::write(&source, "# Agent export\n").unwrap();
+        let output = tempdir().unwrap();
+        let output_path = output.path().canonicalize().unwrap();
+        let denied_destination = output_path.join("denied.md");
+
+        let (event_sender, mut events) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender,
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let tool = ExportFile::new(&root, gate).unwrap();
+        let schema = tool.input_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            json!(["source", "destination", "format"])
+        );
+
+        decision_sender.send(ApprovalDecision::Deny).unwrap();
+        let denied = test_runtime()
+            .block_on(tool.execute(&json!({
+                "source": "data/note.md",
+                "destination": denied_destination,
+                "format": "original"
+            })))
+            .unwrap_err();
+        assert_eq!(denied.to_string(), "change denied by user");
+        assert!(!denied_destination.exists());
+        let approval = drain_events(&mut events)
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::Approval(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(approval.title, "Export file");
+        assert_eq!(approval.kind, ApprovalKind::Confirm);
+        assert!(approval.message.contains(" as Original to "));
+
+        let destination = output_path.join("approved.html");
+        decision_sender.send(ApprovalDecision::Approve).unwrap();
+        let result = test_runtime()
+            .block_on(tool.execute(&json!({
+                "source": "data/note.md",
+                "destination": destination,
+                "format": "html"
+            })))
+            .unwrap();
+        assert!(result.starts_with("exported "));
+        assert!(result.contains(" bytes as html to "));
+        assert!(fs::read_to_string(&destination)
+            .unwrap()
+            .starts_with("<!doctype html>"));
+        assert!(tool
+            .execute(&json!({
+                "source": "data/note.md",
+                "destination": destination,
+                "format": "html"
+            }))
+            .returns_err());
+    }
+
+    #[test]
+    fn export_result_summarizes_renderer_diagnostics() {
+        let outcome = ExportOutcome {
+            destination: PathBuf::from("/tmp/out/note.html"),
+            bytes: 4096,
+            diagnostics: vec![
+                ExportDiagnostic {
+                    severity: ExportDiagnosticSeverity::Warning,
+                    message: "missing image assets/pic.png".to_string(),
+                },
+                ExportDiagnostic {
+                    severity: ExportDiagnosticSeverity::Warning,
+                    message: "unsupported style block ignored".to_string(),
+                },
+            ],
+        };
+        let result = describe_export_outcome(&outcome, ExportFormat::Html);
+        assert!(result.starts_with("exported 4096 bytes as html to /tmp/out/note.html"));
+        assert!(result.contains("2 warning(s): first: warning: missing image assets/pic.png"));
+
+        let quiet = ExportOutcome {
+            destination: PathBuf::from("/tmp/out/note.html"),
+            bytes: 8192,
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(
+            describe_export_outcome(&quiet, ExportFormat::Html),
+            "exported 8192 bytes as html to /tmp/out/note.html"
+        );
     }
 }

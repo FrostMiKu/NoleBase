@@ -76,8 +76,17 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(hint.width() as u16)
         .saturating_sub(u16::from(!hint.is_empty()));
     if !app.status.is_empty() && available_status > 2 {
+        let status_text = if app.export_in_progress {
+            format!(
+                "{} {}",
+                super::agent::spinner_frame(app.animation_tick),
+                app.status
+            )
+        } else {
+            app.status.clone()
+        };
         let status = Line::from(Span::styled(
-            format!(" {}", app.status),
+            format!(" {status_text}"),
             Style::default().fg(app.theme.ui_warning),
         ));
         frame.render_widget(

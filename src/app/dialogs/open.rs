@@ -15,6 +15,73 @@ impl App {
         self.refresh_command_palette();
     }
 
+    pub(in crate::app) fn open_export_dialog(&mut self) {
+        if self.export_in_progress {
+            self.set_status("Export is already in progress");
+            return;
+        }
+        let Some(source) = self.current_export_path() else {
+            self.set_status("No file is open");
+            return;
+        };
+        self.pending_export_source = Some(source);
+        self.pending_export_format = None;
+        self.pending_export_destination = None;
+        let options = ExportFormat::ALL
+            .into_iter()
+            .map(|format| DialogOption::with_hint(format.label(), format.hint()))
+            .collect();
+        self.open_dialog(DialogState::new(
+            "Export file · Select format",
+            String::new(),
+            DialogMode::SingleSelect,
+            DialogPurpose::ExportFormat,
+            options,
+        ));
+    }
+
+    pub(in crate::app) fn open_export_destination_dialog(&mut self) {
+        let input = self.default_export_destination();
+        self.open_export_destination_dialog_with_input(input.as_deref());
+    }
+
+    /// Open the destination prompt with `input` pre-filled (the default
+    /// filename, or the previously submitted destination when restoring
+    /// after a background failure).
+    pub(in crate::app) fn open_export_destination_dialog_with_input(
+        &mut self,
+        input: Option<&str>,
+    ) {
+        let mut dialog = DialogState::new(
+            "Export file · Enter destination",
+            "Destination path  ",
+            DialogMode::SingleLine,
+            DialogPurpose::ExportDestination,
+            Vec::new(),
+        );
+        if let Some(input) = input {
+            dialog.input = input.to_string();
+            dialog.cursor = dialog.input.chars().count();
+        }
+        self.open_dialog(dialog);
+    }
+
+    /// Default destination file name for the current export: the current
+    /// document name with the selected format's extension (the source
+    /// extension for Original).
+    fn default_export_destination(&self) -> Option<String> {
+        let source = self.pending_export_source.as_ref()?;
+        let format = self.pending_export_format?;
+        let stem = source.file_stem().and_then(|stem| stem.to_str())?;
+        let extension = format.required_suffix().map(str::to_owned).or_else(|| {
+            source
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_owned)
+        })?;
+        Some(format!("{stem}.{extension}"))
+    }
+
     pub(in crate::app) fn open_theme_picker(&mut self) {
         let names = match self.storage.list_theme_names() {
             Ok(names) => names,

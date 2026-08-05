@@ -27,6 +27,8 @@ pub enum DialogPurpose {
     Help,
     NewFile,
     RenameFile,
+    ExportFormat,
+    ExportDestination,
     CommandPalette,
     ThemePicker,
     TagRenameSource,

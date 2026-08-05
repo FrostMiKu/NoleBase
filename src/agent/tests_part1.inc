@@ -254,6 +254,71 @@
     }
 
     #[test]
+    fn files_over_one_megabyte_remain_editable_after_paged_read() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("data")).unwrap();
+        fs::create_dir(directory.path().join("config")).unwrap();
+        fs::create_dir(directory.path().join("daily")).unwrap();
+        let line_count = 130_000usize;
+        let content = (1..=line_count)
+            .map(|line| format!("large line {line}\n"))
+            .collect::<String>();
+        assert!(content.len() > 1_000_000);
+        let path = directory.path().join("data/huge.md");
+        fs::write(&path, &content).unwrap();
+        let reads = Arc::new(ReadTracker::default());
+        let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
+        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+
+        let page = read
+            .execute(&json!({"path": format!("data/huge.md:{line_count}-{line_count}")}))
+            .unwrap();
+        assert!(page.contains(&format!("{line_count}:large line {line_count}")));
+        edit.execute(&json!({
+            "path": "data/huge.md",
+            "tag": snapshot_tag(&content),
+            "edits": [{
+                "operation": "replace",
+                "start_line": line_count,
+                "end_line": line_count,
+                "lines": ["edited final line"]
+            }]
+        }))
+        .unwrap();
+
+        let edited = fs::read_to_string(path).unwrap();
+        assert!(edited.len() > 1_000_000);
+        assert!(edited.starts_with("large line 1\n"));
+        assert!(edited.ends_with("large line 129999\nedited final line\n"));
+    }
+
+    #[test]
+    fn write_and_directory_metadata_accept_files_over_one_megabyte() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("data")).unwrap();
+        let content = "x".repeat(1_100_000);
+        let write = Write::new(directory.path()).unwrap();
+        write
+            .execute(&json!({"path": "data/large.txt", "content": content}))
+            .unwrap();
+
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            build_http_client().unwrap(),
+        )
+        .unwrap();
+        let listing: Value = serde_json::from_str(
+            &read
+                .execute(&json!({"path": "data", "depth": 1}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listing["items"][0]["size"], 1_100_000);
+        assert_eq!(listing["items"][0]["line_count"], 1);
+    }
+
+    #[test]
     fn file_change_events_invalidate_only_affected_read_snapshots() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
@@ -295,10 +360,16 @@
         )
         .unwrap();
 
-        let content = SearchContent::new(directory.path()).unwrap();
+        let grep = Grep::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(
-            &content
-                .execute(&json!({"query": "rust", "range": "1-1"}))
+            &grep
+                .execute(&json!({
+                    "pattern": "rust",
+                    "case_sensitive": false,
+                    "fixed_strings": true,
+                    "include": ["*.md"],
+                    "range": "1-1"
+                }))
                 .unwrap(),
         )
         .unwrap();
@@ -307,19 +378,32 @@
         assert_eq!(result["total"], 3);
         assert_eq!(result["has_more"], true);
         assert_eq!(result["next"], "2-2");
-        assert!(result["items"][0]["path"]
-            .as_str()
-            .is_some_and(|path| path.starts_with("daily/") && path.ends_with(".md")));
         assert_eq!(result["items"][0]["line"], 1);
 
         let remaining: Value = serde_json::from_str(
-            &content
-                .execute(&json!({"query": "rust", "range": "2-11"}))
+            &grep
+                .execute(&json!({
+                    "pattern": "rust",
+                    "case_sensitive": false,
+                    "fixed_strings": true,
+                    "include": ["*.md"],
+                    "range": "2-3"
+                }))
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(remaining["items"][0]["path"], "data/RustProject.md");
-        assert_eq!(remaining["items"][1]["path"], "archives/RustHistory.md");
+        let mut paths = remaining["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["path"].as_str().unwrap())
+            .chain(std::iter::once(result["items"][0]["path"].as_str().unwrap()))
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.iter().any(|path| path.starts_with("daily/")));
+        assert!(paths.contains(&"data/RustProject.md"));
+        assert!(paths.contains(&"archives/RustHistory.md"));
 
         let files = SearchFiles::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(

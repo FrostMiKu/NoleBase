@@ -54,6 +54,17 @@ shown as one card. Each card provides:
 Messages render Markdown directly in Daily. Press `v` when a dedicated document
 view is useful for scrolling through a long message.
 
+With a file, Skill, or Daily preview open in Center, run `File: Export…` from
+the command palette. Choose **Original** for byte-for-byte publication or
+**HTML** for a safe standalone `.html` document. The destination prompt starts
+with the source name and correct extension; it accepts an absolute path, a
+`~/...` path, or a path relative to the parent of the Nole root. The
+destination must be outside Nole, its parent must already exist, and the final
+file must not exist. Publication is atomic and never overwrites or leaves a
+partial final file. Rendering runs on a worker thread, so generation does not
+block keyboard input or redraws; a background failure restores the destination
+prompt for retry.
+
 Wikilinks resolve matching filenames across `daily/`, `data/`, and `archives/`.
 When the same name exists in multiple locations, Nole shows a source-labelled
 chooser instead of silently preferring one copy.
@@ -112,6 +123,18 @@ short cooldown. Images reserve twelve terminal rows, scale proportionally, and
 are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
+Standalone HTML export uses the offline MBDown renderer. Raw HTML and unsafe
+links are escaped instead of executed; a restrictive CSP keeps HTML inert.
+Local note links stay visibly marked but inert so a standalone document never
+leaks a private Nole `file://` path. Supported local images are embedded after
+root-containment, symlink, per-image, cumulative-size, and decoded-format
+checks. Managed images are embedded only through valid
+`nole://attachment/<uuid>` references; direct physical `attachments/` and
+`config/` paths are rejected. Remote images are never fetched and remain
+ordinary HTTP(S) links. Missing or broken images and unsupported Mermaid
+diagrams stay visible as explicit fallbacks and are reported as export
+warnings.
+
 Managed attachments are mutable files with stable UUID identities, referenced as
 `nole://attachment/<uuid>`. The same URI works from Daily cards, notes, and Agent
 messages, so moving a note or updating an attachment does not break references.
@@ -120,11 +143,14 @@ type, size, and reference count; `Enter` opens the managed file for editing and
 `d` moves an unreferenced attachment to trash after confirmation. Referenced
 attachments cannot be deleted.
 
-Rendered Markdown links and `[link=...]...[/link]` labels are clickable and open
-with the system default application. Clicking `[[wikilink]]` searches `daily/`,
-`data/`, and `archives/` by filename or filename stem. Multiple MD/MB matches
-open a chooser showing source and format metadata; a missing note is created as
-a new `.md` file under `data/`.
+Rendered Markdown links and `[link=...]...[/link]` labels are clickable. HTTP(S),
+`mailto:`, and other URI links open with the system default application; local
+file links and `![[file]]` embeds resolve relative to the containing Markdown
+file. In Agent messages, which have no containing file, they resolve relative to
+the Nole root. Clicking `[[wikilink]]` searches `daily/`, `data/`, and
+`archives/` by filename or filename stem. Multiple MD/MB matches open a chooser
+showing source and format metadata; a missing note is created as a new `.md`
+file under `data/`.
 
 Hashtags are an exact navigation layer over workspace search. Clicking a
 `#tag` in Daily or a document opens all lines carrying that exact tag, so
@@ -419,6 +445,9 @@ Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
 task, clear its saved session, create or manage notes, or open `template.mb`,
 `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the configured editor.
+`File: Export…` is available when Center is previewing a file, Skill, or Daily
+document. Its Original/HTML picker and destination prompt use the same storage
+policy as the Agent's `export_file` tool.
 Press `Ctrl+\`` or run `Terminal: Open` from the command palette to open a
 PTY-backed floating terminal. Its shell starts in the active Nole directory
 (`~/.nole` by default, or `NOLE_DIR` when configured). Hiding the terminal
@@ -525,27 +554,32 @@ required fields, types, bounds, enums, and unknown-property rejection.
 `read` on a directory lists any directory by absolute path or a path relative to
 the Nole root. `depth=1` returns direct children and values up to 16 include
 nested descendants without following symlinks. Each item includes its type,
-depth, extension, byte size, line count for files up to 1 MB, and creation and
-modification timestamps. Results support metadata sorting and range pagination.
+depth, extension, byte size, streaming line count, and creation and modification
+timestamps. Results support metadata sorting and range pagination.
 
 `list_notes` returns active `data/` notes with their line count, creation and
 modification timestamps, and byte size. Results can be sorted ascending or
 descending by name or any of those metadata fields and paginated with `range`.
 
-`search_content` performs case-insensitive full-text search across daily files,
-active notes, and archived notes, in that order, returning file paths and
-one-based source line numbers. `search_files` uses the same case-insensitive fuzzy
-filename matching as the Files sidebar. Both search tools use range pagination.
+`grep` performs ripgrep-style regular-expression search in any local file or
+directory, with optional case-insensitive or fixed-string matching and include
+globs. It reads files of any size line by line, respects standard ignore files,
+does not follow discovered symlinks, and returns one-based line and byte-column
+positions with range pagination. `search_files` remains the case-insensitive
+fuzzy filename search used by the Files sidebar.
 
-`write` creates a complete new file and always refuses an existing path. The full
-candidate content passes the same MBDown or Skill parser validation before the
-file is created. `edit` accepts one or more line edits and preserves
-the rest of the file internally, so large files do not need to be read or
-submitted in full. `replace` operations use inclusive one-based `start_line` and
-`end_line` values from the original `read` snapshot; `insert` operations use a
-separate one-based `line` anchor and insert before or after it. Each edit provides
-a `lines` array of complete lines without line-ending characters; the tool adds
-separators and never requires the Agent to repeat adjacent anchor text.
+`write` creates a complete new file and always refuses an existing path. Ordinary
+files have no 1 MiB tool limit; workspace files remain subject to the 64 MiB
+per-file and 512 MiB total workspace quotas, while Skills retain their separate
+size limit because they enter Agent context. The full candidate content passes
+MBDown or Skill validation before publication. `edit` accepts one or more line
+edits and streams unchanged content through an atomically published candidate,
+so files larger than 1 MiB remain editable after paged reads. `replace`
+operations use inclusive one-based `start_line` and `end_line` values from the
+original `read` snapshot; `insert` operations use a separate one-based `line`
+anchor and insert before or after it. Each edit provides a `lines` array of
+complete lines without line-ending characters; the tool adds separators and
+never requires the Agent to repeat adjacent anchor text.
 Changed/deleted ranges must have been covered by `read` since the file last
 changed; insertions require adjacent anchor lines. Existing
 `daily/YYYY-MM-DD.md` files use the same `read`, `edit`, and `delete`
@@ -566,6 +600,17 @@ uses the common approval dialog. Generic file
 creation, transfer, and rename tools cannot operate directly inside `daily/`,
 preserving its `YYYY-MM-DD.md` naming invariant. Agent file tools cannot mutate
 anything inside `config/`, and `config/ai.toml` cannot be read.
+
+`export_file` is the only Agent file tool whose destination is outside Nole. It
+requires `source`, `destination`, and an explicit `original` or `html` format.
+Preparation validates the source and destination before a confirmation
+approval; preparation and publication run off the Agent async runtime.
+Publication revalidates source content and destination afterward, never
+overwrites, and returns the resolved destination, exact output byte count, and
+renderer-warning summary. Original preserves any regular source file exactly.
+HTML accepts only UTF-8 `.md`/`.mb` sources and uses the same inert offline
+rendering described above. `config/` and attachment object internals are never
+export sources.
 
 The `notify` tool lets the Agent display a short notification card in the TUI's
 top-right corner and emits the terminal bell. Notifications are non-blocking
@@ -591,10 +636,11 @@ contents are appended to the system prompt in that order for every Agent task.
 `config/`. The Agent may read and update root-level `MEMORY.md`; localized
 updates use the normal read-before-`edit` approval flow.
 
-In `APPROVE` mode, updates and deletes pause and show an MBTUI-rendered diff or
-deletion preview. Use Enter/Y to approve or N/Esc to deny. In `BYPASS` mode
-they proceed without the approval dialog, but the read-before-update rule still
-applies. Adding a new card never requires approval. Note listings return at
+In `APPROVE` mode, updates, deletes, and `export_file` pause and show an
+MBTUI-rendered diff, deletion preview, or export confirmation. Use Enter/Y to
+approve or N/Esc to deny. In `BYPASS` mode they proceed without the approval
+dialog, but read-before-update and export path/identity validation still apply.
+Adding a new card never requires approval. Note listings return at
 most 2,000 entries per call; file and web responses are capped at 1 MB.
 Filesystem mutation tools reject symlink targets. The API configuration itself
 is not exposed to tools.

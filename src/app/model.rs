@@ -29,6 +29,7 @@ pub(super) enum AppCommand {
     NewNoteFromTemplate,
     EditTemplate,
     EditCurrentNote,
+    ExportCurrentFile,
     RenameCurrentNote,
     DeleteCurrentNote,
     ArchiveCurrentNote,
@@ -98,6 +99,12 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Note: Edit",
         description: "Open the current note in your editor",
         keywords: "note edit editor current article",
+    },
+    AppCommandDefinition {
+        id: AppCommand::ExportCurrentFile,
+        label: "File: Export…",
+        description: "Publish the current file outside Nole",
+        keywords: "file export original html publish current",
     },
     AppCommandDefinition {
         id: AppCommand::RenameCurrentNote,
