@@ -66,10 +66,28 @@ impl App {
         self.open_dialog(dialog);
     }
 
-    /// Default destination file name for the current export: the current
-    /// document name with the selected format's extension (the source
-    /// extension for Original).
-    fn default_export_destination(&self) -> Option<String> {
+    /// Ask for explicit confirmation before replacing an existing
+    /// destination. The submitted destination is kept in
+    /// `pending_export_destination`, so confirming starts the overwrite with
+    /// the same path and cancelling restores the destination input verbatim.
+    pub(in crate::app) fn open_export_overwrite_dialog(&mut self) {
+        let destination = self.pending_export_destination.clone().unwrap_or_default();
+        self.open_dialog(DialogState::new(
+            "Export file · Overwrite destination",
+            format!("{destination} already exists. Replace it?"),
+            DialogMode::Confirm,
+            DialogPurpose::ExportOverwrite,
+            Vec::new(),
+        ));
+    }
+
+    /// Default destination input for the current export: the configured
+    /// `export_directory` setting joined with the document name and the
+    /// selected format's extension (the source extension for Original). When
+    /// the setting is missing, blank, or unreadable, the dialog still opens
+    /// with the bare file name and the configuration error is surfaced through
+    /// the existing error state.
+    fn default_export_destination(&mut self) -> Option<String> {
         let source = self.pending_export_source.as_ref()?;
         let format = self.pending_export_format?;
         let stem = source.file_stem().and_then(|stem| stem.to_str())?;
@@ -79,7 +97,19 @@ impl App {
                 .and_then(|extension| extension.to_str())
                 .map(str::to_owned)
         })?;
-        Some(format!("{stem}.{extension}"))
+        let file_name = format!("{stem}.{extension}");
+        match self.storage.default_export_directory() {
+            Ok(directory) => Some(
+                Path::new(&directory)
+                    .join(&file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Err(error) => {
+                self.set_error(format!("Export directory error: {error:#}"));
+                Some(file_name)
+            }
+        }
     }
 
     pub(in crate::app) fn open_theme_picker(&mut self) {

@@ -3,6 +3,7 @@
 use super::super::*;
 
 use crate::export::ExportDiagnostic;
+use crate::storage::{ExportDestinationPolicy, PreparedExport};
 
 impl App {
     pub(crate) fn handle_overlay(&mut self, key: KeyEvent) -> Option<Command> {
@@ -83,6 +84,18 @@ impl App {
             | DialogPurpose::RenameFile
             | DialogPurpose::TagRenameTarget
             | DialogPurpose::ExportDestination => return self.handle_text_dialog(key),
+            DialogPurpose::ExportOverwrite => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        self.confirm_export_overwrite();
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.cancel_export_overwrite();
+                    }
+                    _ => {}
+                }
+                return None;
+            }
             DialogPurpose::Custom => {}
         }
 
@@ -208,10 +221,25 @@ impl App {
             .as_ref()
             .map(|dialog| dialog.input.clone())
             .unwrap_or_default();
-        let prepared = match self
+        // An existing destination never fails or overwrites silently: when it
+        // is a plain file, ask for explicit confirmation first. Directories,
+        // symlinks, and special files are not offered and fall through to the
+        // normal preparation error.
+        if self
             .storage
-            .prepare_export(&source, Path::new(&destination), format)
+            .export_destination_is_overwritable(Path::new(&destination))
+            .unwrap_or(false)
         {
+            self.pending_export_destination = Some(destination);
+            self.open_export_overwrite_dialog();
+            return;
+        }
+        let prepared = match self.storage.prepare_export(
+            &source,
+            Path::new(&destination),
+            format,
+            ExportDestinationPolicy::CreateNew,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 // Keep the dialog open with the typed destination so the
@@ -220,6 +248,20 @@ impl App {
                 return;
             }
         };
+        self.start_export_worker(prepared, destination, format);
+    }
+
+    /// Launch the background publication worker for a prepared export and
+    /// record the pending state so a background failure can restore the
+    /// destination input for a direct retry. The prepared export already
+    /// carries its destination policy (`CreateNew` from the destination
+    /// dialog, `ReplaceExisting` from the overwrite confirmation).
+    fn start_export_worker(
+        &mut self,
+        prepared: PreparedExport,
+        destination: String,
+        format: ExportFormat,
+    ) {
         let resolved = prepared.destination().display().to_string();
         let storage = self.storage.clone();
         let (sender, receiver) = mpsc::channel();
@@ -244,6 +286,45 @@ impl App {
         self.overlay = None;
         self.dialog = None;
         self.set_status(format!("Exporting as {} to {resolved}", format.label()));
+    }
+
+    fn confirm_export_overwrite(&mut self) {
+        let Some(source) = self.pending_export_source.clone() else {
+            self.set_error("Export source is no longer available");
+            self.close_dialog();
+            return;
+        };
+        let Some(format) = self.pending_export_format else {
+            self.set_error("Export format is no longer available");
+            self.close_dialog();
+            return;
+        };
+        let Some(destination) = self.pending_export_destination.clone() else {
+            self.set_error("Export destination is no longer available");
+            self.close_dialog();
+            return;
+        };
+        match self.storage.prepare_export(
+            &source,
+            Path::new(&destination),
+            format,
+            ExportDestinationPolicy::ReplaceExisting,
+        ) {
+            Ok(prepared) => self.start_export_worker(prepared, destination, format),
+            Err(error) => {
+                // The destination changed since the confirmation was offered
+                // (gone, replaced by a directory or symlink, ...). Return to
+                // the destination input so the user can retry without losing
+                // their path.
+                self.set_error(error.to_string());
+                self.open_export_destination_dialog_with_input(Some(&destination));
+            }
+        }
+    }
+
+    fn cancel_export_overwrite(&mut self) {
+        let destination = self.pending_export_destination.clone();
+        self.open_export_destination_dialog_with_input(destination.as_deref());
     }
 
     pub fn poll_export(&mut self) {

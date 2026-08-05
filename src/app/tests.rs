@@ -435,7 +435,7 @@ fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
         Some(DialogPurpose::ExportDestination)
     );
     assert_eq!(app.dialog.as_ref().unwrap().message, "Destination path  ");
-    assert_eq!(app.dialog.as_ref().unwrap().input, "Export me.html");
+    assert_eq!(app.dialog.as_ref().unwrap().input, "~/Export me.html");
     assert_eq!(
         app.dialog.as_ref().unwrap().cursor,
         app.dialog.as_ref().unwrap().input.chars().count()
@@ -465,7 +465,7 @@ fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
 
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "Export me.md");
+    assert_eq!(app.dialog.as_ref().unwrap().input, "~/Export me.md");
     let destination = output.path().join("exact.md");
     app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
     app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
@@ -491,8 +491,8 @@ fn export_format_switch_changes_default_destination_extension() {
     app.open_file_document(&current, DocumentReturn::Daily);
 
     for (index, (expected, format)) in [
-        ("Quarterly Report.mb", ExportFormat::Original),
-        ("Quarterly Report.html", ExportFormat::Html),
+        ("~/Quarterly Report.mb", ExportFormat::Original),
+        ("~/Quarterly Report.html", ExportFormat::Html),
     ]
     .into_iter()
     .enumerate()
@@ -516,6 +516,49 @@ fn export_format_switch_changes_default_destination_extension() {
 }
 
 #[test]
+fn export_destination_default_follows_configured_export_directory() {
+    let (mut app, _directory) = make_app();
+    let current = app.storage.data_dir.join("Doc.md");
+    fs::write(&current, b"# Doc\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.dialog.as_ref().unwrap().input, "~/Doc.md");
+
+    // A changed setting is picked up by the next export immediately.
+    app.handle_key(key(KeyCode::Esc));
+    fs::write(
+        &app.storage.settings_path,
+        "theme = \"default\"\nexport_directory = \"/tmp/exports\"\n",
+    )
+    .unwrap();
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.dialog.as_ref().unwrap().input, "/tmp/exports/Doc.md");
+    app.handle_key(key(KeyCode::Esc));
+}
+
+#[test]
+fn export_destination_falls_back_to_file_name_when_export_directory_invalid() {
+    let (mut app, _directory) = make_app();
+    let current = app.storage.data_dir.join("Doc.md");
+    fs::write(&current, b"# Doc\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+
+    fs::write(
+        &app.storage.settings_path,
+        "theme = \"default\"\nexport_directory = \"   \"\n",
+    )
+    .unwrap();
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.dialog.as_ref().unwrap().input, "Doc.md");
+    assert!(app.status.contains("export_directory"));
+    app.handle_key(key(KeyCode::Esc));
+}
+
+#[test]
 fn daily_note_export_is_available_and_publishes_the_daily_file() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
@@ -534,7 +577,7 @@ fn daily_note_export_is_available_and_publishes_the_daily_file() {
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "2026-08-05.html");
+    assert_eq!(app.dialog.as_ref().unwrap().input, "~/2026-08-05.html");
     let destination = output.path().join("daily.html");
     app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
     app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
@@ -568,7 +611,7 @@ fn skill_document_can_be_exported() {
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "guide.html");
+    assert_eq!(app.dialog.as_ref().unwrap().input, "~/guide.html");
     let destination = output.path().join("guide.html");
     app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
     app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
@@ -660,6 +703,136 @@ fn failed_background_export_restores_destination_for_direct_retry() {
 }
 
 #[test]
+fn existing_export_destination_offers_confirmation_and_cancel_restores_input() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let current = app.storage.data_dir.join("Overwrite me.md");
+    fs::write(&current, b"# New body\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+    let destination = output.path().join("target.md");
+    fs::write(&destination, "old content").unwrap();
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+
+    // No worker starts; an explicit confirmation is requested instead, and
+    // the submitted destination is kept for the cancel path.
+    assert!(!app.export_in_progress);
+    let dialog = app.dialog.as_ref().unwrap();
+    assert_eq!(dialog.purpose, DialogPurpose::ExportOverwrite);
+    assert_eq!(dialog.mode, DialogMode::Confirm);
+    assert!(dialog.message.contains("already exists"));
+    assert_eq!(
+        app.pending_export_destination.as_deref(),
+        Some(destination.to_str().unwrap())
+    );
+    assert_eq!(app.pending_export_format, Some(ExportFormat::Original));
+
+    // Cancelling returns to the destination input with the same path, keeps
+    // the format, and leaves the existing file untouched.
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::ExportDestination)
+    );
+    assert_eq!(
+        app.dialog.as_ref().unwrap().input,
+        destination.to_string_lossy().as_ref()
+    );
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "old content");
+    assert!(!app.export_in_progress);
+    assert_eq!(app.pending_export_format, Some(ExportFormat::Original));
+
+    // The restored input is still usable: a fresh path exports without any
+    // confirmation and the original destination stays untouched.
+    app.dialog.as_mut().unwrap().input = output
+        .path()
+        .join("fresh.md")
+        .to_string_lossy()
+        .into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    assert_eq!(app.dialog.as_ref().map(|dialog| dialog.purpose), None);
+    wait_for_export(&mut app);
+    assert_eq!(
+        fs::read(&output.path().join("fresh.md")).unwrap(),
+        fs::read(&current).unwrap()
+    );
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "old content");
+}
+
+#[test]
+fn confirmed_overwrite_replaces_the_existing_destination() {
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let current = app.storage.data_dir.join("Confirmed.md");
+    fs::write(&current, b"# Replacement body\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+    let destination = output.path().join("target.md");
+    fs::write(&destination, "old content").unwrap();
+
+    app.execute_app_command(AppCommand::ExportCurrentFile);
+    app.handle_key(key(KeyCode::Enter));
+    app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
+    app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.dialog.as_ref().map(|dialog| dialog.purpose),
+        Some(DialogPurpose::ExportOverwrite)
+    );
+
+    // Confirming starts the original background task, which replaces the
+    // destination atomically.
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.export_in_progress);
+    assert!(app.dialog.is_none());
+    assert!(app.status.starts_with("Exporting as Original to "));
+    wait_for_export(&mut app);
+    assert_eq!(fs::read(&destination).unwrap(), fs::read(&current).unwrap());
+    assert!(app.status.starts_with("Exported "));
+    assert!(app.pending_export_destination.is_none());
+    assert!(app.dialog.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_directory_or_symlink_destination_never_offers_overwrite() {
+    use std::os::unix::fs::symlink;
+    let (mut app, _directory) = make_app();
+    let output = tempfile::tempdir().unwrap();
+    let current = app.storage.data_dir.join("Kind check.md");
+    fs::write(&current, "# Body\n").unwrap();
+    app.open_file_document(&current, DocumentReturn::Daily);
+    let directory = output.path().join("dir");
+    fs::create_dir(&directory).unwrap();
+    let target = output.path().join("real.md");
+    fs::write(&target, "precious").unwrap();
+    let link = output.path().join("link.md");
+    symlink(&target, &link).unwrap();
+
+    for bad in [directory.clone(), link.clone()] {
+        app.execute_app_command(AppCommand::ExportCurrentFile);
+        app.handle_key(key(KeyCode::Enter));
+        app.dialog.as_mut().unwrap().input = bad.to_string_lossy().into_owned();
+        app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.purpose),
+            Some(DialogPurpose::ExportDestination),
+            "no overwrite confirmation for {bad:?}"
+        );
+        assert!(!app.export_in_progress);
+        assert!(app.status.contains("already exists"));
+        app.handle_key(key(KeyCode::Esc));
+    }
+    assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+}
+
+#[test]
 fn failed_export_retry_survives_an_unrelated_dialog() {
     let (mut app, _directory) = make_app();
     let source = app.storage.data_dir.join("Retry after help.md");
@@ -698,7 +871,6 @@ fn failed_export_retry_survives_an_unrelated_dialog() {
     );
     assert_eq!(app.dialog.as_ref().unwrap().input, "retry-after-help.md");
 }
-
 
 #[test]
 fn archived_note_gets_restore_instead_of_archive_command() {

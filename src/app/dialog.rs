@@ -29,6 +29,12 @@ pub enum DialogPurpose {
     RenameFile,
     ExportFormat,
     ExportDestination,
+    /// Explicit confirmation that an export may replace an existing
+    /// destination. Opened only when the destination is an existing regular
+    /// non-symlink file; `Enter`/`Y` re-prepares with
+    /// `ExportDestinationPolicy::ReplaceExisting` and `Esc`/`N` returns to
+    /// the destination input unchanged.
+    ExportOverwrite,
     CommandPalette,
     ThemePicker,
     TagRenameSource,

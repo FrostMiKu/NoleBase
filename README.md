@@ -57,13 +57,15 @@ view is useful for scrolling through a long message.
 With a file, Skill, or Daily preview open in Center, run `File: Export…` from
 the command palette. Choose **Original** for byte-for-byte publication or
 **HTML** for a safe standalone `.html` document. The destination prompt starts
-with the source name and correct extension; it accepts an absolute path, a
-`~/...` path, or a path relative to the parent of the Nole root. The
-destination must be outside Nole, its parent must already exist, and the final
-file must not exist. Publication is atomic and never overwrites or leaves a
-partial final file. Rendering runs on a worker thread, so generation does not
-block keyboard input or redraws; a background failure restores the destination
-prompt for retry.
+with the source name and correct extension, prefixed by the configured
+`export_directory` setting (default `~`, the user's home directory). It accepts
+an absolute path, a `~/...` path, or a path relative to the parent of the Nole
+root. The destination must be outside Nole and its parent must already exist.
+If the destination is an existing regular file, Nole asks for explicit
+confirmation before atomically replacing it; directories, symlinks, and special
+files are never replaceable. Publication never leaves a partial final file.
+Rendering runs on a worker thread, so generation does not block keyboard input
+or redraws; a background failure restores the destination prompt for retry.
 
 Wikilinks resolve matching filenames across `daily/`, `data/`, and `archives/`.
 When the same name exists in multiple locations, Nole shows a source-labelled
@@ -123,17 +125,24 @@ short cooldown. Images reserve twelve terminal rows, scale proportionally, and
 are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
-Standalone HTML export uses the offline MBDown renderer. Raw HTML and unsafe
-links are escaped instead of executed; a restrictive CSP keeps HTML inert.
-Local note links stay visibly marked but inert so a standalone document never
-leaks a private Nole `file://` path. Supported local images are embedded after
+Standalone HTML export uses the offline MBDown renderer. Raw HTML, unsupported
+MBDown markers, and unsafe links remain visible as escaped text instead of
+executing; a restrictive CSP permits only the exact inlined renderers. Local
+note links stay visibly marked but inert so a standalone document never leaks a
+private Nole `file://` path. Supported local images are embedded after
 root-containment, symlink, per-image, cumulative-size, and decoded-format
 checks. Managed images are embedded only through valid
 `nole://attachment/<uuid>` references; direct physical `attachments/` and
 `config/` paths are rejected. Remote images are never fetched and remain
-ordinary HTTP(S) links. Missing or broken images and unsupported Mermaid
-diagrams stay visible as explicit fallbacks and are reported as export
-warnings.
+ordinary HTTP(S) links. Missing or broken images stay visible as explicit
+fallbacks and are reported as export warnings. Fenced Mermaid diagrams,
+inline/display math, and language-labelled fenced code render in the browser
+through pinned Mermaid.js, KaTeX, and highlight.js runtimes embedded in the
+single HTML file, including KaTeX fonts and syntax-highlighting styles;
+rendering requires no network, and escaped source remains visible if a
+renderer fails or does not recognize the language. The page pins readable
+light defaults and chooses whichever black/white foreground has the stronger
+WCAG contrast for MBDown blocks with custom backgrounds.
 
 Managed attachments are mutable files with stable UUID identities, referenced as
 `nole://attachment/<uuid>`. The same URI works from Daily cards, notes, and Agent
@@ -258,7 +267,7 @@ under `~/.nole`:
 ```text
 config/         # private application configuration
   ai.toml       # LLM provider and optional Tavily configuration
-  settings.toml # selected theme, external editor, and terminal shell
+  settings.toml # theme, default export directory, editor, and terminal shell
   agent-session.json # current Agent conversation; absent when empty
   AGENTS.md      # user-authored Agent instructions
 themes/         # Agent-editable application and MBDown themes
@@ -304,10 +313,17 @@ overwriting an existing file.
 On first start Nole creates `themes/default.toml` with its current colors and a
 documented `config/settings.toml`. The `editor` and `shell` settings are optional
 and commented out by default. Set either one to override its documented
-fallback:
+fallback. `export_directory` sets the default directory for `File: Export…`
+destinations and defaults to `~`, the user's home directory; it accepts the
+same `~`, absolute, and relative forms as the destination prompt itself:
 
 ```toml
 theme = "default"
+
+# Default directory for File: Export… destinations. "~" is the user's home
+# directory; absolute paths and paths relative to the parent of the Nole root
+# are also accepted.
+export_directory = "~"
 
 # Command used to edit notes. Defaults to $EDITOR, then $VISUAL, then vi.
 # editor = "code -w"

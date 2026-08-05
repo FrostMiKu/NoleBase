@@ -507,13 +507,7 @@ impl Agent {
         let SkillCatalog { skills, warnings } = skill_catalog;
         let tavily_api_key = config.tavily_api_key.trim().to_string();
         let has_web_search = !tavily_api_key.is_empty();
-        let system = system_prompt_sections(
-            nole_root,
-            has_web_search,
-            &agents_instructions,
-            &skills,
-            &memory,
-        );
+        let system = system_prompt_sections(nole_root, &agents_instructions, &skills, &memory);
         let provider: Arc<dyn Provider> = match config.api_format {
             ApiFormat::Messages => Arc::new(MessagesProvider::new(
                 config.api_key.clone(),

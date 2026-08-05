@@ -4,8 +4,9 @@
 //! The first entry of a day creates `YYYY-MM-DD.md`; later entries append to it.
 //! `archives/` is flat storage for articles moved from `data/`.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -28,6 +29,11 @@ const DEFAULT_SETTINGS: &str = r#"theme = "default"
 
 # Show complete thinking blocks instead of a five-line scrolling window.
 show_full_thinking = false
+
+# Default directory for File: Export… destinations. "~" is the user's home
+# directory; absolute paths and paths relative to the parent of the Nole root
+# are also accepted.
+export_directory = "~"
 
 # Command used to edit notes. Defaults to $EDITOR, then $VISUAL, then vi.
 # editor = "code -w"
@@ -64,6 +70,7 @@ struct SettingsFile {
     shell: Option<String>,
     #[serde(default)]
     show_full_thinking: bool,
+    export_directory: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,11 +116,39 @@ struct ExportSourceIdentity {
     content_sha256: [u8; 32],
 }
 
-#[derive(Debug, Clone)]
+/// How the export publication may treat an existing destination. Every
+/// non-interactive caller passes [`ExportDestinationPolicy::CreateNew`]; only
+/// the interactive UI may pass [`ExportDestinationPolicy::ReplaceExisting`]
+/// after the user explicitly confirms an overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportDestinationPolicy {
+    /// Never overwrite an existing destination.
+    CreateNew,
+    /// Atomically replace an existing regular, non-symlink destination. The
+    /// destination is re-validated at publish time and replaced by a rename
+    /// relative to the parent directory handle opened during preparation, so
+    /// the final file is always either the old content or the complete new content.
+    ReplaceExisting,
+}
+
+#[derive(Debug)]
 pub struct PreparedExport {
     source: PathBuf,
+    /// Absolute destination, used for display and result reporting only.
+    /// Every publish-time filesystem operation resolves relative to
+    /// `parent_dir` plus `file_name`, so a rename or symlink swap of the
+    /// parent path after preparation can never redirect the publication.
     destination: PathBuf,
+    /// The single destination file name, operated on relative to `parent_dir`.
+    file_name: OsString,
+    /// The destination parent directory, validated and opened at prepare
+    /// time. Binding temp creation, destination re-validation, and the final
+    /// hard-link/rename to this handle closes the parent-directory-swap
+    /// TOCTOU: even if the original parent path is renamed or replaced with a
+    /// symlink afterwards, publish only ever touches this directory.
+    parent_dir: cap_std::fs::Dir,
     format: ExportFormat,
+    policy: ExportDestinationPolicy,
     identity: ExportSourceIdentity,
     /// UTF-8 source captured once at prepare time for rendered formats, so
     /// publishing renders from the validated snapshot instead of re-reading
@@ -194,6 +229,7 @@ impl Storage {
         source: impl AsRef<Path>,
         destination: impl AsRef<Path>,
         format: ExportFormat,
+        policy: ExportDestinationPolicy,
     ) -> Result<PreparedExport> {
         let canonical_root = fs::canonicalize(&self.root).context("canonicalizing Nole root")?;
         let source_input = source.as_ref();
@@ -248,16 +284,41 @@ impl Storage {
         };
         let destination = self.resolve_export_destination(destination.as_ref(), &canonical_root)?;
         format.validate_destination(&destination)?;
-        if destination.exists() {
-            bail!(
-                "export destination already exists: {}",
-                destination.display()
-            );
+        // Open the validated parent directory and bind every publication
+        // operation to it, so a later rename or symlink swap of the parent
+        // path cannot redirect the publish. Destination policy checks run
+        // against this handle too, keeping the prepare-time validation
+        // race-free.
+        let parent = destination
+            .parent()
+            .context("export destination has no parent directory")?;
+        let file_name = destination
+            .file_name()
+            .context("export destination needs a file name")?
+            .to_os_string();
+        let parent_dir =
+            cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+                .with_context(|| format!("opening export directory {}", parent.display()))?;
+        match policy {
+            ExportDestinationPolicy::CreateNew => {
+                if destination_entry_exists(&parent_dir, &file_name)? {
+                    bail!(
+                        "export destination already exists: {}",
+                        destination.display()
+                    );
+                }
+            }
+            ExportDestinationPolicy::ReplaceExisting => {
+                validate_replaceable_destination(&parent_dir, &file_name, &destination)?;
+            }
         }
         Ok(PreparedExport {
             source: canonical_source.clone(),
             destination,
+            file_name,
+            parent_dir,
             format,
+            policy,
             identity: ExportSourceIdentity {
                 canonical_path: canonical_source,
                 length: metadata.len(),
@@ -306,8 +367,14 @@ impl Storage {
         };
         // Write into a same-directory temp file and publish atomically, so a
         // failed write, flush, render, or race never leaves a partial final
-        // target behind. The temp file is removed on every failure path.
-        let (mut temp_file, temp_path) = create_export_temp(&prepared.destination)?;
+        // target behind. The temp file is created relative to the parent
+        // directory handle bound at prepare time and removed on every failure
+        // path.
+        let (mut temp_file, temp_name) = create_export_temp(
+            &prepared.parent_dir,
+            &prepared.file_name,
+            &prepared.destination,
+        )?;
         let publication = (|| -> Result<u64> {
             let bytes = if let Some(bytes) = &rendered_bytes {
                 temp_file.write_all(bytes)?;
@@ -331,19 +398,51 @@ impl Storage {
             }
             self.revalidate_export_source(prepared)?;
             verify_export_source_content(prepared)?;
-            if prepared.destination.exists() {
-                bail!(
-                    "export destination already exists: {}",
-                    prepared.destination.display()
-                );
+            // The destination is checked again right before publication, all
+            // relative to the directory handle bound at prepare time, so a
+            // change racing the export is caught before anything is linked
+            // into place and a swapped parent path cannot redirect the
+            // publish. CreateNew refuses any existing destination;
+            // ReplaceExisting re-validates that the target is still an
+            // existing regular non-symlink file before the atomic swap.
+            match prepared.policy {
+                ExportDestinationPolicy::CreateNew => {
+                    if destination_entry_exists(&prepared.parent_dir, &prepared.file_name)? {
+                        bail!(
+                            "export destination already exists: {}",
+                            prepared.destination.display()
+                        );
+                    }
+                    publish_no_overwrite(
+                        &prepared.parent_dir,
+                        &temp_name,
+                        &prepared.file_name,
+                        &prepared.destination,
+                    )?;
+                }
+                ExportDestinationPolicy::ReplaceExisting => {
+                    validate_replaceable_destination(
+                        &prepared.parent_dir,
+                        &prepared.file_name,
+                        &prepared.destination,
+                    )?;
+                    prepared
+                        .parent_dir
+                        .rename(&temp_name, &prepared.parent_dir, &prepared.file_name)
+                        .with_context(|| {
+                            format!(
+                                "atomically replacing export destination {}",
+                                prepared.destination.display()
+                            )
+                        })?;
+                }
             }
-            publish_no_overwrite(&temp_path, &prepared.destination)?;
             Ok(bytes)
         })();
         drop(temp_file);
         match publication {
             Ok(bytes) => {
-                let _ = fs::remove_file(&temp_path);
+                let _ = prepared.parent_dir.remove_file(&temp_name);
                 Ok(ExportOutcome {
                     destination: prepared.destination.clone(),
                     bytes,
@@ -351,28 +450,21 @@ impl Storage {
                 })
             }
             Err(error) => {
-                let _ = fs::remove_file(&temp_path);
+                let _ = prepared.parent_dir.remove_file(&temp_name);
                 Err(error).context("publishing export")
             }
         }
     }
 
     fn resolve_export_destination(&self, input: &Path, canonical_root: &Path) -> Result<PathBuf> {
-        let text = input.to_string_lossy();
-        let expanded = if text == "~" || text.starts_with("~/") {
-            let home = dirs::home_dir().context("could not determine home directory")?;
-            if text == "~" {
-                home
-            } else {
-                home.join(&text[2..])
-            }
-        } else if input.is_absolute() {
-            input.to_path_buf()
-        } else {
-            self.root
+        let expanded = match expand_leading_home(input)? {
+            Some(expanded) => expanded,
+            None if input.is_absolute() => input.to_path_buf(),
+            None => self
+                .root
                 .parent()
                 .context("Nole root has no parent directory")?
-                .join(input)
+                .join(input),
         };
         let normalized = normalize_lexical(expanded)?;
         if normalized.starts_with(canonical_root) {
@@ -404,6 +496,27 @@ impl Storage {
         Ok(canonical_parent.join(name))
     }
 
+    /// Resolve `destination` exactly as [`Self::prepare_export`] would and
+    /// report whether it currently names an existing regular file that is not
+    /// a symlink — the only destination an explicit overwrite may replace.
+    /// Directories, symlinks, special files, and missing paths report `false`;
+    /// a resolution failure is returned so the caller can surface the real
+    /// export error instead.
+    pub fn export_destination_is_overwritable(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<bool> {
+        let canonical_root = fs::canonicalize(&self.root).context("canonicalizing Nole root")?;
+        let resolved = self.resolve_export_destination(destination.as_ref(), &canonical_root)?;
+        let Ok(symlink_metadata) = fs::symlink_metadata(&resolved) else {
+            return Ok(false);
+        };
+        if symlink_metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        Ok(fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_file()))
+    }
+
     fn revalidate_export_source(&self, prepared: &PreparedExport) -> Result<()> {
         let canonical_root = fs::canonicalize(&self.root)?;
         reject_symlink_components_below(&canonical_root, &prepared.source)?;
@@ -421,16 +534,15 @@ impl Storage {
 
     fn revalidate_export(&self, prepared: &PreparedExport) -> Result<()> {
         self.revalidate_export_source(prepared)?;
+        // The destination is display-only for the actual publication, which
+        // runs against the directory handle bound at prepare time. Re-resolve
+        // the stored absolute path purely as a consistency check so a moved
+        // parent surfaces a clear error instead of silently publishing
+        // somewhere the user is no longer looking.
         let canonical_root = fs::canonicalize(&self.root)?;
         let resolved = self.resolve_export_destination(&prepared.destination, &canonical_root)?;
         if resolved != prepared.destination {
             bail!("export destination changed after preparation");
-        }
-        if prepared.destination.exists() {
-            bail!(
-                "export destination already exists: {}",
-                prepared.destination.display()
-            );
         }
         Ok(())
     }
@@ -544,6 +656,20 @@ impl Storage {
 
     pub fn show_full_thinking(&self) -> Result<bool> {
         Ok(self.load_settings()?.show_full_thinking)
+    }
+
+    /// Default export directory from settings: the trimmed `export_directory`
+    /// value. The text is resolved later by the existing export destination
+    /// parser, which accepts `~`, absolute, and relative paths. Blank values
+    /// are rejected so the UI surfaces the misconfiguration instead of
+    /// silently exporting somewhere unexpected.
+    pub fn default_export_directory(&self) -> Result<String> {
+        let configured = self.load_settings()?.export_directory;
+        let trimmed = configured.trim();
+        if trimmed.is_empty() {
+            bail!("settings export_directory must not be blank");
+        }
+        Ok(trimmed.to_string())
     }
 
     pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
@@ -1200,14 +1326,16 @@ impl Storage {
     }
 }
 
-/// Create a unique hidden temp file in the destination's directory. The temp
-/// lives next to the final target so the atomic publish below stays on one
-/// filesystem; `create_new` guarantees no two publishers collide.
-fn create_export_temp(destination: &Path) -> Result<(File, PathBuf)> {
-    let parent = destination
-        .parent()
-        .context("export destination has no parent directory")?;
-    let name = destination
+/// Create a unique hidden temp file in the destination's directory, relative
+/// to the parent directory handle bound at prepare time. The temp lives next
+/// to the final target so the atomic publish below stays on one filesystem;
+/// `create_new` guarantees no two publishers collide.
+fn create_export_temp(
+    parent: &cap_std::fs::Dir,
+    file_name: &OsStr,
+    destination: &Path,
+) -> Result<(cap_std::fs::File, OsString)> {
+    let name = Path::new(file_name)
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("export");
@@ -1216,34 +1344,99 @@ fn create_export_temp(destination: &Path) -> Result<(File, PathBuf)> {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     for attempt in 0..16u32 {
-        let temp = parent.join(format!(
+        let temp_name = format!(
             ".{name}.nole-export-{}-{nonce}-{attempt}.tmp",
             std::process::id()
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
-            Ok(file) => return Ok((file, temp)),
+        );
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match parent.open_with(&temp_name, &options) {
+            Ok(file) => return Ok((file, temp_name.into())),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("creating export temp file {}", temp.display()))
+                return Err(error).with_context(|| {
+                    format!(
+                        "creating export temp file next to {}",
+                        destination.display()
+                    )
+                })
             }
         }
     }
     bail!(
-        "could not allocate a unique export temp file in {}",
-        parent.display()
+        "could not allocate a unique export temp file next to {}",
+        destination.display()
     )
 }
 
-/// Publish `temp` as `destination` without ever overwriting an existing file.
+/// Report whether a directory entry exists without following a symlink.
+/// `Dir::exists` follows links on some platforms, which can report false for
+/// dangling links even though CreateNew must reject their occupied names.
+fn destination_entry_exists(parent: &cap_std::fs::Dir, file_name: &OsStr) -> io::Result<bool> {
+    match parent.symlink_metadata(file_name) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Verify the destination — a single file name relative to the bound parent
+/// directory — is an existing regular file that is not a symlink: the only
+/// target [`ExportDestinationPolicy::ReplaceExisting`] may replace.
+/// Directories, symlinks, special files, and missing paths are all rejected so
+/// an explicit overwrite can never clobber anything but a plain file.
+fn validate_replaceable_destination(
+    parent: &cap_std::fs::Dir,
+    file_name: &OsStr,
+    destination: &Path,
+) -> Result<()> {
+    let symlink_metadata = match parent.symlink_metadata(file_name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "export destination does not exist: {}",
+                destination.display()
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspecting export destination {}", destination.display())
+            })
+        }
+    };
+    if symlink_metadata.is_symlink() {
+        bail!(
+            "export destination is a symlink and cannot be replaced: {}",
+            destination.display()
+        );
+    }
+    let metadata = parent
+        .metadata(file_name)
+        .with_context(|| format!("inspecting export destination {}", destination.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "export destination is not a regular file: {}",
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
+/// Publish `temp_name` as `file_name`, both relative to the bound parent
+/// directory, without ever overwriting an existing file.
 ///
 /// A hard link is atomic and fails when the destination already exists, which
 /// preserves the no-overwrite guarantee across the final publication race.
 /// Filesystems that cannot create hard links fail explicitly; an
 /// exists-then-rename fallback would be racy because rename may overwrite a
 /// destination created between the check and the rename.
-fn publish_no_overwrite(temp: &Path, destination: &Path) -> Result<()> {
-    match fs::hard_link(temp, destination) {
+fn publish_no_overwrite(
+    parent: &cap_std::fs::Dir,
+    temp_name: &OsStr,
+    file_name: &OsStr,
+    destination: &Path,
+) -> Result<()> {
+    match parent.hard_link(temp_name, parent, file_name) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             bail!(
@@ -1319,6 +1512,24 @@ fn validate_open_export_source(source: &File, prepared: &PreparedExport) -> Resu
         bail!("export source changed after preparation");
     }
     Ok(())
+}
+
+/// Expand a leading `~` path component to the user's home directory. The
+/// check operates on path components rather than string prefixes, so both
+/// Unix `~/name` and Windows `~\name` resolve under home. Only a bare leading
+/// component equal to `~` is expanded; `~user` and relative paths are left
+/// untouched.
+fn expand_leading_home(input: &Path) -> Result<Option<PathBuf>> {
+    let mut components = input.components();
+    match components.next() {
+        Some(Component::Normal(part)) if part == "~" => {
+            let home = dirs::home_dir().context("could not determine home directory")?;
+            let mut expanded = home;
+            expanded.extend(components.map(Component::as_os_str));
+            Ok(Some(expanded))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn normalize_lexical(path: PathBuf) -> Result<PathBuf> {
@@ -2073,6 +2284,8 @@ mod tests {
         assert!(settings
             .contains("# Show complete thinking blocks instead of a five-line scrolling window."));
         assert!(settings.contains("show_full_thinking = false"));
+        assert!(settings.contains("export_directory = \"~\""));
+        assert_eq!(st.default_export_directory().unwrap(), "~");
         let loaded = st.load_theme(None).unwrap();
         assert_eq!(loaded.requested, "default");
         assert_eq!(loaded.active, "default");
@@ -2268,8 +2481,10 @@ mod tests {
         assert_eq!(defaults.editor, None);
         assert_eq!(defaults.shell, None);
         assert!(!defaults.show_full_thinking);
+        assert_eq!(defaults.export_directory, "~");
 
         let (_directory, storage) = fresh();
+        assert_eq!(storage.default_export_directory().unwrap(), "~");
         storage.write_theme_selection("custom").unwrap();
         assert_eq!(
             fs::read_to_string(&storage.settings_path).unwrap(),
@@ -2278,7 +2493,7 @@ mod tests {
 
         fs::write(
             &storage.settings_path,
-            "theme = \"default\"\neditor = \"hx\"\nshell = \"fish\"\n",
+            "theme = \"default\"\neditor = \"hx\"\nshell = \"fish\"\nexport_directory = \"~\"\n",
         )
         .unwrap();
         storage.write_theme_selection("custom").unwrap();
@@ -2287,12 +2502,13 @@ mod tests {
         assert_eq!(settings.editor.as_deref(), Some("hx"));
         assert_eq!(settings.shell.as_deref(), Some("fish"));
         assert!(!settings.show_full_thinking);
+        assert_eq!(settings.export_directory, "~");
         assert_eq!(storage.editor_command().unwrap(), "hx");
         assert_eq!(storage.terminal_shell().unwrap().as_deref(), Some("fish"));
 
         fs::write(
             &storage.settings_path,
-            "theme = \"default\"\neditor = \"  \"\nshell = \"  \"\n",
+            "theme = \"default\"\neditor = \"  \"\nshell = \"  \"\nexport_directory = \"~\"\n",
         )
         .unwrap();
         // The storage-level fallback reads the ambient environment, so pin it
@@ -2311,6 +2527,31 @@ mod tests {
             Some(value) => std::env::set_var("VISUAL", value),
             None => std::env::remove_var("VISUAL"),
         }
+    }
+
+    #[test]
+    fn default_export_directory_returns_trimmed_config_and_rejects_blank() {
+        let (_directory, storage) = fresh();
+        assert_eq!(storage.default_export_directory().unwrap(), "~");
+
+        fs::write(
+            &storage.settings_path,
+            "theme = \"default\"\nexport_directory = \"  /tmp/exports  \"\n",
+        )
+        .unwrap();
+        assert_eq!(storage.default_export_directory().unwrap(), "/tmp/exports");
+
+        fs::write(
+            &storage.settings_path,
+            "theme = \"default\"\nexport_directory = \"   \"\n",
+        )
+        .unwrap();
+        let error = storage.default_export_directory().unwrap_err();
+        assert!(format!("{error:#}").contains("export_directory"));
+
+        // A missing field fails parsing instead of silently falling back.
+        fs::write(&storage.settings_path, "theme = \"default\"\n").unwrap();
+        assert!(storage.default_export_directory().is_err());
     }
 
     #[test]
@@ -2422,35 +2663,44 @@ mod tests {
     #[test]
     fn export_temp_files_are_unique_siblings() {
         let (_directory, storage) = export_storage();
-        let destination = storage.root.parent().unwrap().join("unique.md");
-        let (first, first_path) = create_export_temp(&destination).unwrap();
-        let (second, second_path) = create_export_temp(&destination).unwrap();
-        assert_ne!(first_path, second_path);
-        assert_eq!(first_path.parent().unwrap(), destination.parent().unwrap());
-        assert!(first_path
-            .file_name()
-            .unwrap()
+        let parent = storage.root.parent().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority()).unwrap();
+        let destination = parent.join("unique.md");
+        let (first, first_name) =
+            create_export_temp(&dir, OsStr::new("unique.md"), &destination).unwrap();
+        let (second, second_name) =
+            create_export_temp(&dir, OsStr::new("unique.md"), &destination).unwrap();
+        assert_ne!(first_name, second_name);
+        assert!(first_name
             .to_string_lossy()
             .starts_with(".unique.md.nole-export-"));
+        assert_eq!(Path::new(&first_name).parent(), Some(Path::new("")));
         drop(first);
         drop(second);
-        fs::remove_file(&first_path).unwrap();
-        fs::remove_file(&second_path).unwrap();
+        dir.remove_file(&first_name).unwrap();
+        dir.remove_file(&second_name).unwrap();
     }
 
     #[test]
     fn atomic_publish_never_clobbers_an_existing_destination() {
         let (_directory, storage) = export_storage();
         let parent = storage.root.parent().unwrap();
-        let temp = parent.join(".target.md.nole-export-test.tmp");
+        let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority()).unwrap();
+        let temp_name = ".target.md.nole-export-test.tmp";
         let destination = parent.join("target.md");
-        fs::write(&temp, "complete").unwrap();
+        dir.write(temp_name, "complete").unwrap();
         fs::write(&destination, "winner").unwrap();
-        let error = publish_no_overwrite(&temp, &destination).unwrap_err();
+        let error = publish_no_overwrite(
+            &dir,
+            OsStr::new(temp_name),
+            OsStr::new("target.md"),
+            &destination,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("already exists"));
         assert_eq!(fs::read_to_string(&destination).unwrap(), "winner");
-        assert!(temp.exists(), "caller still owns the temp file");
-        fs::remove_file(&temp).unwrap();
+        assert!(dir.exists(temp_name), "caller still owns the temp file");
+        dir.remove_file(temp_name).unwrap();
         fs::remove_file(&destination).unwrap();
     }
 
@@ -2462,7 +2712,12 @@ mod tests {
         let source = storage.data_dir.join("write-fail.md");
         fs::write(&source, "content").unwrap();
         let prepared = storage
-            .prepare_export(&source, Path::new("out.md"), ExportFormat::Original)
+            .prepare_export(
+                &source,
+                Path::new("out.md"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
             .unwrap();
         let parent = storage.root.parent().unwrap();
         // A read-only parent makes the write path fail after preparation.
@@ -2482,7 +2737,12 @@ mod tests {
         let bytes = b"\0\xffexact\r\n";
         fs::write(&source, bytes).unwrap();
         let prepared = storage
-            .prepare_export(&source, Path::new("published.dat"), ExportFormat::Original)
+            .prepare_export(
+                &source,
+                Path::new("published.dat"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
             .unwrap();
         let outcome = storage.publish_export(&prepared).unwrap();
         assert_eq!(
@@ -2494,7 +2754,12 @@ mod tests {
         assert_eq!(fs::read(&outcome.destination).unwrap(), bytes);
         assert_no_export_temp_residue(storage.root.parent().unwrap());
         assert!(storage
-            .prepare_export(&source, Path::new("published.dat"), ExportFormat::Original)
+            .prepare_export(
+                &source,
+                Path::new("published.dat"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
             .is_err());
     }
 
@@ -2508,7 +2773,12 @@ mod tests {
         )
         .unwrap();
         let prepared = storage
-            .prepare_export(&source, Path::new("safe.html"), ExportFormat::Html)
+            .prepare_export(
+                &source,
+                Path::new("safe.html"),
+                ExportFormat::Html,
+                ExportDestinationPolicy::CreateNew,
+            )
             .unwrap();
         let outcome = storage.publish_export(&prepared).unwrap();
         assert!(outcome.diagnostics.is_empty());
@@ -2532,7 +2802,12 @@ mod tests {
         let source = storage.data_dir.join("source.md");
         fs::write(&source, "before").unwrap();
         let stale = storage
-            .prepare_export(&source, Path::new("stale.md"), ExportFormat::Original)
+            .prepare_export(
+                &source,
+                Path::new("stale.md"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
             .unwrap();
         fs::write(&source, "changed length").unwrap();
         assert!(storage.publish_export(&stale).is_err());
@@ -2540,7 +2815,12 @@ mod tests {
         assert_no_export_temp_residue(storage.root.parent().unwrap());
 
         let raced = storage
-            .prepare_export(&source, Path::new("race.md"), ExportFormat::Original)
+            .prepare_export(
+                &source,
+                Path::new("race.md"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
             .unwrap();
         fs::write(storage.root.parent().unwrap().join("race.md"), "winner").unwrap();
         assert!(storage.publish_export(&raced).is_err());
@@ -2561,6 +2841,7 @@ mod tests {
                 &source,
                 Path::new("same-length-out.md"),
                 ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
             )
             .unwrap();
         fs::write(&source, "differ").unwrap();
@@ -2585,11 +2866,232 @@ mod tests {
         let source = storage.data_dir.join("changing.bin");
         fs::write(&source, b"approved").unwrap();
         let prepared = storage
-            .prepare_export(&source, Path::new("changing.bin"), ExportFormat::Original)
+            .prepare_export(
+                &source,
+                Path::new("changing.bin"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
             .unwrap();
         let opened = File::open(&source).unwrap();
         validate_open_export_source(&opened, &prepared).unwrap();
         fs::write(&source, b"changed after approval").unwrap();
         assert!(validate_open_export_source(&opened, &prepared).is_err());
+    }
+
+    #[test]
+    fn replace_existing_export_atomically_replaces_a_regular_file() {
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("replace-source.md");
+        fs::write(&source, "new content").unwrap();
+        let parent = storage.root.parent().unwrap();
+        let destination = parent.join("replace-target.md");
+        fs::write(&destination, "old content").unwrap();
+        let prepared = storage
+            .prepare_export(
+                &source,
+                Path::new("replace-target.md"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::ReplaceExisting,
+            )
+            .unwrap();
+        let outcome = storage.publish_export(&prepared).unwrap();
+        assert_eq!(outcome.destination, destination);
+        assert_eq!(outcome.bytes, "new content".len() as u64);
+        assert!(outcome.diagnostics.is_empty());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new content");
+        assert_no_export_temp_residue(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_existing_prepare_rejects_missing_directories_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("replace-kind-source.md");
+        fs::write(&source, "content").unwrap();
+        let parent = storage.root.parent().unwrap();
+        let prepare = |name: &str| {
+            storage
+                .prepare_export(
+                    &source,
+                    Path::new(name),
+                    ExportFormat::Original,
+                    ExportDestinationPolicy::ReplaceExisting,
+                )
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert!(prepare("missing-target.md").contains("does not exist"));
+
+        let directory = parent.join("replace-kind-dir");
+        fs::create_dir(&directory).unwrap();
+        assert!(prepare("replace-kind-dir").contains("not a regular file"));
+
+        let symlink_target = parent.join("replace-kind-real.md");
+        fs::write(&symlink_target, "target").unwrap();
+        let symlink_path = parent.join("replace-kind-link.md");
+        symlink(&symlink_target, &symlink_path).unwrap();
+        assert!(prepare("replace-kind-link.md").contains("symlink"));
+
+        let socket = parent.join("replace-kind.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(prepare("replace-kind.sock").contains("not a regular file"));
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_existing_publish_revalidates_the_destination_before_swapping() {
+        use std::os::unix::fs::symlink;
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("replace-race-source.md");
+        fs::write(&source, "content").unwrap();
+        let parent = storage.root.parent().unwrap();
+        let destination = parent.join("replace-race.md");
+        fs::write(&destination, "old").unwrap();
+        let prepared = storage
+            .prepare_export(
+                &source,
+                Path::new("replace-race.md"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::ReplaceExisting,
+            )
+            .unwrap();
+
+        // The destination is swapped for a symlink after preparation: the
+        // publish must refuse and leave the symlink and its target intact.
+        fs::remove_file(&destination).unwrap();
+        let target = parent.join("replace-race-target.md");
+        fs::write(&target, "precious").unwrap();
+        symlink(&target, &destination).unwrap();
+        let error = storage.publish_export(&prepared).unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_no_export_temp_residue(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_destination_is_overwritable_reports_regular_files_only() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        let (_directory, storage) = export_storage();
+        let parent = storage.root.parent().unwrap();
+        let overwritable = |name: &str| {
+            storage
+                .export_destination_is_overwritable(Path::new(name))
+                .unwrap()
+        };
+
+        assert!(!overwritable("missing.md"));
+
+        let regular = parent.join("overwritable-regular.md");
+        fs::write(&regular, "content").unwrap();
+        assert!(overwritable("overwritable-regular.md"));
+
+        let directory = parent.join("overwritable-dir");
+        fs::create_dir(&directory).unwrap();
+        assert!(!overwritable("overwritable-dir"));
+
+        let symlink_path = parent.join("overwritable-link.md");
+        symlink(&regular, &symlink_path).unwrap();
+        assert!(!overwritable("overwritable-link.md"));
+
+        let dangling = parent.join("overwritable-dangling.md");
+        symlink(parent.join("overwritable-nowhere.md"), &dangling).unwrap();
+        assert!(!overwritable("overwritable-dangling.md"));
+
+        let socket = parent.join("overwritable.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(!overwritable("overwritable.sock"));
+        drop(listener);
+    }
+
+    #[test]
+    fn leading_home_component_expands_to_home_directory() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            expand_leading_home(Path::new("~")).unwrap().as_deref(),
+            Some(home.as_path())
+        );
+        assert_eq!(
+            expand_leading_home(Path::new("~/docs/export.md")).unwrap(),
+            Some(home.join("docs/export.md"))
+        );
+        // The native separator (backslash on Windows) must expand the same
+        // way, which string-prefix matching on "~/" misses.
+        let mut native = PathBuf::from("~");
+        native.push("docs");
+        native.push("export.md");
+        assert_eq!(
+            expand_leading_home(&native).unwrap(),
+            Some(home.join("docs/export.md"))
+        );
+        assert_eq!(expand_leading_home(Path::new("~user")).unwrap(), None);
+        assert_eq!(expand_leading_home(Path::new("relative.md")).unwrap(), None);
+        assert_eq!(expand_leading_home(Path::new("/abs/out.md")).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_is_bound_to_the_parent_directory_handle_opened_at_prepare_time() {
+        use std::os::unix::fs::symlink;
+        let (_directory, storage) = export_storage();
+        let source = storage.data_dir.join("bound-source.md");
+        fs::write(&source, "payload").unwrap();
+        let parent = storage.root.parent().unwrap();
+        let exports = parent.join("exports");
+        fs::create_dir(&exports).unwrap();
+        let prepared = storage
+            .prepare_export(
+                &source,
+                Path::new("exports/out.md"),
+                ExportFormat::Original,
+                ExportDestinationPolicy::CreateNew,
+            )
+            .unwrap();
+
+        // After preparation the parent directory is renamed away and the
+        // original path is replaced with a symlink to a decoy directory. The
+        // publish must only ever act on the directory handle bound at prepare
+        // time: it may error because the display path moved, or it may
+        // publish into the original (moved) directory, but it must never
+        // write through the symlink into the decoy.
+        let moved = parent.join("exports-moved");
+        fs::rename(&exports, &moved).unwrap();
+        let decoy = parent.join("exports-decoy");
+        fs::create_dir(&decoy).unwrap();
+        symlink(&decoy, &exports).unwrap();
+
+        match storage.publish_export(&prepared) {
+            Ok(outcome) => {
+                assert_eq!(fs::read_to_string(moved.join("out.md")).unwrap(), "payload");
+                assert_eq!(outcome.destination, exports.join("out.md"));
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("symlink") || message.contains("does not exist"),
+                    "unexpected publish error: {message}"
+                );
+            }
+        }
+        assert!(
+            !decoy.join("out.md").exists(),
+            "publish must never write through the swapped parent path"
+        );
+        assert!(
+            fs::read_dir(&decoy).unwrap().next().is_none(),
+            "decoy directory must be completely untouched"
+        );
+        assert_no_export_temp_residue(&moved);
+        assert_no_export_temp_residue(parent);
     }
 }

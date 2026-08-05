@@ -849,44 +849,31 @@
     }
 
     #[test]
-    fn system_prompt_guides_download_before_import_attachment() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        let download_bullet = prompt.find("download (url, destination relative to workspace/main)").unwrap();
-        let import_bullet = prompt.find("import_attachment copies").unwrap();
-        assert!(download_bullet < import_bullet);
-        assert!(prompt[download_bullet..].contains("workspace/main"));
-        assert!(prompt[download_bullet..].contains("never overwrites"));
+    fn system_prompt_connects_download_and_attachment_workflows() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains("Use `download` when the bytes must be kept in `workspace/main/`"));
+        assert!(prompt.contains("before importing a remote file as an attachment"));
+        assert!(prompt.contains("`import_attachment` creates a new attachment"));
     }
 
     #[test]
-    fn system_prompt_describes_the_attachment_publish_and_edit_workflow() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        assert!(prompt.contains("import_attachment"));
+    fn system_prompt_keeps_the_attachment_update_contract() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
         assert!(prompt.contains("checkout_attachment"));
         assert!(prompt.contains("update_attachment"));
         assert!(prompt.contains("expected_content_token"));
-        assert!(prompt.contains("workspace/main"));
-        assert!(prompt.contains("nole://attachment/<uuid>"));
-        assert!(prompt.contains("delete_attachment"));
-        assert!(prompt.contains("importing the same content twice yields two distinct attachments"));
+        assert!(prompt.contains("Import the copy instead when a separate attachment is intended"));
+        assert!(prompt.contains("delete_attachment` only removes an unreferenced attachment"));
     }
 
     #[test]
-    fn system_prompt_assigns_review_scope_to_the_main_agent() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        let explore_bullet = prompt
-            .find("Delegate broad, multi-step exploration")
-            .unwrap();
-        let review_bullet = prompt
-            .find("Delegate independent critical evaluation")
-            .unwrap();
-        assert!(review_bullet > explore_bullet);
-        assert!(prompt[review_bullet..]
-            .contains("The main Agent defines the review scope"));
-        assert!(prompt[review_bullet..]
-            .contains("instead of imposing a preset domain checklist"));
-        assert!(prompt[review_bullet..].contains("never mutates anything"));
-        assert!(!prompt[explore_bullet..review_bullet].contains("review"));
+    fn system_prompt_distinguishes_exploration_and_review_without_protocol_details() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains("Use `explore` for broad investigation"));
+        assert!(prompt.contains("`review` for independent evaluation"));
+        assert!(!prompt.contains("isolated read-only agent"));
+        assert!(!prompt.contains("internal work stays out of this conversation"));
+        assert!(!prompt.contains("configured round budget"));
     }
 
     #[test]

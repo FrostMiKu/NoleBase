@@ -112,8 +112,10 @@ pub(super) fn draw_dialog(
         DialogPurpose::DeleteDaily | DialogPurpose::DeleteFile
     ) || (dialog.mode == DialogMode::Confirm
         && dialog.purpose == DialogPurpose::AgentApproval);
+    let warning = dialog.purpose == DialogPurpose::ExportOverwrite;
     let border = match dialog.mode {
         _ if destructive => app.theme.ui_error,
+        _ if warning => app.theme.ui_warning,
         DialogMode::Approval => app.theme.ui_warning,
         DialogMode::SingleLine | DialogMode::FreeText => app.theme.ui_dialog_input,
         DialogMode::SelectOrInput

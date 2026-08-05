@@ -492,69 +492,73 @@
     }
 
     #[test]
-    fn system_prompt_describes_ask_without_runtime_protocol_details() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        assert!(prompt.contains("Use ask"));
+    fn system_prompt_guides_user_decisions_without_inventorying_ui_tools() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains("Use `ask` when a user decision is required"));
+        assert!(!prompt.contains("`notify` for a short TUI notification"));
         assert!(!prompt.contains("conversation is multi-turn"));
         assert!(!prompt.contains("buffers it and delivers it before pending tool calls"));
         assert!(!prompt.contains("Final text is not saved automatically"));
     }
 
     #[test]
-    fn system_prompt_describes_current_mbdown_and_workspace_behavior() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), false, "", "");
-        assert!(prompt.contains("#tag"));
-        assert!(prompt.contains("[[wikilink]]"));
-        assert!(prompt.contains("Wikilinks resolve .md/.mb notes in daily/, data/, and archives/"));
-        assert!(prompt.contains("![[file]]"));
-        assert!(prompt.contains("Fenced mermaid code blocks render locally"));
-        assert!(prompt.contains("must start a source line or follow whitespace"));
-        assert!(prompt.contains("png, jpg, jpeg, gif, and webp"));
-        assert!(prompt.contains("public or private-network hosts"));
-        assert!(prompt.contains("relative to the containing note"));
-        assert!(prompt.contains("Nole root when emitted in the Agent panel"));
-        assert!(prompt.contains("grep for local file contents"));
-        assert!(prompt.contains("absolute paths may point outside Nole"));
-        assert!(prompt.contains("A box border only accepts `single` or `none`"));
-        assert!(prompt.contains("regular Markdown files archived from data/"));
-        assert!(prompt.contains("create them here by default"));
-        assert!(prompt.contains("themes/: editable TOML theme definitions"));
-        assert!(
-            prompt.contains("template.mb: editable content used only by Create note from template")
-        );
-        assert!(prompt.contains("ordinary New note does not use it"));
-        assert!(prompt.contains("config/: application-managed configuration"));
-        assert!(prompt.contains("config/settings.toml: read-only application settings"));
-        assert!(prompt
-            .contains("config/agent-session.json: application-managed persisted Agent session"));
-        assert!(prompt.contains("config/ai.toml: private credentials and AI settings"));
-        assert!(prompt.contains("never read it or expose its contents"));
-        assert!(prompt.contains("Use read on daily/ (a directory) to discover dates"));
-        assert!(prompt.contains("daily/: ordinary Markdown files named YYYY-MM-DD.md"));
-        assert!(prompt.contains("Existing daily Markdown files may be read, edited, or deleted"));
-        assert!(prompt.contains("Local file reads return a `[path#TAG]` snapshot header"));
-        assert!(prompt.contains("absolute one-based `N:text` rows"));
-        assert!(prompt.contains("read again after each successful edit"));
-        assert!(!prompt.contains("prevalidated"));
-        assert!(prompt.contains("workspace/main/: private working sandbox"));
-        assert!(prompt.contains("run without approval"));
-        assert!(prompt.contains("requires approval"));
-        assert!(prompt.contains("nole://attachment/<uuid>"));
-        assert!(prompt.contains("Use read with a URL when you already have one"));
-        assert!(prompt.contains("Delegate broad, multi-step exploration"));
-        assert!(prompt.contains("internal work stays out of this conversation"));
-        assert!(prompt.contains("Use direct read/search tools only for narrow lookups"));
-        assert!(prompt.contains("Use open"));
-        assert!(prompt.contains("export_file is the sole destination-policy exception"));
-        assert!(prompt.contains("never overwrites, and renders HTML/PDF safely and offline"));
-        assert!(!prompt.contains("Generic file tools cannot operate in daily/ or config/"));
+    fn system_prompt_contains_stable_user_facing_contracts_only() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+
+        for required in [
+            "do not invent workspace state",
+            "CommonMark with a small MBDown extension set",
+            "#tag",
+            "[[wikilink]]",
+            "![[file]]",
+            "Fenced `mermaid` blocks",
+            "Restricted BBCode",
+            "Local links and embeds are relative to the containing note",
+            "Root: /tmp/nole",
+            "Managed notes live in `data/`, `daily/`, and `archives/`",
+            "Use `workspace/main/` for temporary or intermediate files",
+            "`config/` is read-only",
+            "Never read or expose `config/ai.toml`",
+            "Read a file before editing it and use the returned snapshot tag",
+            "Use `add_daily_entry`",
+            "Use `export_file` when the destination is outside Nole",
+            "Use `explore` for broad investigation",
+            "Use `read` to inspect a URL",
+        ] {
+            assert!(prompt.contains(required), "missing: {required}");
+        }
+
+        for internal_or_stale in [
+            "HTML/PDF",
+            "exact original bytes or standalone HTML",
+            "width-aware Unicode character diagrams",
+            "must start a source line or follow whitespace",
+            "public or private-network hosts",
+            "persists across restarts",
+            "agent-session.json",
+            "active theme selection",
+            "range, returned, total, has_more",
+            "64 MiB",
+            "bypass mode",
+            "preserves the display name, import source, and import time",
+            "config/AGENTS.md",
+            "Agent memory (MEMORY.md)",
+            "search_web",
+            "`notify` for a short TUI notification",
+            "Use `open` when",
+        ] {
+            assert!(
+                !prompt.contains(internal_or_stale),
+                "internal or stale detail leaked: {internal_or_stale}"
+            );
+        }
+        assert!(prompt.len() < 5_500, "system prompt grew to {} bytes", prompt.len());
     }
 
     #[test]
     fn system_prompt_appends_project_instructions_then_memory() {
         let prompt = system_prompt(
             Path::new("/tmp/nole"),
-            false,
             "PROJECT INSTRUCTION\nsecond line",
             "MEMORY CONTENT\nlast line",
         );
@@ -568,14 +572,12 @@
     fn system_prompt_cache_sections_isolate_dynamic_memory() {
         let first = system_prompt_sections(
             Path::new("/tmp/nole"),
-            false,
             "PROJECT INSTRUCTION",
             &[],
             "first memory",
         );
         let second = system_prompt_sections(
             Path::new("/tmp/nole"),
-            false,
             "PROJECT INSTRUCTION",
             &[],
             "second memory",
@@ -591,7 +593,7 @@
     }
 
     #[test]
-    fn tavily_tool_and_prompt_guidance_are_registered_only_with_a_key() {
+    fn tavily_tool_is_registered_only_with_a_key_without_prompt_duplication() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
@@ -693,9 +695,13 @@
 
         let with_key = make_agent("tvly-test");
         assert!(with_key.tools.contains_key("search_web"));
-        assert!(serde_json::to_string(&with_key.system)
-            .unwrap()
-            .contains("search_web"));
+        assert_eq!(with_key.system, without_key.system);
+        let search = with_key
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "search_web")
+            .unwrap();
+        assert!(search.description.contains("current information"));
     }
 
     #[test]

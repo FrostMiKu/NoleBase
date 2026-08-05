@@ -387,6 +387,24 @@ fn export_destination_uses_spaced_shared_single_line_input() {
 }
 
 #[test]
+fn export_overwrite_confirmation_uses_warning_border() {
+    let (mut app, _directory) = make_app();
+    app.open_dialog(DialogState::new(
+        "Export file · Overwrite destination",
+        "/tmp/out.html already exists. Replace it?",
+        DialogMode::Confirm,
+        DialogPurpose::ExportOverwrite,
+        Vec::new(),
+    ));
+
+    let terminal = render(&mut app, 100, 12);
+    let overlay = app.layout.overlay.expect("overwrite confirmation overlay");
+    let corner = &terminal.backend().buffer()[(overlay.x, overlay.y)];
+    assert_eq!(corner.fg, app.theme.ui_warning);
+    assert_ne!(corner.fg, app.theme.ui_error);
+}
+
+#[test]
 fn command_palette_keeps_its_query_field_position_when_filtering() {
     let (mut app, _directory) = make_app();
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));

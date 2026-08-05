@@ -5,7 +5,9 @@
 //! surfaced instead of being silently swallowed.
 
 mod assets;
+mod highlight;
 mod html;
+mod katex;
 
 use std::fmt;
 use std::path::Path;
@@ -178,10 +180,6 @@ fn convert_render_diagnostics(diagnostics: Vec<html::RenderDiagnostic>) -> Vec<E
                     "image '{}' could not be embedded: {}",
                     diagnostic.target, diagnostic.reason
                 ),
-                html::RenderDiagnosticKind::Mermaid => format!(
-                    "mermaid diagram could not be rendered: {}",
-                    diagnostic.reason
-                ),
             })
         })
         .collect()
@@ -257,7 +255,7 @@ mod tests {
         assert!(html.contains("alt=\"chart\""));
         assert!(html.contains("Image Missing alt"));
         assert!(html.contains("Image Broken alt"));
-        assert!(html.contains("class=\"nole-box\" style=\"border:none;"));
+        assert!(html.contains("class=\"nole-box nole-bg-dark\" style=\"border:none;"));
         assert!(html.contains("background:#00005f"));
         assert!(html.contains("color:#00ffff"));
         assert!(html.contains("<th style=\"text-align:left\">Left</th>"));
@@ -265,8 +263,12 @@ mod tests {
         assert!(html.contains("<th style=\"text-align:right\">Right</th>"));
         assert!(html.contains("href=\"https://example.test\""));
         assert!(!html.contains("[link="));
-        assert!(html.contains("class=\"mermaid-text\""));
-        assert!(!html.contains("<script>"));
+        // The fenced mermaid block becomes an escaped-source container with the
+        // inlined runtime and hashed CSP; the hostile `<script>` in the source
+        // stays inert escaped text.
+        assert!(html.contains("<pre class=\"mermaid\">graph LR; A[Start] --&gt; B[End]"));
+        assert!(html.contains("script-src 'sha256-"));
+        assert!(!html.contains("<script>alert"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::agent::{
     ReadTracker, Tool,
 };
 use crate::export::ExportFormat;
-use crate::storage::{ExportOutcome, Storage, ATTACHMENTS_DIR};
+use crate::storage::{ExportDestinationPolicy, ExportOutcome, Storage, ATTACHMENTS_DIR};
 
 pub struct Edit {
     root: PathBuf,
@@ -567,7 +567,7 @@ impl Tool for ExportFile {
     }
 
     fn description(&self) -> &'static str {
-        "Publish one Nole file to a new destination outside Nole as exact original bytes, safe standalone HTML, or A4 PDF."
+        "Publish one Nole file to a new destination outside Nole as exact original bytes or safe standalone HTML."
     }
 
     fn input_schema(&self) -> Value {
@@ -598,7 +598,12 @@ impl Tool for ExportFile {
         let format = required_string(input, "format")?.parse::<ExportFormat>()?;
         let storage = self.storage.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            storage.prepare_export(source, destination, format)
+            storage.prepare_export(
+                source,
+                destination,
+                format,
+                ExportDestinationPolicy::CreateNew,
+            )
         })
         .await
         .context("joining export preparation")??;
@@ -1804,6 +1809,11 @@ mod tests {
             decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         };
         let tool = ExportFile::new(&root, gate).unwrap();
+        assert_eq!(
+            tool.description(),
+            "Publish one Nole file to a new destination outside Nole as exact original bytes or safe standalone HTML."
+        );
+        assert!(!tool.description().contains("PDF"));
         let schema = tool.input_schema();
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
