@@ -303,8 +303,9 @@ pub struct App {
     pending_tag_rename: Option<String>,
 
     /// The latest published wiki-link index, used to resolve backlinks for the
-    /// open document. `None` until the background indexer's first snapshot.
-    wiki_links: Option<crate::wiki_link_index::WikiLinkIndex>,
+    /// open document and shared with agent wiki-link tools. Publish via
+    /// [`App::apply_wiki_link_index`].
+    wiki_links: crate::wiki_link_index::WikiLinkIndexHandle,
     /// Distinct managed notes linking to the currently open document.
     pub document_backlinks: Vec<PathBuf>,
 
@@ -434,6 +435,7 @@ impl App {
         let attachment_store = AttachmentStore::new(storage.attachments_dir.clone());
         let attachment_usage = AttachmentUsageHandle::new();
         let workspace_index = WorkspaceIndexHandle::default();
+        let wiki_links = crate::wiki_link_index::WikiLinkIndexHandle::default();
         let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
         let permission_bypass = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -451,7 +453,8 @@ impl App {
                 permission_bypass.clone(),
                 cancelled.clone(),
             )
-            .with_workspace_index(workspace_index.clone()),
+            .with_workspace_index(workspace_index.clone())
+            .with_wiki_link_index(wiki_links.clone()),
             attachment_usage.clone(),
         );
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
@@ -524,7 +527,7 @@ impl App {
             tag_note_hitboxes: Vec::new(),
             workspace_index,
             pending_tag_rename: None,
-            wiki_links: None,
+            wiki_links,
             document_backlinks: Vec::new(),
             attachment_store,
             attachment_usage,

@@ -18,10 +18,11 @@ mod review;
 mod skills;
 mod util;
 mod web;
+mod wiki_links;
 mod workspace_quota;
 mod write_policy;
 
 pub use self::{
     attachment_ops::*, download::*, explore::*, file_ops::*, grep::*, interactive::*,
-    notes_tags::*, read::*, review::*, skills::*, web::*,
+    notes_tags::*, read::*, review::*, skills::*, web::*, wiki_links::*,
 };

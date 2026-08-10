@@ -6,10 +6,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::{Grep, ListNotes, ListTags, LoadSkill, Read, SearchFiles, SearchTag, SearchWeb};
+use super::{
+    Backlinks, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
+    SearchTag, SearchWeb,
+};
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
+use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
 
 pub struct Review {
@@ -21,6 +25,7 @@ impl Review {
         root: &Path,
         runtime: SubagentRuntime,
         workspace_index: WorkspaceIndexHandle,
+        wiki_links: WikiLinkIndexHandle,
         client: reqwest::Client,
         tavily_api_key: String,
         skills: &[Skill],
@@ -41,6 +46,8 @@ impl Review {
         review.register(SearchFiles::new(root)?);
         review.register(ListTags::new(workspace_index.clone()));
         review.register(SearchTag::new(root, workspace_index)?);
+        review.register(ResolveWikilink::new(root, wiki_links.clone())?);
+        review.register(Backlinks::new(root, wiki_links)?);
         review.register(LoadSkill::new(skills));
         if !tavily_api_key.is_empty() {
             review.register(SearchWeb {
@@ -194,6 +201,7 @@ mod tests {
             directory.path(),
             runtime(max_rounds, provider, events),
             WorkspaceIndexHandle::default(),
+            WikiLinkIndexHandle::default(),
             reqwest::Client::new(),
             String::new(),
             &[],
@@ -376,6 +384,8 @@ mod tests {
             "search_files",
             "list_tags",
             "search_tag",
+            "resolve_wikilink",
+            "backlinks",
             "load_skill",
         ] {
             assert!(tool_names.contains(&name), "missing read-only tool {name}");
@@ -391,6 +401,7 @@ mod tests {
             "mkdir",
             "remove_dir",
             "rename_tag",
+            "rename_wikilink",
             "add_daily_entry",
             "open",
             "notify",

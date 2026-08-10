@@ -32,6 +32,8 @@ use crate::provider::{
 use crate::skill::{load_skill_catalog, SkillCatalog};
 #[cfg(test)]
 use crate::storage::Storage;
+#[cfg(test)]
+use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
 
 mod activity;
@@ -119,6 +121,7 @@ pub struct AgentRuntime {
     bypass: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     workspace_index: WorkspaceIndexHandle,
+    wiki_links: crate::wiki_link_index::WikiLinkIndexHandle,
 }
 
 impl AgentRuntime {
@@ -138,11 +141,20 @@ impl AgentRuntime {
             bypass,
             cancelled,
             workspace_index: WorkspaceIndexHandle::default(),
+            wiki_links: crate::wiki_link_index::WikiLinkIndexHandle::default(),
         }
     }
 
     pub fn with_workspace_index(mut self, workspace_index: WorkspaceIndexHandle) -> Self {
         self.workspace_index = workspace_index;
+        self
+    }
+
+    pub fn with_wiki_link_index(
+        mut self,
+        wiki_links: crate::wiki_link_index::WikiLinkIndexHandle,
+    ) -> Self {
+        self.wiki_links = wiki_links;
         self
     }
 }
@@ -281,6 +293,8 @@ pub struct AgentWorker {
     events: AgentEventSender,
     #[cfg(test)]
     attachment_usage: AttachmentUsageHandle,
+    #[cfg(test)]
+    wiki_links: WikiLinkIndexHandle,
 }
 
 impl AgentWorker {
@@ -290,6 +304,14 @@ impl AgentWorker {
     #[cfg(test)]
     pub(crate) fn attachment_usage(&self) -> &AttachmentUsageHandle {
         &self.attachment_usage
+    }
+
+    /// The shared wiki-link index this worker's wiki-link tools observe.
+    /// Test-only: lets a regression test verify the app and the worker
+    /// received the same handle.
+    #[cfg(test)]
+    pub(crate) fn wiki_links(&self) -> &WikiLinkIndexHandle {
+        &self.wiki_links
     }
 }
 
@@ -313,6 +335,8 @@ impl AgentWorker {
         let reads = Arc::new(ReadTracker::default());
         let worker_reads = reads.clone();
         let worker_usage = attachment_usage.clone();
+        #[cfg(test)]
+        let worker_wiki_links = runtime.wiki_links.clone();
         std::thread::spawn(move || {
             let async_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -402,6 +426,8 @@ impl AgentWorker {
             events,
             #[cfg(test)]
             attachment_usage,
+            #[cfg(test)]
+            wiki_links: worker_wiki_links,
         }
     }
 
@@ -497,6 +523,7 @@ impl Agent {
             bypass,
             cancelled,
             workspace_index,
+            wiki_links,
         } = runtime;
         let AgentSource {
             config,
@@ -555,6 +582,9 @@ impl Agent {
             workspace_index.clone(),
             gate.clone(),
         )?);
+        agent.register(ResolveWikilink::new(nole_root, wiki_links.clone())?);
+        agent.register(Backlinks::new(nole_root, wiki_links.clone())?);
+        agent.register(RenameWikilink::new(nole_root, wiki_links.clone(), gate.clone())?);
         agent.register(Write::new(nole_root)?);
         agent.register(Copy::new(nole_root)?);
         agent.register(ExportFile::new(nole_root, gate.clone())?);
@@ -594,6 +624,7 @@ impl Agent {
             nole_root,
             subagent_runtime.clone(),
             workspace_index.clone(),
+            wiki_links.clone(),
             client.clone(),
             tavily_api_key.clone(),
             &skills,
@@ -602,6 +633,7 @@ impl Agent {
             nole_root,
             subagent_runtime,
             workspace_index,
+            wiki_links,
             client,
             tavily_api_key,
             &skills,

@@ -1614,6 +1614,104 @@
 
 
     #[test]
+    fn wiki_tools_query_the_shared_index_with_exact_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            storage.data_dir.join("Project.md"),
+            "project body [[Other]]\n",
+        )
+        .unwrap();
+        fs::write(
+            storage.data_dir.join("Referrer.md"),
+            "see [[Project]] and [[Project]]\n",
+        )
+        .unwrap();
+        fs::write(
+            storage.daily_dir.join("2026-07-28.md"),
+            "daily [[project]]\n",
+        )
+        .unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+
+        let resolved: Value = serde_json::from_str(
+            &ResolveWikilink::new(directory.path(), handle.clone())
+                .unwrap()
+                .execute(&json!({"target": "Project"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved["status"], "unique");
+        assert_eq!(resolved["candidates"].as_array().unwrap().len(), 1);
+        assert!(resolved["candidates"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("data/Project.md"));
+
+        let missing: Value = serde_json::from_str(
+            &ResolveWikilink::new(directory.path(), handle.clone())
+                .unwrap()
+                .execute(&json!({"target": "Nope"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(missing["status"], "missing");
+
+        let backlinks: Value = serde_json::from_str(
+            &Backlinks::new(directory.path(), handle.clone())
+                .unwrap()
+                .execute(&json!({"target": "Project.md"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backlinks["count"], 2, "one note per distinct referrer");
+        assert_eq!(backlinks["backlinks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rename_wikilink_requires_approval_and_updates_only_real_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let path = storage.data_dir.join("Links.md");
+        fs::write(
+            &path,
+            "[[Old]] and [[old]] and ```[[Old]]``` and <!-- [[Old]] -->\n",
+        )
+        .unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+        let (event_sender, mut event_receiver) = event_channel();
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender,
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let tool = RenameWikilink::new(directory.path(), handle.clone(), gate).unwrap();
+        let worker = std::thread::spawn(move || {
+            test_runtime().block_on(tool.execute(&json!({"from": "Old", "to": "New"})))
+        });
+
+        let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected approval request");
+        };
+        assert!(request.message.contains("Rename [[Old]] to [[New]]"));
+        decision_sender.send(ApprovalDecision::Approve).unwrap();
+        let result: Value = serde_json::from_str(&worker.join().unwrap().unwrap()).unwrap();
+        assert_eq!(result["documents"], 1);
+        assert_eq!(result["mentions"], 2);
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "[[New]] and [[New]] and ```[[Old]]``` and <!-- [[Old]] -->\n",
+            "code fence and comment targets are untouched"
+        );
+    }
+
+    #[test]
     fn registered_tools_enforce_their_json_schema_before_execution() {
         let (events, mut receiver) = event_channel();
         let tool = Notify { events };

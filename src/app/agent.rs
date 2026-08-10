@@ -412,7 +412,7 @@ impl App {
     }
 
     pub fn apply_wiki_link_index(&mut self, index: crate::wiki_link_index::WikiLinkIndex) {
-        self.wiki_links = Some(index);
+        self.wiki_links.replace(index);
         self.recompute_document_backlinks();
     }
 
@@ -421,9 +421,6 @@ impl App {
     /// and previews have no managed backing note, so they never get backlinks.
     pub(in crate::app) fn recompute_document_backlinks(&mut self) {
         self.document_backlinks.clear();
-        let Some(index) = self.wiki_links.as_ref() else {
-            return;
-        };
         let Some(document) = self.document.as_ref() else {
             return;
         };
@@ -435,7 +432,12 @@ impl App {
         let Some(path) = path else {
             return;
         };
-        self.document_backlinks = index.backlinks(&path);
+        if let Some(backlinks) = self
+            .wiki_links
+            .with_index(|index| index.backlinks(&path))
+        {
+            self.document_backlinks = backlinks;
+        }
     }
 
     pub fn invalidate_agent_reads(&mut self, paths: &[PathBuf]) {

@@ -16,15 +16,14 @@
 //! every managed file containing a wiki target that matches `path` by file
 //! name or stem, exactly as the renderer resolves a clicked `[[target]]`.
 
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use mbdown::{Event, Node};
 
 use crate::document_index::DocumentIndex;
-#[cfg(test)]
 use crate::storage::Storage;
 
 /// Aggregate reference data for one wiki-link target.
@@ -96,7 +95,6 @@ impl WikiLinkIndex {
     }
 
     /// Distinct managed files referencing the wiki target, sorted by path.
-    #[cfg(test)]
     pub fn locations(&self, target: &str) -> Vec<PathBuf> {
         self.references
             .get(target)
@@ -108,6 +106,20 @@ impl WikiLinkIndex {
     /// Whether any managed file references the wiki target.
     pub fn is_referenced(&self, target: &str) -> bool {
         self.references.contains_key(target)
+    }
+
+    /// Resolve a wiki target to the managed notes it names, by file name or
+    /// stem, case-insensitively — the same matching the renderer uses to
+    /// activate a `[[target]]`. The result is sorted by path.
+    pub fn resolve(&self, target: &str) -> Vec<PathBuf> {
+        let mut resolved = self
+            .files
+            .keys()
+            .filter(|path| wiki_name_matches(path, target))
+            .cloned()
+            .collect::<Vec<_>>();
+        resolved.sort();
+        resolved
     }
 
     /// Distinct managed files that link to the note at `path`: every file
@@ -157,6 +169,102 @@ pub(crate) fn wiki_name_matches(path: &Path, requested: &str) -> bool {
         || path
             .file_stem()
             .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
+}
+
+/// Shared, read-only wiki-link index state. Cheap to clone: every clone
+/// observes the same latest published snapshot, so the UI and the agent tools
+/// resolve backlinks against one consistent index.
+#[derive(Clone, Default)]
+pub struct WikiLinkIndexHandle(Arc<RwLock<Option<WikiLinkIndex>>>);
+
+impl WikiLinkIndexHandle {
+    /// Publish the latest index snapshot from the background indexer.
+    pub fn replace(&self, index: WikiLinkIndex) {
+        if let Ok(mut current) = self.0.write() {
+            *current = Some(index);
+        }
+    }
+
+    /// Run `f` against the latest index, or `None` before the first snapshot.
+    pub fn with_index<T>(&self, f: impl FnOnce(&WikiLinkIndex) -> T) -> Option<T> {
+        let current = self.0.read().ok()?;
+        current.as_ref().map(f)
+    }
+
+    /// Re-index the given paths in place (created, modified, or removed).
+    pub fn refresh_paths(&self, storage: &Storage, paths: Vec<PathBuf>) {
+        if let Ok(mut current) = self.0.write() {
+            if let Some(index) = current.as_mut() {
+                let mut unique = paths.into_iter().collect::<HashSet<_>>();
+                let mut changed = false;
+                for path in unique.drain() {
+                    if index.files.remove(&path).is_some() {
+                        changed = true;
+                    }
+                    if let Some(document) = crate::document_index::index_file(storage, &path) {
+                        index.files.insert(path, document.wiki_links);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    index.rebuild_references();
+                }
+            }
+        }
+    }
+}
+
+/// Source spans of every `[[target]]` whose target equals `from`
+/// (case-insensitive), in source order. Only real wiki-link events count:
+/// targets inside code, HTML comments, escaped text, or embeds never produce
+/// those events and are left untouched.
+pub fn matching_wiki_link_spans(source: &str, from: &str) -> Vec<Range<usize>> {
+    let Ok(document) = mbdown::parse(source) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    collect_matching_wiki_link_spans(document.nodes(), from, &mut spans);
+    spans.sort_by_key(|span| span.start);
+    spans
+}
+
+fn collect_matching_wiki_link_spans(
+    nodes: &[Node<'_>],
+    from: &str,
+    spans: &mut Vec<Range<usize>>,
+) {
+    for node in nodes {
+        match node {
+            Node::Markdown(markdown) => {
+                for event in markdown.events() {
+                    if let Event::WikiLink(target) = &event.event {
+                        if target.eq_ignore_ascii_case(from) {
+                            let offset = markdown.source_span().start;
+                            spans.push(offset + event.span.start..offset + event.span.end);
+                        }
+                    }
+                }
+            }
+            Node::Box { children, .. }
+            | Node::Center { children }
+            | Node::Right { children }
+            | Node::Indent { children, .. }
+            | Node::Columns { children, .. }
+            | Node::Column { children, .. } => {
+                collect_matching_wiki_link_spans(children, from, spans)
+            }
+        }
+    }
+}
+
+/// Replace every span in `spans` (the full `[[...]]` region) with `[[to]]`,
+/// applying replacements back-to-front so earlier offsets stay valid.
+pub fn replace_wiki_link_spans(source: &str, spans: &[Range<usize>], to: &str) -> String {
+    let mut output = source.to_string();
+    for span in spans.iter().rev() {
+        output.replace_range(span.clone(), &format!("[[{to}]]"));
+    }
+    output
 }
 
 /// Every wiki-link target in `text` that the MBDown renderer would render as

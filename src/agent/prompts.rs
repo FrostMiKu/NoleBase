@@ -94,6 +94,7 @@ fn system_prompt_text(root: &Path) -> String {
 ## Authoring notes
 Nole notes use CommonMark with a small MBDown extension set. Prefer ordinary Markdown unless an extension improves the result.
 - `#tag`, `[[wikilink]]`, and `![[file]]` are supported. Wikilinks find `.md`/`.mb` notes in `daily/`, `data/`, and `archives/`.
+- Resolve a `[[target]]` with `resolve_wikilink` before writing it, and use `backlinks` to find which notes link to a note. `rename_wikilink` updates every link target across the workspace.
 - Fenced `mermaid` blocks are supported.
 - Local links and embeds are relative to the containing note; links in chat are relative to the Nole root. Image embeds support png, jpg, jpeg, gif, and webp.
 - Restricted BBCode: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=#12abef]`, `[bg=17]`, `[link=https://example.com]`, `[center]`, `[right]`, `[indent first=4]`, `[box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0]`, `[columns gap=2]`, and `[column width=1fr]`. Close tags; box borders are `single` or `none`.

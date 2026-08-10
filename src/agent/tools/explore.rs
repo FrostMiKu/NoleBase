@@ -6,10 +6,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::{Grep, ListNotes, ListTags, LoadSkill, Read, SearchFiles, SearchTag, SearchWeb};
+use super::{
+    Backlinks, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
+    SearchTag, SearchWeb,
+};
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
+use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
 
 pub struct Explore {
@@ -21,6 +25,7 @@ impl Explore {
         root: &Path,
         runtime: SubagentRuntime,
         workspace_index: WorkspaceIndexHandle,
+        wiki_links: WikiLinkIndexHandle,
         client: reqwest::Client,
         tavily_api_key: String,
         skills: &[Skill],
@@ -41,6 +46,8 @@ impl Explore {
         explore.register(SearchFiles::new(root)?);
         explore.register(ListTags::new(workspace_index.clone()));
         explore.register(SearchTag::new(root, workspace_index)?);
+        explore.register(ResolveWikilink::new(root, wiki_links.clone())?);
+        explore.register(Backlinks::new(root, wiki_links)?);
         explore.register(LoadSkill::new(skills));
         if !tavily_api_key.is_empty() {
             explore.register(SearchWeb {
@@ -220,6 +227,7 @@ mod tests {
             directory.path(),
             runtime(25, provider.clone(), events),
             WorkspaceIndexHandle::default(),
+            WikiLinkIndexHandle::default(),
             reqwest::Client::new(),
             String::new(),
             &[],
@@ -284,6 +292,7 @@ mod tests {
             directory.path(),
             runtime(2, provider.clone(), events),
             WorkspaceIndexHandle::default(),
+            WikiLinkIndexHandle::default(),
             reqwest::Client::new(),
             String::new(),
             &[],

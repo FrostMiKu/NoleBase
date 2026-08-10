@@ -3508,6 +3508,29 @@ fn app_index_publish_reaches_the_agent_delete_handles_shared_state() {
 }
 
 #[test]
+fn app_wiki_index_publish_reaches_the_agent_wiki_tools_shared_state() {
+    let (mut app, _directory) = make_app();
+    fs::write(app.storage.data_dir.join("A.md"), "[[B]]\n").unwrap();
+    fs::write(app.storage.data_dir.join("B.md"), "body\n").unwrap();
+    // The Agent worker's wiki-link tools observe the same shared index the
+    // app publishes to: it starts empty and sees the note the moment the app
+    // publishes its first wiki index. This fails if App::new stores a
+    // separate handle instead of the one it cloned into AgentWorker::spawn.
+    let worker_wiki = app.agent_worker.wiki_links().clone();
+    assert!(worker_wiki
+        .with_index(|index| index.backlinks(&app.storage.data_dir.join("B.md")).len())
+        .is_none());
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert_eq!(
+        worker_wiki
+            .with_index(|index| index.backlinks(&app.storage.data_dir.join("B.md")).len())
+            .unwrap(),
+        1,
+        "apply_wiki_link_index must publish to the handle AgentWorker::spawn received"
+    );
+}
+
+#[test]
 fn attachments_view_lists_name_kind_size_and_distinct_locations() {
     let (mut app, _directory) = make_app();
     let id = import_attachment(&mut app, "report.pdf", b"%PDF-1.4x");
