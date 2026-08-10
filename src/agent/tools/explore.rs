@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::{
-    Backlinks, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
-    SearchTag, SearchWeb,
+    Backlinks, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles, SearchTag,
+    SearchWeb,
 };
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};

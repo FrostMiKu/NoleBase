@@ -8,14 +8,79 @@ use serde_json::{json, Value};
 use super::util::{display_path, limited_diff, required_string, MAX_DIFF_BYTES};
 use crate::agent::{ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy};
 use crate::storage::Storage;
-use crate::wiki_link_index::{matching_wiki_link_spans, replace_wiki_link_spans, WikiLinkIndexHandle};
+use crate::wiki_link_index::{
+    matching_wiki_link_spans, replace_wiki_link_spans, WikiLinkIndexHandle,
+};
+
+/// Reject `target` unless it is a legal `[[wikilink]]` target for MBDown:
+/// non-empty, free of surrounding whitespace, and without brackets or
+/// newlines. A target containing `[`, `]`, `\n`, or `\r` would terminate or
+/// inject markup into the `[[...]]` span rather than rename one wiki link, so
+/// such targets are rejected before any diff is shown or file is written.
+fn validate_wiki_target(target: &str) -> Result<()> {
+    if target.is_empty() {
+        bail!("wiki targets must not be empty");
+    }
+    if target.trim() != target {
+        bail!("wiki target must not have leading or trailing whitespace");
+    }
+    if target.contains(['[', ']', '\n', '\r']) {
+        bail!("wiki target must not contain brackets or newlines");
+    }
+    Ok(())
+}
+
+/// Create a unique hidden temp file next to `target` (same directory, same
+/// filesystem) and write `content` into it, so the commit phase can atomically
+/// rename it over the target. Mirrors the export staging convention;
+/// `create_new` guarantees a coincidental file is never clobbered.
+fn stage_replacement(target: &Path, content: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+
+    let parent = target
+        .parent()
+        .context("wiki rename target has no parent directory")?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("wiki-note");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16u32 {
+        let temp_name = format!(
+            ".{name}.nole-rename-{}-{nonce}-{attempt}.tmp",
+            std::process::id()
+        );
+        let temp = parent.join(temp_name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&temp) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(content.as_bytes()) {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(error)
+                        .with_context(|| format!("writing staged file {}", temp.display()));
+                }
+                return Ok(temp);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating staged file next to {}", target.display()))
+            }
+        }
+    }
+    bail!(
+        "could not allocate a staged wiki rename file next to {}",
+        target.display()
+    )
+}
 
 /// Resolve `target` to the managed notes it names, returning the distinct
 /// paths sorted. Empty when the wiki index has not published yet.
-fn resolve_paths(
-    index: &WikiLinkIndexHandle,
-    target: &str,
-) -> Result<Vec<PathBuf>> {
+fn resolve_paths(index: &WikiLinkIndexHandle, target: &str) -> Result<Vec<PathBuf>> {
     index
         .with_index(|index| index.resolve(target))
         .context("wiki-link index is still building")
@@ -190,15 +255,14 @@ impl Tool for RenameWikilink {
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
-        let from = required_string(input, "from")?.trim();
-        let to = required_string(input, "to")?.trim();
-        if from.is_empty() || to.is_empty() {
-            bail!("wiki targets must not be empty");
-        }
+        let from = required_string(input, "from")?;
+        let to = required_string(input, "to")?;
+        validate_wiki_target(from)?;
+        validate_wiki_target(to)?;
         if from.eq_ignore_ascii_case(to) {
             bail!("source and destination wiki targets are the same");
         }
-        let plan = WikiRenamePlan::prepare(&self.index, from, to)?;
+        let plan = WikiRenamePlan::prepare(&self.storage, &self.index, from, to)?;
         let mentions = plan.mentions;
         let mut diff = format!(
             "Rename [[{}]] to [[{}]] in {} documents ({} mentions)\n\n",
@@ -228,8 +292,7 @@ impl Tool for RenameWikilink {
                 kind: ApprovalKind::Diff,
             })
             .await?;
-        let paths = plan.apply()?;
-        self.index.refresh_paths(&self.storage, paths.clone());
+        let paths = plan.apply(&self.storage)?;
         serde_json::to_string_pretty(&json!({
             "from": from,
             "to": to,
@@ -260,12 +323,13 @@ struct WikiFileChange {
 
 impl WikiRenamePlan {
     fn prepare(
+        storage: &Storage,
         index: &WikiLinkIndexHandle,
         from: &str,
         to: &str,
     ) -> Result<Self> {
         let paths = index
-            .with_index(|index| index.locations(from))
+            .with_index(|index| index.locations_ignoring_case(from))
             .context("wiki-link index is still building")?;
         let mut changes = Vec::new();
         for path in paths {
@@ -274,8 +338,12 @@ impl WikiRenamePlan {
             if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                 continue;
             }
-            let before =
-                std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            // Reject candidates that resolve outside the managed directories:
+            // a managed directory swapped for a symlink must never redirect
+            // the rename to files outside daily/, data/, or archives/.
+            storage.validate_wiki_note(&path)?;
+            let before = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
             let spans = matching_wiki_link_spans(&before, from);
             if spans.is_empty() {
                 continue;
@@ -301,8 +369,13 @@ impl WikiRenamePlan {
         })
     }
 
-    fn apply(mut self) -> Result<Vec<PathBuf>> {
+    fn apply(self, storage: &Storage) -> Result<Vec<PathBuf>> {
+        // Re-validate every target and confirm it still holds the exact
+        // content the approval diff was built from. The check-then-act race
+        // between this re-read and the commit below is the accepted TOCTOU
+        // and is intentionally not closed here.
         for change in &self.changes {
+            storage.validate_wiki_note(&change.path)?;
             let current = std::fs::read_to_string(&change.path)
                 .with_context(|| format!("rechecking {}", change.path.display()))?;
             if current != change.before {
@@ -312,11 +385,38 @@ impl WikiRenamePlan {
                 );
             }
         }
-        for change in &self.changes {
-            std::fs::write(&change.path, &change.after)
-                .with_context(|| format!("updating {}", change.path.display()))?;
+        // Stage every replacement to a sibling temp file first, so an
+        // ordinary write failure (full disk, permissions) leaves every
+        // original untouched instead of partially renaming the set.
+        let mut staged: Vec<Option<PathBuf>> = vec![None; self.changes.len()];
+        for (index, change) in self.changes.iter().enumerate() {
+            match stage_replacement(&change.path, &change.after) {
+                Ok(temp) => staged[index] = Some(temp),
+                Err(error) => {
+                    for pending in staged.iter().flatten() {
+                        let _ = std::fs::remove_file(pending);
+                    }
+                    return Err(error);
+                }
+            }
         }
-        let paths = self.changes.drain(..).map(|change| change.path).collect();
+        // Commit by renaming each staged file over its target. A
+        // same-directory rename cannot fail once staging succeeded under
+        // ordinary conditions; if one does anyway, restore the already
+        // committed files from the in-memory originals (best effort).
+        for (index, change) in self.changes.iter().enumerate() {
+            let temp = staged[index].take().expect("staged replacement exists");
+            if let Err(error) = std::fs::rename(&temp, &change.path) {
+                for done in self.changes.iter().take(index) {
+                    let _ = std::fs::write(&done.path, &done.before);
+                }
+                for pending in staged.iter().flatten() {
+                    let _ = std::fs::remove_file(pending);
+                }
+                return Err(error).with_context(|| format!("updating {}", change.path.display()));
+            }
+        }
+        let paths = self.changes.into_iter().map(|change| change.path).collect();
         Ok(paths)
     }
 }

@@ -584,7 +584,11 @@ impl Agent {
         )?);
         agent.register(ResolveWikilink::new(nole_root, wiki_links.clone())?);
         agent.register(Backlinks::new(nole_root, wiki_links.clone())?);
-        agent.register(RenameWikilink::new(nole_root, wiki_links.clone(), gate.clone())?);
+        agent.register(RenameWikilink::new(
+            nole_root,
+            wiki_links.clone(),
+            gate.clone(),
+        )?);
         agent.register(Write::new(nole_root)?);
         agent.register(Copy::new(nole_root)?);
         agent.register(ExportFile::new(nole_root, gate.clone())?);

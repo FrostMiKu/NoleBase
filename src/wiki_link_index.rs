@@ -16,7 +16,9 @@
 //! every managed file containing a wiki target that matches `path` by file
 //! name or stem, exactly as the renderer resolves a clicked `[[target]]`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -24,6 +26,7 @@ use std::sync::{Arc, RwLock};
 use mbdown::{Event, Node};
 
 use crate::document_index::DocumentIndex;
+#[cfg(test)]
 use crate::storage::Storage;
 
 /// Aggregate reference data for one wiki-link target.
@@ -94,12 +97,33 @@ impl WikiLinkIndex {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     /// Distinct managed files referencing the wiki target, sorted by path.
     pub fn locations(&self, target: &str) -> Vec<PathBuf> {
         self.references
             .get(target)
             .map(|entry| entry.locations.clone())
             .unwrap_or_default()
+    }
+
+    /// Distinct managed files referencing any case-insensitive spelling of the
+    /// wiki target, sorted by path. The index keys on the exact target text as
+    /// written, so rename discovery must match case-insensitively like
+    /// [`matching_wiki_link_spans`] or `[[old]]` would never be found when the
+    /// requested target is `Old`.
+    pub fn locations_ignoring_case(&self, target: &str) -> Vec<PathBuf> {
+        let mut locations = Vec::new();
+        for (key, entry) in &self.references {
+            if key.eq_ignore_ascii_case(target) {
+                for path in &entry.locations {
+                    if !locations.contains(path) {
+                        locations.push(path.clone());
+                    }
+                }
+            }
+        }
+        locations.sort();
+        locations
     }
 
     #[cfg(test)]
@@ -133,10 +157,7 @@ impl WikiLinkIndex {
             if file == path {
                 continue;
             }
-            if targets
-                .iter()
-                .any(|target| wiki_name_matches(path, target))
-            {
+            if targets.iter().any(|target| wiki_name_matches(path, target)) {
                 backlinks.push(file.clone());
             }
         }
@@ -190,28 +211,6 @@ impl WikiLinkIndexHandle {
         let current = self.0.read().ok()?;
         current.as_ref().map(f)
     }
-
-    /// Re-index the given paths in place (created, modified, or removed).
-    pub fn refresh_paths(&self, storage: &Storage, paths: Vec<PathBuf>) {
-        if let Ok(mut current) = self.0.write() {
-            if let Some(index) = current.as_mut() {
-                let mut unique = paths.into_iter().collect::<HashSet<_>>();
-                let mut changed = false;
-                for path in unique.drain() {
-                    if index.files.remove(&path).is_some() {
-                        changed = true;
-                    }
-                    if let Some(document) = crate::document_index::index_file(storage, &path) {
-                        index.files.insert(path, document.wiki_links);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    index.rebuild_references();
-                }
-            }
-        }
-    }
 }
 
 /// Source spans of every `[[target]]` whose target equals `from`
@@ -228,11 +227,7 @@ pub fn matching_wiki_link_spans(source: &str, from: &str) -> Vec<Range<usize>> {
     spans
 }
 
-fn collect_matching_wiki_link_spans(
-    nodes: &[Node<'_>],
-    from: &str,
-    spans: &mut Vec<Range<usize>>,
-) {
+fn collect_matching_wiki_link_spans(nodes: &[Node<'_>], from: &str, spans: &mut Vec<Range<usize>>) {
     for node in nodes {
         match node {
             Node::Markdown(markdown) => {
@@ -347,11 +342,7 @@ mod tests {
             "[[Project]] and [[Other]]\n",
         )
         .unwrap();
-        fs::write(
-            storage.archives_dir.join("Old.md"),
-            "[[Project]] again\n",
-        )
-        .unwrap();
+        fs::write(storage.archives_dir.join("Old.md"), "[[Project]] again\n").unwrap();
 
         let index = WikiLinkIndex::build(&storage);
         assert_eq!(index.reference_count("Project"), 3);
@@ -371,14 +362,14 @@ mod tests {
             "[[Project]] twice [[Project]]\n",
         )
         .unwrap();
-        fs::write(
-            storage.daily_dir.join("2026-07-28.md"),
-            "[[Project]]\n",
-        )
-        .unwrap();
+        fs::write(storage.daily_dir.join("2026-07-28.md"), "[[Project]]\n").unwrap();
 
         let index = WikiLinkIndex::build(&storage);
-        assert_eq!(index.reference_count("Project"), 3, "occurrences, not notes");
+        assert_eq!(
+            index.reference_count("Project"),
+            3,
+            "occurrences, not notes"
+        );
         assert_eq!(index.locations("Project").len(), 2, "distinct notes");
     }
 
@@ -388,11 +379,7 @@ mod tests {
         let storage = storage_with(&directory);
         let note = storage.data_dir.join("Project.md");
         fs::write(&note, "own [[Project]] self-link\n").unwrap();
-        fs::write(
-            storage.data_dir.join("A.md"),
-            "[[Project]] exact\n",
-        )
-        .unwrap();
+        fs::write(storage.data_dir.join("A.md"), "[[Project]] exact\n").unwrap();
         fs::write(
             storage.data_dir.join("B.mb"),
             "[[project]] case-insensitive\n",

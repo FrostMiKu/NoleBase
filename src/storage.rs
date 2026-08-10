@@ -1235,6 +1235,46 @@ impl Storage {
         validate_direct_note(&self.archives_dir, target, "archives")
     }
 
+    /// Validate that `path` is a regular, non-symlink managed note directly
+    /// inside one of the wiki-managed directories (daily/, data/, archives/).
+    /// The path is resolved in full before the containment check, so a managed
+    /// directory swapped for a symlink can never redirect the caller to a file
+    /// outside the Nole root. Returns the canonical path.
+    pub(crate) fn validate_wiki_note(&self, path: &Path) -> Result<PathBuf> {
+        if !is_note_path(path) {
+            bail!(
+                "wiki note must have a .md or .mb extension: {}",
+                path.display()
+            );
+        }
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("checking wiki note {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("wiki note must be a regular file: {}", path.display());
+        }
+        let canonical_root = fs::canonicalize(&self.root)
+            .with_context(|| format!("resolving Nole root {}", self.root.display()))?;
+        let canonical = fs::canonicalize(path)
+            .with_context(|| format!("resolving wiki note {}", path.display()))?;
+        if !canonical.starts_with(&canonical_root) {
+            bail!("wiki note escapes the Nole root: {}", path.display());
+        }
+        let managed = [&self.daily_dir, &self.data_dir, &self.archives_dir]
+            .into_iter()
+            .any(|directory| {
+                fs::canonicalize(directory).is_ok_and(|canonical_directory| {
+                    canonical.parent() == Some(canonical_directory.as_path())
+                })
+            });
+        if !managed {
+            bail!(
+                "wiki note must live directly in daily/, data/, or archives/: {}",
+                path.display()
+            );
+        }
+        Ok(canonical)
+    }
+
     /// Read an open Markdown article anywhere within the Nole workspace.
     pub fn read_document_file(&self, path: &Path) -> Result<String> {
         let metadata = fs::symlink_metadata(path)

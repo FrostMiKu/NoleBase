@@ -1636,7 +1636,10 @@ fn document_view_renders_backlink_section_after_body() {
     let screen = buffer_string(&terminal);
     let body = screen.find("body line one").unwrap();
     let heading = screen.find("Backlinks").unwrap();
-    let entry = screen[heading..].find("Source.md").map(|offset| heading + offset).unwrap();
+    let entry = screen[heading..]
+        .find("Source.md")
+        .map(|offset| heading + offset)
+        .unwrap();
     assert!(body < heading, "backlink heading renders after the body");
     assert!(heading < entry, "backlink entries render after the heading");
     assert!(app
@@ -1648,9 +1651,15 @@ fn document_view_renders_backlink_section_after_body() {
     let body_row = screen[..body].matches('\n').count();
     let heading_row = screen[..heading].matches('\n').count();
     let entry_row = screen[..entry].matches('\n').count();
-    assert_eq!(heading_row, body_row + 3, "two blank rows before the heading");
+    assert_eq!(
+        heading_row,
+        body_row + 3,
+        "two blank rows before the heading"
+    );
     assert_eq!(entry_row, heading_row + 2, "blank row after the heading");
-    let heading_line_start = screen[..heading].rfind('\n').map_or(0, |newline| newline + 1);
+    let heading_line_start = screen[..heading]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
     let entry_line_start = screen[..entry].rfind('\n').map_or(0, |newline| newline + 1);
     let heading_column = UnicodeWidthStr::width(&screen[heading_line_start..heading]);
     let entry_column = UnicodeWidthStr::width(&screen[entry_line_start..entry]);
@@ -1666,6 +1675,58 @@ fn document_view_renders_backlink_section_after_body() {
         .unwrap();
     assert_eq!(usize::from(hitbox.area.y), entry_row);
     assert_eq!(usize::from(hitbox.area.x), entry_column);
+}
+
+#[test]
+fn backlink_hitbox_width_matches_the_rendered_truncated_name() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    let source = app
+        .storage
+        .data_dir
+        .join("Source-With-A-Very-Long-Name-That-Forces-Truncation.md");
+    fs::write(&target, "body line one\n").unwrap();
+    fs::write(&source, "see [[Target]]\n").unwrap();
+    app.document = Some(Document {
+        kind: DocumentKind::File(target.clone()),
+        title: "Target.md".to_string(),
+        source: "body line one\n".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert_eq!(app.document_backlinks, vec![source.clone()]);
+
+    // Narrow enough that the long name is ellipsized; the hitbox must cover
+    // exactly the rendered name, not bleed into the page padding.
+    let terminal = render(&mut app, 60, 24);
+    let screen = buffer_string(&terminal);
+    let heading = screen.find("Backlinks").unwrap();
+    let entry = screen[heading..]
+        .find("Source")
+        .map(|offset| heading + offset)
+        .unwrap();
+    let hitbox = app
+        .backlink_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.path == source)
+        .unwrap();
+    let entry_line_start = screen[..entry].rfind('\n').map_or(0, |newline| newline + 1);
+    let entry_column = UnicodeWidthStr::width(&screen[entry_line_start..entry]);
+    // The rendered name ends at the first blank cell after it.
+    let name_end = screen[entry..].find(' ').unwrap();
+    let name_width = UnicodeWidthStr::width(&screen[entry..entry + name_end]);
+    assert!(
+        name_width < UnicodeWidthStr::width(source.to_string_lossy().as_ref()),
+        "the long name must be truncated at this width"
+    );
+    assert_eq!(usize::from(hitbox.area.x), entry_column);
+    assert_eq!(usize::from(hitbox.area.width), name_width);
+    assert!(usize::from(hitbox.area.x) + usize::from(hitbox.area.width) <= 60);
 }
 
 #[test]
@@ -1698,7 +1759,10 @@ fn backlink_section_scrolls_with_the_document_and_stays_clickable() {
     let target = app.storage.data_dir.join("Target.md");
     let source = app.storage.data_dir.join("Source.md");
     // A tall body pushes the Backlinks section below the fold.
-    let body = (0..60).map(|line| format!("filler line {line}")).collect::<Vec<_>>().join("\n");
+    let body = (0..60)
+        .map(|line| format!("filler line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     fs::write(&target, &body).unwrap();
     fs::write(&source, "see [[Target]]\n").unwrap();
     app.document = Some(Document {

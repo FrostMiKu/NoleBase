@@ -432,10 +432,7 @@ impl App {
         let Some(path) = path else {
             return;
         };
-        if let Some(backlinks) = self
-            .wiki_links
-            .with_index(|index| index.backlinks(&path))
-        {
+        if let Some(backlinks) = self.wiki_links.with_index(|index| index.backlinks(&path)) {
             self.document_backlinks = backlinks;
         }
     }

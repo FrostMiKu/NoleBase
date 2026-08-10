@@ -131,7 +131,15 @@ impl App {
             .find(|hitbox| point_in_rect(column, row, hitbox.area))
             .map(|hitbox| hitbox.path.clone())
         {
-            self.open_file_document(&path, DocumentReturn::Daily);
+            // Navigation replaces the open document, so it inherits the
+            // current document's return context (Search, Tags, Daily, ...)
+            // instead of defaulting to Daily.
+            let return_to = self
+                .document
+                .as_ref()
+                .map(|document| document.return_to)
+                .unwrap_or(DocumentReturn::Daily);
+            self.open_file_document(&path, return_to);
             return None;
         }
 

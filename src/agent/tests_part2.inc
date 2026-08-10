@@ -1712,6 +1712,182 @@
     }
 
     #[test]
+    fn rename_wikilink_rejects_illegal_targets_before_diff_or_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let path = storage.data_dir.join("Links.md");
+        fs::write(&path, "[[Old]]\n").unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+        let (event_sender, mut event_receiver) = event_channel();
+        let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = ApprovalGate {
+            bypass: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            events: event_sender,
+            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        };
+        let tool = RenameWikilink::new(directory.path(), handle, gate).unwrap();
+        let run = |input: Value| {
+            test_runtime()
+                .block_on(tool.execute(&input))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        };
+
+        for (input, needle) in [
+            (json!({"from": "", "to": "New"}), "must not be empty"),
+            (json!({"from": "Old", "to": "Ne[w"}), "brackets or newlines"),
+            (json!({"from": "Old", "to": "a]]b"}), "brackets or newlines"),
+            (json!({"from": "Old", "to": "New\nName"}), "brackets or newlines"),
+            (json!({"from": "O[ld", "to": "New"}), "brackets or newlines"),
+            (json!({"from": "Old", "to": "OLD"}), "same"),
+        ] {
+            let error = run(input);
+            assert!(error.contains(needle), "unexpected error: {error}");
+            assert!(
+                event_receiver.try_recv().is_err(),
+                "no approval request may be raised for rejected targets"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[[Old]]\n",
+            "no file may change for rejected targets"
+        );
+    }
+
+    #[test]
+    fn rename_wikilink_discovers_targets_case_insensitively() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let path = storage.data_dir.join("Links.md");
+        fs::write(&path, "see [[old]] here\n").unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+        let tool = RenameWikilink::new(directory.path(), handle, bypass_gate()).unwrap();
+        let result: Value = serde_json::from_str(
+            &test_runtime()
+                .block_on(tool.execute(&json!({"from": "Old", "to": "New"})))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["documents"], 1);
+        assert_eq!(result["mentions"], 1);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "see [[New]] here\n",
+            "the index keys on the written case, so discovery must match case-insensitively"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_wikilink_rejects_symlinks_and_managed_directory_escape() {
+        use std::os::unix::fs::symlink;
+
+        // A note file replaced by a symlink to an outside file after the index
+        // was built is skipped: the rename must never write through it.
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let note = storage.data_dir.join("Note.md");
+        fs::write(&note, "[[Old]]\n").unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("Note.md");
+        fs::write(&outside, "[[Old]] outside\n").unwrap();
+        fs::remove_file(&note).unwrap();
+        symlink(&outside, &note).unwrap();
+        let tool = RenameWikilink::new(directory.path(), handle.clone(), bypass_gate()).unwrap();
+        let error = test_runtime()
+            .block_on(tool.execute(&json!({"from": "Old", "to": "New"})))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("was not found"), "unexpected error: {error}");
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "[[Old]] outside\n",
+            "the outside file must not be rewritten through the symlink"
+        );
+
+        // A managed directory swapped for a symlink to an outside directory
+        // must not redirect the rename: containment validation rejects the
+        // escape before any diff or write.
+        let second = tempfile::tempdir().unwrap();
+        let storage = Storage::new(second.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(storage.data_dir.join("Real.md"), "[[Old]]\n").unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+        let decoy_dir = tempfile::tempdir().unwrap();
+        fs::write(decoy_dir.path().join("Real.md"), "[[Old]] decoy\n").unwrap();
+        let original = second.path().join("data-original");
+        fs::rename(&storage.data_dir, &original).unwrap();
+        symlink(decoy_dir.path(), &storage.data_dir).unwrap();
+        let tool = RenameWikilink::new(second.path(), handle, bypass_gate()).unwrap();
+        let error = test_runtime()
+            .block_on(tool.execute(&json!({"from": "Old", "to": "New"})))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("escapes the Nole root"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(decoy_dir.path().join("Real.md")).unwrap(),
+            "[[Old]] decoy\n",
+            "the decoy must not be rewritten through the symlinked directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_wikilink_write_failure_leaves_all_originals_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        // archives/ sorts before daily/, so the writable file is staged first
+        // and the read-only one fails second: exactly the partial-update case
+        // the staged commit must prevent.
+        let archive_note = storage.archives_dir.join("Archive.md");
+        fs::write(&archive_note, "[[Old]]\n").unwrap();
+        let daily_note = storage.daily_dir.join("2026-07-28.md");
+        fs::write(&daily_note, "[[Old]]\n").unwrap();
+        let handle = WikiLinkIndexHandle::default();
+        handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
+        // Lock the daily directory so staging the second replacement fails
+        // after the first file's replacement has already been staged.
+        let locked = fs::metadata(&storage.daily_dir).unwrap().permissions();
+        fs::set_permissions(&storage.daily_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let tool = RenameWikilink::new(directory.path(), handle, bypass_gate()).unwrap();
+        let result = test_runtime().block_on(tool.execute(&json!({"from": "Old", "to": "New"})));
+        fs::set_permissions(&storage.daily_dir, locked).unwrap();
+        assert!(result.is_err(), "staging into a read-only directory must fail");
+        assert_eq!(
+            fs::read_to_string(&archive_note).unwrap(),
+            "[[Old]]\n",
+            "no partial update: the writable file must stay untouched when a sibling fails"
+        );
+        assert_eq!(fs::read_to_string(&daily_note).unwrap(), "[[Old]]\n");
+        for directory in [&storage.archives_dir, &storage.daily_dir] {
+            let residue: Vec<_> = fs::read_dir(directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".nole-rename-"))
+                .collect();
+            assert!(residue.is_empty(), "staged temp residue: {residue:?}");
+        }
+    }
+
+    #[test]
     fn registered_tools_enforce_their_json_schema_before_execution() {
         let (events, mut receiver) = event_channel();
         let tool = Notify { events };

@@ -3308,6 +3308,41 @@ fn clicking_a_backlink_opens_the_referencing_note() {
 }
 
 #[test]
+fn clicking_a_backlink_keeps_the_open_documents_return_context() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    let source = app.storage.data_dir.join("Source.md");
+    fs::write(&target, "body").unwrap();
+    fs::write(&source, "see [[Target]]\n").unwrap();
+    app.open_file_document(&target, DocumentReturn::Search);
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert_eq!(app.document_backlinks, vec![source.clone()]);
+
+    app.backlink_hitboxes.push(BacklinkHitbox {
+        path: source.clone(),
+        area: Rect::new(3, 2, 10, 1),
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 4,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(app.center_view, CenterView::Document);
+    assert_eq!(
+        app.document.as_ref().map(|document| &document.kind),
+        Some(&DocumentKind::File(source))
+    );
+    // Navigation inherits the replaced document's return context instead of
+    // falling back to Daily.
+    assert_eq!(
+        app.document.as_ref().map(|document| document.return_to),
+        Some(DocumentReturn::Search)
+    );
+}
+
+#[test]
 fn base_escape_and_q_both_quit() {
     let (mut app, _directory) = make_app();
     app.focus = Focus::Center;

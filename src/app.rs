@@ -712,6 +712,7 @@ impl App {
                     self.document_render_lru
                         .remove(&DocumentKind::File(path.clone()));
                     self.document = None;
+                    self.document_backlinks.clear();
                     self.center_view = CenterView::Daily;
                     self.focus = Focus::Center;
                     self.set_error(format!("Reload error: {error}"));
@@ -727,6 +728,7 @@ impl App {
                     Err(error) => {
                         self.document_render_lru.remove(&DocumentKind::Daily(date));
                         self.document = None;
+                        self.document_backlinks.clear();
                         self.center_view = CenterView::Daily;
                         self.focus = Focus::Center;
                         self.set_error(format!("Reload error: {error}"));
@@ -744,6 +746,7 @@ impl App {
                     self.document_render_lru
                         .remove(&DocumentKind::Skill(path.clone()));
                     self.document = None;
+                    self.document_backlinks.clear();
                     self.return_to_skill_browser();
                     self.set_error(format!("Skill reload error: {error}"));
                 }

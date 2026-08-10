@@ -299,9 +299,13 @@ fn register_backlink_hitboxes(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        let name = truncate_to_display_width(&name, viewport.width as usize);
-        let column = 3; // after the one-space indent and the "• " bullet
-        let width = UnicodeWidthStr::width(name.as_str());
+        // Match the renderer's truncation (backlink_section_lines) so the
+        // hitbox covers exactly the visible name, then clamp both the column
+        // and the width into the viewport like the link/tag hitboxes.
+        let name = truncate_to_display_width(&name, viewport.width.saturating_sub(3) as usize);
+        let column = 3.min(viewport.width as usize); // after " " + "• "
+        let width = UnicodeWidthStr::width(name.as_str())
+            .min((viewport.width as usize).saturating_sub(column));
         if width == 0 {
             continue;
         }
@@ -331,6 +335,91 @@ mod tests {
         assert_eq!(
             document_paper_height(100, 100),
             DOCUMENT_TOP_MARGIN + 100 + DOCUMENT_BOTTOM_MARGIN
+        );
+    }
+
+    #[test]
+    fn backlink_hitbox_covers_exactly_the_rendered_truncated_name() {
+        let path = std::path::PathBuf::from("/root/A-Very-Long-Backlink-Name-That-Overflows.md");
+        // The renderer truncates to viewport.width - 3 (the " " + "• " prefix),
+        // so the hitbox must stop there too instead of spanning the full width.
+        let mut hitboxes = Vec::new();
+        register_backlink_hitboxes(
+            &mut hitboxes,
+            std::slice::from_ref(&path),
+            10,
+            Rect::new(0, 0, 40, 20),
+            0,
+        );
+        assert_eq!(hitboxes.len(), 1);
+        let hitbox = &hitboxes[0];
+        assert_eq!(hitbox.area.x, 3);
+        assert_eq!(hitbox.area.width, 37);
+        assert_eq!(hitbox.area.y, 14); // body_line_count + 4 + index - scroll
+        assert!(hitbox.area.x + hitbox.area.width <= 40);
+    }
+
+    #[test]
+    fn backlink_hitbox_skips_names_the_viewport_cannot_show() {
+        let path = std::path::PathBuf::from("/root/Name.md");
+        for width in 0..4u16 {
+            let mut hitboxes = Vec::new();
+            register_backlink_hitboxes(
+                &mut hitboxes,
+                std::slice::from_ref(&path),
+                10,
+                Rect::new(0, 0, width, 20),
+                0,
+            );
+            assert!(hitboxes.is_empty(), "no hitbox below width 4: {width}");
+        }
+        // At four columns only the ellipsized name fits next to the prefix.
+        let mut hitboxes = Vec::new();
+        register_backlink_hitboxes(
+            &mut hitboxes,
+            std::slice::from_ref(&path),
+            10,
+            Rect::new(0, 0, 4, 20),
+            0,
+        );
+        assert_eq!(hitboxes.len(), 1);
+        assert_eq!(hitboxes[0].area.x, 3);
+        assert_eq!(hitboxes[0].area.width, 1);
+        assert!(hitboxes[0].area.x + hitboxes[0].area.width <= 4);
+    }
+
+    #[test]
+    fn backlink_hitbox_keeps_row_math_when_scrolled_past_the_entries() {
+        let path = std::path::PathBuf::from("/root/Name.md");
+        let mut hitboxes = Vec::new();
+        // Rows live in body-row space: body_line_count + 4 + index; entries
+        // below the viewport bottom are dropped, entries above the fold too.
+        register_backlink_hitboxes(
+            &mut hitboxes,
+            &[path.clone(), path.clone()],
+            10,
+            Rect::new(0, 0, 40, 3),
+            13,
+        );
+        assert_eq!(
+            hitboxes
+                .iter()
+                .map(|hitbox| hitbox.area.y)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "row 14 = 10 + 4 skips the top; both entries fit the three-row viewport"
+        );
+        let mut hitboxes = Vec::new();
+        register_backlink_hitboxes(
+            &mut hitboxes,
+            std::slice::from_ref(&path),
+            10,
+            Rect::new(0, 0, 40, 20),
+            30,
+        );
+        assert!(
+            hitboxes.is_empty(),
+            "rows above the scroll window are skipped"
         );
     }
 }

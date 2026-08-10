@@ -48,9 +48,9 @@ use crate::app::{
 };
 use crate::embedded_terminal::{TerminalColor, TerminalSnapshot};
 use crate::model::{
-    Action, AttachmentHitbox, BacklinkHitbox, ButtonHitbox, FileGroup, FileGroupHitbox,
-    FileHitbox, FileListRow, LinkHitbox, LinkTarget, SearchHit, SearchHitbox, TagHitbox,
-    TodoHitbox, WorkspaceViewHitbox,
+    Action, AttachmentHitbox, BacklinkHitbox, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox,
+    FileListRow, LinkHitbox, LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
+    WorkspaceViewHitbox,
 };
 use crate::theme::Theme;
 
