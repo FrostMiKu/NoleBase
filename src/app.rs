@@ -22,10 +22,10 @@ use crate::attachment_usage::AttachmentUsageHandle;
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
 use crate::export::ExportFormat;
 use crate::model::{
-    Action, AttachmentHitbox, ButtonHitbox, DailyNote, DialogOptionHitbox, FileGroup,
-    FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox, LinkTarget, NoteFile, SearchHit,
-    SearchHitbox, TagHitbox, TagNote, TagNoteHitbox, TodoHitbox, TodoItem, WikiLinkCandidate,
-    WikiLinkHitbox, WikiLinkLocation, WorkspaceViewHitbox,
+    Action, AttachmentHitbox, BacklinkHitbox, ButtonHitbox, DailyNote, DialogOptionHitbox,
+    FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox, LinkTarget, NoteFile,
+    SearchHit, SearchHitbox, TagHitbox, TagNote, TagNoteHitbox, TodoHitbox, TodoItem,
+    WikiLinkCandidate, WikiLinkHitbox, WikiLinkLocation, WorkspaceViewHitbox,
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
@@ -106,14 +106,6 @@ pub(in crate::app) fn agent_debug_logging_enabled() -> bool {
 
 pub(in crate::app) fn in_area(col: u16, row: u16, area: Option<Rect>) -> bool {
     area.is_some_and(|area| point_in_rect(col, row, area))
-}
-
-pub(in crate::app) fn wiki_name_matches(path: &Path, requested: &str) -> bool {
-    path.file_name()
-        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(requested))
-        || path
-            .file_stem()
-            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
 }
 
 /// Case-insensitive subsequence matching. An empty query matches every file.
@@ -310,6 +302,12 @@ pub struct App {
     workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
 
+    /// The latest published wiki-link index, used to resolve backlinks for the
+    /// open document. `None` until the background indexer's first snapshot.
+    wiki_links: Option<crate::wiki_link_index::WikiLinkIndex>,
+    /// Distinct managed notes linking to the currently open document.
+    pub document_backlinks: Vec<PathBuf>,
+
     pub attachment_store: AttachmentStore,
     pub attachment_usage: AttachmentUsageHandle,
     pub attachment_entries: Vec<AttachmentEntry>,
@@ -340,6 +338,7 @@ pub struct App {
     pub workspace_view_hitboxes: Vec<WorkspaceViewHitbox>,
     pub search_hitboxes: Vec<SearchHitbox>,
     pub attachment_hitboxes: Vec<AttachmentHitbox>,
+    pub backlink_hitboxes: Vec<BacklinkHitbox>,
     pub wiki_link_hitboxes: Vec<WikiLinkHitbox>,
     pub dialog_hitboxes: Vec<DialogOptionHitbox>,
 
@@ -525,6 +524,8 @@ impl App {
             tag_note_hitboxes: Vec::new(),
             workspace_index,
             pending_tag_rename: None,
+            wiki_links: None,
+            document_backlinks: Vec::new(),
             attachment_store,
             attachment_usage,
             attachment_entries: Vec::new(),
@@ -550,6 +551,7 @@ impl App {
             workspace_view_hitboxes: Vec::new(),
             search_hitboxes: Vec::new(),
             attachment_hitboxes: Vec::new(),
+            backlink_hitboxes: Vec::new(),
             wiki_link_hitboxes: Vec::new(),
             dialog_hitboxes: Vec::new(),
             dialog: None,

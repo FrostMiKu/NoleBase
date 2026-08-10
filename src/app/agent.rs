@@ -411,6 +411,33 @@ impl App {
         }
     }
 
+    pub fn apply_wiki_link_index(&mut self, index: crate::wiki_link_index::WikiLinkIndex) {
+        self.wiki_links = Some(index);
+        self.recompute_document_backlinks();
+    }
+
+    /// Recompute [`App::document_backlinks`] from the published wiki-link index
+    /// for the currently open managed note (daily, data, or archives). Skills
+    /// and previews have no managed backing note, so they never get backlinks.
+    pub(in crate::app) fn recompute_document_backlinks(&mut self) {
+        self.document_backlinks.clear();
+        let Some(index) = self.wiki_links.as_ref() else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let path = match &document.kind {
+            DocumentKind::File(path) => Some(path.clone()),
+            DocumentKind::Daily(date) => self.storage.daily_file_path(&date.to_string()).ok(),
+            DocumentKind::Skill(_) => None,
+        };
+        let Some(path) = path else {
+            return;
+        };
+        self.document_backlinks = index.backlinks(&path);
+    }
+
     pub fn invalidate_agent_reads(&mut self, paths: &[PathBuf]) {
         if let Err(error) = self.agent_worker.invalidate_reads(paths) {
             self.set_error(format!("Agent read-state error: {error:#}"));
@@ -456,6 +483,7 @@ impl App {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Document".to_string())
         };
+        self.recompute_document_backlinks();
         true
     }
 

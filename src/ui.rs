@@ -48,8 +48,9 @@ use crate::app::{
 };
 use crate::embedded_terminal::{TerminalColor, TerminalSnapshot};
 use crate::model::{
-    Action, AttachmentHitbox, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox, FileListRow,
-    LinkHitbox, LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox, WorkspaceViewHitbox,
+    Action, AttachmentHitbox, BacklinkHitbox, ButtonHitbox, FileGroup, FileGroupHitbox,
+    FileHitbox, FileListRow, LinkHitbox, LinkTarget, SearchHit, SearchHitbox, TagHitbox,
+    TodoHitbox, WorkspaceViewHitbox,
 };
 use crate::theme::Theme;
 
@@ -130,6 +131,7 @@ fn clear_hitboxes(app: &mut App) {
     app.workspace_view_hitboxes.clear();
     app.search_hitboxes.clear();
     app.attachment_hitboxes.clear();
+    app.backlink_hitboxes.clear();
     app.tag_note_hitboxes.clear();
 }
 

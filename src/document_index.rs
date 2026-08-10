@@ -20,11 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::attachment_index::{collect_attachment_uris, AttachmentReferenceIndex};
 use crate::storage::Storage;
+use crate::wiki_link_index::{collect_wiki_links, WikiLinkIndex};
 use crate::workspace_index::{collect_document_tags, WorkspaceIndex};
 
 const CACHE_DIR: &str = "cache";
-const CACHE_FILE: &str = "document-index-v1.json";
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FILE: &str = "document-index-v2.json";
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DocumentGroup {
@@ -73,6 +74,7 @@ pub(crate) struct IndexedDocument {
     stamp: FileStamp,
     pub(crate) lines: Vec<IndexedLine>,
     pub(crate) attachment_uris: Vec<String>,
+    pub(crate) wiki_links: Vec<String>,
 }
 
 impl IndexedDocument {
@@ -259,6 +261,7 @@ pub(crate) struct IndexSnapshot {
     pub(crate) revision: u64,
     pub(crate) workspace: WorkspaceIndex,
     pub(crate) attachments: AttachmentReferenceIndex,
+    pub(crate) wiki_links: WikiLinkIndex,
 }
 
 enum IndexCommand {
@@ -374,6 +377,7 @@ fn publish_snapshot(
             revision,
             workspace: WorkspaceIndex::from_documents(documents),
             attachments: AttachmentReferenceIndex::from_documents(documents),
+            wiki_links: WikiLinkIndex::from_documents(documents),
         })
         .is_ok()
 }
@@ -448,9 +452,11 @@ fn parse_file(path: &Path, group: DocumentGroup, stamp: FileStamp) -> Option<Ind
     let source = fs::read_to_string(path).ok()?;
     let mut tags_by_line: HashMap<usize, Vec<String>> = HashMap::new();
     let mut attachment_uris = Vec::new();
+    let mut wiki_links = Vec::new();
     if let Ok(document) = mbdown::parse(&source) {
         collect_document_tags(document.nodes(), &source, &mut tags_by_line);
         attachment_uris = collect_attachment_uris(document.nodes());
+        wiki_links = collect_wiki_links(document.nodes());
     }
     let lines = source
         .lines()
@@ -470,6 +476,7 @@ fn parse_file(path: &Path, group: DocumentGroup, stamp: FileStamp) -> Option<Ind
         stamp,
         lines,
         attachment_uris,
+        wiki_links,
     })
 }
 
@@ -505,7 +512,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
         let note = storage.data_dir.join("Cached.md");
-        fs::write(&note, format!("cached needle #one [file]({})\n", uri())).unwrap();
+        fs::write(
+            &note,
+            format!("cached needle #one [[linked]] [file]({})\n", uri()),
+        )
+        .unwrap();
 
         let (first, first_stats) = DocumentIndex::load_or_build(&storage);
         assert_eq!(
@@ -537,6 +548,10 @@ mod tests {
             AttachmentReferenceIndex::from_documents(&second).reference_count(&uri()),
             1
         );
+        assert_eq!(
+            WikiLinkIndex::from_documents(&second).reference_count("linked"),
+            1
+        );
 
         fs::write(&note, "changed content with a different size #two\n").unwrap();
         let (third, third_stats) = DocumentIndex::load_or_build(&storage);
@@ -552,6 +567,10 @@ mod tests {
         assert_eq!(workspace.tags()[0].name, "two");
         assert_eq!(
             AttachmentReferenceIndex::from_documents(&third).reference_count(&uri()),
+            0
+        );
+        assert_eq!(
+            WikiLinkIndex::from_documents(&third).reference_count("linked"),
             0
         );
     }
@@ -596,7 +615,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
         let note = storage.data_dir.join("Live.md");
-        fs::write(&note, format!("first needle #one [file]({})\n", uri())).unwrap();
+        fs::write(
+            &note,
+            format!("first needle #one [[linked]] [file]({})\n", uri()),
+        )
+        .unwrap();
         let indexer = DocumentIndexer::spawn(storage.clone());
 
         let initial = indexer
@@ -606,6 +629,12 @@ mod tests {
         assert_eq!(initial.revision, 0);
         assert_eq!(initial.workspace.search("needle").len(), 1);
         assert_eq!(initial.attachments.reference_count(&uri()), 1);
+        assert_eq!(initial.wiki_links.reference_count("linked"), 1);
+        assert_eq!(
+            initial.wiki_links.backlinks(&note),
+            Vec::<std::path::PathBuf>::new(),
+            "a note is not its own backlink"
+        );
 
         fs::write(&note, "second value #two\n").unwrap();
         indexer.paths_changed(vec![note.clone()]);
@@ -617,6 +646,7 @@ mod tests {
         assert!(modified.workspace.search("needle").is_empty());
         assert_eq!(modified.workspace.tags()[0].name, "two");
         assert_eq!(modified.attachments.reference_count(&uri()), 0);
+        assert_eq!(modified.wiki_links.reference_count("linked"), 0);
 
         fs::remove_file(&note).unwrap();
         indexer.paths_changed(vec![note]);
@@ -627,5 +657,6 @@ mod tests {
         assert_eq!(deleted.revision, 2);
         assert!(deleted.workspace.tags().is_empty());
         assert_eq!(deleted.attachments.reference_count(&uri()), 0);
+        assert!(!deleted.wiki_links.is_referenced("linked"));
     }
 }

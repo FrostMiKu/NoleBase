@@ -1612,6 +1612,140 @@ fn wikilink_choice_marks_location_and_file_format_as_muted_metadata() {
 }
 
 #[test]
+fn document_view_renders_backlink_section_after_body() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    let source = app.storage.data_dir.join("Source.md");
+    fs::write(&target, "body line one\n").unwrap();
+    fs::write(&source, "see [[Target]]\n").unwrap();
+    app.document = Some(Document {
+        kind: DocumentKind::File(target.clone()),
+        title: "Target.md".to_string(),
+        source: "body line one\n".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert_eq!(app.document_backlinks, vec![source.clone()]);
+
+    let terminal = render(&mut app, 170, 24);
+    let screen = buffer_string(&terminal);
+    let body = screen.find("body line one").unwrap();
+    let heading = screen.find("Backlinks").unwrap();
+    let entry = screen[heading..].find("Source.md").map(|offset| heading + offset).unwrap();
+    assert!(body < heading, "backlink heading renders after the body");
+    assert!(heading < entry, "backlink entries render after the heading");
+    assert!(app
+        .backlink_hitboxes
+        .iter()
+        .any(|hitbox| hitbox.path == source));
+    // Layout: body, two blank rows, heading, blank row, indented entry. The
+    // entry sits two rows below the heading and starts at column 3 (" • ").
+    let body_row = screen[..body].matches('\n').count();
+    let heading_row = screen[..heading].matches('\n').count();
+    let entry_row = screen[..entry].matches('\n').count();
+    assert_eq!(heading_row, body_row + 3, "two blank rows before the heading");
+    assert_eq!(entry_row, heading_row + 2, "blank row after the heading");
+    let heading_line_start = screen[..heading].rfind('\n').map_or(0, |newline| newline + 1);
+    let entry_line_start = screen[..entry].rfind('\n').map_or(0, |newline| newline + 1);
+    let heading_column = UnicodeWidthStr::width(&screen[heading_line_start..heading]);
+    let entry_column = UnicodeWidthStr::width(&screen[entry_line_start..entry]);
+    assert_eq!(
+        entry_column.saturating_sub(heading_column),
+        3,
+        "entry is indented one space under the heading"
+    );
+    let hitbox = app
+        .backlink_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.path == source)
+        .unwrap();
+    assert_eq!(usize::from(hitbox.area.y), entry_row);
+    assert_eq!(usize::from(hitbox.area.x), entry_column);
+}
+
+#[test]
+fn document_view_hides_backlink_section_when_nothing_links_to_the_note() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    fs::write(&target, "body").unwrap();
+    app.document = Some(Document {
+        kind: DocumentKind::File(target),
+        title: "Target.md".to_string(),
+        source: "body".to_string(),
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert!(app.document_backlinks.is_empty());
+
+    let terminal = render(&mut app, 170, 24);
+    assert!(!buffer_string(&terminal).contains("Backlinks"));
+    assert!(app.backlink_hitboxes.is_empty());
+}
+
+#[test]
+fn backlink_section_scrolls_with_the_document_and_stays_clickable() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    let source = app.storage.data_dir.join("Source.md");
+    // A tall body pushes the Backlinks section below the fold.
+    let body = (0..60).map(|line| format!("filler line {line}")).collect::<Vec<_>>().join("\n");
+    fs::write(&target, &body).unwrap();
+    fs::write(&source, "see [[Target]]\n").unwrap();
+    app.document = Some(Document {
+        kind: DocumentKind::File(target),
+        title: "Target.md".to_string(),
+        source: body,
+        scroll: 0,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    app.focus = Focus::Center;
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+
+    // Unscrolled: section is below the fold, no hitbox visible.
+    let _terminal = render(&mut app, 170, 24);
+    assert!(app
+        .backlink_hitboxes
+        .iter()
+        .all(|hitbox| hitbox.area.y >= 24));
+
+    // Scroll to the end: the section scrolls into view and is clickable.
+    app.document.as_mut().unwrap().scroll = 200;
+    let _terminal = render(&mut app, 170, 24);
+    assert!(app
+        .backlink_hitboxes
+        .iter()
+        .any(|hitbox| hitbox.area.y < 24 && hitbox.path == source));
+    let hitbox = app
+        .backlink_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.path == source)
+        .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hitbox.area.x.saturating_add(1),
+        row: hitbox.area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.document.as_ref().map(|document| &document.kind),
+        Some(&DocumentKind::File(source))
+    );
+}
+
+#[test]
 fn approval_panel_with_empty_diff_keeps_body_and_footer() {
     let (mut app, _directory) = make_app();
     app.approval_request = Some(ApprovalRequest {

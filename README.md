@@ -159,7 +159,10 @@ file. In Agent messages, which have no containing file, they resolve relative to
 the Nole root. Clicking `[[wikilink]]` searches `daily/`, `data/`, and
 `archives/` by filename or filename stem. Multiple MD/MB matches open a chooser
 showing source and format metadata; a missing note is created as a new `.md`
-file under `data/`.
+file under `data/`. The document index also records every wiki-link target in
+the managed notes, so opening a note shows a `Backlinks` section under the body
+listing every managed note that links to it — the reverse direction of the link
+graph.
 
 Hashtags are an exact navigation layer over workspace search. Clicking a
 `#tag` in Daily or a document opens all lines carrying that exact tag, so

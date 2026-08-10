@@ -89,6 +89,7 @@ impl App {
             return_to,
             render_cache,
         });
+        self.recompute_document_backlinks();
     }
 
     pub(in crate::app) fn stash_current_document(&mut self) {
@@ -109,6 +110,7 @@ impl App {
         };
         let return_to = document.return_to;
         self.stash_current_document();
+        self.document_backlinks.clear();
         match return_to {
             DocumentReturn::Search => {
                 self.center_view = CenterView::Search;

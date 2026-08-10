@@ -207,3 +207,11 @@ pub struct AttachmentHitbox {
     pub index: usize,
     pub area: Rect,
 }
+
+/// A recorded screen rectangle for a clickable backlink row in the document
+/// view, rebuilt each frame.
+#[derive(Debug, Clone)]
+pub struct BacklinkHitbox {
+    pub path: PathBuf,
+    pub area: Rect,
+}

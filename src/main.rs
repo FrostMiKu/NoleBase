@@ -21,6 +21,7 @@ mod storage;
 mod theme;
 mod ui;
 mod vlist;
+mod wiki_link_index;
 mod workspace_index;
 
 use std::fs;
@@ -357,6 +358,7 @@ fn run(
         if let Some(snapshot) = document_indexer.try_latest_update() {
             app.apply_workspace_index(snapshot.workspace);
             app.apply_attachment_index(snapshot.revision, snapshot.attachments);
+            app.apply_wiki_link_index(snapshot.wiki_links);
         }
         app.poll_agent();
         app.poll_terminal();

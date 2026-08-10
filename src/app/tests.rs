@@ -759,7 +759,7 @@ fn existing_export_destination_offers_confirmation_and_cancel_restores_input() {
     assert_eq!(app.dialog.as_ref().map(|dialog| dialog.purpose), None);
     wait_for_export(&mut app);
     assert_eq!(
-        fs::read(&output.path().join("fresh.md")).unwrap(),
+        fs::read(output.path().join("fresh.md")).unwrap(),
         fs::read(&current).unwrap()
     );
     assert_eq!(fs::read_to_string(&destination).unwrap(), "old content");
@@ -3256,6 +3256,54 @@ fn wikilink_searches_daily_notes_and_chooses_between_all_matching_locations() {
     assert_eq!(
         app.document.as_ref().unwrap().kind,
         DocumentKind::File(created)
+    );
+}
+
+#[test]
+fn wiki_index_publishes_backlinks_for_the_open_note() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    let source = app.storage.data_dir.join("Source.md");
+    fs::write(&target, "body").unwrap();
+    fs::write(&source, "see [[Target]]\n").unwrap();
+    app.open_file_document(&target, DocumentReturn::Daily);
+    assert!(app.document_backlinks.is_empty(), "index not published yet");
+
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert_eq!(app.document_backlinks, vec![source.clone()]);
+
+    // Reopening the note re-derives backlinks from the stored index.
+    app.close_document();
+    app.open_file_document(&target, DocumentReturn::Daily);
+    assert_eq!(app.document_backlinks, vec![source]);
+}
+
+#[test]
+fn clicking_a_backlink_opens_the_referencing_note() {
+    let (mut app, _directory) = make_app();
+    let target = app.storage.data_dir.join("Target.md");
+    let source = app.storage.data_dir.join("Source.md");
+    fs::write(&target, "body").unwrap();
+    fs::write(&source, "see [[Target]]\n").unwrap();
+    app.open_file_document(&target, DocumentReturn::Daily);
+    app.apply_wiki_link_index(crate::wiki_link_index::WikiLinkIndex::build(&app.storage));
+    assert_eq!(app.document_backlinks, vec![source.clone()]);
+
+    app.backlink_hitboxes.push(BacklinkHitbox {
+        path: source.clone(),
+        area: Rect::new(3, 2, 10, 1),
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 4,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(app.center_view, CenterView::Document);
+    assert_eq!(
+        app.document.as_ref().map(|document| &document.kind),
+        Some(&DocumentKind::File(source))
     );
 }
 

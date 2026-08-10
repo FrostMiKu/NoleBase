@@ -17,6 +17,87 @@ fn document_paper_height(width: usize, content_height: usize) -> usize {
         .max(minimum_a4_height)
 }
 
+/// The "Backlinks" section rendered after the note body: two blank separator
+/// rows, a level-2 heading, one blank row, then one indented row per distinct
+/// managed note linking to the open document. The section scrolls with the
+/// document; entry rows are registered as clickable hitboxes by the caller.
+fn backlink_section_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    if app.document_backlinks.is_empty() {
+        return Vec::new();
+    }
+    let heading = Line::from(Span::styled(
+        "Backlinks",
+        Style::default()
+            .fg(app.theme.markdown_heading_2)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let name_style = Style::default()
+        .fg(app.theme.markdown_wikilink)
+        .underline_color(app.theme.markdown_link)
+        .add_modifier(Modifier::UNDERLINED);
+    let bullet = Span::styled("• ", Style::default().fg(app.theme.markdown_list));
+    let mut lines = vec![Line::default(), Line::default(), heading, Line::default()];
+    for path in &app.document_backlinks {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let name = truncate_to_display_width(&name, width.saturating_sub(3));
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            bullet.clone(),
+            Span::styled(name, name_style),
+        ]));
+    }
+    lines
+}
+
+/// Truncate `value` to fit `width` display columns, appending `…` when cut.
+fn truncate_to_display_width(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_string();
+    }
+    let target = width.saturating_sub(1);
+    let mut output = String::new();
+    let mut used: usize = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(character_width) > target {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    format!("{output}…")
+}
+
+/// Slice a visible window across the body and the trailing backlink section,
+/// treating them as one scrollable sequence in body-row coordinate space.
+fn visible_window<'a>(
+    body: &[Line<'a>],
+    backlinks: &[Line<'a>],
+    scroll: usize,
+    viewport_height: usize,
+) -> Vec<Line<'a>> {
+    let body_skip = scroll.min(body.len());
+    let mut visible: Vec<Line<'a>> = body
+        .iter()
+        .skip(body_skip)
+        .take(viewport_height)
+        .cloned()
+        .collect();
+    let remaining = viewport_height.saturating_sub(visible.len());
+    let backlink_skip = scroll.saturating_sub(body.len());
+    visible.extend(
+        backlinks
+            .iter()
+            .skip(backlink_skip)
+            .take(remaining)
+            .cloned(),
+    );
+    visible
+}
+
 pub(super) fn draw_document(
     frame: &mut Frame,
     app: &mut App,
@@ -61,7 +142,15 @@ pub(super) fn draw_document(
         crate::app::DocumentKind::Daily(_) => app.storage.daily_dir.clone(),
         crate::app::DocumentKind::Skill(_) => app.storage.skills_dir.clone(),
     };
-    let (rendered_links, rendered_tags, rendered_images, document_scroll, visible_top_margin) = {
+    let backlink_lines = backlink_section_lines(app, document_area.width as usize);
+    let (
+        rendered_links,
+        rendered_tags,
+        rendered_images,
+        document_scroll,
+        visible_top_margin,
+        body_line_count,
+    ) = {
         let document = app.document.as_mut().expect("document checked above");
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -103,7 +192,11 @@ pub(super) fn draw_document(
         let rendered_tags = rendered.tags.clone();
         let rendered_images = rendered.images.clone();
         let lines = &rendered.lines;
-        let paper_height = document_paper_height(page_area.width as usize, lines.len());
+        let body_line_count = lines.len();
+        let paper_height = document_paper_height(
+            page_area.width as usize,
+            body_line_count.saturating_add(backlink_lines.len()),
+        );
         let max_scroll = paper_height.saturating_sub(unoccluded_document_height as usize);
         document.scroll = (document.scroll as usize).min(max_scroll) as u16;
         let document_scroll = document.scroll as usize;
@@ -124,8 +217,9 @@ pub(super) fn draw_document(
             .min(document_area.height as usize);
         let content_scroll = document_scroll.saturating_sub(DOCUMENT_TOP_MARGIN);
         let mut visible = vec![Line::default(); visible_top_margin];
-        visible.extend(visible_line_window(
+        visible.extend(visible_window(
             lines,
+            &backlink_lines,
             content_scroll,
             (document_area.height as usize).saturating_sub(visible_top_margin),
         ));
@@ -136,6 +230,7 @@ pub(super) fn draw_document(
             rendered_images,
             content_scroll,
             visible_top_margin as u16,
+            body_line_count,
         )
     };
     let content_document_area = Rect::new(
@@ -172,8 +267,58 @@ pub(super) fn draw_document(
             interactive_document_area,
             document_scroll,
         );
+        register_backlink_hitboxes(
+            &mut app.backlink_hitboxes,
+            &app.document_backlinks,
+            body_line_count,
+            interactive_document_area,
+            document_scroll,
+        );
     }
     draw_floating_compose(frame, app, compose_layout, interactive, cursor_position);
+}
+
+/// Register one clickable row per backlink entry. Entry rows live directly
+/// after the body (two separators + heading + one separator), so their row
+/// numbers are `body_line_count + 4 + index` in the same coordinate space the
+/// document links use; entries outside the scrolled viewport are skipped.
+fn register_backlink_hitboxes(
+    hitboxes: &mut Vec<BacklinkHitbox>,
+    backlinks: &[std::path::PathBuf],
+    body_line_count: usize,
+    viewport: Rect,
+    scroll: usize,
+) {
+    let bottom = scroll.saturating_add(viewport.height as usize);
+    for (index, path) in backlinks.iter().enumerate() {
+        let row = body_line_count.saturating_add(4).saturating_add(index);
+        if row < scroll || row >= bottom {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let name = truncate_to_display_width(&name, viewport.width as usize);
+        let column = 3; // after the one-space indent and the "• " bullet
+        let width = UnicodeWidthStr::width(name.as_str());
+        if width == 0 {
+            continue;
+        }
+        hitboxes.push(BacklinkHitbox {
+            path: path.clone(),
+            area: Rect::new(
+                viewport
+                    .x
+                    .saturating_add(u16::try_from(column).unwrap_or(u16::MAX)),
+                viewport
+                    .y
+                    .saturating_add(u16::try_from(row - scroll).unwrap_or(u16::MAX)),
+                u16::try_from(width).unwrap_or(u16::MAX),
+                1,
+            ),
+        });
+    }
 }
 
 #[cfg(test)]

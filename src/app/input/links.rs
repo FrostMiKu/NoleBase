@@ -1,6 +1,7 @@
 //! Keyboard and mouse input: links.
 
 use crate::attachment::AttachmentUri;
+use crate::wiki_link_index::wiki_name_matches;
 
 use super::super::*;
 

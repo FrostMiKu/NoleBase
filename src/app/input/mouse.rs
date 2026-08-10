@@ -125,6 +125,16 @@ impl App {
             return None;
         }
 
+        if let Some(path) = self
+            .backlink_hitboxes
+            .iter()
+            .find(|hitbox| point_in_rect(column, row, hitbox.area))
+            .map(|hitbox| hitbox.path.clone())
+        {
+            self.open_file_document(&path, DocumentReturn::Daily);
+            return None;
+        }
+
         if self.center_view == CenterView::Tags && self.active_tag.is_some() {
             if let Some(index) = self
                 .tag_note_hitboxes
