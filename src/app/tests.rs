@@ -26,6 +26,16 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+/// The default export destination under the user's home directory, spelled
+/// with the platform's path separator (`~/name` on Unix, `~\name` on
+/// Windows).
+fn home_dest(file_name: &str) -> String {
+    Path::new("~")
+        .join(file_name)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn add_daily_note(app: &mut App, body: &str) {
     app.storage.append_to_today(body).unwrap();
     app.reload();
@@ -435,7 +445,10 @@ fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
         Some(DialogPurpose::ExportDestination)
     );
     assert_eq!(app.dialog.as_ref().unwrap().message, "Destination path  ");
-    assert_eq!(app.dialog.as_ref().unwrap().input, "~/Export me.html");
+    assert_eq!(
+        app.dialog.as_ref().unwrap().input,
+        home_dest("Export me.html")
+    );
     assert_eq!(
         app.dialog.as_ref().unwrap().cursor,
         app.dialog.as_ref().unwrap().input.chars().count()
@@ -465,7 +478,10 @@ fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
 
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "~/Export me.md");
+    assert_eq!(
+        app.dialog.as_ref().unwrap().input,
+        home_dest("Export me.md")
+    );
     let destination = output.path().join("exact.md");
     app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
     app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
@@ -491,8 +507,8 @@ fn export_format_switch_changes_default_destination_extension() {
     app.open_file_document(&current, DocumentReturn::Daily);
 
     for (index, (expected, format)) in [
-        ("~/Quarterly Report.mb", ExportFormat::Original),
-        ("~/Quarterly Report.html", ExportFormat::Html),
+        (home_dest("Quarterly Report.mb"), ExportFormat::Original),
+        (home_dest("Quarterly Report.html"), ExportFormat::Html),
     ]
     .into_iter()
     .enumerate()
@@ -524,18 +540,26 @@ fn export_destination_default_follows_configured_export_directory() {
 
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "~/Doc.md");
+    assert_eq!(app.dialog.as_ref().unwrap().input, home_dest("Doc.md"));
 
     // A changed setting is picked up by the next export immediately.
     app.handle_key(key(KeyCode::Esc));
+    let export_dir = tempfile::tempdir().unwrap();
+    let export_dir_text = export_dir.path().display().to_string();
     fs::write(
         &app.storage.settings_path,
-        "theme = \"default\"\nexport_directory = \"/tmp/exports\"\n",
+        format!("theme = \"default\"\nexport_directory = '{export_dir_text}'\n"),
     )
     .unwrap();
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "/tmp/exports/Doc.md");
+    assert_eq!(
+        app.dialog.as_ref().unwrap().input,
+        Path::new(&export_dir_text)
+            .join("Doc.md")
+            .to_string_lossy()
+            .as_ref()
+    );
     app.handle_key(key(KeyCode::Esc));
 }
 
@@ -577,7 +601,10 @@ fn daily_note_export_is_available_and_publishes_the_daily_file() {
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "~/2026-08-05.html");
+    assert_eq!(
+        app.dialog.as_ref().unwrap().input,
+        home_dest("2026-08-05.html")
+    );
     let destination = output.path().join("daily.html");
     app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
     app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
@@ -611,7 +638,7 @@ fn skill_document_can_be_exported() {
     app.execute_app_command(AppCommand::ExportCurrentFile);
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.dialog.as_ref().unwrap().input, "~/guide.html");
+    assert_eq!(app.dialog.as_ref().unwrap().input, home_dest("guide.html"));
     let destination = output.path().join("guide.html");
     app.dialog.as_mut().unwrap().input = destination.to_string_lossy().into_owned();
     app.dialog.as_mut().unwrap().cursor = app.dialog.as_ref().unwrap().input.chars().count();
@@ -3448,7 +3475,8 @@ fn terminal_toggle_retains_one_session_and_shell_exit_discards_it() {
         app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
     app.handle_key(key(KeyCode::Enter));
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Shell exit can be slow on shared CI runners; wait generously.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while app.terminal_process_id().is_some() && std::time::Instant::now() < deadline {
         app.poll_terminal();
         std::thread::sleep(Duration::from_millis(10));

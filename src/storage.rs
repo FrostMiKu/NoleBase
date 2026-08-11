@@ -1594,6 +1594,13 @@ fn reject_existing_symlink_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // Prefix and root components only ever form the volume root
+        // (`\\?\C:\`, `C:\`, `/`), which cannot be a symlink. On Windows a
+        // bare prefix such as `\\?\C:` is not a valid path at all, so
+        // probing it would reject every export even when the tree is safe.
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 bail!("symlink traversal is not allowed: {}", current.display());
