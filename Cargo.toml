@@ -19,6 +19,7 @@ crossterm = "0.29"
 mbdown = "0.1.4"
 mbtui = "0.1.4"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+clipboard-rs = { version = "0.3.5", features = ["image"] }
 base64 = "0.22"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 anyhow = "1"

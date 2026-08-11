@@ -3679,3 +3679,81 @@ fn opening_attachment_opens_the_real_managed_file() {
         fs::canonicalize(app.attachment_store.open(id).unwrap()).unwrap()
     );
 }
+
+#[test]
+fn paste_clipboard_command_is_available_only_in_compose_documents() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Compose;
+    for view in [CenterView::Daily, CenterView::Chat, CenterView::Document] {
+        app.center_view = view;
+        assert!(app.command_available(AppCommand::PasteClipboardAsAttachment));
+    }
+    app.center_view = CenterView::Todo;
+    assert!(!app.command_available(AppCommand::PasteClipboardAsAttachment));
+    app.center_view = CenterView::Daily;
+    app.focus = Focus::Center;
+    assert!(!app.command_available(AppCommand::PasteClipboardAsAttachment));
+    app.focus = Focus::Compose;
+    app.overlay = Some(Overlay::Terminal);
+    assert!(!app.command_available(AppCommand::PasteClipboardAsAttachment));
+}
+
+#[test]
+fn paste_clipboard_references_insert_at_compose_cursor_in_order() {
+    let (mut app, _directory) = make_app();
+    app.focus = Focus::Compose;
+    app.input = "left right".to_string();
+    app.input_cursor = 5;
+    let first = app
+        .attachment_store
+        .import_bytes(b"a", Some("a.txt"))
+        .unwrap();
+    let second = app
+        .attachment_store
+        .import_bytes(b"b", Some("b.txt"))
+        .unwrap();
+    let references = format!(
+        "{}\n{}",
+        crate::attachment::markdown_embed(&first),
+        crate::attachment::markdown_embed(&second)
+    );
+    let expected = format!("left {references}right");
+    app.insert_attachment_references(&[first, second]);
+    assert_eq!(app.input, expected);
+    assert_eq!(app.input_cursor, 5 + references.chars().count());
+    assert!(app
+        .status
+        .starts_with("Imported 2 attachment(s): a.txt, b.txt"));
+}
+
+#[test]
+fn paste_clipboard_shortcut_is_ignored_outside_compose_and_by_terminal_overlay() {
+    let (mut app, _directory) = make_app();
+    app.input = "unchanged".to_string();
+    app.input_cursor = app.input.chars().count();
+    let shortcut = KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(shortcut);
+    assert_eq!(app.input, "unchanged");
+    assert_eq!(
+        app.attachment_store
+            .list(&crate::attachment::AttachmentQuery::default())
+            .unwrap()
+            .total,
+        0
+    );
+
+    app.focus = Focus::Compose;
+    app.overlay = Some(Overlay::Terminal);
+    app.handle_key(shortcut);
+    assert_eq!(app.input, "unchanged");
+    assert_eq!(
+        app.attachment_store
+            .list(&crate::attachment::AttachmentQuery::default())
+            .unwrap()
+            .total,
+        0
+    );
+}

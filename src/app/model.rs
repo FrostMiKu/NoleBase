@@ -42,6 +42,7 @@ pub(super) enum AppCommand {
     EditAgentMemory,
     BrowseSkills,
     BrowseAttachments,
+    PasteClipboardAsAttachment,
 }
 
 pub(super) struct AppCommandDefinition {
@@ -159,6 +160,13 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Attachments: Browse",
         description: "Browse attachments by name, type, size, and references",
         keywords: "attachment attachments browse files media open trash delete",
+    },
+    AppCommandDefinition {
+        id: AppCommand::PasteClipboardAsAttachment,
+        label: "Attachments: Paste from clipboard",
+        description:
+            "Import clipboard files or image into attachments and insert Markdown references",
+        keywords: "attachment paste clipboard image file",
     },
     AppCommandDefinition {
         id: AppCommand::SwitchTheme,

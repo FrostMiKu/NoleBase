@@ -1449,7 +1449,8 @@ fn overlay_records_geometry_and_disables_all_background_hitboxes() {
     }];
     app.focus = Focus::Center;
     app.set_overlay(Overlay::Help);
-    render(&mut app, 220, 24);
+    let terminal = render(&mut app, 220, 40);
+    assert!(buffer_string(&terminal).contains("Ctrl+Alt+V"));
     assert!(app.layout.overlay.is_some());
     assert!(app.hitboxes.is_empty());
     assert!(app.link_hitboxes.is_empty());

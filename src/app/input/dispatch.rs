@@ -12,6 +12,16 @@ impl App {
             self.write_terminal_key(key);
             return None;
         }
+        if key.code == KeyCode::Char('v')
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            if self.can_paste_clipboard_as_attachment() {
+                self.paste_clipboard_as_attachment();
+            }
+            return None;
+        }
         if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self
                 .dialog
@@ -229,5 +239,50 @@ impl App {
                     self.files_context,
                     FilesContext::Search | FilesContext::NewTarget | FilesContext::Rename
                 ))
+    }
+    pub(in crate::app) fn can_paste_clipboard_as_attachment(&self) -> bool {
+        self.overlay.is_none()
+            && self.focus == Focus::Compose
+            && matches!(
+                self.center_view,
+                CenterView::Daily | CenterView::Chat | CenterView::Document
+            )
+    }
+
+    pub(in crate::app) fn paste_clipboard_as_attachment(&mut self) {
+        if !self.can_paste_clipboard_as_attachment() {
+            return;
+        }
+        let metadata = match crate::clipboard::import_clipboard_attachments(&self.attachment_store)
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.set_error(format!("Clipboard attachment error: {error:#}"));
+                return;
+            }
+        };
+        self.insert_attachment_references(&metadata);
+    }
+
+    pub(in crate::app) fn insert_attachment_references(
+        &mut self,
+        metadata: &[crate::attachment::AttachmentMetadata],
+    ) {
+        let references = metadata
+            .iter()
+            .map(crate::attachment::markdown_embed)
+            .collect::<Vec<_>>()
+            .join("\n");
+        paste_into(&mut self.input, &mut self.input_cursor, &references);
+        self.recompute_attachments();
+        let summary = metadata
+            .iter()
+            .map(|item| item.display_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.set_status(format!(
+            "Imported {} attachment(s): {summary}",
+            metadata.len()
+        ));
     }
 }

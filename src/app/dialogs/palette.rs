@@ -101,6 +101,7 @@ impl App {
             }
             AppCommand::BrowseSkills => self.open_skill_browser(),
             AppCommand::BrowseAttachments => self.open_attachments(),
+            AppCommand::PasteClipboardAsAttachment => self.paste_clipboard_as_attachment(),
         }
         None
     }
@@ -128,6 +129,7 @@ impl App {
             | AppCommand::EditAgentMemory
             | AppCommand::BrowseSkills
             | AppCommand::BrowseAttachments => true,
+            AppCommand::PasteClipboardAsAttachment => self.can_paste_clipboard_as_attachment(),
         }
     }
 

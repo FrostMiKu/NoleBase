@@ -7,6 +7,7 @@ mod attachment;
 mod attachment_index;
 mod attachment_usage;
 mod backend;
+mod clipboard;
 mod document_index;
 mod embedded_terminal;
 mod export;

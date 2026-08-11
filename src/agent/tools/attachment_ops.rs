@@ -27,8 +27,8 @@ use super::workspace_quota::{
 };
 use crate::agent::{canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool};
 use crate::attachment::{
-    escape_markdown_label, validate_display_name, AttachmentId, AttachmentMetadata,
-    AttachmentQuery, AttachmentStore, AttachmentUri, MAX_ATTACHMENT_SIZE,
+    markdown_embed, validate_display_name, AttachmentId, AttachmentMetadata, AttachmentQuery,
+    AttachmentStore, AttachmentUri, MAX_ATTACHMENT_SIZE,
 };
 use crate::attachment_usage::{AttachmentUsageHandle, TrashError, TrashResult};
 use crate::storage::Storage;
@@ -73,23 +73,6 @@ fn resolve_import_source(root: &Path, unresolved: &Path) -> Result<PathBuf> {
         bail!("import source must not be inside attachments/");
     }
     Ok(source)
-}
-
-/// Markdown for pasting into notes: an embed for images, a plain link
-/// otherwise. The display name is escaped so hostile names cannot break the
-/// Markdown; both forms reference only the canonical URI.
-fn markdown_embed(metadata: &AttachmentMetadata) -> String {
-    let uri = metadata.uri().to_string();
-    let label = escape_markdown_label(&metadata.display_name);
-    let is_image = metadata
-        .mime_type
-        .as_deref()
-        .is_some_and(|mime| mime.starts_with("image/"));
-    if is_image {
-        format!("![{label}]({uri})")
-    } else {
-        format!("[{label}]({uri})")
-    }
 }
 
 /// Metadata shaped for Agent output. Never contains physical object paths.

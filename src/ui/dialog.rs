@@ -737,6 +737,10 @@ pub(super) fn help_lines(theme: Theme) -> Vec<Line<'static>> {
         key("Ctrl+Enter", "send prompt directly to Agent"),
         key("Ctrl+U", "recall the last append into Compose"),
         key("Ctrl+J", "insert newline"),
+        key(
+            "Ctrl+Alt+V",
+            "paste clipboard files or image as attachments",
+        ),
         key("Esc", "leave / cancel"),
         Line::default(),
         heading("Files"),

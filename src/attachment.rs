@@ -1047,6 +1047,22 @@ pub fn escape_markdown_label(name: &str) -> String {
     out
 }
 
+/// Markdown for inserting an attachment into a note: images use an embed and
+/// other media use a link. Labels are escaped and destinations are canonical.
+pub(crate) fn markdown_embed(metadata: &AttachmentMetadata) -> String {
+    let uri = metadata.uri().to_string();
+    let label = escape_markdown_label(&metadata.display_name);
+    if metadata
+        .mime_type
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("image/"))
+    {
+        format!("![{label}]({uri})")
+    } else {
+        format!("[{label}]({uri})")
+    }
+}
+
 /// Best-effort media type from the display name's extension, used only when
 /// content inspection is inconclusive.
 fn infer_mime_from_extension(name: &str) -> Option<String> {
@@ -1765,5 +1781,27 @@ mod tests {
         let label = escape_markdown_label("x](example).png");
         let embed = format!("![{label}]({uri})");
         assert_eq!(embed, format!("![x\\](example).png]({uri})"));
+    }
+
+    #[test]
+    fn markdown_embed_uses_canonical_uri_and_escaped_label() {
+        let metadata = |display_name: &str, mime_type: &str| AttachmentMetadata {
+            id: AttachmentId::new(),
+            size: 1,
+            display_name: display_name.to_string(),
+            source: display_name.to_string(),
+            mime_type: Some(mime_type.to_string()),
+            imported_at: Utc::now(),
+        };
+        let image = metadata("x](example).png", "image/png");
+        assert_eq!(
+            markdown_embed(&image),
+            format!("![x\\](example).png]({})", image.uri())
+        );
+        let document = metadata("report.pdf", "application/pdf");
+        assert_eq!(
+            markdown_embed(&document),
+            format!("[report.pdf]({})", document.uri())
+        );
     }
 }
