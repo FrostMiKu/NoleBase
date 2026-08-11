@@ -119,6 +119,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
     cursor_position
 }
 
+/// Whether the currently visible UI owns a time-based visual animation.
+///
+/// The event loop asks the renderer instead of maintaining a second list of
+/// page-specific animation exceptions. Any future animated widget belongs in
+/// this decision alongside its rendering condition.
+pub(crate) fn animations_active(app: &App, focused: bool) -> bool {
+    focused
+        && (app.ai_running
+            || app.export_in_progress
+            || app.overlay == Some(Overlay::Terminal)
+            || app.permission_mode == PermissionMode::Bypass
+            || app.focus == Focus::Compose
+            || matches!(app.center_view, CenterView::Daily | CenterView::Tags))
+}
+
 fn clear_hitboxes(app: &mut App) {
     app.hitboxes.clear();
     app.link_hitboxes.clear();

@@ -66,6 +66,7 @@ fn animation_tick(epoch: Instant, now: Instant) -> u64 {
     u64::try_from(tick).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 fn until_next_animation_frame(epoch: Instant, now: Instant) -> Duration {
     let elapsed = now.saturating_duration_since(epoch);
     let remainder = elapsed.as_nanos() % ANIMATION_FRAME_INTERVAL.as_nanos();
@@ -247,7 +248,10 @@ fn watch_workspace(storage: &storage::Storage) -> Result<(RecommendedWatcher, Wa
     Ok((watcher, receiver))
 }
 
-fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::path::PathBuf> {
+fn process_workspace_events(
+    events: &WatchEvents,
+    app: &mut App,
+) -> (Vec<std::path::PathBuf>, bool) {
     // The agent workspace sandbox (workspace/main) churns constantly while an
     // Agent task runs. It is never registered with the watcher, so its events
     // never enter this queue; the check below is defense in depth. Workspace
@@ -319,20 +323,35 @@ fn process_workspace_events(events: &WatchEvents, app: &mut App) -> Vec<std::pat
             Err(error) => watcher_error = Some(error),
         }
     }
+    let mut ui_changed = false;
     if !attachment_paths.is_empty() {
         // Attachment events refresh the browser only: mutable metadata (e.g.
         // display_name) can be edited externally. They never reload the
         // workspace UI or feed the note/attachment reference indexes, which
         // track managed Markdown files only.
         app.attachment_paths_changed(&attachment_paths);
+        ui_changed = true;
     }
     if changed {
         app.reload_workspace();
+        ui_changed = true;
     }
     if let Some(error) = watcher_error {
         app.set_error(format!("File watcher error: {error}"));
+        ui_changed = true;
     }
-    indexed_paths
+    (indexed_paths, ui_changed)
+}
+
+fn event_wait_duration(app: &App, focused: bool) -> Duration {
+    if ui::animations_active(app, focused) {
+        ANIMATION_FRAME_INTERVAL
+    } else {
+        // Static screens do not need redraws. Keep a bounded wait so external
+        // file/indexer updates are noticed even though crossterm cannot wait
+        // on both terminal input and the watcher channel simultaneously.
+        Duration::from_secs(1)
+    }
 }
 
 fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(), B::Error> {
@@ -352,17 +371,25 @@ fn run(
     document_indexer: &DocumentIndexer,
 ) -> Result<()> {
     let animation_epoch = Instant::now();
+    let mut focused = true;
+    let mut needs_draw = true;
     loop {
-        let indexed_paths = process_workspace_events(workspace_events, app);
+        let (indexed_paths, workspace_changed) = process_workspace_events(workspace_events, app);
         document_indexer.paths_changed(indexed_paths);
         if let Some(snapshot) = document_indexer.try_latest_update() {
             app.apply_workspace_index(snapshot.workspace);
             app.apply_attachment_index(snapshot.revision, snapshot.attachments);
             app.apply_wiki_link_index(snapshot.wiki_links);
+            needs_draw = true;
         }
+        needs_draw |= workspace_changed;
+
+        let was_ai_running = app.ai_running;
+        let was_overlay = app.overlay;
         app.poll_agent();
         app.poll_terminal();
         app.poll_export();
+        needs_draw |= was_ai_running != app.ai_running || was_overlay != app.overlay;
         let pending_bells = app.notifications.take_bells();
         if pending_bells > 0 {
             let mut output = io::stdout();
@@ -371,10 +398,17 @@ fn run(
             }
             output.flush()?;
         }
-        let now = Instant::now();
-        app.animation_tick = animation_tick(animation_epoch, now);
-        draw_frame(terminal, app)?;
-        if !event::poll(until_next_animation_frame(animation_epoch, Instant::now()))? {
+
+        let animation_active = ui::animations_active(app, focused);
+        if animation_active || needs_draw {
+            app.animation_tick = animation_tick(animation_epoch, Instant::now());
+            if focused {
+                draw_frame(terminal, app)?;
+                needs_draw = false;
+            }
+        }
+
+        if !event::poll(event_wait_duration(app, focused))? {
             continue;
         }
         let mut events = vec![event::read()?];
@@ -397,14 +431,15 @@ fn run(
                     *accumulated += delta;
                     continue;
                 }
-                flush_wheel(&mut pending_wheel, app);
+                needs_draw |= flush_wheel(&mut pending_wheel, app);
                 if handle_command(app.handle_mouse(mouse), app, terminal)? {
                     quit = true;
                     break;
                 }
+                needs_draw = true;
                 continue;
             }
-            flush_wheel(&mut pending_wheel, app);
+            needs_draw |= flush_wheel(&mut pending_wheel, app);
             match event {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
@@ -415,22 +450,26 @@ fn run(
                         quit = true;
                         break;
                     }
+                    needs_draw = true;
                 }
-                // Base Nole interactions ignore key repeat. The embedded
-                // terminal accepts it so shell input behaves normally.
                 Event::Key(_) => {}
                 Event::Mouse(_) => unreachable!("mouse events handled above"),
-                Event::Paste(text) => app.handle_paste(&text),
-                Event::Resize(width, height) => {
-                    // Kitty can report the old grid size briefly after an alternate-screen
-                    // transition. The resize event carries the authoritative dimensions.
-                    terminal.resize(Rect::new(0, 0, width, height))?;
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                    needs_draw = true;
                 }
-                Event::FocusGained => app.reload_workspace(),
-                Event::FocusLost => {}
+                Event::Resize(width, height) => {
+                    terminal.resize(Rect::new(0, 0, width, height))?;
+                    needs_draw = true;
+                }
+                Event::FocusGained => {
+                    focused = true;
+                    needs_draw = true;
+                }
+                Event::FocusLost => focused = false,
             }
         }
-        flush_wheel(&mut pending_wheel, app);
+        needs_draw |= flush_wheel(&mut pending_wheel, app);
         if quit {
             break;
         }
@@ -438,14 +477,16 @@ fn run(
     Ok(())
 }
 
-fn flush_wheel(pending: &mut Option<(u16, u16, i32)>, app: &mut App) {
-    if let Some((column, row, delta)) = pending.take() {
-        app.handle_wheel(
-            column,
-            row,
-            delta.clamp(-MAX_WHEEL_DELTA_PER_FRAME, MAX_WHEEL_DELTA_PER_FRAME),
-        );
-    }
+fn flush_wheel(pending: &mut Option<(u16, u16, i32)>, app: &mut App) -> bool {
+    let Some((column, row, delta)) = pending.take() else {
+        return false;
+    };
+    app.handle_wheel(
+        column,
+        row,
+        delta.clamp(-MAX_WHEEL_DELTA_PER_FRAME, MAX_WHEEL_DELTA_PER_FRAME),
+    );
+    true
 }
 
 fn resolve_storage() -> Result<storage::Storage> {
@@ -555,6 +596,26 @@ mod tests {
             until_next_animation_frame(epoch, epoch + Duration::from_millis(500)),
             ANIMATION_FRAME_INTERVAL
         );
+    }
+
+    #[test]
+    fn visible_gradient_borders_keep_animation_frames_scheduled() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage::Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let mut app = App::new(storage).unwrap();
+
+        app.center_view = CenterView::Chat;
+        app.focus = app::Focus::Center;
+        assert!(!ui::animations_active(&app, true));
+
+        app.center_view = CenterView::Daily;
+        assert!(ui::animations_active(&app, true));
+        assert!(!ui::animations_active(&app, false));
+
+        app.center_view = CenterView::Chat;
+        app.focus = app::Focus::Compose;
+        assert!(ui::animations_active(&app, true));
     }
 
     #[test]
@@ -679,7 +740,7 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let indexed = process_workspace_events(&receiver, &mut app);
+        let (indexed, _) = process_workspace_events(&receiver, &mut app);
         assert!(
             indexed.is_empty(),
             "workspace events must not reach the note/attachment indexes"
