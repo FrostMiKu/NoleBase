@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::{
-    Backlinks, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles, SearchTag,
-    SearchWeb,
+    Backlinks, Calculate, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
+    SearchTag, SearchWeb,
 };
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
@@ -48,6 +48,7 @@ impl Review {
         review.register(SearchTag::new(root, workspace_index)?);
         review.register(ResolveWikilink::new(root, wiki_links.clone())?);
         review.register(Backlinks::new(root, wiki_links)?);
+        review.register(Calculate);
         review.register(LoadSkill::new(skills));
         if !tavily_api_key.is_empty() {
             review.register(SearchWeb {
@@ -246,6 +247,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(tool_names.contains(&"read"));
         assert!(tool_names.contains(&"search_files"));
+        assert!(tool_names.contains(&"calculate"));
         assert!(!tool_names.contains(&"review"));
         assert!(!tool_names.contains(&"explore"));
         assert!(!tool_names.contains(&"edit"));
@@ -386,6 +388,7 @@ mod tests {
             "search_tag",
             "resolve_wikilink",
             "backlinks",
+            "calculate",
             "load_skill",
         ] {
             assert!(tool_names.contains(&name), "missing read-only tool {name}");

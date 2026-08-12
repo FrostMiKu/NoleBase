@@ -114,6 +114,7 @@ Root: {root}
 - Use `add_daily_entry` to create or append a daily note; existing daily notes can be read, edited, or deleted.
 - Use `export_file` when the destination is outside Nole; it never overwrites.
 - Use `explore` for broad investigation and `review` for independent evaluation; use direct tools for focused work.
+- Use `calculate` for arithmetic and scientific expressions instead of estimating results; trigonometric angles are radians.
 - Use `read` to inspect a URL. Use `download` when the bytes must be kept in `workspace/main/`, including before importing a remote file as an attachment.
 - Use `ask` when a user decision is required.
 

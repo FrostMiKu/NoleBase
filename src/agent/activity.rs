@@ -98,6 +98,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
     match name {
         "explore" => text("task"),
         "review" => text("task"),
+        "calculate" => text("expression"),
         "read" => text("path").map(|path| {
             if is_url(&path) {
                 web_base_url(&path)

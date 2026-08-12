@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::{
-    Backlinks, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles, SearchTag,
-    SearchWeb,
+    Backlinks, Calculate, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
+    SearchTag, SearchWeb,
 };
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
@@ -48,6 +48,7 @@ impl Explore {
         explore.register(SearchTag::new(root, workspace_index)?);
         explore.register(ResolveWikilink::new(root, wiki_links.clone())?);
         explore.register(Backlinks::new(root, wiki_links)?);
+        explore.register(Calculate);
         explore.register(LoadSkill::new(skills));
         if !tavily_api_key.is_empty() {
             explore.register(SearchWeb {
@@ -248,6 +249,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(tool_names.contains(&"read"));
         assert!(tool_names.contains(&"search_files"));
+        assert!(tool_names.contains(&"calculate"));
         assert!(!tool_names.contains(&"explore"));
         assert!(!tool_names.contains(&"edit"));
         assert!(!tool_names.contains(&"download"));

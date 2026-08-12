@@ -303,6 +303,105 @@
     }
 
     #[test]
+    fn end_turn_thinking_only_response_is_automatically_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = [
+            json!({
+                "content": [{"type": "thinking", "thinking": "working"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 8}
+            }),
+            json!({
+                "content": [{"type": "text", "text": "Recovered without user intervention"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20, "output_tokens": 5}
+            }),
+        ];
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice::<Value>(&body).unwrap());
+                let body = serde_json::to_vec(&response).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                reader.get_mut().write_all(&body).unwrap();
+                reader.get_mut().flush().unwrap();
+            }
+            requests
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!(
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 4\n"
+            ),
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let mut conversation = AgentConversation::default();
+
+        let output = run_agent(&agent, "Answer the question", &mut conversation).unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(output, "Recovered without user intervention");
+        assert_eq!(requests.len(), 2);
+        let retry_messages = requests[1]["messages"].as_array().unwrap();
+        assert!(retry_messages.iter().all(|message| {
+            message["role"] != "assistant"
+                || message["content"].as_array().is_some_and(|content| {
+                    content.iter().any(|part| {
+                        part["type"] == "text" || part["type"] == "tool_use"
+                    })
+                })
+        }));
+        assert!(retry_messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Provide a non-empty final answer"))));
+    }
+
+    #[test]
     fn empty_response_diagnostics_include_stop_reason_and_block_types() {
         let diagnostic = empty_response_diagnostic(
             &StopReason::End,
@@ -495,6 +594,7 @@
     fn system_prompt_guides_user_decisions_without_inventorying_ui_tools() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
         assert!(prompt.contains("Use `ask` when a user decision is required"));
+        assert!(prompt.contains("Use `calculate` for arithmetic and scientific expressions instead of estimating results; trigonometric angles are radians."));
         assert!(!prompt.contains("`notify` for a short TUI notification"));
         assert!(!prompt.contains("conversation is multi-turn"));
         assert!(!prompt.contains("buffers it and delivers it before pending tool calls"));
@@ -644,6 +744,7 @@
             "add_daily_entry",
             "explore",
             "review",
+            "calculate",
             "load_skill",
         ] {
             assert!(without_key.tools.contains_key(name), "missing tool {name}");

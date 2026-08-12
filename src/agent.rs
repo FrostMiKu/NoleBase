@@ -570,6 +570,7 @@ impl Agent {
             )));
         }
         agent.register(LoadSkill::new(&skills));
+        agent.register(Calculate);
         agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
         agent.register(Download::new(nole_root, client.clone())?);
         agent.register(ListNotes::new(nole_root)?);
@@ -734,7 +735,9 @@ impl Agent {
             let response_text = response.text();
             if tool_uses.is_empty() {
                 let output = response_text;
-                conversation.messages.push(response.message);
+                if !output.trim().is_empty() {
+                    conversation.messages.push(response.message);
+                }
                 self.checkpoint_conversation(conversation);
                 let buffered = self.take_buffered_prompts()?;
                 if !buffered.is_empty() {
