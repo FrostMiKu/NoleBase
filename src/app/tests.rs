@@ -986,6 +986,23 @@ fn right_from_the_file_tree_returns_to_the_open_document_without_opening_selecti
 }
 
 #[test]
+fn right_from_an_open_document_focuses_workspace_views_without_changing_page() {
+    let (mut app, _directory) = make_app();
+    let note = app.storage.data_dir.join("Open.md");
+    fs::write(&note, "open document\n").unwrap();
+    app.open_file_document(&note, DocumentReturn::Daily);
+
+    app.handle_key(key(KeyCode::Right));
+
+    assert_eq!(app.focus, Focus::Views);
+    assert_eq!(app.center_view, CenterView::Document);
+    assert_eq!(
+        app.document.as_ref().map(|document| &document.kind),
+        Some(&DocumentKind::File(note))
+    );
+}
+
+#[test]
 fn right_from_the_file_tree_returns_to_daily_without_opening_a_note() {
     let (mut app, _directory) = make_app();
     let note = app.storage.data_dir.join("Selected.md");

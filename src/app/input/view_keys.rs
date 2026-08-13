@@ -405,7 +405,7 @@ impl App {
                 None
             }
             code if is_right_key(code) => {
-                self.open_todo();
+                self.open_workspace_views();
                 None
             }
             KeyCode::PageDown => {
