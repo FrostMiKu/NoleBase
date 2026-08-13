@@ -538,11 +538,14 @@ retained as scroll state rather than rendered.
 
 The Agent reads through a single unified `read` tool that dispatches on its
 target. A UTF-8 file returns hashline text: a `[path#TAG]` header, absolute
-one-based `N:text` rows, and a pagination footer. File, PDF, URL, and attachment
-line windows use an inclusive selector suffix such as `data/note.md:50-200`.
-A directory returns a typed JSON listing, while an http(s) URL returns structured
-fetched content with HTML converted to Markdown. The reader is a parser registry,
-so additional formats can be added without changing dispatch logic. When
+one-based `N:text` rows, and a pagination footer. File, extracted document, URL,
+and attachment line windows use an inclusive selector suffix such as
+`data/note.md:50-200`. Office documents, OpenDocument, RTF, EPUB, CSV, and PDF
+are converted to Markdown in-process; extracted Markdown is cached by document
+identity so continuation reads do not repeat conversion. A directory returns a
+typed JSON listing, while an http(s) URL returns structured fetched content with
+HTML converted to Markdown. The reader is a parser registry, so additional
+formats can be added without changing dispatch logic. When
 configured, `search_web` queries Tavily with optional topic, depth, time range,
 answer, result-count, and included/excluded domain controls, then returns compact
 ranked results. Every user prompt sent to the Agent includes the current local

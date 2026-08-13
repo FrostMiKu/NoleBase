@@ -105,7 +105,7 @@ impl Tool for Calculate {
         }
 
         let expression = normalize_leading_decimal(expression);
-        meval::eval_str_with_context(expression.as_ref(), &evaluation_context())
+        meval::eval_str_with_context(expression.as_ref(), evaluation_context())
             .map(format_result)
             .map_err(|error| anyhow::anyhow!("invalid expression: {error}"))
     }

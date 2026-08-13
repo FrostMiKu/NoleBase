@@ -133,20 +133,3 @@ pub(super) fn char_to_byte(text: &str, char_index: usize) -> usize {
         .map(|(byte, _)| byte)
         .unwrap_or(text.len())
 }
-
-pub(super) fn cursor_row_col(input: &str, cursor: usize) -> (usize, usize) {
-    let mut line = 0;
-    let mut column = 0;
-    for (index, character) in input.chars().enumerate() {
-        if index == cursor {
-            break;
-        }
-        if character == '\n' {
-            line += 1;
-            column = 0;
-        } else {
-            column += character.width().unwrap_or(1);
-        }
-    }
-    (line, column)
-}

@@ -7,6 +7,8 @@
 //! logic — only a new parser registered before the generic text-file parser.
 //! Attachment reads are read-only: they never register an edit snapshot.
 
+mod document;
+
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read as _};
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::fs as async_fs;
 use tokio::io::AsyncReadExt as _;
 
@@ -31,12 +34,14 @@ use crate::agent::{
 use crate::attachment::{AttachmentId, AttachmentStore, AttachmentUri};
 use crate::storage::ATTACHMENTS_DIR;
 
+use self::document::{DocumentCache, DocumentFormat, DocumentSourceKey};
+
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
 const MAX_READ_RESPONSE_BYTES: usize = 1_000_000;
 const MAX_READ_LINE_BYTES: usize = 256 * 1024;
 const READ_RESPONSE_OVERHEAD: usize = 8 * 1024;
-const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_WEB_READ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTED_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NOTE_RESULTS: usize = 2_000;
@@ -96,6 +101,7 @@ pub(crate) struct ParseContext {
     pub(crate) reads: Arc<ReadTracker>,
     pub(crate) client: reqwest::Client,
     pub(crate) attachments: AttachmentStore,
+    documents: DocumentCache,
 }
 
 pub(crate) enum ReadPayload {
@@ -133,13 +139,14 @@ impl Read {
             reads,
             client,
             attachments,
+            documents: DocumentCache::default(),
         };
         // Order matters: the generic text-file parser must be tried last so a
         // more specific file parser (for example PDF) can claim a target first.
         let parsers: Vec<Box<dyn ReadParser>> = vec![
             Box::new(WebParser),
             Box::new(DirectoryParser),
-            Box::new(PdfFileParser),
+            Box::new(DocumentFileParser),
             Box::new(AttachmentParser),
             Box::new(TextFileParser),
         ];
@@ -153,7 +160,7 @@ impl Read {
         let file_index = self
             .parsers
             .iter()
-            .position(|parser| parser.name() == "pdf_file")
+            .position(|parser| parser.name() == "document_file")
             .unwrap_or(self.parsers.len());
         self.parsers.insert(file_index, Box::new(parser));
     }
@@ -169,7 +176,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, PDFs, and attachment URIs. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options."
+        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options."
     }
 
     fn input_schema(&self) -> Value {
@@ -178,7 +185,7 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Local file/PDF path, http(s) URL/PDF URL, or attachment URI, optionally suffixed with inclusive lines `:start-end`; or a directory path"
+                    "description": "Local file or document path, http(s) URL, or attachment URI, optionally suffixed with inclusive lines `:start-end`; or a directory path"
                 },
                 "range": range_schema(MAX_DIRECTORY_RESULTS),
                 "depth": {
@@ -564,73 +571,65 @@ impl ReadParser for TextFileParser {
     }
 }
 
-struct PdfFileParser;
+struct DocumentFileParser;
 
 #[async_trait::async_trait]
-impl ReadParser for PdfFileParser {
+impl ReadParser for DocumentFileParser {
     fn name(&self) -> &'static str {
-        "pdf_file"
+        "document_file"
     }
 
     fn matches(&self, target: &Target) -> bool {
-        matches!(target, Target::File { path, .. } if is_pdf_path(path))
+        matches!(target, Target::File { path, .. } if DocumentFormat::from_path(path).is_some())
     }
 
     async fn parse(
         &self,
-        _ctx: &ParseContext,
+        ctx: &ParseContext,
         target: &Target,
         input: &Value,
     ) -> Result<ReadPayload> {
         let Target::File { path, range } = target else {
-            bail!("pdf_file parser received non-file target");
+            bail!("document_file parser received non-file target");
         };
         let metadata = async_fs::metadata(path)
             .await
-            .with_context(|| format!("reading PDF {}", path.display()))?;
-        if metadata.len() > MAX_PDF_BYTES {
-            bail!("PDF exceeds the {MAX_PDF_BYTES} byte extraction limit");
+            .with_context(|| format!("reading document {}", path.display()))?;
+        if metadata.len() > MAX_DOCUMENT_BYTES {
+            bail!("document exceeds the {MAX_DOCUMENT_BYTES} byte extraction limit");
         }
         let (offset, limit) = line_window(*range, input)?;
-        let pdf_path = path.clone();
-        let text = tokio::task::spawn_blocking(move || {
-            pdf_extract::extract_text(&pdf_path)
-                .with_context(|| format!("extracting PDF {}", pdf_path.display()))
-        })
-        .await
-        .context("joining PDF extraction")??;
-        let page = page_extracted_text(&text, offset, limit, json_response_len)?;
-        let mut payload = json!({ "format": "pdf" });
+        let key = DocumentSourceKey::Local {
+            path: path.clone(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        };
+        let document_path = path.clone();
+        let document = ctx
+            .documents
+            .get_or_extract(key, || async move {
+                let bytes = async_fs::read(&document_path)
+                    .await
+                    .with_context(|| format!("reading document {}", document_path.display()))?;
+                if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+                    bail!("document exceeds the {MAX_DOCUMENT_BYTES} byte extraction limit");
+                }
+                let detected = DocumentFormat::from_bytes_or_path(&bytes, &document_path)
+                    .with_context(|| format!("unsupported document {}", document_path.display()))?;
+                document::extract_markdown(bytes, detected).await
+            })
+            .await?;
+        let page = page_extracted_text(&document.markdown, offset, limit, json_response_len)?;
+        let mut payload = json!({ "format": document.format.label() });
         add_structured_page(
             &mut payload,
             page,
-            &target.display(_ctx.root.as_path()),
+            &target.display(ctx.root.as_path()),
             offset,
             limit,
         );
         Ok(ReadPayload::Structured(payload))
     }
-}
-
-fn is_pdf_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
-}
-
-fn is_pdf_content(content_type: Option<&str>, url: &str, bytes: &[u8]) -> bool {
-    content_type
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/pdf"))
-        || url
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".pdf"))
-        || bytes.starts_with(b"%PDF-")
-}
-
-fn extract_pdf_bytes(bytes: Vec<u8>) -> Result<String> {
-    pdf_extract::extract_text_from_mem(&bytes).context("extracting PDF text")
 }
 
 struct AttachmentParser;
@@ -668,24 +667,45 @@ impl ReadParser for AttachmentParser {
             }
             return Ok(ReadPayload::Structured(payload));
         }
-        if mime.eq_ignore_ascii_case("application/pdf") {
-            if metadata.size > MAX_PDF_BYTES {
-                bail!("PDF exceeds the {MAX_PDF_BYTES} byte extraction limit");
+        let attachment_path = Path::new(&metadata.display_name);
+        if DocumentFormat::from_path(attachment_path).is_some() {
+            if metadata.size > MAX_DOCUMENT_BYTES {
+                bail!("document exceeds the {MAX_DOCUMENT_BYTES} byte extraction limit");
             }
             let (offset, limit) = line_window(*range, input)?;
-            let pdf_path = ctx
+            let document_path = ctx
                 .attachments
                 .open(uri.id())
                 .with_context(|| format!("opening attachment {uri}"))?;
-            let text = tokio::task::spawn_blocking(move || {
-                pdf_extract::extract_text(&pdf_path)
-                    .with_context(|| format!("extracting PDF {}", pdf_path.display()))
-            })
-            .await
-            .context("joining PDF extraction")??;
-            let page = page_extracted_text(&text, offset, limit, json_response_len)?;
+            let identity = async_fs::metadata(&document_path)
+                .await
+                .with_context(|| format!("reading attachment {uri}"))?;
+            let key = DocumentSourceKey::Attachment {
+                id: uri.id().to_string(),
+                len: identity.len(),
+                modified: identity.modified().ok(),
+            };
+            let display_name = metadata.display_name.clone();
+            let document = ctx
+                .documents
+                .get_or_extract(key, || async move {
+                    let bytes = async_fs::read(&document_path)
+                        .await
+                        .with_context(|| format!("reading attachment document {display_name}"))?;
+                    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+                        bail!("document exceeds the {MAX_DOCUMENT_BYTES} byte extraction limit");
+                    }
+                    let detected =
+                        DocumentFormat::from_bytes_or_path(&bytes, Path::new(&display_name))
+                            .with_context(|| {
+                                format!("unsupported attachment document {display_name}")
+                            })?;
+                    document::extract_markdown(bytes, detected).await
+                })
+                .await?;
+            let page = page_extracted_text(&document.markdown, offset, limit, json_response_len)?;
             let mut payload = attachment_metadata_json(*uri, &metadata);
-            payload["format"] = json!("pdf");
+            payload["format"] = json!(document.format.label());
             add_structured_page(&mut payload, page, &uri.to_string(), offset, limit);
             return Ok(ReadPayload::Structured(payload));
         }
@@ -897,13 +917,22 @@ impl ReadParser for WebParser {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let bytes = read_http_body_with_limit(response, "response", MAX_WEB_READ_BYTES).await?;
-        let (content, format) = if is_pdf_content(content_type.as_deref(), url, &bytes) {
-            let content = tokio::task::spawn_blocking(move || extract_pdf_bytes(bytes))
-                .await
-                .context("joining PDF extraction")??;
-            (content, "pdf")
+        let url_path = Path::new(url.split(['?', '#']).next().unwrap_or(url));
+        let detected = DocumentFormat::from_bytes_or_path(&bytes, url_path);
+        let (content, format) = if let Some(format) = detected {
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let document = ctx
+                .documents
+                .get_or_extract(DocumentSourceKey::Content(digest), || {
+                    document::extract_markdown(bytes, format)
+                })
+                .await?;
+            (document.markdown.clone(), document.format.label())
         } else {
-            (web_fetch_content(content_type.as_deref(), bytes)?, "text")
+            (
+                Arc::<str>::from(web_fetch_content(content_type.as_deref(), bytes)?),
+                "text",
+            )
         };
         let page = page_extracted_text(&content, offset, limit, json_response_len)?;
         let mut payload = json!({
@@ -1329,6 +1358,7 @@ mod tests {
             reads: Arc::new(ReadTracker::default()),
             client: reqwest::Client::new(),
             attachments: AttachmentStore::new(directory.join(ATTACHMENTS_DIR)),
+            documents: DocumentCache::default(),
         }
     }
 
@@ -1367,6 +1397,10 @@ mod tests {
             format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
         pdf
+    }
+
+    fn simple_rtf(lines: &[&str]) -> Vec<u8> {
+        format!("{{\\rtf1\\ansi {} }}", lines.join("\\par ")).into_bytes()
     }
 
     fn serve_once(
@@ -1422,6 +1456,47 @@ mod tests {
             .unwrap()
             .iter()
             .any(|line| line.as_str().unwrap().contains("PDF marker")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_documents_page_extracted_markdown_and_invalidate_on_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.rtf");
+        fs::write(&path, simple_rtf(&["first", "second", "third"])).unwrap();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(ReadTracker::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let first: Value = serde_json::from_str(
+            &read
+                .execute(&json!({"path": "report.rtf:1-1"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let second: Value = serde_json::from_str(
+            &read
+                .execute(&json!({"path": "report.rtf:3-3"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["format"], "rtf");
+        assert_eq!(first["items"], json!(["first"]));
+        assert_eq!(second["items"], json!(["second"]));
+
+        fs::write(&path, simple_rtf(&["replacement line", "new tail"])).unwrap();
+        let changed: Value = serde_json::from_str(
+            &read
+                .execute(&json!({"path": "report.rtf:1-1"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(changed["items"], json!(["replacement line"]));
     }
 
     #[tokio::test(flavor = "current_thread")]

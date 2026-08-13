@@ -2,6 +2,7 @@
 name = "nole"
 version = "0.9.0"
 edition = "2021"
+rust-version = "1.88"
 description = "An Agent-driven terminal knowledge management system"
 license = "MIT"
 repository = "https://github.com/FrostMiKu/NoleBase"
@@ -23,6 +24,7 @@ clipboard-rs = { version = "0.3.5", features = ["image"] }
 base64 = "0.22"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 anyhow = "1"
+anydoc = "0.1.8"
 async-trait = "0.1"
 cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
@@ -35,7 +37,6 @@ jsonschema = { version = "0.49", default-features = false }
 htmd = "0.5.5"
 notify = "8"
 open = "5"
-pdf-extract = "0.12"
 portable-pty = "0.9"
 unicode-width = "0.2.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
