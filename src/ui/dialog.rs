@@ -62,6 +62,11 @@ pub(super) fn draw_dialog(
             .max(1) as u16
     };
     let option_count = dialog.options.len() as u16;
+    let select_option_height = if dialog.purpose == DialogPurpose::SkillBrowser {
+        3
+    } else {
+        SELECT_OPTION_HEIGHT
+    };
     let desired_height = match dialog.mode {
         DialogMode::Confirm => 5,
         DialogMode::SingleLine => 5,
@@ -77,7 +82,7 @@ pub(super) fn draw_dialog(
             .saturating_add(2),
         DialogMode::SingleSelect | DialogMode::MultiSelect => message_rows
             .min(8)
-            .saturating_add(selection_list_height(option_count, SELECT_OPTION_HEIGHT))
+            .saturating_add(selection_list_height(option_count, select_option_height))
             .saturating_add(1)
             .saturating_add(2),
         DialogMode::Approval => approval_rows
