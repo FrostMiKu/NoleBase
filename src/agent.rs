@@ -694,6 +694,7 @@ impl Agent {
         let mut truncation_retries = 0usize;
         let mut round = 0u32;
         let mut round_limit = self.config.max_rounds;
+        let mut error_recovery_used = false;
 
         loop {
             let buffered = self.take_buffered_prompts()?;
@@ -705,6 +706,7 @@ impl Agent {
                 self.checkpoint_conversation(conversation);
                 round = 0;
                 round_limit = self.config.max_rounds;
+                error_recovery_used = false;
             }
             if round >= round_limit {
                 if !self.request_round_limit_decision(round).await? {
@@ -814,12 +816,17 @@ impl Agent {
                 ToolBatchExecution::Completed {
                     messages,
                     turn_boundary,
+                    retry_after_error,
                 } => {
                     conversation.messages.extend(messages);
                     self.checkpoint_conversation(conversation);
                     if turn_boundary {
                         round = 0;
                         round_limit = self.config.max_rounds;
+                    }
+                    if retry_after_error && round >= round_limit && !error_recovery_used {
+                        round = round.saturating_sub(1);
+                        error_recovery_used = true;
                     }
                 }
                 ToolBatchExecution::Denied(results) => {
@@ -1106,6 +1113,7 @@ impl Agent {
         tool_input_errors: &HashMap<String, String>,
     ) -> Result<ToolBatchExecution> {
         let mut results = Vec::with_capacity(tool_uses.len() + 1);
+        let mut retry_after_error = false;
         let mut buffered = Vec::new();
         let mut index = 0usize;
         while index < tool_uses.len() {
@@ -1145,14 +1153,15 @@ impl Agent {
             let denied = executions
                 .iter()
                 .any(|(_, execution)| matches!(execution, ToolCallExecution::Denied(_)));
-            results.extend(executions.into_iter().map(|(_, execution)| {
+            for (_, execution) in executions {
                 let result = match execution {
                     ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => {
                         result
                     }
                 };
-                Message::tool(result)
-            }));
+                retry_after_error |= result.is_error;
+                results.push(Message::tool(result));
+            }
             if denied {
                 results.extend(
                     tool_uses[end..]
@@ -1174,6 +1183,7 @@ impl Agent {
         Ok(ToolBatchExecution::Completed {
             messages: results,
             turn_boundary,
+            retry_after_error,
         })
     }
 

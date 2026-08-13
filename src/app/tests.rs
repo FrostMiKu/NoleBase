@@ -1789,6 +1789,46 @@ fn application_errors_notify_but_agent_tool_failures_do_not() {
 }
 
 #[test]
+fn next_round_replaces_a_failed_tool_status_with_working_state() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "bad-write".to_string(),
+            message: "Calling Write...".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "bad-write".to_string(),
+            message: "Failed Write: MBDown validation failed".to_string(),
+            preview: None,
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::Round {
+            current: 2,
+            limit: 25,
+        })
+        .unwrap();
+
+    app.poll_agent();
+
+    assert!(app.ai_running);
+    assert_eq!(app.agent_round, 2);
+    assert_eq!(app.status, "AI is working...");
+    assert!(matches!(
+        app.agent_panel.last().map(|entry| entry.as_ref()),
+        Some(AgentPanelEntry::Tool {
+            text,
+            active: false,
+            ..
+        }) if text == "Failed Write: MBDown validation failed"
+    ));
+}
+
+#[test]
 fn agent_open_file_event_displays_the_note_in_the_tui() {
     let (mut app, _directory) = make_app();
     let note = app.storage.data_dir.join("Agent View.md");

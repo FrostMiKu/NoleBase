@@ -1,42 +1,57 @@
     #[test]
-    fn failed_tool_result_is_checkpointed_as_complete_protocol_history() {
+    fn failed_tool_result_is_returned_before_the_round_limit_can_stop_recovery() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let response = json!({
-            "content": [{
-                "type": "tool_use",
-                "id": "bad-daily",
-                "name": "add_daily_entry",
-                "input": {"date": "2026-07-30"}
-            }],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 10, "output_tokens": 2}
-        });
+        let responses = [
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "bad-write",
+                    "name": "write",
+                    "input": {
+                        "path": "data/invalid.md",
+                        "content": "[box border=double]\nbody\n[/box]\n"
+                    }
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            }),
+            json!({
+                "content": [{"type": "text", "text": "Recovered after the rejected write"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 14, "output_tokens": 6}
+            }),
+        ];
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
+            let mut requests = Vec::new();
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
                 }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse().unwrap();
-                }
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
+                requests.push(serde_json::from_slice::<Value>(&request).unwrap());
+                let body = serde_json::to_vec(&response).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                reader.get_mut().write_all(&body).unwrap();
+                reader.get_mut().flush().unwrap();
             }
-            let mut request = vec![0; content_length];
-            reader.read_exact(&mut request).unwrap();
-            let body = serde_json::to_vec(&response).unwrap();
-            write!(
-                reader.get_mut(),
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            reader.get_mut().write_all(&body).unwrap();
-            reader.get_mut().flush().unwrap();
+            requests
         });
 
         let directory = tempfile::tempdir().unwrap();
@@ -50,11 +65,8 @@
         )
         .unwrap();
         let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
-        user_sender
-            .send(AskUserResponse::Answer("Stop".to_string()))
-            .unwrap();
-        let (event_sender, mut event_receiver) = event_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
         let agent = Agent::from_config(
             &storage.ai_config_path,
             &storage.root,
@@ -70,26 +82,19 @@
         .unwrap();
 
         assert_eq!(
-            run_agent(&agent, "Record this", &mut AgentConversation::default()).unwrap(),
-            ""
+            run_agent(&agent, "Write the note", &mut AgentConversation::default()).unwrap(),
+            "Recovered after the rejected write"
         );
-        server.join().unwrap();
-        let checkpoint = drain_events(&mut event_receiver)
-            .into_iter()
-            .filter_map(|event| match event {
-                AgentEvent::ConversationUpdated(conversation) => Some(conversation),
-                _ => None,
-            })
-            .next_back()
-            .unwrap();
-        assert_eq!(checkpoint.messages.len(), 3);
-        let MessagePart::ToolResult(result) = &checkpoint.messages[2].parts[0] else {
-            panic!("expected tool result");
-        };
-        assert_eq!(result.tool_use_id, "bad-daily");
-        assert!(result.is_error);
-        assert!(result.content.contains("invalid input for tool add_daily_entry"));
-        assert!(result.content.contains("content"));
+        let requests = server.join().unwrap();
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let result = &messages[2]["content"][0];
+        assert_eq!(result["tool_use_id"], "bad-write");
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("MBDown validation failed"));
+        assert!(!storage.data_dir.join("invalid.md").exists());
     }
 
     #[test]

@@ -141,6 +141,7 @@ pub(crate) enum ToolBatchExecution {
     Completed {
         messages: Vec<Message>,
         turn_boundary: bool,
+        retry_after_error: bool,
     },
     Denied(Vec<Message>),
 }

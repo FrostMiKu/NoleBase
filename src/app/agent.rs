@@ -244,6 +244,7 @@ impl App {
                 AgentEvent::Round { current, limit } => {
                     self.agent_round = current;
                     self.agent_round_limit = limit;
+                    self.set_status("AI is working...");
                 }
                 AgentEvent::ConversationUpdated(conversation) => {
                     self.agent_conversation = conversation;
