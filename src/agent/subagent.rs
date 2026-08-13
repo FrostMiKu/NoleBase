@@ -137,7 +137,9 @@ impl SubagentRunner {
             self.report_usage(response.token_usage);
             let calls = response.message.tool_calls().cloned().collect::<Vec<_>>();
             let text = response.text();
-            messages.push(response.message);
+            if !text.trim().is_empty() || !calls.is_empty() {
+                messages.push(response.message);
+            }
             if calls.is_empty() {
                 if !text.trim().is_empty() && response.stop_reason != StopReason::Length {
                     return Ok(text);

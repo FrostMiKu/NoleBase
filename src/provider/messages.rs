@@ -497,39 +497,62 @@ fn messages_wire(messages: &[Message]) -> Vec<Value> {
         let (role, blocks) = match message.role {
             MessageRole::User => (
                 "user",
-                message.parts.iter().filter_map(|part| match part {
-                    MessagePart::Text { text } => Some(json!({"type": "text", "text": text})),
-                    _ => None,
-                }).collect::<Vec<_>>(),
+                message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::Text { text } => Some(json!({"type": "text", "text": text})),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
             ),
             MessageRole::Tool => (
                 "user",
-                message.parts.iter().filter_map(|part| match part {
-                    MessagePart::ToolResult(result) => Some(json!({
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_use_id,
-                        "content": result.content,
-                        "is_error": result.is_error,
-                    })),
-                    _ => None,
-                }).collect::<Vec<_>>(),
+                message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::ToolResult(result) => Some(json!({
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_use_id,
+                            "content": result.content,
+                            "is_error": result.is_error,
+                        })),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
             ),
-            MessageRole::Assistant => (
-                "assistant",
-                message.parts.iter().map(|part| match part {
-                    MessagePart::Text { text } => json!({"type": "text", "text": text}),
-                    MessagePart::Thinking { thinking, signature } => json!({
-                        "type": "thinking", "thinking": thinking, "signature": signature
-                    }),
-                    MessagePart::RedactedThinking { data } => {
-                        json!({"type": "redacted_thinking", "data": data})
-                    }
-                    MessagePart::ToolUse(call) => json!({
-                        "type": "tool_use", "id": call.id, "name": call.name, "input": call.input
-                    }),
-                    MessagePart::ToolResult(_) => Value::Null,
-                }).filter(|value| !value.is_null()).collect::<Vec<_>>(),
-            ),
+            MessageRole::Assistant => {
+                let has_output = message.parts.iter().any(|part| match part {
+                    MessagePart::Text { text } => !text.trim().is_empty(),
+                    MessagePart::ToolUse(_) => true,
+                    _ => false,
+                });
+                (
+                    "assistant",
+                    message.parts.iter().filter_map(|part| {
+                        if !has_output {
+                            return None;
+                        }
+                        match part {
+                            MessagePart::Text { text } if !text.trim().is_empty() => {
+                                Some(json!({"type": "text", "text": text}))
+                            }
+                            MessagePart::Text { .. } => None,
+                            MessagePart::Thinking { thinking, signature } => Some(json!({
+                                "type": "thinking", "thinking": thinking, "signature": signature
+                            })),
+                            MessagePart::RedactedThinking { data } => {
+                                Some(json!({"type": "redacted_thinking", "data": data}))
+                            }
+                            MessagePart::ToolUse(call) => Some(json!({
+                                "type": "tool_use", "id": call.id, "name": call.name, "input": call.input
+                            })),
+                            MessagePart::ToolResult(_) => None,
+                        }
+                    }).collect::<Vec<_>>(),
+                )
+            }
         };
         if blocks.is_empty() {
             continue;
@@ -736,18 +759,46 @@ mod cache_tests {
     }
 
     #[test]
-    fn conversation_cache_skips_an_uncacheable_thinking_tail() {
+    fn thinking_only_assistant_is_not_replayed_as_an_invalid_message() {
         let messages = messages_wire(&[
-            Message::user("stable request"),
+            Message::user("original request"),
             Message::assistant(vec![MessagePart::Thinking {
-                thinking: "private reasoning".to_string(),
-                signature: Some("signature".to_string()),
+                thinking: "unfinished private reasoning".to_string(),
+                signature: None,
             }]),
+            Message::user("Provide a non-empty final answer"),
+            Message::user("continue"),
         ]);
 
-        let user = messages[0]["content"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["text"], "original request");
+        assert_eq!(content[1]["text"], "Provide a non-empty final answer");
+        assert_eq!(content[2]["text"], "continue");
+    }
+
+    #[test]
+    fn thinking_is_preserved_when_assistant_has_a_tool_call() {
+        let messages = messages_wire(&[
+            Message::user("research this"),
+            Message::assistant(vec![
+                MessagePart::Thinking {
+                    thinking: "research plan".to_string(),
+                    signature: Some("signature".to_string()),
+                },
+                MessagePart::ToolUse(ToolCall {
+                    id: "search-1".to_string(),
+                    name: "search_web".to_string(),
+                    input: json!({"query": "example"}),
+                }),
+            ]),
+        ]);
+
+        assert_eq!(messages.len(), 2);
         let assistant = messages[1]["content"].as_array().unwrap();
-        assert_eq!(user[0]["cache_control"]["type"], "ephemeral");
-        assert!(assistant[0].get("cache_control").is_none());
+        assert_eq!(assistant[0]["type"], "thinking");
+        assert_eq!(assistant[1]["type"], "tool_use");
     }
 }
