@@ -1361,6 +1361,31 @@ fn search_input_renders_the_shared_cursor_position() {
 }
 
 #[test]
+fn multiline_input_cursor_follows_greedy_mixed_width_wrapping() {
+    let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+    let mut cursor = None;
+
+    terminal
+        .draw(|frame| {
+            cursor = draw_multiline_input(
+                frame,
+                Rect::new(1, 0, 6, 3),
+                "abc中中",
+                5,
+                "",
+                true,
+                Theme::default(),
+            );
+        })
+        .unwrap();
+
+    assert_eq!(cursor, Some(Position::new(3, 1)));
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(1, 1)].symbol(), "中");
+    assert_eq!(buffer[(2, 1)].symbol(), " ");
+}
+
+#[test]
 fn todo_filter_renders_cursor_no_matches_and_filtered_selection_geometry() {
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Todo;

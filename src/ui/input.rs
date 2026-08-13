@@ -64,15 +64,9 @@ pub(super) fn draw_multiline_input(
             })
             .collect()
     };
-    let logical_widths: Vec<usize> = value.split('\n').map(UnicodeWidthStr::width).collect();
     let total_rows = lines.len();
-    let (cursor_line, cursor_column) = cursor_row_col(value, cursor);
-    let cursor_line = cursor_line.min(logical_widths.len().saturating_sub(1));
-    let rows_before: usize = logical_widths[..cursor_line]
-        .iter()
-        .map(|line_width| wrapped_row_count(*line_width, width))
-        .sum();
-    let wrapped_cursor_row = rows_before + cursor_column / width.max(1);
+    let (wrapped_cursor_row, wrapped_cursor_column) =
+        wrapped_cursor_position(value, cursor, width);
     let viewport_height = area.height as usize;
     let scroll = if total_rows <= viewport_height {
         0
@@ -84,7 +78,7 @@ pub(super) fn draw_multiline_input(
     let visible = visible_line_window(&lines, scroll, viewport_height);
     frame.render_widget(Paragraph::new(visible), area);
     show_cursor.then(|| {
-        let x = area.x + (cursor_column % width.max(1)) as u16;
+        let x = area.x + wrapped_cursor_column as u16;
         let visible_row = wrapped_cursor_row.saturating_sub(scroll);
         let y = area.y + (visible_row as u16).min(area.height.saturating_sub(1));
         Position::new(x.min(area.x + area.width - 1), y)
@@ -104,12 +98,33 @@ pub(super) fn visible_line_window<'a>(
         .collect()
 }
 
-pub(super) fn wrapped_row_count(line_width: usize, area_width: usize) -> usize {
-    if line_width == 0 || area_width == 0 {
-        1
-    } else {
-        line_width.div_ceil(area_width)
+
+pub(super) fn wrapped_cursor_position(
+    value: &str,
+    cursor: usize,
+    area_width: usize,
+) -> (usize, usize) {
+    let width = area_width.max(1);
+    let mut row: usize = 0;
+    let mut column: usize = 0;
+    for character in value.chars().take(cursor) {
+        if character == '\n' {
+            row += 1;
+            column = 0;
+            continue;
+        }
+        let character_width = character.width().unwrap_or(1);
+        if column > 0 && column.saturating_add(character_width) > width {
+            row += 1;
+            column = 0;
+        }
+        column = column.saturating_add(character_width);
     }
+    if column == width {
+        row += 1;
+        column = 0;
+    }
+    (row, column)
 }
 
 pub(super) fn char_to_byte(text: &str, char_index: usize) -> usize {
