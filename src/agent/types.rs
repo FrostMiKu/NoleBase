@@ -33,8 +33,10 @@ impl PermissionMode {
 pub enum ApprovalKind {
     /// Show the request as a scrollable unified/side-by-side diff panel.
     Diff,
-    /// Show the request as a confirmation dialog with the message in its body.
+    /// Show a non-destructive action as a confirmation dialog.
     Confirm,
+    /// Show an irreversible or data-removing action as an error-colored confirmation.
+    DestructiveConfirm,
 }
 
 #[derive(Clone, Debug)]

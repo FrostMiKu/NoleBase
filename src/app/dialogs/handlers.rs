@@ -33,7 +33,7 @@ impl App {
                 }
                 return None;
             }
-            DialogPurpose::AgentApproval => {
+            DialogPurpose::AgentApproval | DialogPurpose::AgentDestructiveApproval => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         let _ = self.send_approval(ApprovalDecision::Approve);
@@ -549,7 +549,9 @@ impl App {
         };
         match dialog.purpose {
             DialogPurpose::Help => self.help_scroll = dialog.scroll,
-            DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
+            DialogPurpose::AgentApproval | DialogPurpose::AgentDestructiveApproval => {
+                self.approval_scroll = dialog.scroll
+            }
             _ => {}
         }
     }
@@ -823,7 +825,9 @@ impl App {
                 self.rename_input = dialog.input.clone();
                 self.rename_cursor = dialog.cursor;
             }
-            DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
+            DialogPurpose::AgentApproval | DialogPurpose::AgentDestructiveApproval => {
+                self.approval_scroll = dialog.scroll
+            }
             DialogPurpose::Help => self.help_scroll = dialog.scroll,
             DialogPurpose::WikiLinkChoice => self.wiki_link_index = dialog.selected,
             DialogPurpose::ExportDestination => {}

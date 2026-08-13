@@ -114,10 +114,13 @@ pub(super) fn draw_dialog(
     clear_widget(frame, area);
     let destructive = matches!(
         dialog.purpose,
-        DialogPurpose::DeleteDaily | DialogPurpose::DeleteFile
-    ) || (dialog.mode == DialogMode::Confirm
-        && dialog.purpose == DialogPurpose::AgentApproval);
-    let warning = dialog.purpose == DialogPurpose::ExportOverwrite;
+        DialogPurpose::DeleteDaily
+            | DialogPurpose::DeleteFile
+            | DialogPurpose::AgentDestructiveApproval
+    );
+    let warning = dialog.purpose == DialogPurpose::ExportOverwrite
+        || (dialog.mode == DialogMode::Confirm
+            && dialog.purpose == DialogPurpose::AgentApproval);
     let border = match dialog.mode {
         _ if destructive => app.theme.ui_error,
         _ if warning => app.theme.ui_warning,

@@ -874,11 +874,12 @@ impl App {
         if self.overlay == Some(Overlay::Approval) {
             self.overlay = None;
         }
-        if self
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.purpose == DialogPurpose::AgentApproval)
-        {
+        if self.dialog.as_ref().is_some_and(|dialog| {
+            matches!(
+                dialog.purpose,
+                DialogPurpose::AgentApproval | DialogPurpose::AgentDestructiveApproval
+            )
+        }) {
             self.dialog = None;
         }
         Ok(())

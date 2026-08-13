@@ -335,17 +335,26 @@ impl App {
             Overlay::Approval => {
                 let request = self.approval_request.as_ref();
                 let mut dialog = match request.map(|request| request.kind) {
-                    Some(ApprovalKind::Confirm) => DialogState::new(
-                        request
-                            .map(|request| request.title.clone())
-                            .unwrap_or_else(|| "Confirm change".to_string()),
-                        request
-                            .map(|request| request.message.clone())
-                            .unwrap_or_default(),
-                        DialogMode::Confirm,
-                        DialogPurpose::AgentApproval,
-                        Vec::new(),
-                    ),
+                    Some(ApprovalKind::Confirm | ApprovalKind::DestructiveConfirm) => {
+                        let destructive = request.is_some_and(|request| {
+                            request.kind == ApprovalKind::DestructiveConfirm
+                        });
+                        DialogState::new(
+                            request
+                                .map(|request| request.title.clone())
+                                .unwrap_or_else(|| "Confirm change".to_string()),
+                            request
+                                .map(|request| request.message.clone())
+                                .unwrap_or_default(),
+                            DialogMode::Confirm,
+                            if destructive {
+                                DialogPurpose::AgentDestructiveApproval
+                            } else {
+                                DialogPurpose::AgentApproval
+                            },
+                            Vec::new(),
+                        )
+                    }
                     _ => DialogState::new(
                         request
                             .map(|request| request.title.clone())

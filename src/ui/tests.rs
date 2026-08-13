@@ -1860,12 +1860,27 @@ fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
 }
 
 #[test]
-fn confirm_approval_renders_as_a_destructive_confirmation_dialog() {
+fn confirm_approvals_distinguish_regular_actions_from_destructive_actions() {
     let (mut app, _directory) = make_app();
+    app.approval_request = Some(ApprovalRequest {
+        title: "Export file".to_string(),
+        message: "Export data/Note.md as PDF to Note.pdf?".to_string(),
+        kind: ApprovalKind::Confirm,
+    });
+    app.set_overlay(Overlay::Approval);
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Export file"));
+    assert!(screen.contains("Enter/Y confirm · N/Esc cancel"));
+    let overlay = app.layout.overlay.expect("confirm overlay");
+    let corner_fg = terminal.backend().buffer()[(overlay.x, overlay.y)].fg;
+    assert_eq!(corner_fg, app.theme.ui_warning);
+    assert_ne!(corner_fg, app.theme.ui_error);
+
     app.approval_request = Some(ApprovalRequest {
         title: "Delete file".to_string(),
         message: "Delete data/Empty.md?".to_string(),
-        kind: ApprovalKind::Confirm,
+        kind: ApprovalKind::DestructiveConfirm,
     });
     app.set_overlay(Overlay::Approval);
     let terminal = render(&mut app, 100, 24);

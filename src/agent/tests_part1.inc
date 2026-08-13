@@ -757,7 +757,7 @@
         let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
             panic!("expected approval request");
         };
-        assert_eq!(request.kind, ApprovalKind::Confirm);
+        assert_eq!(request.kind, ApprovalKind::DestructiveConfirm);
         assert_eq!(request.title, "Delete file");
         assert_eq!(request.message, "Delete data/delete.md?");
         decision_sender.send(ApprovalDecision::Approve).unwrap();

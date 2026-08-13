@@ -1062,7 +1062,7 @@ impl Tool for Delete {
                 .request(ApprovalRequest {
                     title: "Delete file".to_string(),
                     message: format!("Delete {relative}?"),
-                    kind: ApprovalKind::Confirm,
+                    kind: ApprovalKind::DestructiveConfirm,
                 })
                 .await?;
         }
@@ -1372,7 +1372,7 @@ mod tests {
                 _ => None,
             })
             .expect("delete_file must request approval");
-        assert_eq!(request.kind, ApprovalKind::Confirm);
+        assert_eq!(request.kind, ApprovalKind::DestructiveConfirm);
         assert_eq!(request.title, "Delete file");
         assert_eq!(request.message, "Delete Old.md?");
     }

@@ -14,7 +14,10 @@ impl App {
                     };
                     match dialog.purpose {
                         DialogPurpose::Help => self.help_scroll = dialog.scroll,
-                        DialogPurpose::AgentApproval => self.approval_scroll = dialog.scroll,
+                        DialogPurpose::AgentApproval
+                        | DialogPurpose::AgentDestructiveApproval => {
+                            self.approval_scroll = dialog.scroll
+                        }
                         _ => {}
                     }
                 }

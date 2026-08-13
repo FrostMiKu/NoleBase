@@ -600,7 +600,7 @@ impl Tool for DeleteAttachment {
                      refused while any note still references it.",
                     metadata.display_name, metadata.size
                 ),
-                kind: ApprovalKind::Confirm,
+                kind: ApprovalKind::DestructiveConfirm,
             })
             .await?;
         let storage = Storage::new(&self.root)?;
@@ -1120,7 +1120,7 @@ mod tests {
         let AgentEvent::Approval(request) = event_receiver.blocking_recv().unwrap() else {
             panic!("expected approval request");
         };
-        assert_eq!(request.kind, ApprovalKind::Confirm);
+        assert_eq!(request.kind, ApprovalKind::DestructiveConfirm);
         assert_eq!(request.title, "Delete attachment");
         assert!(request.message.contains(&uri));
         decision_sender.send(ApprovalDecision::Deny).unwrap();

@@ -22,6 +22,7 @@ pub enum DialogPurpose {
     DeleteFile,
     AgentPrompt,
     AgentApproval,
+    AgentDestructiveApproval,
     AskUser,
     WikiLinkChoice,
     Help,
