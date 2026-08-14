@@ -338,14 +338,15 @@ pub(super) fn render_chat_thinking_box(
     };
     let body_indent = CHAT_BLOCK_PAD + 1 + 1;
     let body_width = width.saturating_sub(body_indent * 2).max(1);
-    let mut markdown = crate::markdown::render_at_width(text, body_width, theme);
+    let text = crate::markdown::expand_tabs(text);
+    let mut body_lines = wrap_spans_to_width(&[Span::raw(text.into_owned())], body_width)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     let hidden_rows = if show_full_thinking {
         0
     } else {
-        markdown
-            .lines
-            .len()
-            .saturating_sub(DEFAULT_THINKING_BODY_ROWS)
+        body_lines.len().saturating_sub(DEFAULT_THINKING_BODY_ROWS)
     };
     let mut title_spans = vec![
         Span::raw(" ".repeat(CHAT_BLOCK_PAD)),
@@ -375,49 +376,22 @@ pub(super) fn render_chat_thinking_box(
     // Body rows align with the "thinking" label's first letter: one pad column
     // plus the spinner cell plus its trailing space. Thinking text stays muted.
     if hidden_rows > 0 {
-        markdown.lines.drain(..hidden_rows);
+        body_lines.drain(..hidden_rows);
     }
-    for line in &mut markdown.lines {
+    for line in &mut body_lines {
         for span in &mut line.spans {
             span.style = span.style.fg(theme.text_muted);
         }
     }
-    let body_row = lines.len();
-    let links = markdown
-        .links
-        .into_iter()
-        .filter_map(|mut link| {
-            if link.row < hidden_rows {
-                return None;
-            }
-            link.row = link.row - hidden_rows + body_row;
-            link.column += body_indent;
-            Some(link)
-        })
-        .collect();
-    let images = markdown
-        .images
-        .into_iter()
-        .filter_map(|mut image| {
-            if image.row < hidden_rows {
-                return None;
-            }
-            image.row = image.row - hidden_rows + body_row;
-            image.column += body_indent;
-            Some(image)
-        })
-        .collect();
-    for markdown_line in markdown.lines {
-        for body in wrap_spans_to_width(&markdown_line.spans, body_width) {
-            let mut spans = Vec::with_capacity(body.len() + 1);
-            spans.push(Span::raw(" ".repeat(body_indent)));
-            spans.extend(body);
-            lines.push(line_with_background(spans, width, style));
-        }
+    for body in body_lines {
+        let mut spans = Vec::with_capacity(body.spans.len() + 1);
+        spans.push(Span::raw(" ".repeat(body_indent)));
+        spans.extend(body.spans);
+        lines.push(line_with_background(spans, width, style));
     }
     lines.push(line_with_background(Vec::new(), width, style));
     lines.push(Line::default());
-    (lines, links, images)
+    (lines, Vec::new(), Vec::new())
 }
 
 #[cfg(test)]
@@ -928,6 +902,23 @@ mod tests {
             .iter()
             .any(|line| line.to_string().contains("line 1")));
         assert!(!full[1].to_string().contains(TRUNCATED_THINKING_LABEL));
+    }
+
+    #[test]
+    fn chat_thinking_renders_invalid_mbdown_as_literal_plain_text() {
+        let source = r#"Planning [box title="..." width=WIDTH and **not styled**"#;
+        let (lines, links, images) =
+            render_chat_thinking_box(source, true, 180, 0, true, Theme::default());
+        let output = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(output.contains(source), "{output:?}");
+        assert!(!output.contains("MBDown parse error"), "{output:?}");
+        assert!(links.is_empty());
+        assert!(images.is_empty());
     }
 
     #[test]

@@ -95,7 +95,7 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
     }
 }
 
-fn expand_tabs(source: &str) -> Cow<'_, str> {
+pub(crate) fn expand_tabs(source: &str) -> Cow<'_, str> {
     if !source.contains('\t') {
         return Cow::Borrowed(source);
     }
