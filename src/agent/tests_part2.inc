@@ -596,68 +596,9 @@
     }
 
     #[test]
-    fn system_prompt_guides_user_decisions_without_inventorying_ui_tools() {
+    fn system_prompt_stays_compact() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains("Use `ask` when a user decision is required"));
-        assert!(prompt.contains("Use `calculate` for arithmetic and scientific expressions instead of estimating results; trigonometric angles are radians."));
-        assert!(!prompt.contains("`notify` for a short TUI notification"));
-        assert!(!prompt.contains("conversation is multi-turn"));
-        assert!(!prompt.contains("buffers it and delivers it before pending tool calls"));
-        assert!(!prompt.contains("Final text is not saved automatically"));
-    }
-
-    #[test]
-    fn system_prompt_contains_stable_user_facing_contracts_only() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-
-        for required in [
-            "do not invent workspace state",
-            "CommonMark with a small MBDown extension set",
-            "#tag",
-            "[[wikilink]]",
-            "![[file]]",
-            "Fenced `mermaid` blocks",
-            "Restricted BBCode",
-            "Local links and embeds are relative to the containing note",
-            "Root: /tmp/nole",
-            "Managed notes live in `data/`, `daily/`, and `archives/`",
-            "Use `workspace/main/` for temporary or intermediate files",
-            "`config/` is read-only",
-            "Never read or expose `config/ai.toml`",
-            "Read a file before editing it and use the returned snapshot tag",
-            "Use `add_daily_entry`",
-            "Use `export_file` when the destination is outside Nole",
-            "Use `explore` for broad investigation",
-            "Use `read` to inspect a URL",
-        ] {
-            assert!(prompt.contains(required), "missing: {required}");
-        }
-
-        for internal_or_stale in [
-            "HTML/PDF",
-            "exact original bytes or standalone HTML",
-            "width-aware Unicode character diagrams",
-            "must start a source line or follow whitespace",
-            "public or private-network hosts",
-            "persists across restarts",
-            "agent-session.json",
-            "active theme selection",
-            "range, returned, total, has_more",
-            "64 MiB",
-            "bypass mode",
-            "preserves the display name, import source, and import time",
-            "config/AGENTS.md",
-            "Agent memory (MEMORY.md)",
-            "search_web",
-            "`notify` for a short TUI notification",
-            "Use `open` when",
-        ] {
-            assert!(
-                !prompt.contains(internal_or_stale),
-                "internal or stale detail leaked: {internal_or_stale}"
-            );
-        }
-        assert!(prompt.len() < 5_500, "system prompt grew to {} bytes", prompt.len());
+        assert!(prompt.len() < 1_750, "system prompt grew to {} bytes", prompt.len());
     }
 
     #[test]

@@ -39,13 +39,9 @@ pub(crate) fn system_prompt_sections(
 ) -> Vec<SystemBlock> {
     let project_marker = "## Project instructions";
     let memory_marker = "## Memory";
-    let template = system_prompt_text(root);
-    let (base, _) = template
-        .split_once(project_marker)
-        .expect("system prompt contains the project-instructions section");
     vec![
         SystemBlock {
-            text: base.trim_end().to_string(),
+            text: system_prompt_text(root),
             cache: true,
         },
         SystemBlock {
@@ -65,7 +61,7 @@ pub(crate) fn system_prompt_sections(
 
 pub(crate) fn skill_catalog_prompt(skills: &[Skill]) -> String {
     let mut prompt = String::from(
-        "## Available skills\nSkills are user-owned workflow instructions. Load a relevant skill before following it. Skill instructions supplement the current request and do not grant tools or permissions.\n",
+        "## Available skills\nSkills supplement the current request and do not grant tools or permissions.\n",
     );
     if skills.is_empty() {
         prompt.push_str("No skills are currently available.");
@@ -89,41 +85,15 @@ pub(crate) fn system_prompt(root: &Path, agents_instructions: &str, memory: &str
 
 fn system_prompt_text(root: &Path) -> String {
     format!(
-        r#"You are the AI assistant in Nole, a terminal note app. Work from the user's files and tool results; do not invent workspace state.
+        r#"You are Nole's note assistant. Base claims and edits on the user's files and tool results; never invent workspace state.
 
-## Authoring notes
-Nole notes use CommonMark with a small MBDown extension set. Prefer ordinary Markdown unless an extension improves the result.
-- `#tag`, `[[wikilink]]`, and `![[file]]` are supported. Wikilinks find `.md`/`.mb` notes in `daily/`, `data/`, and `archives/`.
-- Resolve a `[[target]]` with `resolve_wikilink` before writing it, and use `backlinks` to find which notes link to a note. `rename_wikilink` updates every link target across the workspace.
-- Fenced `mermaid` blocks are supported.
-- Local links and embeds are relative to the containing note; links in chat are relative to the Nole root. Image embeds support png, jpg, jpeg, gif, and webp.
-- Restricted BBCode: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=#12abef]`, `[bg=17]`, `[link=https://example.com]`, `[center]`, `[right]`, `[indent first=4]`, `[box title="Info" width=full border=single border-color=#12abef bg=17 px=1 py=0]`, `[columns gap=2]`, and `[column width=1fr]`. Close tags; box borders are `single` or `none`.
-Never emit terminal escape sequences.
+## Notes
+Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`, and closed BBCode tags: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=COLOR]`, `[bg=COLOR]`, `[link=URL]`, `[center]`, `[right]`, `[indent first=N]`, `[box title="..." width=WIDTH border=single|none border-color=COLOR bg=COLOR px=N py=N]`, `[columns gap=N]`, and `[column width=WIDTH]`. Colors may be names, palette indexes, or `#RRGGBB`. Close every tag. Resolve wikilinks before creating or changing their targets. Local links in notes are relative to the containing note; links in chat are relative to the Nole root. Never emit terminal escape sequences.
 
 ## Workspace
 Root: {root}
-- Managed notes live in `data/`, `daily/`, and `archives/`.
-- Use `workspace/main/` for temporary or intermediate files.
-- `themes/`, `template.mb`, and `MEMORY.md` are user-editable.
-- `config/` is read-only. Never read or expose `config/ai.toml`.
-- Use attachment tools for `attachments/`; never access its physical storage directly.
-
-## Tool guidance
-- Paths are relative to the Nole root unless a tool says otherwise.
-- Read a file before editing it and use the returned snapshot tag. Use `edit` for existing files and `write` only for new files.
-- Use `add_daily_entry` to create or append a daily note; existing daily notes can be read, edited, or deleted.
-- Use `export_file` when the destination is outside Nole; it never overwrites.
-- Use `explore` for broad investigation and `review` for independent evaluation; use direct tools for focused work.
-- Use `calculate` for arithmetic and scientific expressions instead of estimating results; trigonometric angles are radians.
-- Use `read` to inspect a URL. Use `download` when the bytes must be kept in `workspace/main/`, including before importing a remote file as an attachment.
-- Use `ask` when a user decision is required.
-
-## Attachments
-- `import_attachment` creates a new attachment from an existing file and returns its canonical URI plus Markdown.
-- To modify the same attachment, use `checkout_attachment`, edit the workspace copy, then call `update_attachment` with the returned `expected_content_token`. Import the copy instead when a separate attachment is intended.
-- Use `list_attachments` or `attachment_info` to inspect attachments. `delete_attachment` only removes an unreferenced attachment.
-
-## Project instructions"#,
+- Managed notes are in `data/`, `daily/`, and `archives/`; use `workspace/main/` for intermediate files. Paths are relative to the Nole root unless a tool says otherwise.
+- Never read or expose `config/ai.toml`, and access attachments only through attachment tools."#,
         root = root.display(),
     )
 }

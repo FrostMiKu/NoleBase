@@ -849,34 +849,6 @@
     }
 
     #[test]
-    fn system_prompt_connects_download_and_attachment_workflows() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains("Use `download` when the bytes must be kept in `workspace/main/`"));
-        assert!(prompt.contains("before importing a remote file as an attachment"));
-        assert!(prompt.contains("`import_attachment` creates a new attachment"));
-    }
-
-    #[test]
-    fn system_prompt_keeps_the_attachment_update_contract() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains("checkout_attachment"));
-        assert!(prompt.contains("update_attachment"));
-        assert!(prompt.contains("expected_content_token"));
-        assert!(prompt.contains("Import the copy instead when a separate attachment is intended"));
-        assert!(prompt.contains("delete_attachment` only removes an unreferenced attachment"));
-    }
-
-    #[test]
-    fn system_prompt_distinguishes_exploration_and_review_without_protocol_details() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains("Use `explore` for broad investigation"));
-        assert!(prompt.contains("`review` for independent evaluation"));
-        assert!(!prompt.contains("isolated read-only agent"));
-        assert!(!prompt.contains("internal work stays out of this conversation"));
-        assert!(!prompt.contains("configured round budget"));
-    }
-
-    #[test]
     fn user_prompt_includes_current_local_datetime() {
         let now = Local::now();
         let prompt = prompt_with_datetime("Summarize this", now);
