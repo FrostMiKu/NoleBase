@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,6 +12,23 @@ pub mod completions;
 pub mod messages;
 
 pub const DEFAULT_STREAM_BUFFER: usize = 1_024;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+pub(crate) fn build_agent_http_client() -> reqwest::Result<Client> {
+    build_agent_http_client_with_timeouts(HTTP_CONNECT_TIMEOUT, HTTP_READ_IDLE_TIMEOUT)
+}
+
+fn build_agent_http_client_with_timeouts(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> reqwest::Result<Client> {
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
 
 #[derive(Debug)]
 struct TransientProviderError(String);
@@ -229,6 +248,10 @@ pub(crate) fn parse_tool_input(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+
+    use futures_util::StreamExt;
+
     use super::*;
 
     fn assert_send_sync<T: Provider>() {}
@@ -243,5 +266,54 @@ mod tests {
             completions::CompletionsProvider::new("key", "https://example.com").unwrap();
         let providers: [&dyn Provider; 2] = [&messages, &completions];
         assert_eq!(providers.len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_timeout_resets_while_response_body_keeps_arriving() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream.get_mut(),
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.get_mut().flush().unwrap();
+            for chunk in [b"one".as_slice(), b"two", b"three"] {
+                std::thread::sleep(Duration::from_millis(450));
+                write!(stream.get_mut(), "{:X}\r\n", chunk.len()).unwrap();
+                stream.get_mut().write_all(chunk).unwrap();
+                stream.get_mut().write_all(b"\r\n").unwrap();
+                stream.get_mut().flush().unwrap();
+            }
+            stream.get_mut().write_all(b"0\r\n\r\n").unwrap();
+            stream.get_mut().flush().unwrap();
+        });
+
+        let client =
+            build_agent_http_client_with_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+                .unwrap();
+        let response = client
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let mut received = Vec::new();
+        while let Some(chunk) = body.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        server.join().unwrap();
+
+        assert_eq!(received, b"onetwothree");
     }
 }

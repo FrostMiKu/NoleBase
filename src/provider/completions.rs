@@ -13,8 +13,8 @@ use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
 
 use super::{
-    parse_tool_input, transient_provider_error, AssistantMessage, Message, MessagePart,
-    MessageRole, Provider, ProviderEvent, ProviderRequest, StopReason, ToolCall,
+    build_agent_http_client, parse_tool_input, transient_provider_error, AssistantMessage, Message,
+    MessagePart, MessageRole, Provider, ProviderEvent, ProviderRequest, StopReason, ToolCall,
     DEFAULT_STREAM_BUFFER,
 };
 
@@ -36,11 +36,7 @@ impl CompletionsProvider {
         Ok(Self {
             api_key: api_key.into(),
             base_url,
-            client: Client::builder()
-                .timeout(Duration::from_secs(90))
-                .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .context("building Completions HTTP client")?,
+            client: build_agent_http_client().context("building Completions HTTP client")?,
         })
     }
 

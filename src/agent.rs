@@ -26,8 +26,9 @@ use crate::provider::messages::MessagesProvider;
 #[cfg(test)]
 use crate::provider::MessagePart;
 use crate::provider::{
-    is_transient_provider_error, ApiFormat, AssistantMessage, Message, Provider, ProviderEvent,
-    ProviderRequest, StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
+    build_agent_http_client, is_transient_provider_error, ApiFormat, AssistantMessage, Message,
+    Provider, ProviderEvent, ProviderRequest, StopReason, SystemBlock, ToolCall, ToolResult,
+    ToolSpec,
 };
 use crate::skill::{load_skill_catalog, SkillCatalog};
 #[cfg(test)]
@@ -189,11 +190,7 @@ impl ApprovalGate {
 }
 
 fn build_http_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(90))
-        .user_agent(concat!("nole/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")
+    build_agent_http_client().context("building HTTP client")
 }
 
 async fn recv_while_active<T>(
