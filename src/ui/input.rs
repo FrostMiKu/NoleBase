@@ -65,8 +65,7 @@ pub(super) fn draw_multiline_input(
             .collect()
     };
     let total_rows = lines.len();
-    let (wrapped_cursor_row, wrapped_cursor_column) =
-        wrapped_cursor_position(value, cursor, width);
+    let (wrapped_cursor_row, wrapped_cursor_column) = wrapped_cursor_position(value, cursor, width);
     let viewport_height = area.height as usize;
     let scroll = if total_rows <= viewport_height {
         0
@@ -97,7 +96,6 @@ pub(super) fn visible_line_window<'a>(
         .cloned()
         .collect()
 }
-
 
 pub(super) fn wrapped_cursor_position(
     value: &str,
