@@ -1,4 +1,4 @@
-//! Central validation policy for files written by Agent tools.
+//! Preconditions and post-write diagnostics for files written by Agent tools.
 
 use std::fs;
 use std::path::Path;
@@ -10,8 +10,13 @@ pub(super) enum WriteSource<'a> {
     File(&'a Path),
 }
 
-/// Validate the complete candidate at `destination` before a tool changes files.
-pub(super) fn validate_write(
+/// Enforce file contracts that must hold before a tool changes files.
+///
+/// Ordinary Markdown and MBDown syntax is diagnosed after publication so the
+/// Agent can repair the persisted file with a focused edit. Skill documents
+/// remain atomic because malformed metadata would change their executable
+/// contract rather than merely their rendering.
+pub(super) fn validate_write_preconditions(
     root: &Path,
     destination: &Path,
     source: WriteSource<'_>,
@@ -28,17 +33,33 @@ pub(super) fn validate_write(
         }
         return Ok(());
     }
-
-    match source {
-        WriteSource::Text(content) => validate_mbdown(destination, content)?,
-        WriteSource::File(path) if is_mbdown_path(destination) => {
-            let content = fs::read_to_string(path)
-                .with_context(|| format!("reading Markdown candidate {}", path.display()))?;
-            validate_mbdown(destination, &content)?;
-        }
-        WriteSource::File(_) => {}
-    }
     Ok(())
+}
+
+/// Add a non-blocking MBDown diagnostic after a file mutation has succeeded.
+pub(super) fn post_write_result(summary: String, display_path: &str, path: &Path) -> String {
+    match mbdown_warning(display_path, path) {
+        Some(warning) => format!(
+            "{summary}\n{warning}\nThe file change succeeded. Read it and use edit to fix the reported issue."
+        ),
+        None => summary,
+    }
+}
+
+pub(super) fn mbdown_warning(display_path: &str, path: &Path) -> Option<String> {
+    if !is_mbdown_path(path) {
+        return None;
+    }
+    let diagnostic = match fs::read_to_string(path) {
+        Ok(content) => mbdown::validate(&content)
+            .err()
+            .map(|error| error.to_string()),
+        Err(error) => Some(format!(
+            "could not read the written file for validation: {error}"
+        )),
+    };
+    diagnostic
+        .map(|diagnostic| format!("MBDown validation warning for {display_path}: {diagnostic}"))
 }
 
 fn validate_skill_destination(skills: &Path, destination: &Path) -> Result<()> {
@@ -90,16 +111,6 @@ fn is_mbdown_path(path: &Path) -> bool {
         })
 }
 
-fn validate_mbdown(path: &Path, content: &str) -> Result<()> {
-    if !is_mbdown_path(path) {
-        return Ok(());
-    }
-    if let Err(error) = mbdown::validate(content) {
-        bail!("MBDown validation failed for {}: {error}", path.display());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,13 +123,13 @@ mod tests {
         let root = directory.path();
         fs::create_dir(root.join("skills")).unwrap();
 
-        validate_write(
+        validate_write_preconditions(
             root,
             &root.join("skills/valid-skill.md"),
             WriteSource::Text(VALID_SKILL),
         )
         .unwrap();
-        assert!(validate_write(
+        assert!(validate_write_preconditions(
             root,
             &root.join("skills/broken.md"),
             WriteSource::Text("# Missing front matter"),
@@ -126,7 +137,7 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("front matter"));
-        assert!(validate_write(
+        assert!(validate_write_preconditions(
             root,
             &root.join("skills/nested/valid-skill.md"),
             WriteSource::Text(VALID_SKILL),
@@ -143,7 +154,7 @@ mod tests {
         fs::create_dir(root.join("skills")).unwrap();
         let oversized = "x".repeat(crate::skill::MAX_SKILL_BYTES as usize + 1);
 
-        let error = validate_write(
+        let error = validate_write_preconditions(
             root,
             &root.join("skills/oversized.md"),
             WriteSource::Text(&oversized),
@@ -162,13 +173,13 @@ mod tests {
         fs::write(&valid, VALID_SKILL).unwrap();
         fs::write(&invalid, "not a Skill").unwrap();
 
-        validate_write(
+        validate_write_preconditions(
             root,
             &root.join("skills/transferred.md"),
             WriteSource::File(&valid),
         )
         .unwrap();
-        assert!(validate_write(
+        assert!(validate_write_preconditions(
             root,
             &root.join("skills/transferred.md"),
             WriteSource::File(&invalid),

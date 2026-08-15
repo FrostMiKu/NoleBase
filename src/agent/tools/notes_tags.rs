@@ -9,7 +9,7 @@ use super::util::{
     display_path, fuzzy_match, limited_diff, range_schema, required_string, truncate_chars,
     RangeSelector, MAX_DIFF_BYTES, MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
 };
-use super::write_policy::{validate_write, WriteSource};
+use super::write_policy::mbdown_warning;
 use crate::agent::{
     canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy,
 };
@@ -359,23 +359,19 @@ impl Tool for AddDailyEntry {
             .clone()
             .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
         let path = self.storage.daily_file_path(&date)?;
-        let mut candidate = match std::fs::read_to_string(&path) {
-            Ok(existing) => existing,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-        };
-        if !candidate.is_empty() {
-            candidate.push('\n');
-        }
-        candidate.push_str(content);
-        candidate.push('\n');
-        validate_write(&self.storage.root, &path, WriteSource::Text(&candidate))?;
         let note = match requested_date {
             Some(date) => self.storage.append_daily(&date, content)?,
             None => self.storage.append_to_today(content)?,
         };
-        serde_json::to_string(&json!({ "date": note.date.to_string() }))
-            .context("encoding daily result")
+        let display_path = format!("daily/{}.md", note.date);
+        let mut result = json!({ "date": note.date.to_string() });
+        if let Some(warning) = mbdown_warning(&display_path, &path) {
+            result["mbdown_warning"] = json!(warning);
+            result["repair"] = json!(
+                "The entry was added. Read the daily note and use edit to fix the reported issue."
+            );
+        }
+        serde_json::to_string(&result).context("encoding daily result")
     }
 }
 

@@ -1,5 +1,5 @@
     #[test]
-    fn failed_tool_result_is_returned_before_the_round_limit_can_stop_recovery() {
+    fn post_write_diagnostic_is_returned_before_the_round_limit_can_stop_repair() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let responses = [
@@ -17,7 +17,7 @@
                 "usage": {"input_tokens": 10, "output_tokens": 2}
             }),
             json!({
-                "content": [{"type": "text", "text": "Recovered after the rejected write"}],
+                "content": [{"type": "text", "text": "Received the persisted-file diagnostic"}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 14, "output_tokens": 6}
             }),
@@ -83,18 +83,21 @@
 
         assert_eq!(
             run_agent(&agent, "Write the note", &mut AgentConversation::default()).unwrap(),
-            "Recovered after the rejected write"
+            "Received the persisted-file diagnostic"
         );
         let requests = server.join().unwrap();
         let messages = requests[1]["messages"].as_array().unwrap();
         let result = &messages[2]["content"][0];
         assert_eq!(result["tool_use_id"], "bad-write");
-        assert_eq!(result["is_error"], true);
+        assert_eq!(result["is_error"], false);
         assert!(result["content"]
             .as_str()
             .unwrap()
-            .contains("MBDown validation failed"));
-        assert!(!storage.data_dir.join("invalid.md").exists());
+            .contains("MBDown validation warning"));
+        assert_eq!(
+            fs::read_to_string(storage.data_dir.join("invalid.md")).unwrap(),
+            "[box border=double]\nbody\n[/box]\n"
+        );
     }
 
     #[test]
@@ -992,34 +995,40 @@
     }
 
     #[test]
-    fn markdown_writes_fail_mbdown_validation_before_mutation_or_approval() {
+    fn markdown_writes_persist_and_return_diagnostics_for_focused_repairs() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         let invalid = "[box border=double]\nbody\n[/box]\n";
 
         let write = Write::new(directory.path()).unwrap();
-        let error = write
+        let result = write
             .execute(&json!({"path": "data/invalid.md", "content": invalid}))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("box border must be single or none"));
-        assert!(!storage.data_dir.join("invalid.md").exists());
+            .unwrap();
+        assert!(result.contains("wrote"));
+        assert!(result.contains("MBDown validation warning"));
+        assert!(result.contains("box border must be single or none"));
+        assert!(result.contains("file change succeeded"));
+        assert!(result.contains("Read it and use edit"));
+        assert_eq!(
+            fs::read_to_string(storage.data_dir.join("invalid.md")).unwrap(),
+            invalid
+        );
 
-        let mermaid_error = write
+        let mermaid_result = write
             .execute(&json!({
                 "path": "data/invalid-mermaid.md",
                 "content": "# Diagram\n\n```mermaid\nclassDiagram\nclass Agent~T~ {}\n```\n"
             }))
-            .unwrap_err()
-            .to_string();
-        assert!(mermaid_error.contains("Mermaid validation failed at line 3"));
-        assert!(mermaid_error.contains("generics not yet supported"));
-        assert!(!storage.data_dir.join("invalid-mermaid.md").exists());
+            .unwrap();
+        assert!(mermaid_result.contains("Mermaid validation failed at line 3"));
+        assert!(mermaid_result.contains("generics not yet supported"));
+        assert!(storage.data_dir.join("invalid-mermaid.md").exists());
 
-        write
+        let plain_result = write
             .execute(&json!({"path": "data/plain.txt", "content": invalid}))
             .unwrap();
+        assert!(!plain_result.contains("MBDown validation warning"));
         assert_eq!(fs::read_to_string(storage.data_dir.join("plain.txt")).unwrap(), invalid);
 
         let path = storage.data_dir.join("note.md");
@@ -1039,20 +1048,8 @@
             .unwrap()
             .execute(&json!({"path": "data/note.md"}))
             .unwrap();
-        let (event_sender, mut event_receiver) = event_channel();
-        let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let edit = Edit::new(
-            directory.path(),
-            ApprovalGate {
-                bypass: Arc::new(AtomicBool::new(false)),
-                cancelled: Arc::new(AtomicBool::new(false)),
-                events: event_sender,
-                decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-            },
-            reads,
-        )
-        .unwrap();
-        let error = test_runtime()
+        let edit = Edit::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
+        let result = test_runtime()
             .block_on(edit.execute(&json!({
                 "path": "data/note.md",
                 "tag": file_snapshot_tag(&path),
@@ -1063,13 +1060,16 @@
                     "lines": ["[box border=double]", "body", "[/box]"]
                 }]
             })))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("box border must be single or none"));
-        assert!(event_receiver.try_recv().is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
+            .unwrap();
+        assert!(result.contains("edited data/note.md"));
+        assert!(result.contains("box border must be single or none"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
 
-        let error = test_runtime()
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
+            .unwrap()
+            .execute(&json!({"path": "data/note.md"}))
+            .unwrap();
+        let repaired = test_runtime()
             .block_on(edit.execute(&json!({
                 "path": "data/note.md",
                 "tag": file_snapshot_tag(&path),
@@ -1077,15 +1077,12 @@
                     "operation": "replace",
                     "start_line": 1,
                     "end_line": 1,
-                    "lines": ["```mermaid", "classDiagram", "class Agent~T~ {}", "```"]
+                    "lines": ["[box border=single]"]
                 }]
             })))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("Mermaid validation failed at line 1"));
-        assert!(error.contains("generics not yet supported"));
-        assert!(event_receiver.try_recv().is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
+            .unwrap();
+        assert_eq!(repaired, "edited data/note.md");
+        assert!(mbdown::validate(&fs::read_to_string(&path).unwrap()).is_ok());
     }
 
     #[test]
@@ -1459,15 +1456,18 @@
         add.execute(&json!({"date": "2026-07-28", "content": "existing"}))
             .unwrap();
         let path = storage.daily_file_path("2026-07-28").unwrap();
-        let error = add
+        let result = add
             .execute(&json!({
                 "date": "2026-07-28",
                 "content": "[box border=double]\ninvalid\n[/box]"
             }))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("box border must be single or none"));
-        assert_eq!(fs::read_to_string(path).unwrap(), "existing\n");
+            .unwrap();
+        assert!(result.contains("MBDown validation warning"));
+        assert!(result.contains("box border must be single or none"));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "existing\n\n[box border=double]\ninvalid\n[/box]\n"
+        );
     }
 
     #[test]

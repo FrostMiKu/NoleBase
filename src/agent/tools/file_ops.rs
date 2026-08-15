@@ -14,7 +14,9 @@ use super::workspace_quota::{
     check_workspace_staged_write, check_workspace_write, check_workspace_writes,
     copy_with_workspace_limits, workspace_dir, workspace_edit_budget,
 };
-use super::write_policy::{validate_write, WriteSource};
+use super::write_policy::{
+    mbdown_warning, post_write_result, validate_write_preconditions, WriteSource,
+};
 use crate::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
     ReadTracker, Tool,
@@ -167,7 +169,7 @@ impl Tool for Edit {
         if prepared.candidate_identity == prepared.original_identity {
             return Ok(format!("no changes needed for {relative}"));
         }
-        validate_write(&self.root, &path, WriteSource::File(prepared.path()))?;
+        validate_write_preconditions(&self.root, &path, WriteSource::File(prepared.path()))?;
         if outside_agent_workspace(&self.root, &path) {
             self.gate
                 .request(ApprovalRequest {
@@ -185,7 +187,11 @@ impl Tool for Edit {
         check_workspace_staged_write(&self.root, &path, prepared.path(), prepared.candidate_len)?;
         prepared.publish(&path)?;
         self.reads.consume_file(&path)?;
-        Ok(format!("edited {relative}"))
+        Ok(post_write_result(
+            format!("edited {relative}"),
+            relative,
+            &path,
+        ))
     }
 }
 
@@ -540,9 +546,13 @@ impl Tool for Copy {
         let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
-        validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
         let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
-        Ok(format!("copied {bytes} bytes to {destination_text}"))
+        Ok(post_write_result(
+            format!("copied {bytes} bytes to {destination_text}"),
+            destination_text,
+            &destination,
+        ))
     }
 }
 
@@ -687,7 +697,7 @@ impl Tool for Move {
         let identity = capture_source_identity(&source)?;
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
-        validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
         check_workspace_write(&self.root, &destination, identity.len)?;
         if outside_agent_workspace(&self.root, &source) {
             self.gate
@@ -705,7 +715,11 @@ impl Tool for Move {
         revalidate_source(&identity)?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
-        Ok(format!("moved {bytes} bytes to {destination_text}"))
+        Ok(post_write_result(
+            format!("moved {bytes} bytes to {destination_text}"),
+            destination_text,
+            &destination,
+        ))
     }
 }
 
@@ -787,7 +801,7 @@ impl Tool for MoveMany {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("checking batch destination"),
             }
-            validate_write(&self.root, &destination, WriteSource::File(&source))?;
+            validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
             transfers.push((source, destination, identity));
         }
         check_workspace_writes(
@@ -848,12 +862,25 @@ impl Tool for MoveMany {
         for (source, destination, _) in &completed {
             send_file_moved(&self.events, &self.root, source, destination);
         }
-        serde_json::to_string_pretty(&json!({
+        let warnings = completed
+            .iter()
+            .filter_map(|(_, destination, _)| {
+                let display = display_path(&self.root, destination);
+                mbdown_warning(&display, destination)
+            })
+            .collect::<Vec<_>>();
+        let mut result = json!({
             "destination_directory": directory_text,
             "count": moved.len(),
             "moved": moved,
-        }))
-        .context("encoding batch move result")
+        });
+        if !warnings.is_empty() {
+            result["mbdown_warnings"] = json!(warnings);
+            result["repair"] = json!(
+                "Files were moved. Read each affected file and use edit to fix the reported issue."
+            );
+        }
+        serde_json::to_string_pretty(&result).context("encoding batch move result")
     }
 }
 
@@ -959,7 +986,7 @@ impl Tool for Rename {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("checking rename destination"),
         }
-        validate_write(&self.root, &destination, WriteSource::File(&source))?;
+        validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
         check_workspace_write(&self.root, &destination, identity.len)?;
         if outside_agent_workspace(&self.root, &source) {
             self.gate
@@ -977,9 +1004,11 @@ impl Tool for Rename {
         revalidate_source(&identity)?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
-        Ok(format!(
-            "renamed {path_text} to {} ({bytes} bytes)",
-            display_path(&self.root, &destination)
+        let destination_text = display_path(&self.root, &destination);
+        Ok(post_write_result(
+            format!("renamed {path_text} to {destination_text} ({bytes} bytes)"),
+            &destination_text,
+            &destination,
         ))
     }
 }
@@ -1130,7 +1159,7 @@ impl Tool for Write {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
         }
-        validate_write(&self.root, &path, WriteSource::Text(content))?;
+        validate_write_preconditions(&self.root, &path, WriteSource::Text(content))?;
         check_workspace_write(&self.root, &path, content.len() as u64)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -1138,7 +1167,11 @@ impl Tool for Write {
             .open(&path)
             .with_context(|| format!("writing file {}", path.display()))?;
         file.write_all(content.as_bytes())?;
-        Ok(format!("wrote {} bytes to {relative}", content.len()))
+        Ok(post_write_result(
+            format!("wrote {} bytes to {relative}", content.len()),
+            relative,
+            &path,
+        ))
     }
 }
 

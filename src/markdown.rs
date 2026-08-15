@@ -8,7 +8,7 @@ use std::path::Path;
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
 use mbtui::Renderer;
 use ratatui::style::Color;
-use ratatui::text::{Line, Text};
+use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
@@ -86,13 +86,33 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
                 images: rendered.images,
             }
         }
-        Err(error) => RenderedMarkup {
-            lines: Text::raw(format!("MBDown parse error: {error}")).lines,
+        Err(_) => RenderedMarkup {
+            lines: plain_text_lines(source.as_ref(), width.max(1)),
             links: Vec::new(),
             tags: Vec::new(),
             images: Vec::new(),
         },
     }
+}
+
+fn plain_text_lines(source: &str, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for source_line in source.split('\n') {
+        let source_line = source_line.strip_suffix('\r').unwrap_or(source_line);
+        let mut row = String::new();
+        let mut row_width = 0;
+        for character in source_line.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if row_width + character_width > width && !row.is_empty() {
+                lines.push(Line::raw(std::mem::take(&mut row)));
+                row_width = 0;
+            }
+            row.push(character);
+            row_width += character_width;
+        }
+        lines.push(Line::raw(row));
+    }
+    lines
 }
 
 pub(crate) fn expand_tabs(source: &str) -> Cow<'_, str> {
@@ -519,6 +539,24 @@ mod tests {
         assert!(output
             .lines()
             .all(|line| UnicodeWidthStr::width(line) <= 48));
+    }
+
+    #[test]
+    fn invalid_mbdown_falls_back_to_width_bounded_plain_text() {
+        let source = "# Visible source\n\n[box border=double]\nbody\n[/box]";
+        let rendered = render_at_width(source, WIDTH);
+
+        assert_eq!(text(&rendered.lines), source);
+        assert!(rendered.links.is_empty());
+        assert!(rendered.tags.is_empty());
+        assert!(rendered.images.is_empty());
+
+        let wrapped = render_at_width("[box border=double] abcdefghijklmnop", 10);
+        assert!(wrapped
+            .lines
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 10));
+        assert!(!text(&wrapped.lines).contains("MBDown parse error"));
     }
 
     #[test]
