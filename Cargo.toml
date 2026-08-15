@@ -1,6 +1,6 @@
 [package]
 name = "nole"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 rust-version = "1.88"
 description = "An Agent-driven terminal knowledge management system"
