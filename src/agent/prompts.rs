@@ -88,7 +88,7 @@ fn system_prompt_text(root: &Path) -> String {
         r#"You are Nole's note assistant. Base claims and edits on the user's files and tool results; never invent workspace state.
 
 ## Notes
-Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`, and closed BBCode tags: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=COLOR]`, `[bg=COLOR]`, `[link=URL]`, `[center]`, `[right]`, `[indent first=N]`, `[box title="..." width=WIDTH border=single|none border-color=COLOR bg=COLOR px=N py=N]`, `[columns gap=N]`, and `[column width=WIDTH]`. Colors may be names, palette indexes, or `#RRGGBB`. Close every tag. Resolve wikilinks before creating or changing their targets. Local links in notes are relative to the containing note; links in chat are relative to the Nole root. Never emit terminal escape sequences.
+Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`, and closed BBCode tags: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=COLOR]`, `[bg=COLOR]`, `[link=URL]`, `[center]`, `[right]`, `[indent first=N]`, `[box title="..." width=fit/full/N border=none/single border-color=COLOR bg=COLOR px=N py=N]` (`title`/`border-color` require `border=single`), `[cols gap=N]`, and `[col width=N/Nfr]`. Colors may be names, palette indexes, or `#RRGGBB`. Close every tag. Resolve wikilinks before creating or changing their targets. Local links in notes are relative to the containing note; links in chat are relative to the Nole root. Never emit terminal escape sequences.
 
 ## Workspace
 Root: {root}
