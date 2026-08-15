@@ -24,7 +24,7 @@ clipboard-rs = { version = "0.3.5", features = ["image"] }
 base64 = "0.22"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 anyhow = "1"
-anydoc = "0.1.8"
+anydoc = "0.1.9"
 async-trait = "0.1"
 cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
