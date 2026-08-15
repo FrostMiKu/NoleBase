@@ -27,3 +27,4 @@ pub use self::{
     attachment_ops::*, calculator::*, download::*, explore::*, file_ops::*, grep::*,
     interactive::*, notes_tags::*, read::*, review::*, skills::*, web::*, wiki_links::*,
 };
+pub(crate) use write_policy::REPAIR_REQUIRED_MARKER;

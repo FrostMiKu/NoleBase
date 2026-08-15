@@ -36,11 +36,16 @@ pub(super) fn validate_write_preconditions(
     Ok(())
 }
 
+/// Marker present in a successful mutation result that still needs a focused
+/// follow-up edit. The Agent loop treats a result carrying this marker as a
+/// recovery round so the round limit cannot interrupt the repair.
+pub(crate) const REPAIR_REQUIRED_MARKER: &str = "use edit to fix the reported issue";
+
 /// Add a non-blocking MBDown diagnostic after a file mutation has succeeded.
 pub(super) fn post_write_result(summary: String, display_path: &str, path: &Path) -> String {
     match mbdown_warning(display_path, path) {
         Some(warning) => format!(
-            "{summary}\n{warning}\nThe file change succeeded. Read it and use edit to fix the reported issue."
+            "{summary}\n{warning}\nThe file change succeeded. Read it and {REPAIR_REQUIRED_MARKER}."
         ),
         None => summary,
     }

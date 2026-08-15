@@ -15,7 +15,8 @@ use super::workspace_quota::{
     copy_with_workspace_limits, workspace_dir, workspace_edit_budget,
 };
 use super::write_policy::{
-    mbdown_warning, post_write_result, validate_write_preconditions, WriteSource,
+    mbdown_warning, post_write_result, validate_write_preconditions, REPAIR_REQUIRED_MARKER,
+    WriteSource,
 };
 use crate::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
@@ -876,9 +877,9 @@ impl Tool for MoveMany {
         });
         if !warnings.is_empty() {
             result["mbdown_warnings"] = json!(warnings);
-            result["repair"] = json!(
-                "Files were moved. Read each affected file and use edit to fix the reported issue."
-            );
+            result["repair"] = json!(format!(
+                "Files were moved. Read each affected file and {REPAIR_REQUIRED_MARKER}."
+            ));
         }
         serde_json::to_string_pretty(&result).context("encoding batch move result")
     }

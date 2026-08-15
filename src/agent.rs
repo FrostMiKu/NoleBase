@@ -1156,7 +1156,8 @@ impl Agent {
                         result
                     }
                 };
-                retry_after_error |= result.is_error;
+                retry_after_error |= result.is_error
+                    || result.content.contains(REPAIR_REQUIRED_MARKER);
                 results.push(Message::tool(result));
             }
             if denied {

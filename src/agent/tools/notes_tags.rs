@@ -9,7 +9,7 @@ use super::util::{
     display_path, fuzzy_match, limited_diff, range_schema, required_string, truncate_chars,
     RangeSelector, MAX_DIFF_BYTES, MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
 };
-use super::write_policy::mbdown_warning;
+use super::write_policy::{mbdown_warning, REPAIR_REQUIRED_MARKER};
 use crate::agent::{
     canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy,
 };
@@ -367,9 +367,9 @@ impl Tool for AddDailyEntry {
         let mut result = json!({ "date": note.date.to_string() });
         if let Some(warning) = mbdown_warning(&display_path, &path) {
             result["mbdown_warning"] = json!(warning);
-            result["repair"] = json!(
-                "The entry was added. Read the daily note and use edit to fix the reported issue."
-            );
+            result["repair"] = json!(format!(
+                "The entry was added. Read the daily note and {REPAIR_REQUIRED_MARKER}."
+            ));
         }
         serde_json::to_string(&result).context("encoding daily result")
     }
