@@ -1933,7 +1933,7 @@ fn agent_diff_approval_switches_layout_with_terminal_width() {
     let (mut app, _directory) = make_app();
     app.approval_request = Some(ApprovalRequest {
         title: "Update data/note.md".to_string(),
-        message: "--- old\n+++ new\n@@ -1 +1 @@\n-old value\n+new value\n".to_string(),
+        message: "--- old\n+++ new\n@@ -9,1 +9,1 @@\n-old value\n+new value\n".to_string(),
         kind: ApprovalKind::Diff,
     });
     app.set_overlay(Overlay::Approval);
@@ -1956,15 +1956,15 @@ fn agent_diff_approval_switches_layout_with_terminal_width() {
         .lines()
         .find(|line| line.contains("-old value") && line.contains("+new value"))
         .expect("side-by-side change row");
-    assert!(changed_line.contains("  1 │ -old value"));
-    assert!(changed_line.contains(" ┃ "));
-    assert!(changed_line.contains("  1 │ +new value"));
+    assert!(changed_line.contains("-old value"));
+    assert!(changed_line.contains("│   9  9 │ +new value"));
+    assert!(!changed_line.contains('┃'));
 
     let hunk_line = wide_screen
         .lines()
-        .find(|line| line.contains("@@ -1 +1 @@"))
+        .find(|line| line.contains("@@ -9,1 +9,1 @@"))
         .expect("hunk row");
-    assert!(hunk_line.contains(" ┃ "));
+    assert!(!hunk_line.contains('┃'));
 
     let buffer = wide.backend().buffer();
     let changed_y = (0..buffer.area.height)
@@ -1976,10 +1976,10 @@ fn agent_diff_approval_switches_layout_with_terminal_width() {
         })
         .expect("changed row");
     let content_start = wide_overlay.x + 2;
-    let divider = content_start + (wide_overlay.width - 4 - 3) / 2;
-    assert!((content_start..divider)
+    let column_boundary = content_start + (wide_overlay.width - 4) / 2;
+    assert!((content_start..column_boundary)
         .all(|x| buffer[(x, changed_y)].bg == app.theme.diff_deletion_background));
-    assert!((divider + 3..wide_overlay.x + wide_overlay.width - 2)
+    assert!((column_boundary..wide_overlay.x + wide_overlay.width - 2)
         .all(|x| buffer[(x, changed_y)].bg == app.theme.diff_addition_background));
 }
 
@@ -2134,6 +2134,50 @@ fn side_by_side_diff_tracks_line_numbers_across_multiple_hunks() {
             (Some(40), Some(50)),
         ]
     );
+}
+
+#[test]
+fn side_by_side_diff_aligns_context_insertions_and_deletions() {
+    let diff = "--- old\n+++ new\n@@ -1,3 +1,3 @@\n 测试文本\n+插入一行\n 第二行\n-第三行\n";
+    let rows = side_by_side_diff_rows(diff);
+
+    assert_eq!(
+        rows[3],
+        SideBySideDiffRow::Columns {
+            before: None,
+            after: Some(SideBySideDiffCell::new(
+                "+插入一行",
+                DiffLineKind::Addition,
+                Some(2),
+            )),
+        }
+    );
+    assert_eq!(
+        rows[5],
+        SideBySideDiffRow::Columns {
+            before: Some(SideBySideDiffCell::new(
+                "-第三行",
+                DiffLineKind::Deletion,
+                Some(3),
+            )),
+            after: None,
+        }
+    );
+
+    let rendered = side_by_side_diff_lines(diff, 40, Theme::default())
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(rendered[3].contains("  2 │ +插入一行"));
+    assert_eq!(rendered[3].matches('│').count(), 1);
+    assert!(rendered[5].contains("-第三行"));
+    assert!(rendered[5].contains("│   3"));
+    assert_eq!(rendered[5].matches('│').count(), 1);
 }
 
 #[test]

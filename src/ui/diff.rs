@@ -223,10 +223,8 @@ pub(super) fn side_by_side_diff_lines(
         .max()
         .unwrap_or(1)
         .max(3);
-    let divider_width = 3;
-    let columns_width = width.saturating_sub(divider_width);
-    let before_width = columns_width / 2;
-    let after_width = columns_width.saturating_sub(before_width);
+    let before_width = width / 2;
+    let after_width = width.saturating_sub(before_width);
     let line_number_gutter_width = line_number_width + 3;
     if before_width <= line_number_gutter_width || after_width <= line_number_gutter_width {
         return Vec::new();
@@ -236,12 +234,18 @@ pub(super) fn side_by_side_diff_lines(
     for row in rows {
         let (before, after) = match row {
             SideBySideDiffRow::Full(text, kind) => {
-                (Some(SideBySideDiffCell::new(text, kind, None)), None)
+                let style = diff_line_style(kind, theme);
+                lines.extend(
+                    wrap_spans_to_width(&[Span::styled(text.to_string(), style)], width)
+                        .into_iter()
+                        .map(|spans| Line::from(pad_spans(spans, width, style))),
+                );
+                continue;
             }
             SideBySideDiffRow::Columns { before, after } => (before, after),
         };
-        let before_lines = diff_cell_lines(before, before_width, line_number_width, theme);
-        let after_lines = diff_cell_lines(after, after_width, line_number_width, theme);
+        let before_lines = diff_cell_lines(before, before_width, line_number_width, true, theme);
+        let after_lines = diff_cell_lines(after, after_width, line_number_width, false, theme);
         let height = before_lines.len().max(after_lines.len()).max(1);
         for row in 0..height {
             let mut spans = pad_spans(
@@ -249,13 +253,6 @@ pub(super) fn side_by_side_diff_lines(
                 before_width,
                 Style::default().bg(theme.markdown_code_block_background),
             );
-            spans.push(Span::styled(
-                " ┃ ",
-                Style::default()
-                    .fg(theme.ui_dialog_choice)
-                    .bg(theme.surface_overlay)
-                    .add_modifier(Modifier::BOLD),
-            ));
             spans.extend(pad_spans(
                 after_lines.get(row).cloned().unwrap_or_default(),
                 after_width,
@@ -271,6 +268,7 @@ pub(super) fn diff_cell_lines(
     cell: Option<SideBySideDiffCell<'_>>,
     width: usize,
     line_number_width: usize,
+    line_number_on_right: bool,
     theme: Theme,
 ) -> Vec<Vec<Span<'static>>> {
     let Some(cell) = cell else {
@@ -278,6 +276,7 @@ pub(super) fn diff_cell_lines(
     };
     let content_width = width.saturating_sub(line_number_width + 3);
     let content_style = diff_line_style(cell.kind, theme);
+    let has_line_number = cell.line_number.is_some();
     wrap_spans_to_width(
         &[Span::styled(cell.text.to_string(), content_style)],
         content_width,
@@ -293,11 +292,18 @@ pub(super) fn diff_cell_lines(
             " ".repeat(line_number_width)
         };
         let gutter_style = content_style.fg(theme.text_muted);
-        let mut spans = vec![
-            Span::styled(number, gutter_style),
-            Span::styled(" │ ", gutter_style),
-        ];
-        spans.extend(content);
+        let number = Span::styled(number, gutter_style);
+        let separator = Span::styled(if has_line_number { " │ " } else { "   " }, gutter_style);
+        let spans = if line_number_on_right {
+            let mut spans = pad_spans(content, content_width, content_style);
+            spans.push(separator);
+            spans.push(number);
+            spans
+        } else {
+            let mut spans = vec![number, separator];
+            spans.extend(content);
+            spans
+        };
         pad_spans(spans, width, content_style)
     })
     .collect()
