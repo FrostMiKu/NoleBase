@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::NaiveDate;
@@ -61,6 +61,7 @@ pub(in crate::app) const DAILY_PAGE_STEP: u16 = 5;
 pub(in crate::app) const AGENT_PAGE_STEP: u16 = 8;
 pub(in crate::app) const DOCUMENT_PAGE_STEP: u16 = 10;
 pub(in crate::app) const DIALOG_PAGE_STEP: i32 = 8;
+pub(crate) const CODE_COPY_FEEDBACK_TTL: Duration = Duration::from_secs(2);
 
 /// Move a selection index by `delta` within `[0, len)`.
 /// Clamps on both ends; an empty list keeps the index at zero.
@@ -342,6 +343,8 @@ pub struct App {
     pub backlink_hitboxes: Vec<BacklinkHitbox>,
     pub wiki_link_hitboxes: Vec<WikiLinkHitbox>,
     pub dialog_hitboxes: Vec<DialogOptionHitbox>,
+    code_copy_pending_area: Option<Rect>,
+    code_copy_feedback: Option<CodeCopyFeedback>,
 
     /// The one modal state shared by all command-style dialogs.
     pub dialog: Option<DialogState>,
@@ -406,6 +409,13 @@ struct SkillBrowserReturn {
 struct ExportJobResult {
     format: ExportFormat,
     outcome: Result<ExportOutcome, String>,
+}
+
+#[derive(Clone)]
+struct CodeCopyFeedback {
+    source: String,
+    area: Rect,
+    expires_at: Instant,
 }
 
 impl App {
@@ -557,6 +567,8 @@ impl App {
             backlink_hitboxes: Vec::new(),
             wiki_link_hitboxes: Vec::new(),
             dialog_hitboxes: Vec::new(),
+            code_copy_pending_area: None,
+            code_copy_feedback: None,
             dialog: None,
             dialog_result: None,
             command_matches: Vec::new(),
@@ -603,6 +615,51 @@ impl App {
             ai_cancelling: false,
             undo_stack: Vec::new(),
         })
+    }
+
+    pub(crate) fn begin_code_copy(&mut self, area: Rect) {
+        self.code_copy_pending_area = Some(area);
+    }
+
+    pub(crate) fn complete_code_copy(&mut self, source: &str, now: Instant) {
+        let Some(area) = self.code_copy_pending_area.take() else {
+            return;
+        };
+        self.code_copy_feedback = Some(CodeCopyFeedback {
+            source: source.to_string(),
+            area,
+            expires_at: now + CODE_COPY_FEEDBACK_TTL,
+        });
+    }
+
+    pub(crate) fn cancel_code_copy(&mut self) {
+        self.code_copy_pending_area = None;
+    }
+
+    pub(crate) fn has_code_copy_feedback(&self) -> bool {
+        self.code_copy_feedback.is_some()
+    }
+
+    pub(crate) fn visible_code_copy_feedback(&mut self, now: Instant) -> Option<Rect> {
+        if self
+            .code_copy_feedback
+            .as_ref()
+            .is_some_and(|feedback| now >= feedback.expires_at)
+        {
+            self.code_copy_feedback = None;
+            return None;
+        }
+        let feedback = self.code_copy_feedback.as_ref()?;
+        self.link_hitboxes
+            .iter()
+            .any(|hitbox| {
+                hitbox.area == feedback.area
+                    && matches!(
+                        &hitbox.target,
+                        LinkTarget::CopyCode(source) if source == &feedback.source
+                    )
+            })
+            .then_some(feedback.area)
     }
 
     pub(super) fn reload_thinking_display_config(&mut self) {

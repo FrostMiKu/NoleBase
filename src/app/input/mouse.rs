@@ -108,12 +108,15 @@ impl App {
             return None;
         }
 
-        if let Some(target) = self
+        if let Some((target, area)) = self
             .link_hitboxes
             .iter()
             .find(|hitbox| point_in_rect(column, row, hitbox.area))
-            .map(|hitbox| hitbox.target.clone())
+            .map(|hitbox| (hitbox.target.clone(), hitbox.area))
         {
+            if matches!(target, LinkTarget::CopyCode(_)) {
+                self.begin_code_copy(area);
+            }
             return self.activate_link(target);
         }
 

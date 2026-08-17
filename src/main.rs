@@ -175,6 +175,19 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
             }
             Ok(false)
         }
+        Some(Command::CopyText(text)) => {
+            match clipboard::write_text(&text) {
+                Ok(()) => {
+                    app.complete_code_copy(&text, Instant::now());
+                    app.set_status("Code copied");
+                }
+                Err(error) => {
+                    app.cancel_code_copy();
+                    app.set_error(format!("Clipboard error: {error:#}"));
+                }
+            }
+            Ok(false)
+        }
         Some(Command::OpenPath(path)) => {
             match open::that_detached(&path) {
                 Ok(()) => app.set_status(format!("Opened {}", path.display())),

@@ -66,6 +66,8 @@ pub enum LinkTarget {
     /// A mutable attachment URI (`nole://attachment/<lowercase-hyphenated-uuid>`),
     /// resolved through the attachment store only when activated.
     Attachment(String),
+    /// A rendered code-block action carrying the exact fenced source.
+    CopyCode(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

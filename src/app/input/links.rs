@@ -9,6 +9,7 @@ impl App {
     pub(in crate::app) fn activate_link(&mut self, target: LinkTarget) -> Option<Command> {
         match target {
             LinkTarget::External(target) => Some(Command::OpenLink(target)),
+            LinkTarget::CopyCode(source) => Some(Command::CopyText(source)),
             LinkTarget::Attachment(uri) => {
                 let uri = match AttachmentUri::parse(&uri) {
                     Ok(uri) => uri,

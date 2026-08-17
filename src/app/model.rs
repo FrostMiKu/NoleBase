@@ -16,6 +16,7 @@ pub enum Command {
     Edit(PathBuf),
     OpenLink(String),
     OpenPath(PathBuf),
+    CopyText(String),
     SetMouseCapture(bool),
 }
 

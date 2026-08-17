@@ -7,11 +7,9 @@ use std::path::Path;
 
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
 use mbtui::Renderer;
-use ratatui::style::Color;
-use ratatui::text::Line;
-use unicode_width::UnicodeWidthChar;
-#[cfg(test)]
-use unicode_width::UnicodeWidthStr;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::AttachmentUri;
 use crate::model::LinkTarget;
@@ -47,13 +45,20 @@ pub fn to_lines_at_width(source: &str, width: usize, theme: Theme) -> Vec<Line<'
 }
 
 pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMarkup {
-    let source = expand_tabs(source);
-    match mbdown::parse(source.as_ref()) {
+    let expanded = expand_tabs(source);
+    match mbdown::parse(expanded.as_ref()) {
         Ok(document) => {
+            let code_specs = if matches!(expanded, Cow::Borrowed(_)) {
+                code_block_specs(document.nodes())
+            } else {
+                mbdown::parse(source)
+                    .map(|original| code_block_specs(original.nodes()))
+                    .unwrap_or_default()
+            };
             let rendered = Renderer::with_theme(width.max(1), theme.markdown_theme())
                 .with_image_height(12)
                 .render(&document);
-            let lines = rendered.text.lines;
+            let mut lines = rendered.text.lines;
             let specs = link_specs(document.nodes());
             let mut links = locate_links(&lines, &specs, theme.markdown_link);
             let mut tags = Vec::new();
@@ -79,6 +84,7 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
                     _ => {}
                 }
             }
+            links.extend(decorate_code_blocks(&mut lines, &code_specs, theme));
             RenderedMarkup {
                 lines,
                 links,
@@ -87,7 +93,7 @@ pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMark
             }
         }
         Err(_) => RenderedMarkup {
-            lines: plain_text_lines(source.as_ref(), width.max(1)),
+            lines: plain_text_lines(expanded.as_ref(), width.max(1)),
             links: Vec::new(),
             tags: Vec::new(),
             images: Vec::new(),
@@ -146,6 +152,156 @@ pub(crate) fn expand_tabs(source: &str) -> Cow<'_, str> {
 struct LinkSpec {
     label: String,
     target: LinkTarget,
+}
+
+const COPY_BUTTON: &str = " Copy ";
+const CODE_BLOCK_PADDING: usize = 2;
+
+#[derive(Clone)]
+struct CodeBlockSpec {
+    language: String,
+    source: String,
+}
+
+fn code_block_specs(nodes: &[Node<'_>]) -> Vec<CodeBlockSpec> {
+    let mut blocks = Vec::new();
+    collect_code_block_specs(nodes, &mut blocks);
+    blocks
+}
+
+fn collect_code_block_specs(nodes: &[Node<'_>], blocks: &mut Vec<CodeBlockSpec>) {
+    for node in nodes {
+        match node {
+            Node::Markdown(markdown) => collect_event_code_blocks(markdown.events(), blocks),
+            Node::Box { children, .. }
+            | Node::Center { children }
+            | Node::Right { children }
+            | Node::Indent { children, .. }
+            | Node::Columns { children, .. }
+            | Node::Column { children, .. } => collect_code_block_specs(children, blocks),
+        }
+    }
+}
+
+fn collect_event_code_blocks(events: &[mbdown::SpannedEvent<'_>], blocks: &mut Vec<CodeBlockSpec>) {
+    let mut index = 0;
+    while index < events.len() {
+        let Event::Start(Container::CodeBlock(info)) = &events[index].event else {
+            index += 1;
+            continue;
+        };
+        let end = events[index + 1..]
+            .iter()
+            .position(|item| matches!(item.event, Event::End(ContainerEnd::CodeBlock)))
+            .map_or(events.len(), |offset| index + 1 + offset);
+        let source = events[index + 1..end]
+            .iter()
+            .filter_map(|item| match &item.event {
+                Event::Text(text)
+                | Event::Code(text)
+                | Event::Html(text)
+                | Event::InlineHtml(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        blocks.push(CodeBlockSpec {
+            language: info
+                .as_deref()
+                .and_then(code_language)
+                .unwrap_or("text")
+                .to_string(),
+            source,
+        });
+        index = end.saturating_add(1);
+    }
+}
+
+fn code_language(info: &str) -> Option<&str> {
+    let language = info
+        .split_whitespace()
+        .next()?
+        .trim_matches(|character| matches!(character, '{' | '}' | '.'));
+    (!language.is_empty()).then_some(language)
+}
+
+/// Overlay a right-aligned action on each rendered fenced-code header and
+/// expose it through the existing clickable-region pipeline used by every view.
+fn decorate_code_blocks(
+    lines: &mut [Line<'static>],
+    specs: &[CodeBlockSpec],
+    theme: Theme,
+) -> Vec<RenderedLink> {
+    let background = Some(theme.markdown_code_block_background);
+    let label_color = Some(theme.markdown_code_label);
+    let button_width = UnicodeWidthStr::width(COPY_BUTTON);
+    let mut used = Vec::new();
+    let mut actions = Vec::new();
+
+    for spec in specs {
+        let mut candidate = None;
+        'rows: for (row, line) in lines.iter().enumerate() {
+            let mut column = 0;
+            for (span_index, span) in line.spans.iter().enumerate() {
+                let span_width = UnicodeWidthStr::width(span.content.as_ref());
+                let label = span.content.trim();
+                if span.style.bg == background
+                    && span.style.fg == label_color
+                    && !label.is_empty()
+                    && spec.language.starts_with(label)
+                    && !used.contains(&(row, column))
+                {
+                    let mut region_end = span_index;
+                    while region_end + 1 < line.spans.len()
+                        && line.spans[region_end + 1].style.bg == background
+                    {
+                        region_end += 1;
+                    }
+                    let trailing = &line.spans[region_end];
+                    let trailing_width = UnicodeWidthStr::width(trailing.content.as_ref());
+                    if trailing.content.chars().all(char::is_whitespace)
+                        && trailing_width >= button_width + CODE_BLOCK_PADDING
+                    {
+                        candidate = Some((row, column, region_end, trailing_width));
+                        break 'rows;
+                    }
+                }
+                column += span_width;
+            }
+        }
+
+        let Some((row, label_column, trailing_index, trailing_width)) = candidate else {
+            continue;
+        };
+        used.push((row, label_column));
+        let trailing_start = lines[row].spans[..trailing_index]
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>();
+        let before = trailing_width - button_width - CODE_BLOCK_PADDING;
+        let button_column = trailing_start + before;
+        let trailing_style = lines[row].spans[trailing_index].style;
+        lines[row].spans.splice(
+            trailing_index..=trailing_index,
+            [
+                Span::styled(" ".repeat(before), trailing_style),
+                Span::styled(
+                    COPY_BUTTON,
+                    Style::default()
+                        .fg(theme.text_muted)
+                        .bg(theme.markdown_code_block_background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(CODE_BLOCK_PADDING), trailing_style),
+            ],
+        );
+        actions.push(RenderedLink {
+            target: LinkTarget::CopyCode(spec.source.clone()),
+            row,
+            column: button_column,
+            width: button_width,
+        });
+    }
+    actions
 }
 
 /// Classify a raw Markdown or BBCode link target. Managed attachment URIs stay
@@ -539,6 +695,35 @@ mod tests {
         assert!(output
             .lines()
             .all(|line| UnicodeWidthStr::width(line) <= 48));
+    }
+
+    #[test]
+    fn code_block_copy_action_is_right_aligned_and_keeps_exact_source() {
+        let rendered = render_at_width("```rust\nfn main() {\n\tprintln!(\"hi\");\n}\n```", 48);
+        let action = rendered
+            .links
+            .iter()
+            .find(|link| matches!(link.target, LinkTarget::CopyCode(_)))
+            .expect("code copy action");
+        assert_eq!(
+            action.target,
+            LinkTarget::CopyCode("fn main() {\n\tprintln!(\"hi\");\n}\n".to_string())
+        );
+        assert_eq!(action.width, UnicodeWidthStr::width(COPY_BUTTON));
+        assert_eq!(action.column + action.width + CODE_BLOCK_PADDING, 48);
+        let header = rendered.lines[action.row]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("rust"));
+        assert!(header.contains(COPY_BUTTON));
+        let button = rendered.lines[action.row]
+            .spans
+            .iter()
+            .find(|span| span.content == COPY_BUTTON)
+            .expect("copy button span");
+        assert_eq!(button.style.fg, Some(Theme::default().text_muted));
     }
 
     #[test]

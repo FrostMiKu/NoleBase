@@ -26,6 +26,8 @@ mod todo;
 mod util;
 mod views;
 
+use std::time::Instant;
+
 use self::{
     agent::*, attachments::*, chat::*, compose::*, daily::*, dialog::*, diff::*, document::*,
     files::*, footer::*, input::*, notification::*, search::*, tags::*, terminal::*, todo::*,
@@ -103,6 +105,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
     } else {
         draw_narrow_workspace(frame, app, body, interactive, &mut cursor_position);
     }
+    draw_code_copy_feedback(frame, app);
     draw_footer(frame, app, footer);
     if let Some(message) = app.notifications.visible() {
         draw_notification(frame, root, &message, app.theme);
@@ -126,12 +129,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
 /// this decision alongside its rendering condition.
 pub(crate) fn animations_active(app: &App, focused: bool) -> bool {
     focused
-        && (app.ai_running
+        && (app.has_code_copy_feedback()
+            || app.ai_running
             || app.export_in_progress
             || app.overlay == Some(Overlay::Terminal)
             || app.permission_mode == PermissionMode::Bypass
             || app.focus == Focus::Compose
             || matches!(app.center_view, CenterView::Daily | CenterView::Tags))
+}
+
+fn draw_code_copy_feedback(frame: &mut Frame, app: &mut App) {
+    let Some(area) = app.visible_code_copy_feedback(Instant::now()) else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "Copied",
+            Style::default()
+                .fg(app.theme.text_muted)
+                .bg(app.theme.markdown_code_block_background)
+                .add_modifier(Modifier::BOLD),
+        )),
+        area,
+    );
 }
 
 fn clear_hitboxes(app: &mut App) {

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use std::fs;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use ratatui::Terminal;
 use tempfile::tempdir;
 
 use super::*;
+use crate::app::{Command, CODE_COPY_FEEDBACK_TTL};
 
 #[test]
 fn clearing_a_floating_widget_sanitizes_wide_characters_at_its_edges() {
@@ -2920,7 +2922,7 @@ fn document_scroll_overwrites_box_borders_from_the_previous_frame() {
 }
 
 #[test]
-fn document_code_block_background_has_no_wrapped_gaps() {
+fn document_code_block_renders_and_exposes_a_clickable_copy_button() {
     let (mut app, _directory) = make_app();
     app.focus = Focus::Center;
     app.center_view = CenterView::Document;
@@ -2946,6 +2948,58 @@ fn document_code_block_background_has_no_wrapped_gaps() {
         .collect::<Vec<_>>();
     assert_eq!(rows.len(), 7);
     assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    let copy = app
+        .link_hitboxes
+        .iter()
+        .find(|hitbox| matches!(hitbox.target, LinkTarget::CopyCode(_)))
+        .expect("visible code copy button")
+        .clone();
+    assert_eq!(
+        (copy.area.x..copy.area.x + copy.area.width)
+            .map(|x| buffer[(x, copy.area.y)].symbol())
+            .collect::<String>(),
+        " Copy "
+    );
+    assert!(buffer_string(&terminal)
+        .lines()
+        .nth(copy.area.y as usize)
+        .is_some_and(|row| row.contains("rust") && row.contains(" Copy ")));
+    let copied_source = "fn main() {\n    println!(\"hello\");\n}\n";
+    assert_eq!(
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: copy.area.x,
+            row: copy.area.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Some(Command::CopyText(copied_source.to_string()))
+    );
+
+    app.complete_code_copy(copied_source, Instant::now());
+    assert!(animations_active(&app, true));
+    let copied = render(&mut app, 80, 30);
+    let copied_buffer = copied.backend().buffer();
+    assert_eq!(
+        (copy.area.x..copy.area.x + copy.area.width)
+            .map(|x| copied_buffer[(x, copy.area.y)].symbol())
+            .collect::<String>(),
+        "Copied"
+    );
+
+    app.begin_code_copy(copy.area);
+    app.complete_code_copy(
+        copied_source,
+        Instant::now() - CODE_COPY_FEEDBACK_TTL - Duration::from_millis(1),
+    );
+    let restored = render(&mut app, 80, 30);
+    let restored_buffer = restored.backend().buffer();
+    assert_eq!(
+        (copy.area.x..copy.area.x + copy.area.width)
+            .map(|x| restored_buffer[(x, copy.area.y)].symbol())
+            .collect::<String>(),
+        " Copy "
+    );
+    assert!(!animations_active(&app, true));
 }
 
 #[test]

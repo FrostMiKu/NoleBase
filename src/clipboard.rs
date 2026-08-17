@@ -45,6 +45,15 @@ pub(crate) fn read_attachment_content() -> Result<ClipboardAttachmentContent> {
     bail!("clipboard does not contain files or an image")
 }
 
+/// Replace the system clipboard with plain text.
+pub(crate) fn write_text(text: &str) -> Result<()> {
+    let clipboard = ClipboardContext::new()
+        .map_err(|error| anyhow::anyhow!("opening system clipboard: {error}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| anyhow::anyhow!("writing clipboard text: {error}"))
+}
+
 fn encode_png(rgba: image::RgbaImage) -> Result<Vec<u8>> {
     let mut png = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(rgba)
