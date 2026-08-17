@@ -15,8 +15,8 @@ use super::workspace_quota::{
     copy_with_workspace_limits, workspace_dir, workspace_edit_budget,
 };
 use super::write_policy::{
-    mbdown_warning, post_write_result, validate_write_preconditions, REPAIR_REQUIRED_MARKER,
-    WriteSource,
+    mbdown_warning, post_write_result, validate_write_preconditions, WriteSource,
+    REPAIR_REQUIRED_MARKER,
 };
 use crate::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,

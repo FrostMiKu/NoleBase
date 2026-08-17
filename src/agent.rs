@@ -232,6 +232,9 @@ pub trait Tool: Send + Sync {
     }
     async fn execute(&self, input: &Value) -> Result<String>;
 }
+pub(crate) fn tool_error_message(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
 
 /// A tool paired with its compiled model-facing input contract.
 pub(crate) struct RegisteredTool {
@@ -1156,8 +1159,8 @@ impl Agent {
                         result
                     }
                 };
-                retry_after_error |= result.is_error
-                    || result.content.contains(REPAIR_REQUIRED_MARKER);
+                retry_after_error |=
+                    result.is_error || result.content.contains(REPAIR_REQUIRED_MARKER);
                 results.push(Message::tool(result));
             }
             if denied {
@@ -1253,7 +1256,7 @@ impl Agent {
                 let denied = error.downcast_ref::<ApprovalDenied>().is_some();
                 let result = ToolResult {
                     tool_use_id: id.to_string(),
-                    content: error.to_string(),
+                    content: tool_error_message(&error),
                     is_error: true,
                 };
                 if denied {

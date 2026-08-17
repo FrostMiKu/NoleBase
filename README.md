@@ -545,8 +545,11 @@ are converted to Markdown in-process; extracted Markdown is cached by document
 identity so continuation reads do not repeat conversion. A directory returns a
 typed JSON listing, while an http(s) URL returns structured fetched content with
 HTML converted to Markdown. The reader is a parser registry, so additional
-formats can be added without changing dispatch logic. When
-configured, `search_web` queries Tavily with optional topic, depth, time range,
+formats can be added without changing dispatch logic.
+Failed fetches identify the request or processing phase; HTTP status failures
+also include the final URL, selected diagnostic headers, and a bounded,
+control-character-sanitized response preview.
+When configured, `search_web` queries Tavily with optional topic, depth, time range,
 answer, result-count, and included/excluded domain controls, then returns compact
 ranked results. Every user prompt sent to the Agent includes the current local
 date and time. File reads default to 200 lines and accept at most 2,000 lines per

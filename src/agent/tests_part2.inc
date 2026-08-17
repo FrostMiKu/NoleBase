@@ -1965,3 +1965,12 @@
             Ok(AgentEvent::Notification(message)) if message == "valid"
         ));
     }
+
+    #[test]
+    fn tool_error_messages_preserve_the_complete_cause_chain() {
+        let error = anyhow::anyhow!("connection refused").context("fetching page");
+        assert_eq!(
+            tool_error_message(&error),
+            "fetching page: connection refused"
+        );
+    }

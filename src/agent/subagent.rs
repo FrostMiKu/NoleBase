@@ -273,7 +273,7 @@ impl SubagentRunner {
             },
             Err(error) => ToolResult {
                 tool_use_id: call.id.clone(),
-                content: error.to_string(),
+                content: super::tool_error_message(&error),
                 is_error: true,
             },
         }
