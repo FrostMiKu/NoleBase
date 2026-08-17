@@ -22,7 +22,7 @@ use super::{
 /// An inclusive one-based line window `start..=end` requested via a
 /// `path:start-end` selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct LineRange {
+pub(in crate::agent) struct LineRange {
     offset: usize,
     limit: usize,
 }

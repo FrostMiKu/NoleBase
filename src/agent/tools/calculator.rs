@@ -7,18 +7,28 @@ use crate::agent::Tool;
 
 pub struct Calculate;
 
-fn evaluation_context() -> meval::Context<'static> {
-    let mut context = meval::Context::new();
-    context
-        .var("tau", std::f64::consts::TAU)
-        .func("cbrt", f64::cbrt)
-        .func("trunc", f64::trunc)
-        .func("log", f64::log10)
-        .func("log2", f64::log2)
-        .func2("pow", f64::powf)
-        .func2("logb", |base, value| value.log(base))
-        .func2("hypot", f64::hypot);
-    context
+fn evaluate(expression: &str) -> std::result::Result<f64, fasteval::Error> {
+    let mut namespace = |name: &str, arguments: Vec<f64>| match (name, arguments.as_slice()) {
+        ("pi", []) => Some(std::f64::consts::PI),
+        ("e", []) => Some(std::f64::consts::E),
+        ("tau", []) => Some(std::f64::consts::TAU),
+        ("sqrt", [value]) => Some(value.sqrt()),
+        ("exp", [value]) => Some(value.exp()),
+        ("ln", [value]) => Some(value.ln()),
+        ("signum", [value]) => Some(value.signum()),
+        ("asinh", [value]) => Some(value.asinh()),
+        ("acosh", [value]) => Some(value.acosh()),
+        ("atanh", [value]) => Some(value.atanh()),
+        ("atan2", [left, right]) => Some(left.atan2(*right)),
+        ("cbrt", [value]) => Some(value.cbrt()),
+        ("trunc", [value]) => Some(value.trunc()),
+        ("log2", [value]) => Some(value.log2()),
+        ("pow", [base, exponent]) => Some(base.powf(*exponent)),
+        ("logb", [base, value]) => Some(value.log(*base)),
+        ("hypot", [left, right]) => Some(left.hypot(*right)),
+        _ => None,
+    };
+    fasteval::ez_eval(expression, &mut namespace)
 }
 fn normalize_leading_decimal(expression: &str) -> std::borrow::Cow<'_, str> {
     let bytes = expression.as_bytes();
@@ -105,7 +115,7 @@ impl Tool for Calculate {
         }
 
         let expression = normalize_leading_decimal(expression);
-        meval::eval_str_with_context(expression.as_ref(), evaluation_context())
+        evaluate(expression.as_ref())
             .map(format_result)
             .map_err(|error| anyhow::anyhow!("invalid expression: {error}"))
     }
