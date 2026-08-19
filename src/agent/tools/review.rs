@@ -413,7 +413,7 @@ mod tests {
             "checkout_attachment",
             "update_attachment",
             "delete_attachment",
-            "download",
+            "http_request",
             "explore",
             "review",
         ] {

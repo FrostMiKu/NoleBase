@@ -68,7 +68,6 @@ pub(crate) fn tool_start_activity(call: &Value) -> String {
     match name {
         "read" if raw_target.as_deref().is_some_and(is_url) => format!("Fetching Web...{target}"),
         "search_web" => format!("Searching Web...{target}"),
-        "download" => format!("Downloading...{target}"),
         _ => format!("Calling {}...{target}", tool_display_name(name)),
     }
 }
@@ -106,14 +105,23 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
                 path
             }
         }),
+        "http_request" => text("url").map(|url| {
+            let method = input
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("GET")
+                .to_uppercase();
+            match input.get("save_to").and_then(Value::as_str) {
+                Some(destination) => format!("{method} {url} -> {destination}"),
+                None => format!("{method} {url}"),
+            }
+        }),
         "grep" => text("pattern"),
         "search_web" | "search_files" | "list_tags" => text("query"),
         "search_tag" => text("tag"),
         "resolve_wikilink" | "backlinks" => text("target"),
-        "rename_tag" | "rename_wikilink" => Some(format!("{} -> {}", text("from")?, text("to")?)),
         "add_daily_entry" => Some(text("date").unwrap_or_else(|| "Today".to_string())),
         "copy" | "move" => Some(format!("{} -> {}", text("source")?, text("destination")?)),
-        "download" => Some(format!("{} -> {}", text("url")?, text("destination")?)),
         "import_attachment" => text("source"),
         "attachment_info" | "delete_attachment" => text("uri"),
         "checkout_attachment" => Some(format!("{} -> {}", text("uri")?, text("destination")?)),

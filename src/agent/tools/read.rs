@@ -179,7 +179,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options."
+        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options. To fetch the raw unprocessed response body instead, use `http_request`."
     }
 
     fn input_schema(&self) -> Value {

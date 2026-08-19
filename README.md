@@ -295,8 +295,9 @@ workspace/
 The Agent may create, edit, move, and delete files freely inside
 `workspace/main/`. Clearing the Agent session clears and recreates this
 directory. Moving a source from elsewhere remains approval-gated because it
-removes user-owned data. The `download` tool streams any http(s) URL into a new
-file under `workspace/main/` (see below). Generic file tools cannot access
+removes user-owned data. The `http_request` tool's `save_to` option streams any
+http(s) URL into a new file under `workspace/main/` (see below). Generic file
+tools cannot access
 attachment internals; the Agent uses dedicated tools to import, read, list, check
 out, update, and delete attachments. `checkout_attachment` creates an editable
 workspace copy and returns a content token; after editing, `update_attachment`
@@ -556,18 +557,23 @@ ranked results. Every user prompt sent to the Agent includes the current local
 date and time. File reads default to 200 lines and accept at most 2,000 lines per
 call. Paths under the Nole root are returned in root-relative form so they can be
 passed directly to other file tools.
-
 While `read` inspects content (HTML is converted to Markdown, and results are
-capped at 1 MB), the `download` tool preserves a remote file's exact bytes as a
-new file under `workspace/main/`. It accepts a required http(s) `url` and a
-required `destination` relative to `workspace/main`, streams the body into a
-hidden staging file while computing its SHA-256 incrementally, and publishes it
-only when the transfer is complete — returning the saved root-relative `path`,
-exact `bytes`, optional `media_type`, the final `url` after redirects, and a
-`sha256:<hex>` content token. Downloads never overwrite existing files, never
-follow symlinks, and enforce the 64 MiB per-file and 512 MiB workspace total
-quotas against both the declared `Content-Length` and the actual streamed bytes;
-a failed or cancelled download leaves no partial file. The saved file can be used
+capped at 1 MB), the `http_request` tool preserves a remote response's exact
+bytes as a new file under `workspace/main/` when given `save_to`. It accepts a
+required http(s) `url`, an optional `method` (GET, POST, PUT, PATCH, DELETE, or
+HEAD), optional `headers`, an optional string `body`, and an optional `range`
+object (`offset` + `limit`) for byte-range requests. Without `save_to`, the
+unprocessed response is returned inline — status, final URL, response headers,
+and body (UTF-8 text or base64), capped at 1 MB with `truncated` and
+`content_length` reported when larger so the Agent can page with `range` or fall
+back to `save_to`. With `save_to`, the body is streamed into a hidden staging
+file while its SHA-256 is computed incrementally and published only when the
+transfer is complete — returning the saved root-relative `path`, exact `bytes`,
+optional `media_type`, the final `url` after redirects, and a `sha256:<hex>`
+content token. Saved files never overwrite existing files, never follow
+symlinks, and enforce the 64 MiB per-file and 512 MiB workspace total quotas
+against both the declared `Content-Length` and the actual streamed bytes; a
+failed or cancelled transfer leaves no partial file. The saved file can be used
 immediately by `read`, `import_attachment`, or any generic workspace tool.
 
 Paginated local list and search tools use an inclusive one-based `range` such as

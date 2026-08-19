@@ -837,7 +837,7 @@
     }
 
     #[test]
-    fn download_tool_is_registered_only_for_the_main_agent() {
+    fn http_request_tool_is_registered_for_the_main_agent() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
@@ -858,13 +858,16 @@
             ),
         )
         .unwrap();
-        let registered = agent.tools.get("download").expect("download is registered");
+        let registered = agent
+            .tools
+            .get("http_request")
+            .expect("http_request is registered");
         assert_eq!(registered.execution_policy(), ToolExecutionPolicy::Network);
         let definition = agent
             .definitions
             .iter()
-            .find(|definition| definition.name == "download")
-            .expect("download has a model-facing definition");
+            .find(|definition| definition.name == "http_request")
+            .expect("http_request has a model-facing definition");
         let schema = &definition.input_schema;
         let required = schema["required"]
             .as_array()
@@ -872,9 +875,10 @@
             .iter()
             .map(|value| value.as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(required, ["url", "destination"]);
+        assert_eq!(required, ["url"]);
         assert!(schema["properties"]["url"]["minLength"].as_u64() == Some(1));
-        assert!(schema["properties"]["destination"]["minLength"].as_u64() == Some(1));
+        assert!(schema["properties"]["range"].is_object());
+        assert!(schema["properties"]["save_to"].is_object());
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -949,16 +953,25 @@
         );
 
         let download = json!({
-            "name": "download",
-            "input": {"url": "https://example.com/blob.bin", "destination": "binaries/blob.bin"}
+            "name": "http_request",
+            "input": {"url": "https://example.com/blob.bin", "save_to": "binaries/blob.bin"}
         });
         assert_eq!(
             tool_start_activity(&download),
-            "Downloading...\nhttps://example.com/blob.bin -> binaries/blob.bin"
+            "Calling Http Request...\nGET https://example.com/blob.bin -> binaries/blob.bin"
         );
         assert_eq!(
             tool_finish_activity(&download, None),
-            "Completed Download.\nhttps://example.com/blob.bin -> binaries/blob.bin"
+            "Completed Http Request.\nGET https://example.com/blob.bin -> binaries/blob.bin"
+        );
+
+        let request = json!({
+            "name": "http_request",
+            "input": {"url": "https://api.example.com:8443/v1/items?page=2", "method": "POST"}
+        });
+        assert_eq!(
+            tool_start_activity(&request),
+            "Calling Http Request...\nPOST https://api.example.com:8443/v1/items?page=2"
         );
     }
 

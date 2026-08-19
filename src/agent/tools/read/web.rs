@@ -207,6 +207,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn url_response_converts_html_by_default() {
+        let html = b"<!doctype html><html><body><h1>Reader heading</h1><script>ignored()</script></body></html>";
+        let (url, server) = serve_once("text/html; charset=utf-8", html.to_vec());
+        let read = Read::new(
+            tempfile::tempdir().unwrap().path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let output = read.execute(&json!({"path": url})).await.unwrap();
+        server.join().unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["format"], "text");
+        assert_eq!(parsed["items"], json!(["# Reader heading"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn web_http_failures_report_status_headers_and_bounded_body() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

@@ -252,7 +252,7 @@ mod tests {
         assert!(tool_names.contains(&"calculate"));
         assert!(!tool_names.contains(&"explore"));
         assert!(!tool_names.contains(&"edit"));
-        assert!(!tool_names.contains(&"download"));
+        assert!(!tool_names.contains(&"http_request"));
         assert!(!tool_names.contains(&"ask"));
         assert_eq!(requests[1].messages.len(), 3);
         assert_eq!(

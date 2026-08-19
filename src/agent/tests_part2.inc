@@ -618,6 +618,15 @@
     }
 
     #[test]
+    fn system_prompt_explains_persistent_memory_maintenance() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains("MEMORY.md"));
+        assert!(prompt.contains("persistent Agent memory"));
+        assert!(prompt.contains("durable user preferences"));
+        assert!(prompt.contains("Do not store secrets"));
+    }
+
+    #[test]
     fn system_prompt_cache_sections_isolate_dynamic_memory() {
         let first = system_prompt_sections(
             Path::new("/tmp/nole"),
@@ -679,6 +688,7 @@
             .unwrap()
             .contains("search_web"));
         for name in [
+            "http_request",
             "write",
             "edit",
             "copy",
