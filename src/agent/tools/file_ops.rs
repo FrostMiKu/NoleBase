@@ -3,301 +3,27 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::file_edit::{inspect_text_file, prepare_edit};
 use super::util::{display_path, required_string};
 use super::workspace_quota::{
-    check_workspace_staged_write, check_workspace_write, check_workspace_writes,
-    copy_with_workspace_limits, workspace_dir, workspace_edit_budget,
+    check_workspace_write, check_workspace_writes, copy_with_workspace_limits, workspace_dir,
 };
 use super::write_policy::{
     mbdown_warning, post_write_result, validate_write_preconditions, WriteSource,
     REPAIR_REQUIRED_MARKER,
 };
 use crate::agent::{
-    canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest,
-    ReadTracker, Tool,
+    canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest, Tool,
 };
 use crate::export::ExportFormat;
 use crate::storage::{ExportDestinationPolicy, ExportOutcome, Storage, ATTACHMENTS_DIR};
 
-pub struct Edit {
-    root: PathBuf,
-    gate: ApprovalGate,
-    reads: Arc<ReadTracker>,
-}
-
-impl Edit {
-    pub fn new(root: &Path, gate: ApprovalGate, reads: Arc<ReadTracker>) -> Result<Self> {
-        let root = canonical_root(root)?;
-        Ok(Self { root, gate, reads })
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for Edit {
-    fn name(&self) -> &'static str {
-        "edit"
-    }
-
-    fn description(&self) -> &'static str {
-        "Apply one or more line-based replacements or insertions to an existing UTF-8 file using the path and snapshot tag returned by read."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "tag": {
-                    "type": "string",
-                    "pattern": "^[0-9A-Fa-f]{4}$",
-                    "description": "Four-hex snapshot tag from the latest `[path#TAG]` read header"
-                },
-                "edits": {
-                    "type": "array", "minItems": 1, "maxItems": 100,
-                    "items": {
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "operation": { "type": "string", "const": "replace" },
-                                    "start_line": {
-                                        "type": "integer", "minimum": 1,
-                                        "description": "One-based first line to replace, inclusive"
-                                    },
-                                    "end_line": {
-                                        "type": "integer", "minimum": 1,
-                                        "description": "One-based last line to replace, inclusive"
-                                    },
-                                    "lines": {
-                                        "type": "array",
-                                        "description": "Complete replacement lines without line-ending characters. Use an empty array to delete the inclusive range",
-                                        "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
-                                    }
-                                },
-                                "required": ["operation", "start_line", "end_line", "lines"],
-                                "additionalProperties": false
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "operation": { "type": "string", "const": "insert" },
-                                    "line": {
-                                        "type": "integer", "minimum": 1,
-                                        "description": "One-based source line used as the insertion anchor"
-                                    },
-                                    "position": {
-                                        "type": "string", "enum": ["before", "after"],
-                                        "description": "Insert before or after the anchor line; use before line 1 for an empty file"
-                                    },
-                                    "lines": {
-                                        "type": "array", "minItems": 1,
-                                        "description": "Complete lines to insert without line-ending characters",
-                                        "items": { "type": "string", "pattern": "^[^\\r\\n]*$" }
-                                    }
-                                },
-                                "required": ["operation", "line", "position", "lines"],
-                                "additionalProperties": false
-                            }
-                        ]
-                    }
-                }
-            },
-            "required": ["path", "tag", "edits"], "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let relative = required_string(input, "path")?;
-        let tag = required_string(input, "tag")?;
-        let edits = parse_line_edits(input)?;
-        let unresolved = safe_relative(&self.root, relative)?;
-        if fs::symlink_metadata(&unresolved)?.file_type().is_symlink() {
-            bail!("refusing to edit through a symlink");
-        }
-        let path = fs::canonicalize(&unresolved)
-            .with_context(|| format!("resolving existing file {}", unresolved.display()))?;
-        match path_zone(&self.root, &path) {
-            PathZone::Config => bail!("edit cannot operate inside config/"),
-            PathZone::Attachments => {
-                bail!("generic file tools cannot operate inside attachments/")
-            }
-            _ => {}
-        }
-        let state = self
-            .reads
-            .file_state(&path)?
-            .context("edit requires read on the same path first")?;
-        if !state.tag.eq_ignore_ascii_case(tag) {
-            bail!("snapshot tag mismatch for {relative}; read the file again before editing");
-        }
-        let inspection = inspect_text_file(&path)?;
-        if state.identity != inspection.identity {
-            self.reads.consume_file(&path)?;
-            bail!("file changed since read; read it again before editing");
-        }
-        let total_lines = inspection.total_lines;
-        for edit in &edits {
-            if edit.end_line_exclusive > total_lines {
-                if edit.insertion {
-                    bail!(
-                        "invalid insertion anchor for line {} in file with {total_lines} lines",
-                        edit.anchor_line
-                    );
-                }
-                bail!(
-                    "invalid inclusive edit range {} through {} for file with {total_lines} lines",
-                    edit.start_line + 1,
-                    edit.end_line_exclusive
-                );
-            }
-            state.ensure_edit_read(edit.start_line, edit.end_line_exclusive)?;
-        }
-
-        let budget = workspace_edit_budget(&self.root, &path)?;
-        let prepared = match prepare_edit(&path, relative, &edits, &inspection, budget) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.reads.consume_file(&path)?;
-                return Err(error);
-            }
-        };
-        if prepared.candidate_identity == prepared.original_identity {
-            return Ok(format!("no changes needed for {relative}"));
-        }
-        validate_write_preconditions(&self.root, &path, WriteSource::File(prepared.path()))?;
-        if outside_agent_workspace(&self.root, &path) {
-            self.gate
-                .request(ApprovalRequest {
-                    title: format!("Edit {relative}"),
-                    message: prepared.diff.clone(),
-                    kind: ApprovalKind::Diff,
-                })
-                .await?;
-        }
-        let current = inspect_text_file(&path)?;
-        if current.identity != prepared.original_identity {
-            self.reads.consume_file(&path)?;
-            bail!("file changed before editing; read it again and retry");
-        }
-        check_workspace_staged_write(&self.root, &path, prepared.path(), prepared.candidate_len)?;
-        prepared.publish(&path)?;
-        self.reads.consume_file(&path)?;
-        Ok(post_write_result(
-            format!("edited {relative}"),
-            relative,
-            &path,
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub struct LineEdit {
-    pub(super) start_line: usize,
-    pub(super) end_line_exclusive: usize,
-    pub(super) lines: Vec<String>,
-    pub(super) insertion: bool,
-    pub(super) anchor_line: usize,
-}
-
-pub fn parse_line_edits(input: &Value) -> Result<Vec<LineEdit>> {
-    let values = input
-        .get("edits")
-        .and_then(Value::as_array)
-        .context("field edits must be an array")?;
-    if values.is_empty() || values.len() > 100 {
-        bail!("edits must contain between 1 and 100 entries");
-    }
-    let mut edits = values
-        .iter()
-        .map(|value| {
-            let lines = parse_edit_lines(value)?;
-            match value.get("operation").and_then(Value::as_str) {
-                Some("replace") => {
-                    let start_line = edit_line_number(value, "start_line")?;
-                    let end_line = edit_line_number(value, "end_line")?;
-                    if start_line > end_line {
-                        bail!("replace start_line must not exceed inclusive end_line");
-                    }
-                    Ok(LineEdit {
-                        start_line: start_line - 1,
-                        end_line_exclusive: end_line,
-                        lines,
-                        insertion: false,
-                        anchor_line: start_line,
-                    })
-                }
-                Some("insert") => {
-                    if lines.is_empty() {
-                        bail!("insert lines must not be empty");
-                    }
-                    let line = edit_line_number(value, "line")?;
-                    let position = value
-                        .get("position")
-                        .and_then(Value::as_str)
-                        .context("insert position must be 'before' or 'after'")?;
-                    let start_line = match position {
-                        "before" => line - 1,
-                        "after" => line,
-                        other => bail!("unsupported insert position: {other}"),
-                    };
-                    Ok(LineEdit {
-                        start_line,
-                        end_line_exclusive: start_line,
-                        lines,
-                        insertion: true,
-                        anchor_line: line,
-                    })
-                }
-                Some(operation) => bail!("unsupported edit operation: {operation}"),
-                None => bail!("edit operation must be 'replace' or 'insert'"),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    edits.sort_by_key(|edit| (edit.start_line, edit.end_line_exclusive));
-    for pair in edits.windows(2) {
-        let previous = &pair[0];
-        let current = &pair[1];
-        if current.start_line < previous.end_line_exclusive
-            || current.start_line == previous.start_line
-        {
-            bail!("edits must not overlap or share a start_line");
-        }
-    }
-    Ok(edits)
-}
-
-fn edit_line_number(value: &Value, field: &str) -> Result<usize> {
-    let line = value
-        .get(field)
-        .and_then(Value::as_u64)
-        .filter(|line| *line > 0)
-        .with_context(|| format!("edit {field} must be a positive one-based integer"))?;
-    usize::try_from(line).with_context(|| format!("{field} is too large"))
-}
-
-fn parse_edit_lines(value: &Value) -> Result<Vec<String>> {
-    value
-        .get("lines")
-        .and_then(Value::as_array)
-        .context("edit lines must be an array")?
-        .iter()
-        .map(|line| {
-            let line = line.as_str().context("each edit line must be a string")?;
-            if line.contains('\r') || line.contains('\n') {
-                bail!("edit lines must not contain line-ending characters");
-            }
-            Ok(line.to_string())
-        })
-        .collect()
-}
-
-fn safe_relative(root: &Path, input: &str) -> Result<PathBuf> {
+pub(super) fn safe_relative(root: &Path, input: &str) -> Result<PathBuf> {
     let relative = Path::new(input);
     if relative.is_absolute()
         || relative.components().any(|component| {
@@ -384,7 +110,7 @@ pub(crate) fn path_zone(root: &Path, path: &Path) -> PathZone {
 
 /// Whether mutating `path` requires user approval. Everything under
 /// `workspace/main` is the current session's sandbox and bypasses the gate.
-fn outside_agent_workspace(root: &Path, path: &Path) -> bool {
+pub(super) fn outside_agent_workspace(root: &Path, path: &Path) -> bool {
     !matches!(path_zone(root, path), PathZone::Workspace)
 }
 
@@ -463,7 +189,7 @@ fn revalidate_source(identity: &SourceIdentity) -> Result<()> {
 /// Move a file to a new path. Same-filesystem moves use an atomic `rename`;
 /// only a cross-device error (EXDEV) falls back to a durable copy, sync, and
 /// remove of the source.
-fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
+pub(super) fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
     match fs::rename(source, destination) {
         Ok(()) => {
             let bytes = fs::metadata(destination)
@@ -1336,7 +1062,9 @@ mod tests {
         drain_events, event_channel, test_runtime, TestFutureResultExt,
     };
     use crate::agent::ApprovalDecision;
-    use crate::agent::{snapshot_identity, snapshot_tag};
+    use crate::agent::Edit;
+    use crate::agent::hashline::RegisterBank;
+    use crate::agent::snapshots::{snapshot_identity, snapshot_tag, SnapshotStore};
     use crate::export::{ExportDiagnostic, ExportDiagnosticSeverity};
 
     fn gate_without_decisions() -> (ApprovalGate, tokio::sync::broadcast::Receiver<AgentEvent>) {
@@ -1420,25 +1148,25 @@ mod tests {
 
         let draft = workspace.join("draft.md");
         fs::write(&draft, "wip\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
+        let registers = Arc::new(RegisterBank::default());
         let content = fs::read_to_string(&draft).unwrap();
         let canonical_draft = fs::canonicalize(&draft).unwrap();
         reads
-            .mark_file(
-                canonical_draft,
+            .record(
+                canonical_draft.clone(),
                 snapshot_identity(&content),
                 snapshot_tag(&content),
-                0,
-                1,
-                1,
+                content.lines().count(),
+                None,
+                (0, content.lines().count()),
             )
             .unwrap();
         let (gate, mut events) = gate_without_decisions();
-        let edit = Edit::new(&root, gate, reads).unwrap();
+        let edit = Edit::new(&root, gate, reads.clone(), registers).unwrap();
+        let tag = reads.head(&canonical_draft).unwrap().unwrap().tag;
         let input = json!({
-            "path": "workspace/main/draft.md",
-            "tag": snapshot_tag(&content),
-            "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["edited"]}]
+            "patch": format!("[workspace/main/draft.md#{tag}]\nPUT 1.=1:\n+edited\n")
         });
         let output = execute_unapproved(move || test_runtime().block_on(edit.execute(&input)));
         assert!(output.contains("edited workspace/main/draft.md"));
@@ -1446,25 +1174,24 @@ mod tests {
         assert_no_approval_requested(drain_events(&mut events));
 
         // Snapshot checks still gate workspace edits: a stale tag is refused.
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
+        let registers = Arc::new(RegisterBank::default());
         let content = fs::read_to_string(&draft).unwrap();
         let canonical_draft = fs::canonicalize(&draft).unwrap();
         reads
-            .mark_file(
-                canonical_draft,
+            .record(
+                canonical_draft.clone(),
                 snapshot_identity(&content),
                 snapshot_tag(&content),
-                0,
-                1,
-                1,
+                content.lines().count(),
+                None,
+                (0, content.lines().count()),
             )
             .unwrap();
         let (gate, _) = gate_without_decisions();
-        let edit = Edit::new(&root, gate, reads).unwrap();
+        let edit = Edit::new(&root, gate, reads, registers).unwrap();
         let input = json!({
-            "path": "workspace/main/draft.md",
-            "tag": "DEAD",
-            "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["again"]}]
+            "patch": "[workspace/main/draft.md#DEAD]\nPUT 1.=1:\n+again\n"
         });
         let error = test_runtime().block_on(edit.execute(&input)).unwrap_err();
         assert!(error.to_string().contains("snapshot tag mismatch"));
@@ -1784,14 +1511,13 @@ mod tests {
         let escape = workspace.join("escape.md");
         symlink(&outside_file, &escape).unwrap();
 
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
+        let registers = Arc::new(RegisterBank::default());
         let (gate, _) = gate_without_decisions();
-        let edit = Edit::new(&root, gate, reads).unwrap();
+        let edit = Edit::new(&root, gate, reads, registers).unwrap();
         let error = test_runtime()
             .block_on(edit.execute(&json!({
-                "path": "workspace/main/escape.md",
-                "tag": "0000",
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["x"]}]
+                "patch": "[workspace/main/escape.md#0000]\nPUT 1.=1:\n+x\n"
             })))
             .unwrap_err();
         assert!(error.to_string().contains("symlink"));

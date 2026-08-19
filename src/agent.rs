@@ -40,19 +40,21 @@ use crate::workspace_index::WorkspaceIndexHandle;
 mod activity;
 mod config;
 mod context;
+pub(crate) mod hashline;
 mod prompts;
 mod subagent;
+mod snapshots;
 #[cfg(test)]
 mod test_support;
 mod tools;
-mod tracking;
 mod types;
 
 pub(crate) use self::activity::*;
 pub(crate) use self::config::*;
 pub(crate) use self::context::*;
+pub(crate) use self::hashline::*;
 pub(crate) use self::prompts::*;
-pub(crate) use self::tracking::*;
+pub(crate) use self::snapshots::*;
 pub use self::types::*;
 
 use tools::*;
@@ -289,7 +291,8 @@ struct AgentSource {
 pub struct AgentWorker {
     tasks: Sender<AgentTask>,
     cancelled: Arc<AtomicBool>,
-    reads: Arc<ReadTracker>,
+    reads: Arc<SnapshotStore>,
+    registers: Arc<RegisterBank>,
     events: AgentEventSender,
     #[cfg(test)]
     attachment_usage: AttachmentUsageHandle,
@@ -332,8 +335,10 @@ impl AgentWorker {
         let (tasks, receiver) = mpsc::channel::<AgentTask>();
         let cancelled = runtime.cancelled.clone();
         let events = runtime.events.clone();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let worker_reads = reads.clone();
+        let registers = Arc::new(RegisterBank::default());
+        let worker_registers = registers.clone();
         let worker_usage = attachment_usage.clone();
         #[cfg(test)]
         let worker_wiki_links = runtime.wiki_links.clone();
@@ -371,6 +376,7 @@ impl AgentWorker {
                             runtime.clone(),
                             http,
                             worker_reads.clone(),
+                            worker_registers.clone(),
                             worker_usage.clone(),
                         )?);
                         loaded_source = Some(source);
@@ -423,6 +429,7 @@ impl AgentWorker {
             tasks,
             cancelled,
             reads,
+            registers,
             events,
             #[cfg(test)]
             attachment_usage,
@@ -461,7 +468,9 @@ impl AgentWorker {
     }
 
     pub fn clear_read_state(&self) -> Result<()> {
-        self.reads.clear()
+        self.reads.clear()?;
+        self.registers.clear()?;
+        Ok(())
     }
 
     pub fn invalidate_reads(&self, paths: &[PathBuf]) -> Result<()> {
@@ -502,7 +511,8 @@ impl Agent {
             nole_root,
             runtime,
             client,
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
+            Arc::new(RegisterBank::default()),
             AttachmentUsageHandle::default(),
         )
     }
@@ -512,7 +522,8 @@ impl Agent {
         nole_root: &Path,
         runtime: AgentRuntime,
         client: Client,
-        reads: Arc<ReadTracker>,
+        reads: Arc<SnapshotStore>,
+        registers: Arc<RegisterBank>,
         attachment_usage: AttachmentUsageHandle,
     ) -> Result<Self> {
         let AgentRuntime {
@@ -600,7 +611,7 @@ impl Agent {
         agent.register(MoveMany::new(nole_root, file_events.clone(), gate.clone())?);
         agent.register(Rename::new(nole_root, file_events, gate.clone())?);
         agent.register(Delete::new(nole_root, gate.clone())?);
-        agent.register(Edit::new(nole_root, gate.clone(), reads)?);
+        agent.register(Edit::new(nole_root, gate.clone(), reads, registers)?);
         agent.register(AddDailyEntry::new(nole_root)?);
         agent.register(Open::new(nole_root, agent.events.clone())?);
         agent.register(Notify {

@@ -33,7 +33,7 @@ use tokio::fs as async_fs;
 use tokio::io::AsyncReadExt as _;
 
 use super::util::{portable_path, range_schema, required_string};
-use crate::agent::{canonical_root, ReadTracker, Tool, ToolExecutionPolicy};
+use crate::agent::{canonical_root, SnapshotStore, Tool, ToolExecutionPolicy};
 use crate::attachment::{AttachmentStore, AttachmentUri};
 use crate::storage::ATTACHMENTS_DIR;
 
@@ -101,7 +101,7 @@ impl Target {
 /// Shared dependencies handed to every [`ReadParser`].
 pub(crate) struct ParseContext {
     pub(crate) root: PathBuf,
-    pub(crate) reads: Arc<ReadTracker>,
+    pub(crate) reads: Arc<SnapshotStore>,
     pub(crate) client: reqwest::Client,
     pub(crate) attachments: AttachmentStore,
     documents: DocumentCache,
@@ -134,7 +134,7 @@ pub struct Read {
 }
 
 impl Read {
-    pub fn new(root: &Path, reads: Arc<ReadTracker>, client: reqwest::Client) -> Result<Self> {
+    pub fn new(root: &Path, reads: Arc<SnapshotStore>, client: reqwest::Client) -> Result<Self> {
         let root = canonical_root(root)?;
         let attachments = AttachmentStore::new(root.join(ATTACHMENTS_DIR));
         let ctx = ParseContext {
@@ -327,7 +327,7 @@ mod tests {
         fs::write(directory.path().join("sample.pdf"), b"%PDF-1.4").unwrap();
         let mut read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -395,7 +395,7 @@ mod tests {
         assert!(object.exists());
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();

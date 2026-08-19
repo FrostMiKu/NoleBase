@@ -2,8 +2,9 @@
 //!
 //! This fallback is registered last so more specific file parsers (for
 //! example PDF) can claim a target first. It scans the complete file to retain
-//! a strong edit identity and exact line count while returning only a bounded
-//! line window, and gates edits through the shared `ReadTracker`.
+//! a strong edit identity, exact line count, and bounded normalized text for
+//! drift recovery while returning only a bounded line window, and gates edits
+//! through the shared `SnapshotStore`.
 
 use std::fmt::Write as _;
 
@@ -43,7 +44,7 @@ impl ReadParser for TextFileParser {
         }
         let (offset, limit) = line_window(*range, input)?;
         let page_path = path.clone();
-        let page = tokio::task::spawn_blocking(move || {
+        let mut page = tokio::task::spawn_blocking(move || {
             read_utf8_page(&page_path, offset, limit, plain_response_len)
         })
         .await
@@ -82,13 +83,13 @@ impl ReadParser for TextFileParser {
             let total_lines = page
                 .total_lines
                 .expect("local text reads always scan the complete file");
-            let tracked_tag = ctx.reads.mark_file(
+            let tracked_tag = ctx.reads.record(
                 path.clone(),
                 identity,
                 tag.clone(),
-                page.start,
-                page.end,
                 total_lines,
+                page.full_text.take(),
+                (page.start, page.end),
             )?;
             debug_assert_eq!(tag, tracked_tag);
         }
@@ -105,7 +106,7 @@ mod tests {
 
     use super::super::test_support::large_text;
     use super::super::Read;
-    use crate::agent::{ReadTracker, Tool};
+    use crate::agent::{SnapshotStore, Tool};
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_files_over_one_megabyte_are_read_in_pages() {
@@ -114,7 +115,7 @@ mod tests {
         let content = large_text(50_000);
         assert!(content.len() > 1_000_000);
         fs::write(&path, &content).unwrap();
-        let tracker = Arc::new(ReadTracker::default());
+        let tracker = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), tracker.clone(), reqwest::Client::new()).unwrap();
 
         let output = read
@@ -125,7 +126,7 @@ mod tests {
         assert!(output.contains("[Showing lines 49991-49995"));
         assert!(output.contains("Continue with large.txt:49996-50000"));
         assert!(tracker
-            .file_state(&fs::canonicalize(path).unwrap())
+            .head(&fs::canonicalize(path).unwrap())
             .unwrap()
             .is_some());
         let final_page = read

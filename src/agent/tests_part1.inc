@@ -187,7 +187,7 @@
             .unwrap();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             build_http_client().unwrap(),
         )
         .unwrap();
@@ -220,9 +220,15 @@
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         fs::write(directory.path().join("data/large.md"), &content).unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
 
         let first = read
             .execute(&json!({"path": "data/large.md:1-200"}))
@@ -234,9 +240,10 @@
         ));
         assert!(edit
             .execute(&json!({
-                "path": "data/large.md",
-                "tag": snapshot_tag(&content),
-                "edits": [{"operation": "insert", "line": 450, "position": "after", "lines": ["done"]}]
+                "patch": format!(
+                    "[data/large.md#{}]\nPUT >450:\n+done\n",
+                    snapshot_tag(&content)
+                )
             }))
             .returns_err());
 
@@ -246,9 +253,10 @@
         assert_eq!(first.lines().next(), last.lines().next());
         assert!(last.ends_with("[Showing lines 401-450 of 450]"));
         edit.execute(&json!({
-            "path": "data/large.md",
-            "tag": snapshot_tag(&content),
-            "edits": [{"operation": "insert", "line": 450, "position": "after", "lines": ["done"]}]
+            "patch": format!(
+                "[data/large.md#{}]\nPUT >450:\n+done\n",
+                snapshot_tag(&content)
+            )
         }))
         .unwrap();
     }
@@ -266,23 +274,25 @@
         assert!(content.len() > 1_000_000);
         let path = directory.path().join("data/huge.md");
         fs::write(&path, &content).unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
 
         let page = read
             .execute(&json!({"path": format!("data/huge.md:{line_count}-{line_count}")}))
             .unwrap();
         assert!(page.contains(&format!("{line_count}:large line {line_count}")));
         edit.execute(&json!({
-            "path": "data/huge.md",
-            "tag": snapshot_tag(&content),
-            "edits": [{
-                "operation": "replace",
-                "start_line": line_count,
-                "end_line": line_count,
-                "lines": ["edited final line"]
-            }]
+            "patch": format!(
+                "[data/huge.md#{}]\nPUT {line_count}.={line_count}:\n+edited final line\n",
+                snapshot_tag(&content)
+            )
         }))
         .unwrap();
 
@@ -304,7 +314,7 @@
 
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             build_http_client().unwrap(),
         )
         .unwrap();
@@ -327,7 +337,7 @@
         let beta = directory.path().join("data/beta.md");
         fs::write(&alpha, "alpha\n").unwrap();
         fs::write(&beta, "beta\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         read.execute(&json!({"path": "data/alpha.md"})).unwrap();
         read.execute(&json!({"path": "data/beta.md"})).unwrap();
@@ -335,11 +345,11 @@
         let beta = fs::canonicalize(beta).unwrap();
 
         reads.invalidate(&alpha).unwrap();
-        assert!(reads.file_state(&alpha).unwrap().is_none());
-        assert!(reads.file_state(&beta).unwrap().is_some());
+        assert!(reads.head(&alpha).unwrap().is_none());
+        assert!(reads.head(&beta).unwrap().is_some());
 
         reads.invalidate(&directory.path().join("data")).unwrap();
-        assert!(reads.file_state(&beta).unwrap().is_none());
+        assert!(reads.head(&beta).unwrap().is_none());
     }
 
     #[test]
@@ -431,7 +441,7 @@
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("config/ai.toml"), "api_key='secret'").unwrap();
         fs::write(directory.path().join("daily/2026-07-27.md"), "daily entry").unwrap();
-        let read = Read::new(directory.path(), Arc::new(ReadTracker::default()), build_http_client().unwrap()).unwrap();
+        let read = Read::new(directory.path(), Arc::new(SnapshotStore::default()), build_http_client().unwrap()).unwrap();
         assert!(read
             .execute(&json!({"path": "config/ai.toml"}))
             .returns_err());
@@ -456,17 +466,24 @@
         .unwrap();
         fs::write(directory.path().join("MEMORY.md"), "old memory\n").unwrap();
 
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         let write = Write::new(directory.path()).unwrap();
 
         read.execute(&json!({"path": "config/AGENTS.md"})).unwrap();
         assert!(edit
             .execute(&json!({
-                "path": "config/AGENTS.md",
-                "tag": file_snapshot_tag(directory.path().join("config/AGENTS.md")),
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["changed"]}]
+                "patch": format!(
+                    "[config/AGENTS.md#{}]\nPUT 1.=1:\n+changed\n",
+                    file_snapshot_tag(directory.path().join("config/AGENTS.md"))
+                )
             }))
             .returns_err());
         assert!(write
@@ -484,9 +501,10 @@
         read.execute(&json!({"path": "themes/custom.toml"}))
             .unwrap();
         edit.execute(&json!({
-            "path": "themes/custom.toml",
-            "tag": file_snapshot_tag(directory.path().join("themes/custom.toml")),
-                "edits": [{"operation": "replace", "start_line": 2, "end_line": 2, "lines": ["action = \"#010203\""]}]
+            "patch": format!(
+                "[themes/custom.toml#{}]\nPUT 2.=2:\n+action = \"#010203\"\n",
+                file_snapshot_tag(directory.path().join("themes/custom.toml"))
+            )
         }))
         .unwrap();
         assert_eq!(
@@ -496,9 +514,10 @@
 
         read.execute(&json!({"path": "MEMORY.md"})).unwrap();
         edit.execute(&json!({
-            "path": "MEMORY.md",
-            "tag": file_snapshot_tag(directory.path().join("MEMORY.md")),
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["new memory"]}]
+            "patch": format!(
+                "[MEMORY.md#{}]\nPUT 1.=1:\n+new memory\n",
+                file_snapshot_tag(directory.path().join("MEMORY.md"))
+            )
         }))
         .unwrap();
         assert_eq!(
@@ -517,7 +536,7 @@
         fs::write(storage.data_dir.join("Nested/Beta.txt"), "three\n").unwrap();
         let list = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             build_http_client().unwrap(),
         )
         .unwrap();

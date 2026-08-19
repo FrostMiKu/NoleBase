@@ -888,7 +888,7 @@
 
         let tool = Read::new(
             tempfile::tempdir().unwrap().path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             build_http_client().unwrap(),
         )
         .unwrap();
@@ -911,19 +911,25 @@
         fs::create_dir(directory.path().join("config")).unwrap();
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("data/note.md"), "old\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
-        let edit = Edit::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
+        let reads = Arc::new(SnapshotStore::default());
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads.clone(),
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
+        let tag = file_snapshot_tag(directory.path().join("data/note.md"));
         let input = json!({
-            "path": "data/note.md",
-            "tag": file_snapshot_tag(directory.path().join("data/note.md")),
-            "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["new"]}]
+            "patch": format!("[data/note.md#{tag}]\nPUT 1.=1:\n+new\n")
         });
+        // Editing a file that was never read is rejected outright.
         assert!(edit.execute(&input).returns_err());
 
         let read = Read::new(directory.path(), reads, build_http_client().unwrap()).unwrap();
         read.execute(&json!({"path": "data/note.md"})).unwrap();
         let mut wrong_tag = input.clone();
-        wrong_tag["tag"] = json!(if input["tag"] == "0000" { "FFFF" } else { "0000" });
+        wrong_tag["patch"] = json!(format!("[data/note.md#0000]\nPUT 1.=1:\n+new\n"));
         assert!(edit
             .execute(&wrong_tag)
             .unwrap_err()
@@ -934,13 +940,14 @@
             fs::read_to_string(directory.path().join("data/note.md")).unwrap(),
             "new\n"
         );
+        // The snapshot the first edit was anchored on is now stale: the very
+        // line the patch touches changed, so re-applying it must fail until a
+        // re-read.
         assert!(edit
-            .execute(&json!({
-                "path": "data/note.md",
-                "tag": file_snapshot_tag(directory.path().join("data/note.md")),
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["again"]}]
-            }))
-            .returns_err());
+            .execute(&input)
+            .unwrap_err()
+            .to_string()
+            .contains("file changed since read at line 1"));
 
         let write = Write::new(directory.path()).unwrap();
         let schema = write.input_schema();
@@ -973,25 +980,60 @@
         fs::create_dir(directory.path().join("daily")).unwrap();
         let path = directory.path().join("data/note.md");
         fs::write(&path, "old\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
         let output = read
             .execute(&json!({"path": "data/note.md"}))
             .unwrap();
         assert!(output.starts_with(&format!("[data/note.md#{}]", snapshot_tag("old\n"))));
 
+        // The external change rewrote the very line the patch targets, so the
+        // rebase must fail: the retained snapshot can no longer prove that
+        // line of the edit still exists unchanged in the live file.
         fs::write(&path, "changed elsewhere\n").unwrap();
-        let error = Edit::new(directory.path(), bypass_gate(), reads)
+        let error = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads.clone(),
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap()
+        .execute(&json!({
+            "patch": format!("[data/note.md#{}]\nPUT 1.=1:\n+agent change\n", snapshot_tag("old\n"))
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("file changed since read at line 1"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "changed elsewhere\n");
+
+        // When the external change hit an unrelated line only, the edit REBASES
+        // onto the live file (from the retained pre-change text) and lands.
+        fs::write(&path, "old\nnew unrelated line\n").unwrap();
+        let reads = Arc::new(SnapshotStore::default());
+        Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
-            .execute(&json!({
-                "path": "data/note.md",
-                "tag": snapshot_tag("old\n"),
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["agent change"]}]
-            }))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("file changed since read"));
-        assert_eq!(fs::read_to_string(path).unwrap(), "changed elsewhere\n");
+            .execute(&json!({"path": "data/note.md"}))
+            .unwrap();
+        fs::write(&path, "old\nnew unrelated line\nappended externally\n").unwrap();
+        let result = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap()
+        .execute(&json!({
+            "patch": format!(
+                "[data/note.md#{}]\nPUT 1.=1:\n+agent change\n",
+                snapshot_tag("old\nnew unrelated line\n")
+            )
+        }))
+        .unwrap();
+        assert!(result.contains("edited data/note.md"));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "agent change\nnew unrelated line\nappended externally\n"
+        );
     }
 
     #[test]
@@ -1043,22 +1085,24 @@
             .to_string();
         assert!(overwrite_error.contains("write only creates new files"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "valid\n");
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/note.md"}))
             .unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads.clone()).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads.clone(),
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         let result = test_runtime()
             .block_on(edit.execute(&json!({
-                "path": "data/note.md",
-                "tag": file_snapshot_tag(&path),
-                "edits": [{
-                    "operation": "replace",
-                    "start_line": 1,
-                    "end_line": 1,
-                    "lines": ["[box border=double]", "body", "[/box]"]
-                }]
+                "patch": format!(
+                    "[data/note.md#{}]\nPUT 1.=1:\n+[box border=double]\n+body\n+[/box]\n",
+                    file_snapshot_tag(&path)
+                )
             })))
             .unwrap();
         assert!(result.contains("edited data/note.md"));
@@ -1071,17 +1115,13 @@
             .unwrap();
         let repaired = test_runtime()
             .block_on(edit.execute(&json!({
-                "path": "data/note.md",
-                "tag": file_snapshot_tag(&path),
-                "edits": [{
-                    "operation": "replace",
-                    "start_line": 1,
-                    "end_line": 1,
-                    "lines": ["[box border=single]"]
-                }]
+                "patch": format!(
+                    "[data/note.md#{}]\nPUT 1.=1:\n+[box border=single]\n",
+                    file_snapshot_tag(&path)
+                )
             })))
             .unwrap();
-        assert_eq!(repaired, "edited data/note.md");
+        assert!(repaired.contains("edited data/note.md"));
         assert!(mbdown::validate(&fs::read_to_string(&path).unwrap()).is_ok());
     }
 
@@ -1121,22 +1161,24 @@
             .to_string();
         assert!(overwrite_error.contains("write only creates new files"));
         assert_eq!(fs::read_to_string(&existing).unwrap(), valid);
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "skills/existing.md"}))
             .unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         let edit_error = edit
             .execute(&json!({
-                "path": "skills/existing.md",
-                "tag": file_snapshot_tag(&existing),
-                "edits": [{
-                    "operation": "replace",
-                    "start_line": 2,
-                    "end_line": 2,
-                    "lines": ["desc: Wrong field"]
-                }]
+                "patch": format!(
+                    "[skills/existing.md#{}]\nPUT 2.=2:\n+desc: Wrong field\n",
+                    file_snapshot_tag(&existing)
+                )
             }))
             .unwrap_err()
             .to_string();
@@ -1203,33 +1245,29 @@
         storage.ensure_files().unwrap();
         let path = storage.data_dir.join("range.md");
         fs::write(&path, "zero\none\ntwo\nthree\nfour\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/range.md"}))
             .unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         let schema = edit.input_schema();
-        assert_eq!(schema["required"], json!(["path", "tag", "edits"]));
-        assert_eq!(
-            schema["properties"]["edits"]["items"]["oneOf"][0]["properties"]
-                ["start_line"]["minimum"],
-            1
-        );
-        assert_eq!(
-            schema["properties"]["edits"]["items"]["oneOf"][1]["required"],
-            json!(["operation", "line", "position", "lines"])
-        );
+        assert_eq!(schema["required"], json!(["patch"]));
+        assert_eq!(schema["properties"]["patch"], json!({"type": "string"}));
+        assert_eq!(schema["additionalProperties"], json!(false));
 
+        // `PUT N.=M:` replaces every original line from N through M inclusive.
         edit.execute(&json!({
-            "path": "data/range.md",
-            "tag": file_snapshot_tag(&path),
-            "edits": [{
-                "operation": "replace",
-                "start_line": 2,
-                "end_line": 4,
-                "lines": ["replacement"]
-            }]
+            "patch": format!(
+                "[data/range.md#{}]\nPUT 2.=4:\n+replacement\n",
+                file_snapshot_tag(&path)
+            )
         }))
         .unwrap();
 
@@ -1237,12 +1275,6 @@
             fs::read_to_string(&path).unwrap(),
             "zero\nreplacement\nfour\n"
         );
-        assert!(parse_line_edits(&json!({
-            "edits": [{"start_line": 1, "end_line": 4, "lines": ["legacy"]}]
-        }))
-        .unwrap_err()
-        .to_string()
-        .contains("operation must be 'replace' or 'insert'"));
     }
 
     #[test]
@@ -1257,132 +1289,151 @@
             .collect::<String>();
         fs::write(&path, &original).unwrap();
 
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         read.execute(&json!({"path": "data/large.md:11-11"}))
             .unwrap();
         edit.execute(&json!({
-            "path": "data/large.md",
-            "tag": file_snapshot_tag(&path),
-            "edits": [{"operation": "replace", "start_line": 11, "end_line": 11, "lines": ["changed 10"]}]
+            "patch": format!(
+                "[data/large.md#{}]\nPUT 11.=11:\n+changed 10\n",
+                file_snapshot_tag(&path)
+            )
         }))
         .unwrap();
 
         fs::write(&path, &original).unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         read.execute(&json!({"path": "data/large.md:11-11"}))
             .unwrap();
         let error = edit
             .execute(&json!({
-                "path": "data/large.md",
-                "tag": file_snapshot_tag(&path),
-                "edits": [{"operation": "replace", "start_line": 3, "end_line": 3, "lines": ["changed 2"]}]
+                "patch": format!(
+                    "[data/large.md#{}]\nPUT 3.=3:\n+changed 2\n",
+                    file_snapshot_tag(&path)
+                )
             }))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("changed lines 3 through 3"));
+        assert!(error.contains("read lines 3 through 3"));
 
         fs::write(&path, "first\nsecond\nthird\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         let read = Read::new(directory.path(), reads.clone(), build_http_client().unwrap()).unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         read.execute(&json!({"path": "data/large.md:2-2"}))
             .unwrap();
         let error = edit
             .execute(&json!({
-                "path": "data/large.md",
-                "tag": file_snapshot_tag(&path),
-                "edits": [{"operation": "insert", "line": 2, "position": "before", "lines": ["inserted"]}]
+                "patch": format!(
+                    "[data/large.md#{}]\nPUT <2:\n+inserted\n",
+                    file_snapshot_tag(&path)
+                )
             }))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("insertion anchor lines 1 through 2"));
+        assert!(error.contains("read lines 1 through 2"));
     }
 
     #[test]
-    fn file_edit_rejects_lines_with_embedded_newlines() {
+    fn file_edit_body_rows_are_single_lines_and_preserve_line_endings() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         let path = storage.data_dir.join("table.md");
         let original = "| model | score |\n| --- | --- |\n| MM26 | 0.65 |\n";
         fs::write(&path, original).unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/table.md"}))
             .unwrap();
-        let edit = Edit::new(directory.path(), bypass_gate(), reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
 
-        let error = edit
-            .execute(&json!({
-                "path": "data/table.md",
-                "tag": file_snapshot_tag(&path),
-                "edits": [{
-                    "operation": "insert",
-                    "line": 3,
-                    "position": "before",
-                    "lines": ["| SAC | 0.639 |\n| MM26"]
-                }]
-            }))
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("edit lines must not contain line-ending characters"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-
+        // A hashline `+` body row is exactly one line of the new file: one row
+        // inserted before line 3 lands as a single line, never split.
         edit.execute(&json!({
-                "path": "data/table.md",
-                "tag": file_snapshot_tag(&path),
-                "edits": [{
-                    "operation": "insert",
-                    "line": 3,
-                    "position": "before",
-                    "lines": ["| SAC | 0.639 |"]
-                }]
+            "patch": format!(
+                "[data/table.md#{}]\nPUT <3:\n+| SAC | 0.639 |\n",
+                file_snapshot_tag(&path)
+            )
         }))
         .unwrap();
         assert_eq!(
-            fs::read_to_string(path).unwrap(),
+            fs::read_to_string(&path).unwrap(),
             "| model | score |\n| --- | --- |\n| SAC | 0.639 |\n| MM26 | 0.65 |\n"
         );
 
+        // An EOF insert onto a file with no trailing newline still works.
         let eof_path = storage.data_dir.join("eof.md");
         fs::write(&eof_path, "old").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/eof.md"}))
             .unwrap();
-        Edit::new(directory.path(), bypass_gate(), reads)
-            .unwrap()
-            .execute(&json!({
-                "path": "data/eof.md",
-                "tag": file_snapshot_tag(&eof_path),
-                "edits": [{"operation": "insert", "line": 1, "position": "after", "lines": ["new"]}]
-            }))
-            .unwrap();
+        Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap()
+        .execute(&json!({
+            "patch": format!("[data/eof.md#{}]\nPUT >$:\n+new\n", file_snapshot_tag(&eof_path))
+        }))
+        .unwrap();
         assert_eq!(fs::read_to_string(&eof_path).unwrap(), "old\nnew\n");
 
+        // A CRLF file stays CRLF after an edit.
         let crlf_path = storage.data_dir.join("crlf.md");
         fs::write(&crlf_path, "old\r\nvalue\r\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/crlf.md"}))
             .unwrap();
-        Edit::new(directory.path(), bypass_gate(), reads)
-            .unwrap()
-            .execute(&json!({
-                "path": "data/crlf.md",
-                "tag": file_snapshot_tag(&crlf_path),
-                "edits": [{"operation": "replace", "start_line": 2, "end_line": 2, "lines": ["changed"]}]
-            }))
-            .unwrap();
-        assert_eq!(fs::read_to_string(crlf_path).unwrap(), "old\r\nchanged\r\n");
+        Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap()
+        .execute(&json!({
+            "patch": format!(
+                "[data/crlf.md#{}]\nPUT 2.=2:\n+changed\n",
+                file_snapshot_tag(&crlf_path)
+            )
+        }))
+        .unwrap();
+        assert_eq!(fs::read_to_string(&crlf_path).unwrap(), "old\r\nchanged\r\n");
     }
 
     #[test]
@@ -1391,19 +1442,25 @@
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         storage.append_daily("2026-07-27", "old").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .unwrap();
-        Edit::new(directory.path(), bypass_gate(), reads)
-            .unwrap()
-            .execute(&json!({
-                "path": "daily/2026-07-27.md",
-                "tag": file_snapshot_tag(storage.daily_file_path("2026-07-27").unwrap()),
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["edited"]}]
-            }))
-            .unwrap();
+        Edit::new(
+            directory.path(),
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap()
+        .execute(&json!({
+            "patch": format!(
+                "[daily/2026-07-27.md#{}]\nPUT 1.=1:\n+edited\n",
+                file_snapshot_tag(storage.daily_file_path("2026-07-27").unwrap())
+            )
+        }))
+        .unwrap();
         assert_eq!(storage.load_daily_notes().unwrap()[0].body, "edited");
 
         Delete::new(directory.path(), bypass_gate())
@@ -1477,7 +1534,7 @@
         fs::create_dir(directory.path().join("config")).unwrap();
         fs::create_dir(directory.path().join("daily")).unwrap();
         fs::write(directory.path().join("data/note.md"), "old\n").unwrap();
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
             .execute(&json!({"path": "data/note.md"}))
@@ -1490,12 +1547,19 @@
             events: event_sender,
             decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         };
-        let edit = Edit::new(directory.path(), gate, reads).unwrap();
+        let edit = Edit::new(
+            directory.path(),
+            gate,
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(edit.execute(&json!({
-                "path": "data/note.md",
-                "tag": snapshot_tag("old\n"),
-                "edits": [{"operation": "replace", "start_line": 1, "end_line": 1, "lines": ["new"]}]
+                "patch": format!(
+                    "[data/note.md#{}]\nPUT 1.=1:\n+new\n",
+                    snapshot_tag("old\n")
+                )
             })))
         });
 

@@ -170,7 +170,7 @@ mod tests {
 
     use super::super::test_support::{large_text, simple_pdf};
     use super::super::{Read, ATTACHMENTS_DIR};
-    use crate::agent::{ReadTracker, Tool};
+    use crate::agent::{SnapshotStore, Tool};
     use crate::attachment::AttachmentStore;
 
     #[tokio::test(flavor = "current_thread")]
@@ -185,7 +185,7 @@ mod tests {
             .to_string();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -218,7 +218,7 @@ mod tests {
             .to_string();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -258,7 +258,7 @@ mod tests {
             .to_string();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -290,7 +290,7 @@ mod tests {
             .to_string();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -317,7 +317,7 @@ mod tests {
             .to_string();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -338,7 +338,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();

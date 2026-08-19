@@ -483,10 +483,11 @@ One Agent worker lives for the lifetime of the application. It reuses its HTTP
 connection pool, tool instances, precomputed tool definitions, and unchanged
 file-read snapshots across prompts. Before each task it checks the actual
 contents of `ai.toml`, `AGENTS.md`, and `MEMORY.md`, rebuilding the Agent only
-when one changed. File-read snapshots remain valid across prompts while the
-file content is unchanged; editing consumes the relevant snapshot, workspace
+when one changed. Versioned file-read snapshots remain valid across prompts;
+successful edits immediately record the new tag while retaining recent versions
+for conservative line-level recovery when unrelated content drifts. Workspace
 file events invalidate only affected paths, a final content comparison catches
-missed events, and clearing the Agent session clears all remaining read state.
+missed events, and clearing the Agent session clears snapshots and registers.
 Tool definitions are emitted in fixed registration order instead of hash-map
 iteration order. Messages requests use four explicit prompt-cache breakpoints:
 the final tool, the stable base system block, the skill catalog after project
@@ -597,18 +598,25 @@ fuzzy filename search used by the Files sidebar.
 files have no 1 MiB tool limit; workspace files remain subject to the 64 MiB
 per-file and 512 MiB total workspace quotas, while Skills retain their separate
 size limit because they enter Agent context. The full candidate content passes
-MBDown or Skill validation before publication. `edit` accepts one or more line
-edits and streams unchanged content through an atomically published candidate,
-so files larger than 1 MiB remain editable after paged reads. `replace`
-operations use inclusive one-based `start_line` and `end_line` values from the
-original `read` snapshot; `insert` operations use a separate one-based `line`
-anchor and insert before or after it. Each edit provides a `lines` array of
-complete lines without line-ending characters; the tool adds separators and
-never requires the Agent to repeat adjacent anchor text.
-Changed/deleted ranges must have been covered by `read` since the file last
-changed; insertions require adjacent anchor lines. Existing
-`daily/YYYY-MM-DD.md` files use the same `read`, `edit`, and `delete`
-operations as other Markdown files.
+MBDown or Skill validation before publication. `edit` accepts a hashline patch:
+each section starts with the latest `[path#TAG]` returned by `read`, followed by
+operations against the original one-based line numbers. `PUT N.=M:` replaces an
+inclusive range with `+TEXT` body rows; `PUT <N:`, `PUT >N:`, and `PUT >$:`
+insert before, after, or at end-of-file. `PUT N*:` and `PUT >N*:` resolve
+Markdown, brace-delimited, and indentation-delimited blocks. `CUT` captures and
+deletes a range or block, and a later `PUT ... @name` pastes a named register;
+`REM` and `MV DEST` perform section-level delete and move operations. Multiple
+sections are preflighted together before publication.
+
+Unchanged content streams through bounded temporary candidates, so files larger
+than 1 MiB remain editable after paged reads; hashline planning is capped at
+8 MiB. Changed/deleted ranges must have been covered by `read`, and insertions
+require adjacent anchor lines. On an old retained tag, edits rebase only when
+every touched line and insertion anchor is unchanged; conflicting drift is
+rejected. Each successful edit returns the new tag, line count, and renumbered
+changed windows, so another edit needs no intervening read. Existing
+`daily/YYYY-MM-DD.md` files use the same `read`, `edit`, and `delete` operations
+as other Markdown files.
 `add_daily_entry` remains the high-level create-or-append operation and does not
 require approval. Its optional `date` uses `YYYY-MM-DD`; omitting it records
 content on the current local date.

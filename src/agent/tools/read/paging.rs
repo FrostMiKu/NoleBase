@@ -12,7 +12,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::agent::{SnapshotIdentityHasher, SnapshotTagHasher};
+use crate::agent::{
+    normalize_hash_line, MAX_SNAPSHOT_TEXT_BYTES, SnapshotIdentityHasher, SnapshotTagHasher,
+};
 
 use super::{
     DEFAULT_READ_LINES, MAX_EXTRACTED_TEXT_BYTES, MAX_READ_LINES, MAX_READ_LINE_BYTES,
@@ -86,10 +88,14 @@ pub(super) struct TextPage {
     pub(super) has_more: bool,
     pub(super) tag: Option<String>,
     pub(super) identity: Option<[u8; 32]>,
+    /// Complete normalized text of the scanned file, `None` once it exceeds the
+    /// snapshot retention cap or when the parser produced no identity.
+    pub(super) full_text: Option<String>,
 }
 
 /// Read one UTF-8 line window with bounded response memory while scanning the
-/// complete file to retain a strong edit identity and exact line count.
+/// complete file to retain a strong edit identity, exact line count, and the
+/// bounded normalized text kept for drift recovery.
 pub(super) fn read_utf8_page(
     path: &Path,
     offset: usize,
@@ -100,6 +106,7 @@ pub(super) fn read_utf8_page(
     let mut reader = BufReader::new(file);
     let mut tag_hasher = SnapshotTagHasher::default();
     let mut identity_hasher = SnapshotIdentityHasher::default();
+    let mut full_text = Some(String::new());
     let mut selected = Vec::with_capacity(limit.min(DEFAULT_READ_LINES));
     let mut line = Vec::new();
     let mut lines_seen = 0usize;
@@ -125,8 +132,18 @@ pub(super) fn read_utf8_page(
         if text.len() > MAX_READ_LINE_BYTES {
             bail!("line {} exceeds the 256 KiB read limit", lines_seen + 1);
         }
-        tag_hasher.update(&line);
-        identity_hasher.update(&line);
+        let normalized = normalize_hash_line(text);
+        tag_hasher.update(normalized.as_bytes());
+        tag_hasher.update(b"\n");
+        identity_hasher.update(normalized.as_bytes());
+        identity_hasher.update(b"\n");
+        if let Some(full) = full_text.as_mut() {
+            full.push_str(&normalized);
+            full.push('\n');
+            if full.len() > MAX_SNAPSHOT_TEXT_BYTES {
+                full_text = None;
+            }
+        }
         if lines_seen >= offset && selected.len() < limit && !response_full {
             let cost = encoded_len(text).saturating_add(32);
             if response_bytes.saturating_add(cost) <= response_budget {
@@ -153,6 +170,7 @@ pub(super) fn read_utf8_page(
         has_more: end < lines_seen,
         tag: Some(tag_hasher.finish()),
         identity: Some(identity_hasher.finish()),
+        full_text,
     }))
 }
 
@@ -223,6 +241,7 @@ pub(super) fn page_extracted_text(
         has_more,
         tag: None,
         identity: None,
+        full_text: None,
     })
 }
 

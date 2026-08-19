@@ -10,14 +10,14 @@ use serde_json::{json, Value};
 
 use super::document::DocumentCache;
 use super::{ParseContext, ReadParser, ReadPayload, Target};
-use crate::agent::ReadTracker;
+use crate::agent::SnapshotStore;
 use crate::attachment::AttachmentStore;
 use crate::storage::ATTACHMENTS_DIR;
 
 pub(crate) fn attachment_ctx(directory: &Path) -> ParseContext {
     ParseContext {
         root: directory.to_path_buf(),
-        reads: Arc::new(ReadTracker::default()),
+        reads: Arc::new(SnapshotStore::default()),
         client: reqwest::Client::new(),
         attachments: AttachmentStore::new(directory.join(ATTACHMENTS_DIR)),
         documents: DocumentCache::default(),

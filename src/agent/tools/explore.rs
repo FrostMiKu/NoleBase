@@ -11,7 +11,7 @@ use super::{
     SearchTag, SearchWeb,
 };
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
-use crate::agent::{ReadTracker, Tool, ToolExecutionPolicy};
+use crate::agent::{SnapshotStore, Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
 use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
@@ -39,7 +39,7 @@ impl Explore {
         let mut explore = Self {
             runner: SubagentRunner::new(runtime, profile),
         };
-        let reads = Arc::new(ReadTracker::default());
+        let reads = Arc::new(SnapshotStore::default());
         explore.register(Read::new(root, reads, client.clone())?);
         explore.register(ListNotes::new(root)?);
         explore.register(Grep::new(root)?);

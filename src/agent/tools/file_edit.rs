@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::file_ops::LineEdit;
 use super::util::MAX_DIFF_BYTES;
-use crate::agent::SnapshotIdentityHasher;
+use crate::agent::hashline::LineEdit;
+use crate::agent::{normalize_hash_line, SnapshotIdentityHasher};
 
 pub(super) struct FileInspection {
     pub identity: [u8; 32],
@@ -17,6 +17,19 @@ pub(super) struct FileInspection {
     line_ending: &'static str,
     ends_with_newline: bool,
     permissions: Permissions,
+}
+
+/// Feeds one raw source line into the identity hasher as its normalized form
+/// followed by a single `\n`, keeping identities consistent with the read
+/// pipeline so CRLF versus LF files and trailing whitespace never invalidate an
+/// edit anchor. The display-facing line-ending and final-newline detection
+/// stays on the raw bytes.
+fn hash_normalized_line(identity: &mut SnapshotIdentityHasher, raw: &str) {
+    let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
+    let text = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+    let normalized = normalize_hash_line(text);
+    identity.update(normalized.as_bytes());
+    identity.update(b"\n");
 }
 
 pub(super) struct PreparedEdit {
@@ -72,9 +85,9 @@ pub(super) fn inspect_text_file(path: &Path) -> Result<FileInspection> {
         if read == 0 {
             break;
         }
-        std::str::from_utf8(&line)
+        let raw = std::str::from_utf8(&line)
             .with_context(|| format!("target is not valid UTF-8: {}", path.display()))?;
-        identity.update(&line);
+        hash_normalized_line(&mut identity, raw);
         total_lines = total_lines.saturating_add(1);
         uses_crlf |= line.ends_with(b"\r\n");
         ends_with_newline = line.ends_with(b"\n");
@@ -253,9 +266,9 @@ fn read_source_line(
     {
         bail!("file changed while preparing edit; read it again and retry");
     }
-    std::str::from_utf8(line)
+    let raw = std::str::from_utf8(line)
         .with_context(|| format!("target is not valid UTF-8: {}", source.display()))?;
-    identity.update(line);
+    hash_normalized_line(identity, raw);
     Ok(())
 }
 
@@ -449,8 +462,8 @@ fn read_preview_line<R: BufRead>(
     {
         bail!("file changed while preparing edit; read it again and retry");
     }
-    std::str::from_utf8(line).context("source is not valid UTF-8 while building diff preview")?;
-    identity.update(line);
+    let raw = std::str::from_utf8(line).context("source is not valid UTF-8 while building diff preview")?;
+    hash_normalized_line(identity, raw);
     Ok(())
 }
 

@@ -81,7 +81,7 @@ mod tests {
 
     use super::super::test_support::{simple_pdf, simple_rtf};
     use super::super::Read;
-    use crate::agent::{ReadTracker, Tool};
+    use crate::agent::{SnapshotStore, Tool};
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_pdf_paths_extract_selected_text_lines() {
@@ -93,7 +93,7 @@ mod tests {
         .unwrap();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -118,7 +118,7 @@ mod tests {
         fs::write(&path, simple_rtf(&["first", "second", "third"])).unwrap();
         let read = Read::new(
             directory.path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();

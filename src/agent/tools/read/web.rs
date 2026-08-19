@@ -185,14 +185,14 @@ mod tests {
     use super::super::test_support::{serve_once, simple_pdf};
     use super::super::Read;
     use super::MAX_WEB_ERROR_PREVIEW_BYTES;
-    use crate::agent::{ReadTracker, Tool};
+    use crate::agent::{SnapshotStore, Tool};
 
     #[tokio::test(flavor = "current_thread")]
     async fn url_selectors_page_reader_mode_text() {
         let (url, server) = serve_once("text/plain", b"first\nsecond\nthird\n".to_vec());
         let read = Read::new(
             tempfile::tempdir().unwrap().path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -234,7 +234,7 @@ mod tests {
         let url = format!("http://{address}");
         let read = Read::new(
             tempfile::tempdir().unwrap().path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -257,7 +257,7 @@ mod tests {
         let url = format!("http://{address}");
         let read = Read::new(
             tempfile::tempdir().unwrap().path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -274,7 +274,7 @@ mod tests {
         let (url, server) = serve_once("application/pdf", simple_pdf("Remote PDF marker"));
         let read = Read::new(
             tempfile::tempdir().unwrap().path(),
-            Arc::new(ReadTracker::default()),
+            Arc::new(SnapshotStore::default()),
             reqwest::Client::new(),
         )
         .unwrap();
