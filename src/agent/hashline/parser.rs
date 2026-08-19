@@ -93,7 +93,9 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
                 });
                 continue;
             }
-            let section = current.as_mut().expect("a PUT header implies an open section");
+            let section = current
+                .as_mut()
+                .expect("a PUT header implies an open section");
             let hunk = flush_body(open)?;
             push_hunk(section, hunk)?;
         }
@@ -116,9 +118,16 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
 
         let captures = section_header_regex().captures(header);
         if let Some(captures) = captures {
-            let path = captures.name("path").map(|m| m.as_str()).unwrap_or("").to_string();
-            let tag =
-                captures.name("tag").map(|m| m.as_str()).unwrap_or("").to_uppercase();
+            let path = captures
+                .name("path")
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tag = captures
+                .name("tag")
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .to_uppercase();
             if let Some(previous) = current.take() {
                 sections.push(previous.into_section());
             }
@@ -136,11 +145,15 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
         }
 
         if current.is_none() {
-            return Err(anyhow!("line {line_num}: expected a [path#TAG] section header"));
+            return Err(anyhow!(
+                "line {line_num}: expected a [path#TAG] section header"
+            ));
         }
 
         if line.starts_with('+') {
-            return Err(anyhow!("line {line_num}: body row without a PUT ...: header"));
+            return Err(anyhow!(
+                "line {line_num}: body row without a PUT ...: header"
+            ));
         }
 
         let section = current.as_mut().expect("checked Some above");
@@ -151,7 +164,11 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
                         "line {line_num}: {kind} must be the last hunk of the section"
                     ));
                 }
-                body = Some(OpenBody { locator, header_line: line_num, rows: Vec::new() });
+                body = Some(OpenBody {
+                    locator,
+                    header_line: line_num,
+                    rows: Vec::new(),
+                });
             }
             Some(ParsedOp::Bodyless(op)) => {
                 let hunk = Hunk { line_num, op };
@@ -159,13 +176,17 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
             }
             None => {
                 let text: String = header.chars().take(UNRECOGNIZED_TEXT_CAP).collect();
-                return Err(anyhow!("line {line_num}: unrecognized hashline syntax: {text}"));
+                return Err(anyhow!(
+                    "line {line_num}: unrecognized hashline syntax: {text}"
+                ));
             }
         }
     }
 
     if let Some(open) = body.take() {
-        let section = current.as_mut().expect("a PUT header implies an open section");
+        let section = current
+            .as_mut()
+            .expect("a PUT header implies an open section");
         let hunk = flush_body(open)?;
         push_hunk(section, hunk)?;
     }
@@ -178,7 +199,11 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
 
 /// Converts a terminated body into its `PUT` hunk, rejecting empty bodies.
 fn flush_body(open: OpenBody) -> Result<Hunk> {
-    let OpenBody { locator, header_line, rows } = open;
+    let OpenBody {
+        locator,
+        header_line,
+        rows,
+    } = open;
     if rows.is_empty() {
         let guidance = match locator {
             PutLocator::Span(SpanLocator::Range { start, end }) => {
@@ -189,7 +214,13 @@ fn flush_body(open: OpenBody) -> Result<Hunk> {
         };
         return Err(anyhow!("line {header_line}: empty PUT body; {guidance}"));
     }
-    Ok(Hunk { line_num: header_line, op: Op::Put { locator, payload: Payload::Body(rows) } })
+    Ok(Hunk {
+        line_num: header_line,
+        op: Op::Put {
+            locator,
+            payload: Payload::Body(rows),
+        },
+    })
 }
 
 /// Records a hunk on a section, enforcing that `REM` and `MV` are terminal.
@@ -260,7 +291,11 @@ fn split_register_colon(input: &str) -> Result<(&str, Option<String>, bool), Str
         if !valid_register(name) {
             return Err(format!("invalid register name `@{name}`"));
         }
-        Ok((without_colon[..split].trim_end(), Some(name.to_string()), had_colon))
+        Ok((
+            without_colon[..split].trim_end(),
+            Some(name.to_string()),
+            had_colon,
+        ))
     } else {
         Ok((without_colon, None, had_colon))
     }
@@ -303,11 +338,15 @@ fn parse_put(rest: &str) -> Result<ParsedOp, String> {
                     "PUT over a range or block needs a body (`:`) or a named register".into(),
                 );
             };
-            Ok(ParsedOp::Bodyless(Op::Put { locator, payload: Payload::Register(Some(name)) }))
+            Ok(ParsedOp::Bodyless(Op::Put {
+                locator,
+                payload: Payload::Register(Some(name)),
+            }))
         }
-        PutLocator::Gap(_) => {
-            Ok(ParsedOp::Bodyless(Op::Put { locator, payload: Payload::Register(register) }))
-        }
+        PutLocator::Gap(_) => Ok(ParsedOp::Bodyless(Op::Put {
+            locator,
+            payload: Payload::Register(register),
+        })),
     }
 }
 
@@ -410,7 +449,12 @@ mod tests {
     use super::*;
 
     fn section(patch: &str) -> Section {
-        parse_patch(patch).unwrap().sections.into_iter().next().unwrap()
+        parse_patch(patch)
+            .unwrap()
+            .sections
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     #[test]
@@ -447,7 +491,10 @@ MV \"dest dir/c.md\"
         assert_eq!(first.line_num, 1);
         let hunk = |i: usize| first.hunks[i].line_num;
         let lines: Vec<usize> = first.hunks.iter().map(|h| h.line_num).collect();
-        assert_eq!(lines, vec![2, 5, 7, 9, 11, 13, 15, 16, 17, 18, 19, 20, 21, 22]);
+        assert_eq!(
+            lines,
+            vec![2, 5, 7, 9, 11, 13, 15, 16, 17, 18, 19, 20, 21, 22]
+        );
         assert_eq!(hunk(0), 2);
         assert_eq!(
             first.hunks[0].op,
@@ -529,11 +576,17 @@ MV \"dest dir/c.md\"
         );
         assert_eq!(
             first.hunks[11].op,
-            Op::Cut { locator: SpanLocator::Range { start: 13, end: 14 }, register: None }
+            Op::Cut {
+                locator: SpanLocator::Range { start: 13, end: 14 },
+                register: None
+            }
         );
         assert_eq!(
             first.hunks[12].op,
-            Op::Cut { locator: SpanLocator::Block(15), register: Some("reg".into()) }
+            Op::Cut {
+                locator: SpanLocator::Block(15),
+                register: Some("reg".into())
+            }
         );
         assert_eq!(first.hunks[13].op, Op::Rem);
 
@@ -543,7 +596,9 @@ MV \"dest dir/c.md\"
         assert_eq!(second.line_num, 23);
         assert_eq!(
             second.hunks[0].op,
-            Op::Mv { dest: "dest dir/c.md".into() }
+            Op::Mv {
+                dest: "dest dir/c.md".into()
+            }
         );
     }
 
@@ -585,7 +640,10 @@ PUT 1.=1:
 ";
         let section = section(patch);
         let body = match &section.hunks[0].op {
-            Op::Put { payload: Payload::Body(rows), .. } => rows,
+            Op::Put {
+                payload: Payload::Body(rows),
+                ..
+            } => rows,
             other => panic!("expected PUT body, got {other:?}"),
         };
         assert_eq!(body, &["+plus", "-minus", "  spaces", "", "trailing  "]);
@@ -603,7 +661,10 @@ PUT 2.=2:
         let section = section(patch);
         assert_eq!(section.hunks.len(), 2);
         let row = |i: usize| match &section.hunks[i].op {
-            Op::Put { payload: Payload::Body(rows), .. } => rows.clone(),
+            Op::Put {
+                payload: Payload::Body(rows),
+                ..
+            } => rows.clone(),
             other => panic!("expected PUT body, got {other:?}"),
         };
         assert_eq!(row(0), vec!["row1"]);
@@ -616,7 +677,10 @@ PUT 2.=2:
         let section = section(patch);
         assert_eq!(section.tag, "0000");
         match &section.hunks[0].op {
-            Op::Put { locator: PutLocator::Span(SpanLocator::Range { start: 1, end: 1 }), payload: Payload::Body(rows) } => {
+            Op::Put {
+                locator: PutLocator::Span(SpanLocator::Range { start: 1, end: 1 }),
+                payload: Payload::Body(rows),
+            } => {
                 assert_eq!(rows, &["ok  "]);
             }
             other => panic!("unexpected op: {other:?}"),
@@ -634,21 +698,36 @@ PUT 2.=2:
     #[test]
     fn content_before_first_section_header_is_rejected() {
         let err = parse_patch("garbage\n[f#0000]").unwrap_err();
-        assert!(err.to_string().contains("line 1: expected a [path#TAG] section header"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 1: expected a [path#TAG] section header"),
+            "{err}"
+        );
     }
 
     #[test]
     fn duplicate_section_path_is_rejected() {
         let err = parse_patch("[f#0000]\nREM\n[f#1111]\nREM").unwrap_err();
-        assert!(err.to_string().contains("line 3: duplicate section for f"), "{err}");
+        assert!(
+            err.to_string().contains("line 3: duplicate section for f"),
+            "{err}"
+        );
     }
 
     #[test]
     fn range_start_must_not_exceed_end() {
         let err = parse_patch("[f#0000]\nPUT 5.=3:").unwrap_err();
-        assert!(err.to_string().contains("line 2: range start must not exceed end"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 2: range start must not exceed end"),
+            "{err}"
+        );
         let err = parse_patch("[f#0000]\nCUT 5.=3").unwrap_err();
-        assert!(err.to_string().contains("line 2: range start must not exceed end"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 2: range start must not exceed end"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -667,24 +746,37 @@ PUT 2.=2:
     #[test]
     fn body_row_without_open_put_header_is_rejected() {
         let err = parse_patch("[f#0000]\n+orphan").unwrap_err();
-        assert!(err.to_string().contains("line 2: body row without a PUT ...: header"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 2: body row without a PUT ...: header"),
+            "{err}"
+        );
     }
 
     #[test]
     fn empty_put_body_is_rejected_with_cut_guidance() {
         let err = parse_patch("[f#0000]\nPUT 2.=4:\n[g#0000]").unwrap_err();
         assert!(
-            err.to_string().contains("line 2: empty PUT body; use CUT 2.=4 to delete"),
+            err.to_string()
+                .contains("line 2: empty PUT body; use CUT 2.=4 to delete"),
             "{err}"
         );
         let err = parse_patch("[f#0000]\nPUT 3*:\n").unwrap_err();
-        assert!(err.to_string().contains("line 2: empty PUT body; use CUT 3* to delete"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 2: empty PUT body; use CUT 3* to delete"),
+            "{err}"
+        );
     }
 
     #[test]
     fn unrecognized_syntax_is_rejected_and_truncated() {
         let err = parse_patch("[f#0000]\n  PUT 1.:").unwrap_err();
-        assert!(err.to_string().contains("line 2: unrecognized hashline syntax:   PUT 1.:"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 2: unrecognized hashline syntax:   PUT 1.:"),
+            "{err}"
+        );
         let long = "x".repeat(200);
         let err = parse_patch(&format!("[f#0000]\n{long}")).unwrap_err();
         let message = err.to_string();
@@ -711,20 +803,36 @@ PUT 2.=2:
     #[test]
     fn quoted_mv_dest_and_unquoted_rest_of_line() {
         let spaced = section("[f#0000]\nMV \"a b/c d.md\"\n");
-        assert_eq!(spaced.hunks[0].op, Op::Mv { dest: "a b/c d.md".into() });
+        assert_eq!(
+            spaced.hunks[0].op,
+            Op::Mv {
+                dest: "a b/c d.md".into()
+            }
+        );
         let plain = section("[f#0000]\nMV out.md\n");
-        assert_eq!(plain.hunks[0].op, Op::Mv { dest: "out.md".into() });
+        assert_eq!(
+            plain.hunks[0].op,
+            Op::Mv {
+                dest: "out.md".into()
+            }
+        );
     }
 
     #[test]
     fn register_name_charset_is_rejected() {
         for bad in ["@bad name", "@", "@with/slash", "@dotted.name"] {
             let err = parse_patch(&format!("[f#0000]\nPUT 2.=4 {bad}")).unwrap_err();
-            assert!(err.to_string().contains("line 2: invalid register name"), "{bad}: {err}");
+            assert!(
+                err.to_string().contains("line 2: invalid register name"),
+                "{bad}: {err}"
+            );
         }
         let ok = parse_patch("[f#0000]\nPUT 2.=4 @a_B-9\n").unwrap();
         match &ok.sections[0].hunks[0].op {
-            Op::Put { payload: Payload::Register(Some(name)), .. } => assert_eq!(name, "a_B-9"),
+            Op::Put {
+                payload: Payload::Register(Some(name)),
+                ..
+            } => assert_eq!(name, "a_B-9"),
             other => panic!("unexpected op: {other:?}"),
         }
     }
@@ -735,25 +843,45 @@ PUT 2.=2:
             let err = parse_patch(&format!("[f#0000]\n{bad}")).unwrap_err();
             let message = err.to_string();
             assert!(message.starts_with("line 2: "), "{bad}: {message}");
-            assert!(message.contains("PUT locator") || message.contains("CUT locator"), "{bad}: {message}");
+            assert!(
+                message.contains("PUT locator") || message.contains("CUT locator"),
+                "{bad}: {message}"
+            );
         }
     }
 
     #[test]
     fn rem_and_mv_must_be_last_hunks_of_their_section() {
         let err = parse_patch("[f#0000]\nREM\nCUT 1.=2").unwrap_err();
-        assert!(err.to_string().contains("line 3: REM must be the last hunk of the section"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 3: REM must be the last hunk of the section"),
+            "{err}"
+        );
         let err = parse_patch("[f#0000]\nMV x.md\nCUT 1.=2").unwrap_err();
-        assert!(err.to_string().contains("line 3: MV must be the last hunk of the section"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 3: MV must be the last hunk of the section"),
+            "{err}"
+        );
         let err = parse_patch("[f#0000]\nPUT 1.=1:\n+x\nREM\nCUT 2.=3").unwrap_err();
-        assert!(err.to_string().contains("line 5: REM must be the last hunk of the section"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 5: REM must be the last hunk of the section"),
+            "{err}"
+        );
     }
 
     #[test]
     fn mv_may_follow_line_edits() {
         let section = section("[f#0000]\nPUT 1.=1:\n+x\nMV y.md\n");
         assert_eq!(section.hunks.len(), 2);
-        assert_eq!(section.hunks[1].op, Op::Mv { dest: "y.md".into() });
+        assert_eq!(
+            section.hunks[1].op,
+            Op::Mv {
+                dest: "y.md".into()
+            }
+        );
     }
 
     #[test]
@@ -769,7 +897,11 @@ PUT 2.=2:
     #[test]
     fn put_with_both_colon_and_register_is_rejected() {
         let err = parse_patch("[f#0000]\nPUT 1.=2 @r:").unwrap_err();
-        assert!(err.to_string().contains("line 2: PUT with a `:` header takes body rows"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("line 2: PUT with a `:` header takes body rows"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -777,6 +909,9 @@ PUT 2.=2:
         let err = parse_patch("[f#0000]\nCUT 1.=2:").unwrap_err();
         assert!(err.to_string().contains("line 2: "), "{err}");
         let err = parse_patch("[f#0000]\nCUT <3").unwrap_err();
-        assert!(err.to_string().contains("line 2: invalid CUT locator `<3`"), "{err}");
+        assert!(
+            err.to_string().contains("line 2: invalid CUT locator `<3`"),
+            "{err}"
+        );
     }
 }

@@ -115,11 +115,7 @@ impl Snapshot {
     pub(crate) fn ensure_seen(&self, start: usize, end: usize) -> Result<()> {
         if start < end {
             if !self.covers(start, end) {
-                bail!(
-                    "edit must read lines {} through {} first",
-                    start + 1,
-                    end
-                );
+                bail!("edit must read lines {} through {} first", start + 1, end);
             }
         } else if self.total_lines > 0 {
             let anchor_start = start.saturating_sub(1);
@@ -289,16 +285,13 @@ impl SnapshotStore {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("snapshot store lock poisoned"))?;
-        Ok(inner
-            .history
-            .get(path)
-            .and_then(|history| {
-                history
-                    .versions
-                    .iter()
-                    .find(|version| version.tag.eq_ignore_ascii_case(tag))
-                    .cloned()
-            }))
+        Ok(inner.history.get(path).and_then(|history| {
+            history
+                .versions
+                .iter()
+                .find(|version| version.tag.eq_ignore_ascii_case(tag))
+                .cloned()
+        }))
     }
 
     /// Moves a path's whole history to a new canonical location (used by `MV`);
@@ -435,7 +428,10 @@ mod tests {
         assert_eq!(snapshot_tag(lf), snapshot_tag(crlf));
         assert_eq!(snapshot_tag(lf), snapshot_tag(trailing_no_newline));
         assert_eq!(snapshot_identity(lf), snapshot_identity(crlf));
-        assert_eq!(snapshot_identity(lf), snapshot_identity(trailing_no_newline));
+        assert_eq!(
+            snapshot_identity(lf),
+            snapshot_identity(trailing_no_newline)
+        );
     }
 
     #[test]
@@ -516,7 +512,10 @@ mod tests {
         for tag in &tags[1..] {
             assert!(store.by_tag(&path, tag).unwrap().is_some());
         }
-        assert_eq!(store.head(&path).unwrap().unwrap().tag, tags[MAX_SNAPSHOT_VERSIONS]);
+        assert_eq!(
+            store.head(&path).unwrap().unwrap().tag,
+            tags[MAX_SNAPSHOT_VERSIONS]
+        );
     }
 
     #[test]
@@ -526,11 +525,19 @@ mod tests {
         let first = record_version(&store, &path, "first\n", (0, 1));
         record_version(&store, &path, "second\n", (0, 1));
         assert_eq!(
-            store.by_tag(&path, &first.to_lowercase()).unwrap().unwrap().tag,
+            store
+                .by_tag(&path, &first.to_lowercase())
+                .unwrap()
+                .unwrap()
+                .tag,
             first
         );
         assert_eq!(
-            store.by_tag(&path, &first.to_uppercase()).unwrap().unwrap().tag,
+            store
+                .by_tag(&path, &first.to_uppercase())
+                .unwrap()
+                .unwrap()
+                .tag,
             first
         );
     }
@@ -672,7 +679,10 @@ mod tests {
         record_version(&store, &refreshed, "content 5\n", (0, 1));
         let extra = PathBuf::from("/tmp/lru33.md");
         record_version(&store, &extra, "content 33\n", (0, 1));
-        assert!(store.head(&PathBuf::from("/tmp/lru1.md")).unwrap().is_none());
+        assert!(store
+            .head(&PathBuf::from("/tmp/lru1.md"))
+            .unwrap()
+            .is_none());
         assert!(store.head(&refreshed).unwrap().is_some());
     }
 

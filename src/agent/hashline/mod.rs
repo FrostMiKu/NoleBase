@@ -56,10 +56,18 @@ pub(crate) struct Hunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
-    Put { locator: PutLocator, payload: Payload },
-    Cut { locator: SpanLocator, register: Option<String> },
+    Put {
+        locator: PutLocator,
+        payload: Payload,
+    },
+    Cut {
+        locator: SpanLocator,
+        register: Option<String>,
+    },
     Rem,
-    Mv { dest: String },
+    Mv {
+        dest: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

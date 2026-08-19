@@ -462,7 +462,8 @@ fn read_preview_line<R: BufRead>(
     {
         bail!("file changed while preparing edit; read it again and retry");
     }
-    let raw = std::str::from_utf8(line).context("source is not valid UTF-8 while building diff preview")?;
+    let raw = std::str::from_utf8(line)
+        .context("source is not valid UTF-8 while building diff preview")?;
     hash_normalized_line(identity, raw);
     Ok(())
 }

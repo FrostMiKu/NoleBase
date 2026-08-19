@@ -20,7 +20,10 @@ impl RegisterBank {
     /// Overwrites the register `name` (or the anonymous register when `name` is
     /// `None`) with `lines`.
     pub(crate) fn store(&self, name: Option<&str>, lines: Vec<String>) -> Result<()> {
-        let mut storage = self.storage.lock().map_err(|_| anyhow!("register bank lock poisoned"))?;
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| anyhow!("register bank lock poisoned"))?;
         storage.insert(name.map(str::to_owned), lines);
         Ok(())
     }
@@ -29,13 +32,19 @@ impl RegisterBank {
     /// register has never been stored. Registers are re-pastable, so copies
     /// are returned rather than moved out.
     pub(crate) fn load(&self, name: Option<&str>) -> Result<Option<Vec<String>>> {
-        let storage = self.storage.lock().map_err(|_| anyhow!("register bank lock poisoned"))?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| anyhow!("register bank lock poisoned"))?;
         Ok(storage.get(&name.map(str::to_owned)).cloned())
     }
 
     /// Removes every register entry.
     pub(crate) fn clear(&self) -> Result<()> {
-        let mut storage = self.storage.lock().map_err(|_| anyhow!("register bank lock poisoned"))?;
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| anyhow!("register bank lock poisoned"))?;
         storage.clear();
         Ok(())
     }
@@ -48,8 +57,12 @@ mod tests {
     #[test]
     fn store_and_load_named_register_roundtrip() {
         let bank = RegisterBank::default();
-        bank.store(Some("reg"), vec!["a".into(), "b".into()]).unwrap();
-        assert_eq!(bank.load(Some("reg")).unwrap(), Some(vec!["a".into(), "b".into()]));
+        bank.store(Some("reg"), vec!["a".into(), "b".into()])
+            .unwrap();
+        assert_eq!(
+            bank.load(Some("reg")).unwrap(),
+            Some(vec!["a".into(), "b".into()])
+        );
     }
 
     #[test]
@@ -63,8 +76,12 @@ mod tests {
     fn store_overwrites_previous_lines() {
         let bank = RegisterBank::default();
         bank.store(Some("reg"), vec!["old".into()]).unwrap();
-        bank.store(Some("reg"), vec!["new1".into(), "new2".into()]).unwrap();
-        assert_eq!(bank.load(Some("reg")).unwrap(), Some(vec!["new1".into(), "new2".into()]));
+        bank.store(Some("reg"), vec!["new1".into(), "new2".into()])
+            .unwrap();
+        assert_eq!(
+            bank.load(Some("reg")).unwrap(),
+            Some(vec!["new1".into(), "new2".into()])
+        );
     }
 
     #[test]

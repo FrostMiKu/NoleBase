@@ -63,9 +63,7 @@ pub(crate) fn plan_section(
         match &hunk.op {
             Op::Put { locator, payload } => {
                 if matches!(planned.file_op, Some(FileOp::Remove)) {
-                    bail!(
-                        "line {line_num}: REM cannot be combined with line edits"
-                    );
+                    bail!("line {line_num}: REM cannot be combined with line edits");
                 }
                 let body = match payload {
                     Payload::Body(rows) => rows.clone(),
@@ -135,9 +133,7 @@ pub(crate) fn plan_section(
             }
             Op::Cut { locator, register } => {
                 if matches!(planned.file_op, Some(FileOp::Remove)) {
-                    bail!(
-                        "line {line_num}: REM cannot be combined with line edits"
-                    );
+                    bail!("line {line_num}: REM cannot be combined with line edits");
                 }
                 let (start, end, anchor, resolution) = match locator {
                     SpanLocator::Range { start, end } => {
@@ -210,9 +206,7 @@ pub(crate) fn plan_section(
 /// Require a 1-based line to name an existing line of the original file.
 fn check_line(line_num: usize, n: usize, total: usize) -> Result<()> {
     if n == 0 || n > total {
-        bail!(
-            "line {line_num}: line {n} is past the end of the file ({total} lines)"
-        );
+        bail!("line {line_num}: line {n} is past the end of the file ({total} lines)");
     }
     Ok(())
 }
@@ -222,9 +216,7 @@ fn check_line(line_num: usize, n: usize, total: usize) -> Result<()> {
 /// insertion even when the file is empty.
 fn check_gap_before(line_num: usize, n: usize, total: usize) -> Result<()> {
     if n == 0 || (n > total && !(total == 0 && n == 1)) {
-        bail!(
-            "line {line_num}: line {n} is past the end of the file ({total} lines)"
-        );
+        bail!("line {line_num}: line {n} is past the end of the file ({total} lines)");
     }
     Ok(())
 }
@@ -281,10 +273,7 @@ fn push_touched(
     if span {
         touched.push((start, end));
     } else {
-        touched.push((
-            start.saturating_sub(1),
-            (start + 1).min(total),
-        ));
+        touched.push((start.saturating_sub(1), (start + 1).min(total)));
     }
 }
 
@@ -404,12 +393,7 @@ mod tests {
     #[test]
     fn lowers_range_replace() {
         let planned = plan_section(
-            &section(vec![put_range(
-                4,
-                2,
-                3,
-                vec!["replacement".to_string()],
-            )]),
+            &section(vec![put_range(4, 2, 3, vec!["replacement".to_string()])]),
             &lines(&["one", "two", "three", "four"]),
             Syntax::Unknown,
             &RegisterBank::default(),
@@ -450,7 +434,11 @@ mod tests {
     #[test]
     fn lowers_insert_before() {
         let planned = plan_section(
-            &section(vec![gap_put(6, GapLocator::Before(2), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                6,
+                GapLocator::Before(2),
+                vec!["x".to_string()],
+            )]),
             &lines(&["one", "two", "three"]),
             Syntax::Unknown,
             &RegisterBank::default(),
@@ -473,7 +461,11 @@ mod tests {
     #[test]
     fn lowers_insert_after() {
         let planned = plan_section(
-            &section(vec![gap_put(7, GapLocator::After(2), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                7,
+                GapLocator::After(2),
+                vec!["x".to_string()],
+            )]),
             &lines(&["one", "two", "three"]),
             Syntax::Unknown,
             &RegisterBank::default(),
@@ -681,7 +673,10 @@ mod tests {
         assert_eq!(planned.edits[1].start_line, 2);
         assert_eq!(planned.edits[1].end_line_exclusive, 2);
         assert!(planned.edits[1].insertion);
-        assert_eq!(planned.edits[1].lines, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(
+            planned.edits[1].lines,
+            vec!["one".to_string(), "two".to_string()]
+        );
         // The captured copy survives outside the section as well.
         assert_eq!(
             registers.load(Some("keep")).unwrap(),
@@ -855,10 +850,7 @@ mod tests {
         assert_eq!(planned.edits[1].start_line, 1);
         assert_eq!(planned.edits[1].end_line_exclusive, 2);
         // The order matches what prepare_edit drains: insertion first.
-        assert_eq!(
-            planned.touched,
-            vec![(0, 2)]
-        );
+        assert_eq!(planned.touched, vec![(0, 2)]);
     }
 
     #[test]
@@ -871,7 +863,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert_eq!(error, "line 50: line 10 is past the end of the file (3 lines)");
+        assert_eq!(
+            error,
+            "line 50: line 10 is past the end of the file (3 lines)"
+        );
     }
 
     #[test]
@@ -884,13 +879,20 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert_eq!(error, "line 51: line 9 is past the end of the file (3 lines)");
+        assert_eq!(
+            error,
+            "line 51: line 9 is past the end of the file (3 lines)"
+        );
     }
 
     #[test]
     fn insert_after_last_line_is_valid() {
         let planned = plan_section(
-            &section(vec![gap_put(52, GapLocator::After(3), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                52,
+                GapLocator::After(3),
+                vec!["x".to_string()],
+            )]),
             &lines(&["one", "two", "three"]),
             Syntax::Unknown,
             &RegisterBank::default(),
@@ -903,21 +905,32 @@ mod tests {
     #[test]
     fn insert_before_past_end_is_rejected() {
         let error = plan_section(
-            &section(vec![gap_put(53, GapLocator::Before(5), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                53,
+                GapLocator::Before(5),
+                vec!["x".to_string()],
+            )]),
             &lines(&["one", "two", "three"]),
             Syntax::Unknown,
             &RegisterBank::default(),
         )
         .unwrap_err()
         .to_string();
-        assert_eq!(error, "line 53: line 5 is past the end of the file (3 lines)");
+        assert_eq!(
+            error,
+            "line 53: line 5 is past the end of the file (3 lines)"
+        );
     }
 
     #[test]
     fn empty_file_accepts_only_head_and_eof_inserts() {
         let bank = RegisterBank::default();
         let head = plan_section(
-            &section(vec![gap_put(54, GapLocator::Before(1), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                54,
+                GapLocator::Before(1),
+                vec!["x".to_string()],
+            )]),
             &[],
             Syntax::Unknown,
             &bank,
@@ -945,23 +958,37 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert_eq!(span, "line 56: line 1 is past the end of the file (0 lines)");
+        assert_eq!(
+            span,
+            "line 56: line 1 is past the end of the file (0 lines)"
+        );
 
         let after = plan_section(
-            &section(vec![gap_put(57, GapLocator::After(1), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                57,
+                GapLocator::After(1),
+                vec!["x".to_string()],
+            )]),
             &[],
             Syntax::Unknown,
             &bank,
         )
         .unwrap_err()
         .to_string();
-        assert_eq!(after, "line 57: line 1 is past the end of the file (0 lines)");
+        assert_eq!(
+            after,
+            "line 57: line 1 is past the end of the file (0 lines)"
+        );
     }
 
     #[test]
     fn edge_boundary_before_is_valid_on_empty_file() {
         let planned = plan_section(
-            &section(vec![gap_put(58, GapLocator::Before(1), vec!["x".to_string()])]),
+            &section(vec![gap_put(
+                58,
+                GapLocator::Before(1),
+                vec!["x".to_string()],
+            )]),
             &[],
             Syntax::Unknown,
             &RegisterBank::default(),

@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::agent::{
-    normalize_hash_line, MAX_SNAPSHOT_TEXT_BYTES, SnapshotIdentityHasher, SnapshotTagHasher,
+    normalize_hash_line, SnapshotIdentityHasher, SnapshotTagHasher, MAX_SNAPSHOT_TEXT_BYTES,
 };
 
 use super::{

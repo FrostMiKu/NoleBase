@@ -92,7 +92,7 @@ Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`
 
 ## Workspace
 Root: {root}
-- Managed notes are in `data/`, `daily/`, and `archives/`; use `workspace/main/` for intermediate files. Paths are relative to the Nole root unless a tool says otherwise.
+- `MEMORY.md` at the Nole root is persistent Agent memory. Read it when useful and update it with focused edits when durable user preferences, project facts, or workflow decisions should survive future tasks. Do not store secrets or transient task details there.
 - Never read or expose `config/ai.toml`, and access attachments only through attachment tools."#,
         root = root.display(),
     )

@@ -149,9 +149,7 @@ fn mapped_line(map: &[Option<usize>], index: usize) -> Option<usize> {
 fn mapped(map: &[Option<usize>], index: usize, line: usize) -> Result<usize> {
     match mapped_line(map, index) {
         Some(live) => Ok(live),
-        None => bail!(
-            "file changed since read at line {line}; read it again before editing"
-        ),
+        None => bail!("file changed since read at line {line}; read it again before editing"),
     }
 }
 
@@ -201,10 +199,7 @@ mod tests {
     #[test]
     fn noop_when_base_and_live_match() {
         let base = "a\nb\nc\nd\n";
-        let mut planned = plan(
-            vec![replace(1, 3)],
-            vec![(1, 3)],
-        );
+        let mut planned = plan(vec![replace(1, 3)], vec![(1, 3)]);
         rebase_edits(base, base, &mut planned).unwrap();
         assert_eq!(planned.edits[0].start_line, 1);
         assert_eq!(planned.edits[0].end_line_exclusive, 3);
@@ -215,10 +210,7 @@ mod tests {
     fn shifts_edits_down_when_lines_are_inserted_above() {
         let base = "a\nb\nc\nd\n";
         let live = "a\nN1\nN2\nb\nc\nd\n";
-        let mut planned = plan(
-            vec![replace(1, 3)],
-            vec![(1, 3)],
-        );
+        let mut planned = plan(vec![replace(1, 3)], vec![(1, 3)]);
         rebase_edits(base, live, &mut planned).unwrap();
         // b and c moved from 0-based 1..3 to 3..5.
         assert_eq!(planned.edits[0].start_line, 3);
@@ -232,10 +224,7 @@ mod tests {
     fn shifts_edits_up_when_lines_are_deleted_above() {
         let base = "a\nb\nc\nd\n";
         let live = "b\nc\nd\n";
-        let mut planned = plan(
-            vec![replace(1, 3)],
-            vec![(1, 3)],
-        );
+        let mut planned = plan(vec![replace(1, 3)], vec![(1, 3)]);
         rebase_edits(base, live, &mut planned).unwrap();
         assert_eq!(planned.edits[0].start_line, 0);
         assert_eq!(planned.edits[0].end_line_exclusive, 2);
@@ -246,10 +235,7 @@ mod tests {
     fn eof_insertion_follows_an_appended_tail() {
         let base = "a\nb\n";
         let live = "a\nb\nX\nY\n";
-        let mut planned = plan(
-            vec![insert(2, 0)],
-            vec![(1, 2)],
-        );
+        let mut planned = plan(vec![insert(2, 0)], vec![(1, 2)]);
         rebase_edits(base, live, &mut planned).unwrap();
         // The EOF gap is still after the unchanged last line.
         assert_eq!(planned.edits[0].start_line, 2);
@@ -260,10 +246,7 @@ mod tests {
     fn rejects_when_a_touched_line_was_modified() {
         let base = "a\nb\nc\n";
         let live = "a\nMOD\nc\n";
-        let mut planned = plan(
-            vec![replace(1, 3)],
-            vec![(1, 3)],
-        );
+        let mut planned = plan(vec![replace(1, 3)], vec![(1, 3)]);
         let error = rebase_edits(base, live, &mut planned)
             .unwrap_err()
             .to_string();
@@ -281,10 +264,7 @@ mod tests {
         let live = "fn a() {\n  1\n}\nfn B() {\n  2\n}\n";
         // AfterBlock(4) resolves to lines 4-6 in base; the neighbourhood
         // covers only the block end, so the anchor check must reject.
-        let mut planned = plan(
-            vec![insert(6, 4)],
-            vec![(5, 6)],
-        );
+        let mut planned = plan(vec![insert(6, 4)], vec![(5, 6)]);
         let error = rebase_edits(base, live, &mut planned)
             .unwrap_err()
             .to_string();
@@ -298,10 +278,7 @@ mod tests {
     fn rejects_when_a_span_interior_line_was_modified() {
         let base = "a\nb\nc\nd\n";
         let live = "a\nb\nMOD\nd\n";
-        let mut planned = plan(
-            vec![replace(1, 3)],
-            vec![(1, 3)],
-        );
+        let mut planned = plan(vec![replace(1, 3)], vec![(1, 3)]);
         let error = rebase_edits(base, live, &mut planned)
             .unwrap_err()
             .to_string();
@@ -315,10 +292,7 @@ mod tests {
     fn empty_base_maps_head_insertion_to_live_head() {
         let base = "";
         let live = "x\ny\n";
-        let mut planned = plan(
-            vec![insert(0, 1)],
-            Vec::new(),
-        );
+        let mut planned = plan(vec![insert(0, 1)], Vec::new());
         rebase_edits(base, live, &mut planned).unwrap();
         assert_eq!(planned.edits[0].start_line, 0);
         assert_eq!(planned.edits[0].end_line_exclusive, 0);
@@ -330,13 +304,7 @@ mod tests {
         // 1); plan_section already emitted the insertion first.
         let base = "a\nb\nc\nd\n";
         let live = "a\nN\nb\nc\nd\n";
-        let mut planned = plan(
-            vec![
-                insert(1, 2),
-                replace(1, 3),
-            ],
-            vec![(0, 3)],
-        );
+        let mut planned = plan(vec![insert(1, 2), replace(1, 3)], vec![(0, 3)]);
         rebase_edits(base, live, &mut planned).unwrap();
         assert_eq!(planned.edits.len(), 2);
         assert!(planned.edits[0].insertion);
