@@ -34,22 +34,22 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let surface_style = Style::default()
         .bg(app.theme.surface_status_context)
         .fg(app.theme.text_on_accent);
-    let mode_line = if app.permission_mode == PermissionMode::Bypass {
+    let mode_line = if app.permission_mode == PermissionMode::Yolo {
         let mut spans = vec![
             mouse_status,
             Span::styled(surface_segment.clone(), surface_style),
         ];
-        let bypass_style = Style::default().bg(app.theme.surface_overlay);
-        spans.push(Span::styled(" ", bypass_style));
-        spans.extend("BYPASS".chars().enumerate().map(|(index, character)| {
+        let yolo_style = Style::default().bg(app.theme.surface_overlay);
+        spans.push(Span::styled(" ", yolo_style));
+        spans.extend("YOLO".chars().enumerate().map(|(index, character)| {
             Span::styled(
                 character.to_string(),
-                bypass_style
+                yolo_style
                     .fg(animated_color(index * 8, app.animation_tick, app.theme))
                     .add_modifier(Modifier::BOLD),
             )
         }));
-        spans.push(Span::styled(" ", bypass_style));
+        spans.push(Span::styled(" ", yolo_style));
         Line::from(spans)
     } else {
         Line::from(vec![

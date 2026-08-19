@@ -5,7 +5,7 @@ use std::fs;
 #[cfg(test)]
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,8 +42,8 @@ mod config;
 mod context;
 pub(crate) mod hashline;
 mod prompts;
-mod subagent;
 mod snapshots;
+mod subagent;
 #[cfg(test)]
 mod test_support;
 mod tools;
@@ -121,7 +121,7 @@ pub struct AgentRuntime {
     decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
     user_responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>>>,
     input_buffer: Arc<Mutex<Vec<String>>>,
-    bypass: Arc<AtomicBool>,
+    permission_mode: Arc<AtomicU8>,
     cancelled: Arc<AtomicBool>,
     workspace_index: WorkspaceIndexHandle,
     wiki_links: crate::wiki_link_index::WikiLinkIndexHandle,
@@ -133,7 +133,7 @@ impl AgentRuntime {
         decisions: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
         user_responses: tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>,
         input_buffer: Arc<Mutex<Vec<String>>>,
-        bypass: Arc<AtomicBool>,
+        permission_mode: Arc<AtomicU8>,
         cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -141,7 +141,7 @@ impl AgentRuntime {
             decisions: Arc::new(tokio::sync::Mutex::new(decisions)),
             user_responses: Arc::new(tokio::sync::Mutex::new(user_responses)),
             input_buffer,
-            bypass,
+            permission_mode,
             cancelled,
             workspace_index: WorkspaceIndexHandle::default(),
             wiki_links: crate::wiki_link_index::WikiLinkIndexHandle::default(),
@@ -164,17 +164,69 @@ impl AgentRuntime {
 
 #[derive(Clone)]
 struct ApprovalGate {
-    bypass: Arc<AtomicBool>,
+    /// Shared three-state permission mode (see [`PermissionMode::code`]).
+    mode: Arc<AtomicU8>,
+    /// Canonical NOLE root used to decide whether a path is inside the vault.
+    root: PathBuf,
     cancelled: Arc<AtomicBool>,
     events: AgentEventSender,
     decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
 }
 
 impl ApprovalGate {
-    async fn request(&self, request: ApprovalRequest) -> Result<()> {
-        if self.bypass.load(Ordering::Relaxed) {
-            return Ok(());
+    fn new(
+        mode: Arc<AtomicU8>,
+        root: PathBuf,
+        cancelled: Arc<AtomicBool>,
+        events: AgentEventSender,
+        decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
+    ) -> Self {
+        Self {
+            mode,
+            root,
+            cancelled,
+            events,
+            decisions,
         }
+    }
+
+    fn mode(&self) -> PermissionMode {
+        PermissionMode::from_code(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// An approval for a change already known to live inside the NOLE root.
+    ///
+    /// `Approve` always asks; `Auto` and `Yolo` are satisfied without asking
+    /// because the change touches nothing outside the vault.
+    async fn request(&self, request: ApprovalRequest) -> Result<()> {
+        match self.mode() {
+            PermissionMode::Approve => self.request_impl(request).await,
+            PermissionMode::Auto | PermissionMode::Yolo => Ok(()),
+        }
+    }
+
+    /// An approval for a change touching `paths`, deciding from the actual
+    /// paths (never a string prefix) whether the user must be asked:
+    ///
+    /// - `Approve` always asks.
+    /// - `Auto` asks only when at least one path is outside the canonical
+    ///   NOLE root.
+    /// - `Yolo` never asks.
+    async fn request_for_paths(&self, request: ApprovalRequest, paths: &[&Path]) -> Result<()> {
+        match self.mode() {
+            PermissionMode::Approve => self.request_impl(request).await,
+            PermissionMode::Auto => {
+                if paths.iter().any(|path| !path.starts_with(&self.root)) {
+                    self.request_impl(request).await
+                } else {
+                    Ok(())
+                }
+            }
+            PermissionMode::Yolo => Ok(()),
+        }
+    }
+
+    async fn request_impl(&self, request: ApprovalRequest) -> Result<()> {
         self.events
             .send(AgentEvent::Approval(request))
             .context("sending approval request")?;
@@ -531,7 +583,7 @@ impl Agent {
             decisions,
             user_responses,
             input_buffer,
-            bypass,
+            permission_mode,
             cancelled,
             workspace_index,
             wiki_links,
@@ -569,12 +621,13 @@ impl Agent {
             cancelled: cancelled.clone(),
             concurrency,
         };
-        let gate = ApprovalGate {
-            bypass,
-            cancelled: cancelled.clone(),
+        let gate = ApprovalGate::new(
+            permission_mode,
+            canonical_root(nole_root)?,
+            cancelled.clone(),
             events,
             decisions,
-        };
+        );
         for warning in warnings {
             let _ = agent.events.send(AgentEvent::Notification(format!(
                 "Skill warning: {warning}"
@@ -601,11 +654,11 @@ impl Agent {
             wiki_links.clone(),
             gate.clone(),
         )?);
-        agent.register(Write::new(nole_root)?);
-        agent.register(Copy::new(nole_root)?);
+        agent.register(Write::new(nole_root, gate.clone())?);
+        agent.register(Copy::new(nole_root, gate.clone())?);
         agent.register(ExportFile::new(nole_root, gate.clone())?);
-        agent.register(Mkdir::new(nole_root)?);
-        agent.register(RemoveDir::new(nole_root)?);
+        agent.register(Mkdir::new(nole_root, gate.clone())?);
+        agent.register(RemoveDir::new(nole_root, gate.clone())?);
         let file_events = agent.events.clone();
         agent.register(Move::new(nole_root, file_events.clone(), gate.clone())?);
         agent.register(MoveMany::new(nole_root, file_events.clone(), gate.clone())?);

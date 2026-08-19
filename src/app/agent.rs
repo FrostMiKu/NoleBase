@@ -1,6 +1,7 @@
 //! Agent coordination: the event loop, prompt dispatch, session lifecycle,
 //! and approval / ask-user / permission handling.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::*;
@@ -272,14 +273,13 @@ impl App {
                     }
                 }
                 AgentEvent::Approval(request) => {
-                    if self.permission_mode == PermissionMode::Bypass {
-                        let _ = self.send_approval(ApprovalDecision::Approve);
-                    } else {
-                        self.set_status(format!("Approval required: {}", request.title));
-                        self.approval_request = Some(request);
-                        self.approval_scroll = 0;
-                        self.set_overlay(Overlay::Approval);
-                    }
+                    // The gate is the single decision source: whatever lands
+                    // here already needs an explicit user decision. The UI must
+                    // not re-decide based on its permission mode.
+                    self.set_status(format!("Approval required: {}", request.title));
+                    self.approval_request = Some(request);
+                    self.approval_scroll = 0;
+                    self.set_overlay(Overlay::Approval);
                 }
                 AgentEvent::AskUser(request) => {
                     self.set_status(if request.kind == AskUserKind::RoundLimit {
@@ -888,13 +888,13 @@ impl App {
     }
 
     pub(super) fn toggle_permission_mode(&mut self) {
-        self.permission_mode = self.permission_mode.toggled();
-        self.permission_bypass.store(
-            self.permission_mode == PermissionMode::Bypass,
-            Ordering::Relaxed,
-        );
-        if self.permission_mode == PermissionMode::Bypass && self.overlay == Some(Overlay::Approval)
-        {
+        self.permission_mode = self.permission_mode.cycled();
+        self.permission_mode_atomic
+            .store(self.permission_mode.code(), Ordering::Relaxed);
+        // Entering YOLO approves whatever approval is currently waiting.
+        // Entering AUTO or APPROVE never blindly approves a pending request —
+        // the gate decides whether it still needs a user decision.
+        if self.permission_mode == PermissionMode::Yolo && self.overlay == Some(Overlay::Approval) {
             let _ = self.send_approval(ApprovalDecision::Approve);
         }
         self.set_status(format!("Permission mode: {}", self.permission_mode.label()));

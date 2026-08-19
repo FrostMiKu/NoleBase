@@ -810,7 +810,7 @@ fn tool_activity_places_detail_on_a_connected_second_line() {
 }
 
 #[test]
-fn bypass_mode_animates_in_the_footer_and_daily_advertises_commands() {
+fn yolo_mode_animates_in_the_footer_and_daily_advertises_commands() {
     let (mut app, _directory) = make_app();
     let approve = render(&mut app, 170, 24);
     let approve_screen = buffer_string(&approve);
@@ -826,27 +826,27 @@ fn bypass_mode_animates_in_the_footer_and_daily_advertises_commands() {
         ctp::SAPPHIRE
     );
 
-    app.permission_mode = PermissionMode::Bypass;
+    app.permission_mode = PermissionMode::Yolo;
     app.animation_tick = 0;
     let first = render(&mut app, 170, 24);
     let footer_y = 23;
     let first_screen = buffer_string(&first);
     let first_footer = first_screen.lines().last().unwrap();
-    let bypass_byte = first_footer.find("BYPASS").unwrap();
-    let bypass_x = first_footer[..bypass_byte].width() as u16;
-    let first_colors = (bypass_x..bypass_x + "BYPASS".width() as u16)
+    let yolo_byte = first_footer.find("YOLO").unwrap();
+    let yolo_x = first_footer[..yolo_byte].width() as u16;
+    let first_colors = (yolo_x..yolo_x + "YOLO".width() as u16)
         .map(|x| first.backend().buffer()[(x, footer_y)].fg)
         .collect::<Vec<_>>();
     assert!(first_footer.contains("Ctrl+P commands"));
     assert!(first_colors
         .iter()
         .all(|color| matches!(color, Color::Rgb(..))));
-    assert!((bypass_x..bypass_x + "BYPASS".width() as u16)
+    assert!((yolo_x..yolo_x + "YOLO".width() as u16)
         .all(|x| first.backend().buffer()[(x, footer_y)].bg == ctp::CRUST));
 
     app.animation_tick = 1;
     let second = render(&mut app, 170, 24);
-    let second_colors = (bypass_x..bypass_x + "BYPASS".width() as u16)
+    let second_colors = (yolo_x..yolo_x + "YOLO".width() as u16)
         .map(|x| second.backend().buffer()[(x, footer_y)].fg)
         .collect::<Vec<_>>();
     assert_ne!(first_colors, second_colors);
@@ -1883,7 +1883,7 @@ fn agent_prompt_and_diff_approval_render_as_opaque_overlays() {
     assert!(screen.contains("Update data/note.md"));
     assert!(screen.contains("-old value"));
     assert!(screen.contains("+new value"));
-    assert!(screen.contains("Tab bypass"));
+    assert!(screen.contains("Tab mode"));
 }
 
 #[test]
@@ -1916,7 +1916,7 @@ fn confirm_approvals_distinguish_regular_actions_from_destructive_actions() {
     assert!(screen.contains("Delete data/Empty.md?"));
     assert!(screen.contains("Enter/Y confirm · N/Esc cancel"));
     assert!(
-        !screen.contains("Tab bypass"),
+        !screen.contains("Tab mode"),
         "confirm approvals must not use the diff panel"
     );
     let overlay = app.layout.overlay.expect("confirm overlay");

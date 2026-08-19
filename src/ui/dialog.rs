@@ -253,7 +253,7 @@ pub(super) fn draw_dialog(
             draw_dialog_footer(
                 frame,
                 footer,
-                "Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab bypass",
+                "Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab mode",
                 app.theme,
             );
         }
@@ -725,7 +725,7 @@ pub(super) fn help_lines(theme: Theme) -> Vec<Line<'static>> {
         heading("Workspace"),
         key("f / t", "focus Files / Todo"),
         key("← → / ↑ ↓", "move focus between panes"),
-        key("Tab", "toggle approve / bypass mode"),
+        key("Tab", "cycle approve / auto / yolo mode"),
         key("Ctrl+P", "open command palette"),
         key("#", "browse workspace tags"),
         key("Ctrl+`", "toggle workspace terminal"),

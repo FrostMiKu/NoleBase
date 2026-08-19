@@ -6,25 +6,49 @@ use std::time::Duration;
 use crate::agent_session::{AgentConversation, TokenUsage};
 use crate::provider::{Message, ToolResult};
 
+/// How the agent runtime decides whether a proposed change needs user approval.
+///
+/// The mode is shared with the UI through an [`std::sync::Arc`]`<AtomicU8>`
+/// using the stable codes from [`PermissionMode::code`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PermissionMode {
-    Approve,
-    Bypass,
+    /// Ask the user for every approval request.
+    Approve = 0,
+    /// Ask only for changes that touch paths outside the NOLE root.
+    Auto = 1,
+    /// Never ask; approve every request.
+    Yolo = 2,
 }
 
 impl PermissionMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Approve => "APPROVE",
-            Self::Bypass => "BYPASS",
+    /// Stable encoding for sharing the mode through an `Arc<AtomicU8>`.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Stable, non-panicking decode of a stored code. Unknown values fall back
+    /// to [`Self::Approve`].
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Approve,
+            1 => Self::Auto,
+            2 => Self::Yolo,
+            _ => Self::Approve,
         }
     }
 
-    pub fn toggled(self) -> Self {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Approve => Self::Bypass,
-            Self::Bypass => Self::Approve,
+            Self::Approve => "APPROVE",
+            Self::Auto => "AUTO",
+            Self::Yolo => "YOLO",
         }
+    }
+
+    /// Cycle through the modes in Tab order: APPROVE → AUTO → YOLO → APPROVE.
+    pub fn cycled(self) -> Self {
+        Self::from_code(self.code().wrapping_add(1))
     }
 }
 

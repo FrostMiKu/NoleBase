@@ -259,8 +259,8 @@ file. Editing from a message preview keeps that preview open and refreshes it.
 
 Mouse activation uses only the left button. The wheel scrolls the pane under the
 pointer, and confirmations/Help block all interaction with the workspace below.
-`Tab` globally switches between approval mode and bypass mode without changing
-keyboard focus.
+`Tab` globally cycles `APPROVE`, `AUTO`, and `YOLO` permission modes without
+changing keyboard focus.
 
 ## Storage
 
@@ -465,8 +465,8 @@ application command pipeline; the initial commands interrupt the active Agent
 task, clear its saved session, create or manage notes, or open `template.mb`,
 `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the configured editor.
 `File: Export…` is available when Center is previewing a file, Skill, or Daily
-document. Its Original/HTML picker and destination prompt use the same storage
-policy as the Agent's `export_file` tool.
+document. The UI retains its Original/HTML picker; the Agent's `export_file`
+tool exposes HTML rendering only because exact-byte external copies use `copy`.
 Press `Ctrl+\`` or run `Terminal: Open` from the command palette to open a
 PTY-backed floating terminal. Its shell starts in the active Nole directory
 (`~/.nole` by default, or `NOLE_DIR` when configured). Hiding the terminal
@@ -496,8 +496,8 @@ breakpoint makes the unchanged conversation prefix reusable while edits to
 MEMORY.md, skills, or project instructions can still fall back to an earlier
 stable prefix. The current timestamp remains in the newest user message.
 The Agent can inspect the same shared tag index with `list_tags` and
-`search_tag`. Its `rename_tag` tool shows a multi-file diff and follows the
-normal approval/bypass policy before changing exact Hashtag source spans.
+`search_tag`. Its `rename_tag` tool follows the active permission policy before
+changing exact Hashtag source spans across a multi-file diff.
 Broad exploration, discovery, comparison, and research run through the
 `explore` tool. It starts an isolated read-only agent with file, note, tag, and
 web lookup tools, but no mutation, interaction, or recursive-agent tools. Its
@@ -623,27 +623,21 @@ content on the current local date.
 The Agent can list `daily/` to discover available dates before reading the
 relevant files.
 
-`copy` and `move` accept a regular source file anywhere on the filesystem, but
-the destination must be a new path inside the Nole directory; neither operation
-requires approval. `move_many` moves up to 200 sources into one existing Nole
-directory, preserves basenames, preflights all collisions, and attempts rollback
-if a later move fails. `rename` gives same-directory renames an explicit
-non-overwriting operation. `delete` only accepts regular files inside Nole and
-uses the common approval dialog. Generic file
-creation, transfer, and rename tools cannot operate directly inside `daily/`,
-preserving its `YYYY-MM-DD.md` naming invariant. Agent file tools cannot mutate
-anything inside `config/`, and `config/ai.toml` cannot be read.
+Generic file mutation tools accept paths relative to the Nole directory or
+absolute paths elsewhere on the filesystem. They preserve the existing safety
+contracts: regular-file checks, no symlink traversal, create-new destinations,
+read-before-`edit` snapshots, collision preflight, and rollback for a failed
+`move_many`. Relative paths still resolve under Nole. Generic tools cannot mutate
+`config/`, attachment internals, or files directly inside `daily/`; recursive
+directory removal inside Nole remains limited to `workspace/main/`.
 
-`export_file` is the only Agent file tool whose destination is outside Nole. It
-requires `source`, `destination`, and an explicit `original` or `html` format.
-Preparation validates the source and destination before a confirmation
-approval; preparation and publication run off the Agent async runtime.
-Publication revalidates source content and destination afterward, never
-overwrites, and returns the resolved destination, exact output byte count, and
-renderer-warning summary. Original preserves any regular source file exactly.
-HTML accepts only UTF-8 `.md`/`.mb` sources and uses the same inert offline
-rendering described above. `config/` and attachment object internals are never
-export sources.
+`export_file` renders a UTF-8 `.md` or `.mb` source as standalone HTML at a
+new external destination. Preparation validates the source and destination
+before the permission gate; preparation and publication run off the Agent
+async runtime. Publication revalidates source content and destination afterward,
+never overwrites, and returns the resolved destination, exact output byte count,
+and renderer-warning summary. Exact-byte external copies use the generic `copy`
+tool instead. `config/` and attachment object internals are never export sources.
 
 The `notify` tool lets the Agent display a short notification card in the TUI's
 top-right corner and emits the terminal bell. Notifications are non-blocking
@@ -654,7 +648,7 @@ the user directly.
 The `ask` tool pauses the Agent and opens a TUI dialog for clarification.
 The Agent may provide up to ten choices; use Up/Down and Enter to select one,
 or type a different free-text response. Esc cancels the question. Questions
-are interactive requests rather than permission checks, so APPROVE/BYPASS does
+are interactive requests rather than permission checks, so permission mode does
 not skip them.
 
 The system prompt requires the Agent to use `ask` when it needs an answer before
@@ -669,10 +663,11 @@ contents are appended to the system prompt in that order for every Agent task.
 `config/`. The Agent may read and update root-level `MEMORY.md`; localized
 updates use the normal read-before-`edit` approval flow.
 
-In `APPROVE` mode, updates, deletes, and `export_file` pause and show an
-MBTUI-rendered diff, deletion preview, or export confirmation. Use Enter/Y to
-approve or N/Esc to deny. In `BYPASS` mode they proceed without the approval
-dialog, but read-before-update and export path/identity validation still apply.
+In `APPROVE` mode, filesystem mutations and other sensitive updates always pause
+for a diff or confirmation. `AUTO` approves mutations under `${NOLE_DIR}`
+automatically but requires explicit approval for paths elsewhere. `YOLO` skips
+all permission dialogs. Every mode retains path, symlink, identity,
+read-before-update, and non-overwrite validation.
 Adding a new card never requires approval. Note listings return at
 most 2,000 entries per call; file and web responses are capped at 1 MB.
 Filesystem mutation tools reject symlink targets. The API configuration itself

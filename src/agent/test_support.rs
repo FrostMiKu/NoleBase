@@ -1,13 +1,14 @@
 //! Shared test helpers used by both the agent-runtime tests and the tool tests.
 
-use std::sync::atomic::AtomicBool;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
 
 use anyhow::Result;
 
 use super::{
-    AgentEvent, AgentEventSender, AgentRunCompletion, ApprovalGate, ToolBatchExecution,
-    AGENT_STREAM_BUFFER,
+    AgentEvent, AgentEventSender, AgentRunCompletion, ApprovalDecision, ApprovalGate,
+    PermissionMode, ToolBatchExecution, AGENT_STREAM_BUFFER,
 };
 use crate::agent::{Agent, AgentConversation};
 use crate::provider::Message;
@@ -84,13 +85,33 @@ pub(crate) fn completed_tool_results(execution: ToolBatchExecution) -> Vec<Messa
 
 pub(crate) const TEST_MESSAGES_CONFIG: &str = "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'https://api.anthropic.com'\n";
 
+/// A gate in YOLO mode: every request passes without asking (the root is never
+/// consulted and can stay empty).
 pub(crate) fn bypass_gate() -> ApprovalGate {
     let (event_sender, _event_receiver) = event_channel();
     let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-    ApprovalGate {
-        bypass: Arc::new(AtomicBool::new(true)),
-        cancelled: Arc::new(AtomicBool::new(false)),
-        events: event_sender,
-        decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-    }
+    ApprovalGate::new(
+        Arc::new(AtomicU8::new(PermissionMode::Yolo.code())),
+        PathBuf::new(),
+        Arc::new(AtomicBool::new(false)),
+        event_sender,
+        Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+    )
+}
+
+/// A gate in the given mode over `root`, wired so tests can observe approval
+/// events and supply decisions.
+pub(crate) fn gate(
+    mode: PermissionMode,
+    root: &std::path::Path,
+    events: AgentEventSender,
+    decisions: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
+) -> ApprovalGate {
+    ApprovalGate::new(
+        Arc::new(AtomicU8::new(mode.code())),
+        std::fs::canonicalize(root).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+        events,
+        Arc::new(tokio::sync::Mutex::new(decisions)),
+    )
 }

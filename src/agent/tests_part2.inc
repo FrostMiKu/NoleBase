@@ -75,7 +75,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Auto.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -175,7 +175,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -287,7 +287,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -379,7 +379,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -448,7 +448,7 @@
                 approval_receiver,
                 user_receiver,
                 input_buffer.clone(),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -578,7 +578,7 @@
                 approval_receiver,
                 user_receiver,
                 input_buffer.clone(),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -666,7 +666,7 @@
                     approval_receiver,
                     user_receiver,
                     Arc::new(Mutex::new(Vec::new())),
-                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                     Arc::new(AtomicBool::new(false)),
                 ),
             )
@@ -949,7 +949,7 @@
             .to_string()
             .contains("file changed since read at line 1"));
 
-        let write = Write::new(directory.path()).unwrap();
+        let write = Write::new(directory.path(), bypass_gate()).unwrap();
         let schema = write.input_schema();
         assert!(schema["properties"].get("overwrite").is_none());
         let existing_error = write
@@ -1043,7 +1043,7 @@
         storage.ensure_files().unwrap();
         let invalid = "[box border=double]\nbody\n[/box]\n";
 
-        let write = Write::new(directory.path()).unwrap();
+        let write = Write::new(directory.path(), bypass_gate()).unwrap();
         let result = write
             .execute(&json!({"path": "data/invalid.md", "content": invalid}))
             .unwrap();
@@ -1133,7 +1133,7 @@
         let valid = "---\ndescription: Original workflow\n---\n\n# Steps\n";
         let invalid = "# Missing front matter\n";
 
-        let write = Write::new(directory.path()).unwrap();
+        let write = Write::new(directory.path(), bypass_gate()).unwrap();
         let create_error = write
             .execute(&json!({
                 "path": "skills/broken.md",
@@ -1190,7 +1190,7 @@
         let move_source = outside.path().join("moved.md");
         fs::write(&copy_source, invalid).unwrap();
         fs::write(&move_source, invalid).unwrap();
-        assert!(Copy::new(directory.path())
+        assert!(Copy::new(directory.path(), bypass_gate())
             .unwrap()
             .execute(&json!({
                 "source": copy_source,
@@ -1468,7 +1468,7 @@
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .unwrap();
         assert!(!storage.daily_dir.join("2026-07-27.md").exists());
-        assert!(Write::new(directory.path())
+        assert!(Write::new(directory.path(), bypass_gate())
             .unwrap()
             .execute(&json!({
                 "path": "daily/2026-07-27.md",
@@ -1541,12 +1541,7 @@
             .unwrap();
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(PermissionMode::Approve, directory.path(), event_sender, decision_receiver);
         let edit = Edit::new(
             directory.path(),
             gate,
@@ -1692,12 +1687,7 @@
         handle.replace(crate::workspace_index::WorkspaceIndex::build(&storage));
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(PermissionMode::Approve, directory.path(), event_sender, decision_receiver);
         let tool = RenameTag::new(directory.path(), handle.clone(), gate).unwrap();
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(tool.execute(&json!({"from": "old", "to": "new"})))
@@ -1796,12 +1786,7 @@
         handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(PermissionMode::Approve, directory.path(), event_sender, decision_receiver);
         let tool = RenameWikilink::new(directory.path(), handle.clone(), gate).unwrap();
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(tool.execute(&json!({"from": "Old", "to": "New"})))
@@ -1833,12 +1818,7 @@
         handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
         let (event_sender, mut event_receiver) = event_channel();
         let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(PermissionMode::Approve, directory.path(), event_sender, decision_receiver);
         let tool = RenameWikilink::new(directory.path(), handle, gate).unwrap();
         let run = |input: Value| {
             test_runtime()
@@ -2037,4 +2017,52 @@
             tool_error_message(&error),
             "fetching page: connection refused"
         );
+    }
+
+    #[test]
+    fn approval_gate_enforces_approve_auto_yolo_path_matrix() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root_dir.path()).unwrap();
+        let internal = root.join("data/note.md");
+        let outside_dir = tempfile::tempdir().unwrap();
+        let external = fs::canonicalize(outside_dir.path()).unwrap().join("external.md");
+        let request = || ApprovalRequest {
+            title: "Test change".to_string(),
+            message: "Change path?".to_string(),
+            kind: ApprovalKind::Confirm,
+        };
+
+        let (events, mut receiver) = event_channel();
+        let (_decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let auto_internal = gate(PermissionMode::Auto, &root, events, decision_receiver);
+        test_runtime()
+            .block_on(auto_internal.request_for_paths(request(), &[&internal]))
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+
+        let (events, mut receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let auto_external = gate(PermissionMode::Auto, &root, events, decision_receiver);
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime()
+            .block_on(auto_external.request_for_paths(request(), &[&internal, &external]))
+            .unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(AgentEvent::Approval(_))));
+
+        let (events, mut receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let approve_internal = gate(PermissionMode::Approve, &root, events, decision_receiver);
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime()
+            .block_on(approve_internal.request_for_paths(request(), &[&internal]))
+            .unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(AgentEvent::Approval(_))));
+
+        let (events, mut receiver) = event_channel();
+        let (_decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let yolo_external = gate(PermissionMode::Yolo, &root, events, decision_receiver);
+        test_runtime()
+            .block_on(yolo_external.request_for_paths(request(), &[&external]))
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
     }

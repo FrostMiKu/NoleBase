@@ -17,9 +17,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use super::file_edit::{inspect_text_file, prepare_edit, FileInspection, PreparedEdit};
-use super::file_ops::{
-    move_to_new_file, outside_agent_workspace, path_zone, safe_relative, PathZone,
-};
+use super::file_ops::{move_to_new_file, path_zone, resolve_mutation_path, PathZone};
 use super::util::required_string;
 use super::workspace_quota::{check_workspace_staged_write, workspace_edit_budget};
 use super::write_policy::{post_write_result, validate_write_preconditions, WriteSource};
@@ -62,9 +60,10 @@ impl Edit {
     }
 
     /// Resolve an existing edit target: canonical parent, no symlinks, and
-    /// never inside `config/` or `attachments/`.
-    fn resolve_path(&self, relative: &str) -> Result<PathBuf> {
-        let unresolved = safe_relative(&self.root, relative)?;
+    /// never inside `config/` or `attachments/`. The target may be a Nole-
+    /// relative path or an external absolute path.
+    fn resolve_path(&self, input: &str) -> Result<PathBuf> {
+        let unresolved = resolve_mutation_path(&self.root, input)?;
         let metadata = fs::symlink_metadata(&unresolved)
             .with_context(|| format!("checking {}", unresolved.display()))?;
         if metadata.file_type().is_symlink() {
@@ -83,9 +82,10 @@ impl Edit {
     }
 
     /// Resolve the destination of an `MV` op: canonical parent, no existing
-    /// file, and never inside `config/` or `attachments/`.
+    /// file, and never inside `config/` or `attachments/`. The destination may
+    /// be a Nole-relative path or an external absolute path.
     fn resolve_destination(&self, dest_text: &str) -> Result<PathBuf> {
-        let destination = safe_relative(&self.root, dest_text)?;
+        let destination = resolve_mutation_path(&self.root, dest_text)?;
         match path_zone(&self.root, &destination) {
             PathZone::Config => bail!("edit cannot move files inside config/"),
             PathZone::Attachments => {
@@ -142,12 +142,7 @@ impl Edit {
             rebase_edits(&base, &normalize_text(&raw_text), &mut planned)?;
             planned
         } else {
-            plan_section(
-                section,
-                &raw_lines,
-                syntax_for_path(&path),
-                &self.registers,
-            )?
+            plan_section(section, &raw_lines, syntax_for_path(&path), &self.registers)?
         };
 
         for &(start, end) in &planned.touched {
@@ -161,19 +156,19 @@ impl Edit {
             dest = Some(self.resolve_destination(text)?);
         }
 
-        let prepared = if planned.edits.is_empty() || matches!(planned.file_op, Some(FileOp::Remove))
-        {
-            None
-        } else {
-            let budget = workspace_edit_budget(&self.root, &path)?;
-            match prepare_edit(&path, relative, &planned.edits, &inspection, budget) {
-                Ok(prepared) => Some(prepared),
-                Err(error) => {
-                    let _ = self.reads.invalidate(&path);
-                    return Err(error);
+        let prepared =
+            if planned.edits.is_empty() || matches!(planned.file_op, Some(FileOp::Remove)) {
+                None
+            } else {
+                let budget = workspace_edit_budget(&self.root, &path)?;
+                match prepare_edit(&path, relative, &planned.edits, &inspection, budget) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        let _ = self.reads.invalidate(&path);
+                        return Err(error);
+                    }
                 }
-            }
-        };
+            };
 
         Ok(SectionPlan {
             relative: relative.to_string(),
@@ -191,18 +186,16 @@ impl Edit {
         })
     }
 
-    /// Request one approval when anything leaves the agent workspace, showing
-    /// every section's staged diff plus its file operation.
+    /// Request approval for the whole patch, covering every touched path and
+    /// every move destination. The gate decides by path: APPROVE always asks,
+    /// AUTO asks only when a path leaves the Nole root, YOLO never asks.
     async fn approve(&self, plans: &[SectionPlan]) -> Result<()> {
-        let needs_approval = plans.iter().any(|plan| {
-            outside_agent_workspace(&self.root, &plan.path)
-                || plan
-                    .dest
-                    .as_ref()
-                    .is_some_and(|dest| outside_agent_workspace(&self.root, dest))
-        });
-        if !needs_approval {
-            return Ok(());
+        let mut paths = Vec::with_capacity(plans.len() * 2);
+        for plan in plans {
+            paths.push(plan.path.as_path());
+            if let Some(dest) = &plan.dest {
+                paths.push(dest.as_path());
+            }
         }
         let mut message = String::new();
         for plan in plans {
@@ -226,11 +219,14 @@ impl Edit {
             format!("Edit {} files", plans.len())
         };
         self.gate
-            .request(ApprovalRequest {
-                title,
-                message,
-                kind: ApprovalKind::Diff,
-            })
+            .request_for_paths(
+                ApprovalRequest {
+                    title,
+                    message,
+                    kind: ApprovalKind::Diff,
+                },
+                &paths,
+            )
             .await?;
         Ok(())
     }
@@ -292,10 +288,7 @@ impl Edit {
                     self.reads.consume(&plan.path)?;
                 }
                 Some(FileOp::Move { .. }) => {
-                    let destination = plan
-                        .dest
-                        .as_ref()
-                        .context("move destination is missing")?;
+                    let destination = plan.dest.as_ref().context("move destination is missing")?;
                     move_to_new_file(&plan.path, destination).with_context(|| {
                         format!(
                             "moving {} to {}",
@@ -413,9 +406,7 @@ impl SectionPlan {
     fn surviving_location(&self) -> Option<(&Path, &str)> {
         match &self.planned.file_op {
             Some(FileOp::Remove) => None,
-            Some(FileOp::Move { .. }) => {
-                Some((self.dest.as_ref()?, self.dest_relative.as_str()))
-            }
+            Some(FileOp::Move { .. }) => Some((self.dest.as_ref()?, self.dest_relative.as_str())),
             None => Some((&self.path, self.relative.as_str())),
         }
     }
@@ -546,15 +537,17 @@ impl Tool for Edit {
 
     fn description(&self) -> &'static str {
         "Apply a hashline patch to files you have already read: one or more [PATH#TAG] sections. \
-PATH is relative to the Nole root; TAG is the 4-hex snapshot tag from the file's latest read \
-result (the [path#TAG] header); consecutive edits reuse the NEW tag each edit returns. Ops: \
+PATH is relative to the Nole root or an absolute external path; TAG is the 4-hex snapshot tag \
+from the file's latest read result (the [path#TAG] header); consecutive edits reuse the NEW tag \
+each edit returns. Ops: \
 PUT N.=M: replaces original inclusive lines N..M with the following + body rows; PUT N*: \
 replaces the syntactic block starting at line N; PUT <N: inserts body before line N (<1 = file \
 head); PUT >N: inserts body after line N (>$ = file tail); PUT >N*: inserts after the block at \
 line N; CUT N.=M or CUT N* deletes a span and captures it, with an optional trailing @name; PUT \
 <N @name, PUT >N @name, PUT N.=M @name or PUT N* @name pastes a captured register (@name is \
-required for span replaces). REM deletes the file. MV DEST moves or renames it (double-quote \
-DEST only when it contains spaces); line edits in the section apply to the source first. Body \
+required for span replaces). REM deletes the file. MV DEST moves or renames it (DEST is relative \
+to the Nole root or an absolute external path; double-quote DEST only when it contains spaces); \
+line edits in the section apply to the source first. Body \
 rows are +TEXT verbatim with leading spaces preserved; a bare + is a blank line; they appear \
 only under a : header. Line numbers are ORIGINAL file numbers, never shifted by earlier hunks. \
 Example: [data/note.md#3F2A]\nPUT 2.=2:\n+replacement text\n. The result shows each edited \
@@ -607,7 +600,8 @@ mod tests {
 
     use super::*;
     use crate::agent::snapshots::{snapshot_identity, snapshot_tag};
-    use crate::agent::test_support::{bypass_gate, test_runtime};
+    use crate::agent::test_support::{bypass_gate, event_channel, gate, test_runtime};
+    use crate::agent::{AgentEvent, ApprovalDecision, PermissionMode};
 
     fn workspace() -> (tempfile::TempDir, PathBuf) {
         let directory = tempdir().unwrap();
@@ -763,10 +757,7 @@ mod tests {
             })))
             .unwrap_err();
         assert!(error.to_string().contains("must read lines"));
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "alpha\nbeta\ngamma\n"
-        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta\ngamma\n");
     }
 
     #[test]
@@ -811,7 +802,10 @@ mod tests {
         let to = fs::canonicalize(root.join("workspace/main/to.md")).unwrap();
         assert_eq!(fs::read_to_string(&to).unwrap(), "MOVED\nsecond\n");
         assert!(reads.head(&from).unwrap().is_none());
-        let anchored = reads.head(&to).unwrap().expect("moved snapshot is anchored");
+        let anchored = reads
+            .head(&to)
+            .unwrap()
+            .expect("moved snapshot is anchored");
         assert_eq!(anchored.tag, extract_tag(&result, "workspace/main/to.md"));
     }
 
@@ -847,5 +841,50 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "alpha\nBETA\nchanged-externally\ngamma\n"
         );
+    }
+    #[test]
+    fn auto_mode_gates_absolute_external_edits_and_denial_preserves_content() {
+        let (_directory, root) = workspace();
+        let outside = tempdir().unwrap();
+        let path = fs::canonicalize(outside.path())
+            .unwrap()
+            .join("external.txt");
+        fs::write(&path, "before\n").unwrap();
+        let path = fs::canonicalize(path).unwrap();
+        let reads = Arc::new(SnapshotStore::default());
+        let tag = record_full(&reads, &path, "before\n");
+        let patch = json!({
+            "patch": format!("[{}#{tag}]\nPUT 1.=1:\n+after\n", path.display())
+        });
+
+        let (events, mut receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let edit = Edit::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+            reads.clone(),
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Deny).unwrap();
+        let error = test_runtime().block_on(edit.execute(&patch)).unwrap_err();
+        assert!(error.to_string().contains("change denied by user"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        assert!(receiver
+            .try_recv()
+            .is_ok_and(|event| matches!(event, AgentEvent::Approval(_))));
+
+        let (events, _receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let edit = Edit::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime().block_on(edit.execute(&patch)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
     }
 }

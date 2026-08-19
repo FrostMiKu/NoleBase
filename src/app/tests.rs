@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
 use crate::attachment::AttachmentStore;
@@ -1209,16 +1210,28 @@ fn ctrl_p_toggles_the_command_palette_without_replacing_other_dialogs() {
 }
 
 #[test]
-fn tab_switches_permission_mode_without_changing_focus() {
+fn tab_cycles_permission_mode_approve_auto_yolo_without_changing_focus() {
     let (mut app, _directory) = make_app();
     assert_eq!(app.focus, Focus::Center);
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.permission_mode, PermissionMode::Bypass);
+    assert_eq!(app.permission_mode, PermissionMode::Auto);
     assert_eq!(app.focus, Focus::Center);
-    assert!(app.permission_bypass.load(Ordering::Relaxed));
+    assert_eq!(
+        app.permission_mode_atomic.load(Ordering::Relaxed),
+        PermissionMode::Auto.code()
+    );
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.permission_mode, PermissionMode::Yolo);
+    assert_eq!(
+        app.permission_mode_atomic.load(Ordering::Relaxed),
+        PermissionMode::Yolo.code()
+    );
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.permission_mode, PermissionMode::Approve);
-    assert!(!app.permission_bypass.load(Ordering::Relaxed));
+    assert_eq!(
+        app.permission_mode_atomic.load(Ordering::Relaxed),
+        PermissionMode::Approve.code()
+    );
 }
 
 #[test]

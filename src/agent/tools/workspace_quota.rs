@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn copy_tool_wiring_refuses_oversized_workspace_destinations() {
         use super::super::file_ops::Copy;
-        use crate::agent::test_support::test_runtime;
+        use crate::agent::test_support::{bypass_gate, test_runtime};
 
         let (_directory, root) = fresh_root();
         let source = root.join("data/source.bin");
@@ -442,7 +442,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_WORKSPACE_FILE_BYTES + 1)
             .unwrap();
-        let copy = Copy::new(&root).unwrap();
+        let copy = Copy::new(&root, bypass_gate()).unwrap();
         let error = test_runtime()
             .block_on(copy.execute(&json!({
                 "source": source.to_string_lossy(),

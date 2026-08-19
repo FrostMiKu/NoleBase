@@ -133,7 +133,7 @@ pub(crate) fn animations_active(app: &App, focused: bool) -> bool {
             || app.ai_running
             || app.export_in_progress
             || app.overlay == Some(Overlay::Terminal)
-            || app.permission_mode == PermissionMode::Bypass
+            || app.permission_mode == PermissionMode::Yolo
             || app.focus == Focus::Compose
             || matches!(app.center_view, CenterView::Daily | CenterView::Tags))
 }

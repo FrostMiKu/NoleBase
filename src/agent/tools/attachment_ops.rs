@@ -617,14 +617,11 @@ impl Tool for DeleteAttachment {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
-
     use super::*;
     use crate::agent::test_support::{
-        bypass_gate, event_channel, test_runtime, TestFutureResultExt,
+        bypass_gate, event_channel, gate, test_runtime, TestFutureResultExt,
     };
-    use crate::agent::{AgentEvent, ApprovalDecision};
+    use crate::agent::{AgentEvent, ApprovalDecision, PermissionMode};
     use crate::attachment_index::AttachmentReferenceIndex;
 
     /// A valid 1x1 transparent PNG so content-based media detection reports
@@ -1001,12 +998,12 @@ mod tests {
 
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender,
+            decision_receiver,
+        );
         let update = UpdateAttachment::new(&root, gate).unwrap();
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(update.execute(&json!({
@@ -1095,12 +1092,12 @@ mod tests {
 
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender,
+            decision_receiver,
+        );
         let delete = DeleteAttachment::new(&root, gate, ready_usage(&root)).unwrap();
 
         // Malformed references are refused without any approval request.
@@ -1140,12 +1137,12 @@ mod tests {
 
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender,
+            decision_receiver,
+        );
         let delete = DeleteAttachment::new(&root, gate, ready_usage(&root)).unwrap();
         let worker_uri = uri.clone();
         let worker = std::thread::spawn(move || {

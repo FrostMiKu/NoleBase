@@ -181,7 +181,7 @@
     fn file_tools_stay_inside_root() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
-        let write = Write::new(directory.path()).unwrap();
+        let write = Write::new(directory.path(), bypass_gate()).unwrap();
         write
             .execute(&json!({"path": "data/test.md", "content": "hello\nworld\n"}))
             .unwrap();
@@ -307,7 +307,7 @@
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         let content = "x".repeat(1_100_000);
-        let write = Write::new(directory.path()).unwrap();
+        let write = Write::new(directory.path(), bypass_gate()).unwrap();
         write
             .execute(&json!({"path": "data/large.txt", "content": content}))
             .unwrap();
@@ -475,7 +475,7 @@
             Arc::new(RegisterBank::default()),
         )
         .unwrap();
-        let write = Write::new(directory.path()).unwrap();
+        let write = Write::new(directory.path(), bypass_gate()).unwrap();
 
         read.execute(&json!({"path": "config/AGENTS.md"})).unwrap();
         assert!(edit
@@ -640,7 +640,7 @@
         fs::write(&move_source, "move me").unwrap();
         let canonical_move_source = fs::canonicalize(&move_source).unwrap();
 
-        let copy = Copy::new(directory.path()).unwrap();
+        let copy = Copy::new(directory.path(), bypass_gate()).unwrap();
         copy.execute(&json!({
             "source": copy_source,
             "destination": "data/copied.md"
@@ -760,16 +760,27 @@
         let outside = tempfile::NamedTempFile::new().unwrap();
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        let outside_delete = Delete::new(
+            directory.path(),
+            gate(PermissionMode::Approve, directory.path(), event_sender.clone(), decision_receiver),
+        )
+        .unwrap();
+        let outside_path = outside.path().to_path_buf();
+        let outside_worker = std::thread::spawn(move || {
+            test_runtime().block_on(outside_delete.execute(&json!({"path": outside_path})))
+        });
+        let AgentEvent::Approval(_) = event_receiver.blocking_recv().unwrap() else {
+            panic!("expected external delete approval request");
         };
-        let delete = Delete::new(directory.path(), gate).unwrap();
-        assert!(delete
-            .execute(&json!({"path": outside.path()}))
-            .returns_err());
+        decision_sender.send(ApprovalDecision::Deny).unwrap();
+        assert!(outside_worker.join().unwrap().is_err());
+
+        let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let delete = Delete::new(
+            directory.path(),
+            gate(PermissionMode::Approve, directory.path(), event_sender, decision_receiver),
+        )
+        .unwrap();
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(delete.execute(&json!({"path": "data/delete.md"})))
         });
@@ -802,7 +813,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -842,7 +853,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -984,7 +995,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -1100,7 +1111,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -1264,7 +1275,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -1429,7 +1440,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -1524,7 +1535,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -1630,7 +1641,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )
@@ -1728,7 +1739,7 @@
                 approval_receiver,
                 user_receiver,
                 Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
             ),
         )

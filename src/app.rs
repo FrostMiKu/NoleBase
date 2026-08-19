@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -363,7 +363,7 @@ pub struct App {
     agent_input_buffer: Arc<Mutex<Vec<String>>>,
     pub ai_running: bool,
     pub permission_mode: PermissionMode,
-    permission_bypass: Arc<AtomicBool>,
+    permission_mode_atomic: Arc<AtomicU8>,
     pub agent_panel: Vec<Arc<AgentPanelEntry>>,
     active_agent_tools: HashMap<String, usize>,
     pub(crate) agent_vlist: AgentVirtualList,
@@ -447,7 +447,7 @@ impl App {
         let workspace_index = WorkspaceIndexHandle::default();
         let wiki_links = crate::wiki_link_index::WikiLinkIndexHandle::default();
         let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
-        let permission_bypass = Arc::new(AtomicBool::new(false));
+        let permission_mode_atomic = Arc::new(AtomicU8::new(PermissionMode::Approve.code()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let (event_sender, _) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
         let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -460,7 +460,7 @@ impl App {
                 approval_receiver,
                 user_receiver,
                 agent_input_buffer.clone(),
-                permission_bypass.clone(),
+                permission_mode_atomic.clone(),
                 cancelled.clone(),
             )
             .with_workspace_index(workspace_index.clone())
@@ -582,7 +582,7 @@ impl App {
             agent_input_buffer,
             ai_running: false,
             permission_mode: PermissionMode::Approve,
-            permission_bypass,
+            permission_mode_atomic,
             agent_panel,
             active_agent_tools: HashMap::new(),
             agent_vlist: AgentVirtualList::default(),

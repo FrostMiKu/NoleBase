@@ -23,35 +23,39 @@ use crate::agent::{
 use crate::export::ExportFormat;
 use crate::storage::{ExportDestinationPolicy, ExportOutcome, Storage, ATTACHMENTS_DIR};
 
-pub(super) fn safe_relative(root: &Path, input: &str) -> Result<PathBuf> {
-    let relative = Path::new(input);
-    if relative.is_absolute()
-        || relative.components().any(|component| {
+/// Resolve a mutation input to a target path. Relative inputs resolve against
+/// `root` and must stay inside it (even through a symlinked parent); absolute
+/// inputs are used directly as external paths. The deepest existing ancestor is
+/// canonicalized so no symlink in the parent chain is followed, and the final
+/// component is appended as the literal leaf name.
+pub(super) fn resolve_mutation_path(root: &Path, input: &str) -> Result<PathBuf> {
+    let absolute = Path::new(input).is_absolute();
+    let unresolved = if absolute {
+        PathBuf::from(input)
+    } else {
+        let relative = Path::new(input);
+        if relative.components().any(|component| {
             matches!(
                 component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
-        })
-    {
-        bail!("path must stay within the Nole root");
-    }
-    let path = root.join(relative);
-    let parent = path.parent().context("path has no parent")?;
+        }) {
+            bail!("relative path must not contain `..` or an absolute component");
+        }
+        root.join(relative)
+    };
+    let parent = unresolved.parent().context("path has no parent")?;
     let canonical_parent = fs::canonicalize(parent)
         .with_context(|| format!("resolving parent directory {}", parent.display()))?;
-    if !canonical_parent.starts_with(root) {
+    if !absolute && !canonical_parent.starts_with(root) {
         bail!("path escapes the Nole root");
     }
-    let name = path.file_name().context("path must name a file")?;
+    let name = unresolved.file_name().context("path must name a file")?;
     Ok(canonical_parent.join(name))
 }
 
 fn resolve_transfer_source(root: &Path, input: &str) -> Result<PathBuf> {
-    let unresolved = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        root.join(input)
-    };
+    let unresolved = resolve_mutation_path(root, input)?;
     let file_type = fs::symlink_metadata(&unresolved)
         .with_context(|| format!("checking source {}", unresolved.display()))?
         .file_type();
@@ -65,7 +69,7 @@ fn resolve_transfer_source(root: &Path, input: &str) -> Result<PathBuf> {
 }
 
 fn resolve_new_destination(root: &Path, input: &str) -> Result<PathBuf> {
-    let destination = safe_relative(root, input)?;
+    let destination = resolve_mutation_path(root, input)?;
     ensure_not_special(root, &destination)?;
     match fs::symlink_metadata(&destination) {
         Ok(_) => bail!("destination already exists: {input}"),
@@ -106,12 +110,6 @@ pub(crate) fn path_zone(root: &Path, path: &Path) -> PathZone {
     } else {
         PathZone::Normal
     }
-}
-
-/// Whether mutating `path` requires user approval. Everything under
-/// `workspace/main` is the current session's sandbox and bypasses the gate.
-pub(super) fn outside_agent_workspace(root: &Path, path: &Path) -> bool {
-    !matches!(path_zone(root, path), PathZone::Workspace)
 }
 
 pub fn ensure_not_special(root: &Path, path: &Path) -> Result<()> {
@@ -245,12 +243,14 @@ fn move_across_devices(source: &Path, destination: &Path) -> Result<u64> {
 
 pub struct Copy {
     root: PathBuf,
+    gate: ApprovalGate,
 }
 
 impl Copy {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            gate,
         })
     }
 }
@@ -262,7 +262,7 @@ impl Tool for Copy {
     }
 
     fn description(&self) -> &'static str {
-        "Copy an existing regular file to a new destination under the Nole root without overwriting."
+        "Copy an existing regular file to a new destination without overwriting: a Nole-relative path, or an external absolute path."
     }
 
     fn input_schema(&self) -> Value {
@@ -274,6 +274,20 @@ impl Tool for Copy {
         let destination_text = required_string(input, "destination")?;
         let destination = resolve_new_destination(&self.root, destination_text)?;
         validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
+                    title: "Copy file".to_string(),
+                    message: format!(
+                        "Copy {} to {}?",
+                        display_path(&self.root, &source),
+                        display_path(&self.root, &destination)
+                    ),
+                    kind: ApprovalKind::Confirm,
+                },
+                &[&source, &destination],
+            )
+            .await?;
         let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
         Ok(post_write_result(
             format!("copied {bytes} bytes to {destination_text}"),
@@ -304,35 +318,31 @@ impl Tool for ExportFile {
     }
 
     fn description(&self) -> &'static str {
-        "Publish one Nole file to a new destination outside Nole as exact original bytes or safe standalone HTML."
+        "Render one Nole Markdown file as safe standalone HTML at a new external destination."
     }
-
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Nole-root-relative path, or an absolute path within Nole"
+                    "description": "Nole-root-relative .md or .mb path, or an absolute path within Nole"
                 },
                 "destination": {
                     "type": "string",
-                    "description": "Absolute, ~/..., or relative to the parent of Nole; must be outside Nole and not exist"
-                },
-                "format": {
-                    "enum": ["original", "html"],
-                    "description": "HTML requires a UTF-8 .md or .mb source and a matching destination suffix"
+                    "description": "Absolute, ~/..., or relative to the parent of Nole; must be outside Nole, end in .html, and not exist"
                 }
             },
-            "required": ["source", "destination", "format"],
+            "required": ["source", "destination"],
             "additionalProperties": false
         })
     }
 
+
     async fn execute(&self, input: &Value) -> Result<String> {
         let source = required_string(input, "source")?.to_string();
         let destination = required_string(input, "destination")?.to_string();
-        let format = required_string(input, "format")?.parse::<ExportFormat>()?;
+        let format = ExportFormat::Html;
         let storage = self.storage.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             storage.prepare_export(
@@ -345,16 +355,19 @@ impl Tool for ExportFile {
         .await
         .context("joining export preparation")??;
         self.gate
-            .request(ApprovalRequest {
-                title: "Export file".to_string(),
-                message: format!(
-                    "Export {} as {} to {}?",
-                    prepared.source().display(),
-                    format.label(),
-                    prepared.destination().display()
-                ),
-                kind: ApprovalKind::Confirm,
-            })
+            .request_for_paths(
+                ApprovalRequest {
+                    title: "Export file".to_string(),
+                    message: format!(
+                        "Export {} as {} to {}?",
+                        prepared.source().display(),
+                        format.label(),
+                        prepared.destination().display()
+                    ),
+                    kind: ApprovalKind::Confirm,
+                },
+                &[prepared.source(), prepared.destination()],
+            )
             .await?;
         // Rendering HTML is CPU-bound, so publish on the blocking pool.
         let storage = self.storage.clone();
@@ -412,7 +425,7 @@ impl Tool for Move {
     }
 
     fn description(&self) -> &'static str {
-        "Move an existing regular file to a new destination under the Nole root without overwriting."
+        "Move an existing regular file to a new destination without overwriting: a Nole-relative path, or an external absolute path."
     }
 
     fn input_schema(&self) -> Value {
@@ -426,9 +439,9 @@ impl Tool for Move {
         let destination = resolve_new_destination(&self.root, destination_text)?;
         validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
         check_workspace_write(&self.root, &destination, identity.len)?;
-        if outside_agent_workspace(&self.root, &source) {
-            self.gate
-                .request(ApprovalRequest {
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
                     title: "Move file".to_string(),
                     message: format!(
                         "Move {} to {}?",
@@ -436,9 +449,10 @@ impl Tool for Move {
                         display_path(&self.root, &destination)
                     ),
                     kind: ApprovalKind::Confirm,
-                })
-                .await?;
-        }
+                },
+                &[&source, &destination],
+            )
+            .await?;
         revalidate_source(&identity)?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
@@ -473,7 +487,7 @@ impl Tool for MoveMany {
     }
 
     fn description(&self) -> &'static str {
-        "Move multiple regular files into an existing directory under the Nole root, preserving their basenames and never overwriting."
+        "Move multiple regular files into an existing directory, preserving their basenames and never overwriting; sources, or the destination directory, may be external absolute paths."
     }
 
     fn input_schema(&self) -> Value {
@@ -486,7 +500,7 @@ impl Tool for MoveMany {
                 },
                 "destination_directory": {
                     "type": "string",
-                    "description": "Existing directory relative to the Nole root"
+                    "description": "Existing directory relative to the Nole root, or an absolute external directory"
                 }
             },
             "required": ["sources", "destination_directory"],
@@ -538,23 +552,26 @@ impl Tool for MoveMany {
                 .map(|(_, destination, identity)| (destination.as_path(), identity.len)),
         )?;
 
-        if transfers
+        let approval_paths = transfers
             .iter()
-            .any(|(source, _, _)| outside_agent_workspace(&self.root, source))
-        {
-            self.gate
-                .request(ApprovalRequest {
+            .map(|(source, _, _)| source.as_path())
+            .chain(std::iter::once(destination_directory.as_path()))
+            .collect::<Vec<_>>();
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
                     title: "Move files".to_string(),
                     message: format!(
                         "Move {} file{} into {}?",
                         transfers.len(),
                         if transfers.len() == 1 { "" } else { "s" },
-                        directory_text
+                        display_path(&self.root, &destination_directory)
                     ),
                     kind: ApprovalKind::Confirm,
-                })
-                .await?;
-        }
+                },
+                &approval_paths,
+            )
+            .await?;
 
         for (_, _, identity) in &transfers {
             revalidate_source(identity)?;
@@ -612,17 +629,27 @@ impl Tool for MoveMany {
 }
 
 fn resolve_destination_directory(root: &Path, input: &str) -> Result<PathBuf> {
-    let relative = Path::new(input);
-    if relative.is_absolute() {
-        bail!("destination_directory must be relative to the Nole root");
-    }
-    let unresolved = root.join(relative);
+    let absolute = Path::new(input).is_absolute();
+    let unresolved = if absolute {
+        PathBuf::from(input)
+    } else {
+        let relative = Path::new(input);
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            bail!("destination_directory must not contain `..`");
+        }
+        root.join(relative)
+    };
     if fs::symlink_metadata(&unresolved)?.file_type().is_symlink() {
         bail!("destination_directory cannot be a symlink");
     }
     let directory = fs::canonicalize(&unresolved)
         .with_context(|| format!("resolving destination directory {input}"))?;
-    if !directory.starts_with(root) {
+    if !absolute && !directory.starts_with(root) {
         bail!("destination_directory escapes the Nole root");
     }
     ensure_not_special(root, &directory)?;
@@ -670,14 +697,14 @@ impl Tool for Rename {
     }
 
     fn description(&self) -> &'static str {
-        "Rename a regular file without changing its directory or overwriting another path."
+        "Rename a regular file within its own directory without overwriting another path; the file may be external (absolute path)."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path relative to the Nole root" },
+                "path": { "type": "string", "description": "Path relative to the Nole root, or an absolute external path" },
                 "new_name": { "type": "string", "description": "New basename only" }
             },
             "required": ["path", "new_name"], "additionalProperties": false
@@ -686,14 +713,8 @@ impl Tool for Rename {
 
     async fn execute(&self, input: &Value) -> Result<String> {
         let path_text = required_string(input, "path")?;
-        if Path::new(path_text).is_absolute() {
-            bail!("rename path must be relative to the Nole root");
-        }
         let source = resolve_transfer_source(&self.root, path_text)?;
         let identity = capture_source_identity(&source)?;
-        if !source.starts_with(&self.root) {
-            bail!("rename source must be under the Nole root");
-        }
         let new_name = required_string(input, "new_name")?;
         let candidate = Path::new(new_name);
         if candidate.file_name().is_none()
@@ -715,9 +736,9 @@ impl Tool for Rename {
         }
         validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
         check_workspace_write(&self.root, &destination, identity.len)?;
-        if outside_agent_workspace(&self.root, &source) {
-            self.gate
-                .request(ApprovalRequest {
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
                     title: "Rename file".to_string(),
                     message: format!(
                         "Rename {} to {}?",
@@ -725,9 +746,10 @@ impl Tool for Rename {
                         display_path(&self.root, &destination)
                     ),
                     kind: ApprovalKind::Confirm,
-                })
-                .await?;
-        }
+                },
+                &[&source, &destination],
+            )
+            .await?;
         revalidate_source(&identity)?;
         let bytes = move_to_new_file(&source, &destination)?;
         send_file_moved(&self.events, &self.root, &source, &destination);
@@ -757,7 +779,7 @@ fn transfer_schema() -> Value {
         "type": "object",
         "properties": {
             "source": { "type": "string" },
-            "destination": { "type": "string", "description": "Path relative to the Nole root" }
+            "destination": { "type": "string", "description": "Path relative to the Nole root, or an absolute external path" }
         },
         "required": ["source", "destination"], "additionalProperties": false
     })
@@ -784,21 +806,21 @@ impl Tool for Delete {
     }
 
     fn description(&self) -> &'static str {
-        "Delete an existing regular file under the Nole root."
+        "Delete an existing regular file: a Nole-relative path, or an external absolute path."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object", "properties": {
-                "path": { "type": "string", "description": "Path relative to the Nole root" }
+                "path": { "type": "string", "description": "Path relative to the Nole root, or an absolute external file" }
             },
             "required": ["path"], "additionalProperties": false
         })
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
-        let relative = required_string(input, "path")?;
-        let unresolved = safe_relative(&self.root, relative)?;
+        let path_text = required_string(input, "path")?;
+        let unresolved = resolve_mutation_path(&self.root, path_text)?;
         let metadata = fs::symlink_metadata(&unresolved)
             .with_context(|| format!("checking {}", unresolved.display()))?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -813,15 +835,16 @@ impl Tool for Delete {
             _ => {}
         }
         let modified = metadata.modified().ok();
-        if outside_agent_workspace(&self.root, &path) {
-            self.gate
-                .request(ApprovalRequest {
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
                     title: "Delete file".to_string(),
-                    message: format!("Delete {relative}?"),
+                    message: format!("Delete {path_text}?"),
                     kind: ApprovalKind::DestructiveConfirm,
-                })
-                .await?;
-        }
+                },
+                &[&path],
+            )
+            .await?;
 
         let current = fs::symlink_metadata(&unresolved)
             .with_context(|| format!("rechecking {}", unresolved.display()))?;
@@ -834,18 +857,20 @@ impl Tool for Delete {
             bail!("file changed before deletion; inspect it again and retry");
         }
         fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
-        Ok(format!("deleted {relative}"))
+        Ok(format!("deleted {path_text}"))
     }
 }
 
 pub struct Write {
     root: PathBuf,
+    gate: ApprovalGate,
 }
 
 impl Write {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            gate,
         })
     }
 }
@@ -856,22 +881,22 @@ impl Tool for Write {
         "write"
     }
     fn description(&self) -> &'static str {
-        "Create a complete new UTF-8 text file without overwriting; use read and edit for existing files."
+        "Create a complete new UTF-8 text file without overwriting; use read and edit for existing files. Path may be Nole-relative or an external absolute path."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Nole-relative path, or an absolute external path" },
                 "content": { "type": "string" }
             },
             "required": ["path", "content"], "additionalProperties": false
         })
     }
     async fn execute(&self, input: &Value) -> Result<String> {
-        let relative = required_string(input, "path")?;
+        let path_text = required_string(input, "path")?;
         let content = required_string(input, "content")?;
-        let path = safe_relative(&self.root, relative)?;
+        let path = resolve_mutation_path(&self.root, path_text)?;
         match path_zone(&self.root, &path) {
             PathZone::Config | PathZone::Daily => {
                 bail!("generic file tools cannot operate on this special file");
@@ -884,10 +909,24 @@ impl Tool for Write {
         match fs::symlink_metadata(&path) {
             Ok(_) => bail!("write only creates new files; use read and edit for existing files"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
+            Err(error) => return Err(error).with_context(|| format!("checking {path_text}")),
         }
         validate_write_preconditions(&self.root, &path, WriteSource::Text(content))?;
         check_workspace_write(&self.root, &path, content.len() as u64)?;
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
+                    title: "Write file".to_string(),
+                    message: format!(
+                        "Write {} bytes to {}?",
+                        content.len(),
+                        display_path(&self.root, &path)
+                    ),
+                    kind: ApprovalKind::Confirm,
+                },
+                &[&path],
+            )
+            .await?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let mut file = options
@@ -895,31 +934,37 @@ impl Tool for Write {
             .with_context(|| format!("writing file {}", path.display()))?;
         file.write_all(content.as_bytes())?;
         Ok(post_write_result(
-            format!("wrote {} bytes to {relative}", content.len()),
-            relative,
+            format!("wrote {} bytes to {path_text}", content.len()),
+            path_text,
             &path,
         ))
     }
 }
 
 /// Resolve a directory path to create, canonicalizing the deepest existing
-/// ancestor and appending the missing components. The result stays within the
-/// Nole root and no symlink is followed.
+/// ancestor and appending the missing components. Relative inputs stay within
+/// the Nole root; absolute inputs create directories outside it. No symlink in
+/// the ancestor chain is followed.
 fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
-    let relative = Path::new(input);
-    if relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!("path must stay within the Nole root");
-    }
-    let mut existing = root.to_path_buf();
+    let path = Path::new(input);
+    let absolute = path.is_absolute();
+    let mut existing = if absolute {
+        PathBuf::from(Component::RootDir.as_os_str())
+    } else {
+        root.to_path_buf()
+    };
     let mut missing = Vec::new();
-    for component in relative.components() {
+    let mut missing_started = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => continue,
+            Component::ParentDir => bail!("path must not contain `..`"),
+            Component::Normal(_) => {}
+        }
+        if missing_started {
+            missing.push(component.as_os_str().to_os_string());
+            continue;
+        }
         let candidate = existing.join(component.as_os_str());
         match fs::symlink_metadata(&candidate) {
             Ok(metadata) => {
@@ -929,6 +974,7 @@ fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
                 existing = candidate;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_started = true;
                 missing.push(component.as_os_str().to_os_string());
             }
             Err(error) => {
@@ -941,7 +987,7 @@ fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
     }
     let canonical = fs::canonicalize(&existing)
         .with_context(|| format!("resolving parent directory {}", existing.display()))?;
-    if !canonical.starts_with(root) {
+    if !absolute && !canonical.starts_with(root) {
         bail!("path escapes the Nole root");
     }
     let mut path = canonical;
@@ -953,12 +999,14 @@ fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
 
 pub struct Mkdir {
     root: PathBuf,
+    gate: ApprovalGate,
 }
 
 impl Mkdir {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            gate,
         })
     }
 }
@@ -970,42 +1018,54 @@ impl Tool for Mkdir {
     }
 
     fn description(&self) -> &'static str {
-        "Create a new directory and any missing parents under the Nole root without following symlinks."
+        "Create a new directory and any missing parents without following symlinks: a Nole-relative path, or an external absolute path."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory path relative to the Nole root" }
+                "path": { "type": "string", "description": "Directory path relative to the Nole root, or an absolute external directory" }
             },
             "required": ["path"], "additionalProperties": false
         })
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
-        let relative = required_string(input, "path")?;
-        let path = resolve_new_directory(&self.root, relative)?;
+        let path_text = required_string(input, "path")?;
+        let path = resolve_new_directory(&self.root, path_text)?;
         match path_zone(&self.root, &path) {
             PathZone::Config | PathZone::Daily | PathZone::Attachments => {
                 bail!("generic file tools cannot operate on this special file");
             }
             _ => {}
         }
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
+                    title: "Create directory".to_string(),
+                    message: format!("Create directory {}?", display_path(&self.root, &path)),
+                    kind: ApprovalKind::Confirm,
+                },
+                &[&path],
+            )
+            .await?;
         fs::create_dir_all(&path)
             .with_context(|| format!("creating directory {}", path.display()))?;
-        Ok(format!("created directory {relative}"))
+        Ok(format!("created directory {path_text}"))
     }
 }
 
 pub struct RemoveDir {
     root: PathBuf,
+    gate: ApprovalGate,
 }
 
 impl RemoveDir {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
+            gate,
         })
     }
 }
@@ -1017,22 +1077,22 @@ impl Tool for RemoveDir {
     }
 
     fn description(&self) -> &'static str {
-        "Recursively remove a directory tree inside workspace/main without following symlinks."
+        "Recursively remove a directory tree without following symlinks: inside workspace/main, or an external absolute directory."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory path relative to the Nole root, inside workspace/main" }
+                "path": { "type": "string", "description": "Directory path relative to the Nole root inside workspace/main, or an external absolute directory" }
             },
             "required": ["path"], "additionalProperties": false
         })
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
-        let relative = required_string(input, "path")?;
-        let unresolved = safe_relative(&self.root, relative)?;
+        let path_text = required_string(input, "path")?;
+        let unresolved = resolve_mutation_path(&self.root, path_text)?;
         let metadata = fs::symlink_metadata(&unresolved)
             .with_context(|| format!("checking {}", unresolved.display()))?;
         if metadata.file_type().is_symlink() {
@@ -1043,40 +1103,49 @@ impl Tool for RemoveDir {
         }
         let path = fs::canonicalize(&unresolved)
             .with_context(|| format!("resolving {}", unresolved.display()))?;
-        if !matches!(path_zone(&self.root, &path), PathZone::Workspace) {
+        // Inside Nole, recursive removal stays confined to the Agent workspace;
+        // an external absolute directory is a plain external path and allowed.
+        if path.starts_with(&self.root)
+            && !matches!(path_zone(&self.root, &path), PathZone::Workspace)
+        {
             bail!("recursive removal is only allowed inside workspace/main");
         }
+        self.gate
+            .request_for_paths(
+                ApprovalRequest {
+                    title: "Remove directory".to_string(),
+                    message: format!("Remove directory {}?", display_path(&self.root, &path)),
+                    kind: ApprovalKind::DestructiveConfirm,
+                },
+                &[&path],
+            )
+            .await?;
         fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
-        Ok(format!("removed directory {relative}"))
+        Ok(format!("removed directory {path_text}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
     use tempfile::tempdir;
 
     use super::*;
-    use crate::agent::test_support::{
-        drain_events, event_channel, test_runtime, TestFutureResultExt,
-    };
-    use crate::agent::ApprovalDecision;
-    use crate::agent::Edit;
     use crate::agent::hashline::RegisterBank;
     use crate::agent::snapshots::{snapshot_identity, snapshot_tag, SnapshotStore};
+    use crate::agent::test_support::{
+        bypass_gate, drain_events, event_channel, gate, test_runtime, TestFutureResultExt,
+    };
+    use crate::agent::Edit;
+    use crate::agent::{ApprovalDecision, PermissionMode};
     use crate::export::{ExportDiagnostic, ExportDiagnosticSeverity};
 
-    fn gate_without_decisions() -> (ApprovalGate, tokio::sync::broadcast::Receiver<AgentEvent>) {
+    fn gate_without_decisions(
+        root: &Path,
+    ) -> (ApprovalGate, tokio::sync::broadcast::Receiver<AgentEvent>) {
         let (event_sender, event_receiver) = event_channel();
         let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
         (
-            ApprovalGate {
-                bypass: Arc::new(AtomicBool::new(false)),
-                cancelled: Arc::new(AtomicBool::new(false)),
-                events: event_sender,
-                decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-            },
+            gate(PermissionMode::Auto, root, event_sender, decision_receiver),
             event_receiver,
         )
     }
@@ -1114,12 +1183,12 @@ mod tests {
         fs::write(root.join("Old.md"), "content").unwrap();
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender,
+            decision_receiver,
+        );
         let tool = Delete::new(&root, gate).unwrap();
         let input = json!({"path": "Old.md"});
         decision_sender.send(ApprovalDecision::Approve).unwrap();
@@ -1162,7 +1231,7 @@ mod tests {
                 (0, content.lines().count()),
             )
             .unwrap();
-        let (gate, mut events) = gate_without_decisions();
+        let (gate, mut events) = gate_without_decisions(&root);
         let edit = Edit::new(&root, gate, reads.clone(), registers).unwrap();
         let tag = reads.head(&canonical_draft).unwrap().unwrap().tag;
         let input = json!({
@@ -1188,7 +1257,7 @@ mod tests {
                 (0, content.lines().count()),
             )
             .unwrap();
-        let (gate, _) = gate_without_decisions();
+        let (gate, _) = gate_without_decisions(&root);
         let edit = Edit::new(&root, gate, reads, registers).unwrap();
         let input = json!({
             "patch": "[workspace/main/draft.md#DEAD]\nPUT 1.=1:\n+again\n"
@@ -1199,7 +1268,7 @@ mod tests {
 
         let removed = workspace.join("trash.md");
         fs::write(&removed, "remove").unwrap();
-        let (gate, mut events) = gate_without_decisions();
+        let (gate, mut events) = gate_without_decisions(&root);
         let delete = Delete::new(&root, gate).unwrap();
         let input = json!({"path": "workspace/main/trash.md"});
         let output = execute_unapproved(move || test_runtime().block_on(delete.execute(&input)));
@@ -1220,7 +1289,7 @@ mod tests {
         let moved = workspace.join("a.txt");
         fs::write(&moved, "a").unwrap();
         let (event_sender, mut events) = event_channel();
-        let (gate, mut gate_events) = gate_without_decisions();
+        let (gate, mut gate_events) = gate_without_decisions(&root);
         let mover = Move::new(&root, event_sender, gate).unwrap();
         let input =
             json!({"source": "workspace/main/a.txt", "destination": "workspace/main/b.txt"});
@@ -1232,7 +1301,7 @@ mod tests {
         let _ = drain_events(&mut events);
 
         let (event_sender, _) = event_channel();
-        let (gate, mut gate_events) = gate_without_decisions();
+        let (gate, mut gate_events) = gate_without_decisions(&root);
         let renamer = Rename::new(&root, event_sender, gate).unwrap();
         let input = json!({"path": "workspace/main/b.txt", "new_name": "c.txt"});
         let output = execute_unapproved(move || test_runtime().block_on(renamer.execute(&input)));
@@ -1242,8 +1311,8 @@ mod tests {
         assert_no_approval_requested(drain_events(&mut gate_events));
 
         // mkdir and remove_dir manage directories inside the workspace freely.
-        // Neither tool consults an approval gate; they run unapproved by design.
-        let mkdir = Mkdir::new(&root).unwrap();
+        let (gate, mut mkdir_events) = gate_without_decisions(&root);
+        let mkdir = Mkdir::new(&root, gate).unwrap();
         let output = execute_unapproved(move || {
             test_runtime().block_on(mkdir.execute(&json!({
                 "path": "workspace/main/newdir/sub"
@@ -1251,17 +1320,20 @@ mod tests {
         });
         assert!(output.contains("created directory workspace/main/newdir/sub"));
         assert!(workspace.join("newdir/sub").is_dir());
+        assert_no_approval_requested(drain_events(&mut mkdir_events));
 
-        let remover = RemoveDir::new(&root).unwrap();
+        let (gate, mut remove_events) = gate_without_decisions(&root);
+        let remover = RemoveDir::new(&root, gate).unwrap();
         let output = execute_unapproved(move || {
             test_runtime().block_on(remover.execute(&json!({"path": "workspace/main/newdir"})))
         });
         assert!(output.contains("removed directory workspace/main/newdir"));
         assert!(!workspace.join("newdir").exists());
 
+        assert_no_approval_requested(drain_events(&mut remove_events));
         // remove_dir refuses trees outside workspace/main.
         fs::create_dir_all(root.join("data/notes")).unwrap();
-        let remover = RemoveDir::new(&root).unwrap();
+        let remover = RemoveDir::new(&root, bypass_gate()).unwrap();
         let error = test_runtime()
             .block_on(remover.execute(&json!({"path": "data/notes"})))
             .unwrap_err();
@@ -1280,13 +1352,13 @@ mod tests {
 
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender.clone(),
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
-        let mover = Move::new(&root, event_sender, gate).unwrap();
+        let approval_gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender.clone(),
+            decision_receiver,
+        );
+        let mover = Move::new(&root, event_sender, approval_gate).unwrap();
         let input = json!({
             "source": move_source,
             "destination": "data/moved.md"
@@ -1308,13 +1380,13 @@ mod tests {
         fs::write(&move_source, "move me").unwrap();
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender.clone(),
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
-        let mover = Move::new(&root, event_sender, gate).unwrap();
+        let approval_gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender.clone(),
+            decision_receiver,
+        );
+        let mover = Move::new(&root, event_sender, approval_gate).unwrap();
         let input = json!({
             "source": move_source,
             "destination": "data/moved.md"
@@ -1340,13 +1412,13 @@ mod tests {
         fs::create_dir_all(root.join("data/collected")).unwrap();
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender.clone(),
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
-        let mover = MoveMany::new(&root, event_sender, gate).unwrap();
+        let approval_gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender.clone(),
+            decision_receiver,
+        );
+        let mover = MoveMany::new(&root, event_sender, approval_gate).unwrap();
         let input = json!({
             "sources": [alpha, beta],
             "destination_directory": "data/collected"
@@ -1413,12 +1485,12 @@ mod tests {
 
         let (event_sender, mut event_receiver) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender.clone(),
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender.clone(),
+            decision_receiver,
+        );
         let mover = Move::new(&root, event_sender, gate).unwrap();
         let input = json!({
             "source": move_source,
@@ -1449,40 +1521,40 @@ mod tests {
         let attachment_path = "attachments/objects/ab.txt";
 
         let (event_sender, _) = event_channel();
-        let (gate, _) = gate_without_decisions();
+        let (gate, _) = gate_without_decisions(&root);
         assert!(Delete::new(&root, gate)
             .unwrap()
             .execute(&json!({"path": attachment_path}))
             .returns_err());
-        assert!(Write::new(&root)
+        assert!(Write::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"path": "attachments/objects/new.txt", "content": "x"}))
             .returns_err());
-        assert!(Copy::new(&root)
+        assert!(Copy::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"source": attachment_path, "destination": "data/copied.txt"}))
             .returns_err());
-        assert!(Copy::new(&root)
+        assert!(Copy::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"source": "data/foo.txt", "destination": "attachments/objects/x.txt"}))
             .returns_err());
         assert!(
-            Move::new(&root, event_sender.clone(), gate_without_decisions().0)
+            Move::new(&root, event_sender.clone(), gate_without_decisions(&root).0)
                 .unwrap()
                 .execute(&json!({"source": attachment_path, "destination": "data/moved.txt"}))
                 .returns_err()
         );
         assert!(
-            Rename::new(&root, event_sender.clone(), gate_without_decisions().0)
+            Rename::new(&root, event_sender.clone(), gate_without_decisions(&root).0)
                 .unwrap()
                 .execute(&json!({"path": attachment_path, "new_name": "x.txt"}))
                 .returns_err()
         );
-        assert!(Mkdir::new(&root)
+        assert!(Mkdir::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"path": "attachments/newdir"}))
             .returns_err());
-        assert!(RemoveDir::new(&root)
+        assert!(RemoveDir::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"path": "attachments/objects"}))
             .returns_err());
@@ -1503,7 +1575,7 @@ mod tests {
         let outside_file = outside.path().join("secret.txt");
         fs::write(&outside_file, "secret").unwrap();
 
-        assert!(Mkdir::new(&root)
+        assert!(Mkdir::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"path": "workspace/../data/evil"}))
             .returns_err());
@@ -1513,7 +1585,7 @@ mod tests {
 
         let reads = Arc::new(SnapshotStore::default());
         let registers = Arc::new(RegisterBank::default());
-        let (gate, _) = gate_without_decisions();
+        let (gate, _) = gate_without_decisions(&root);
         let edit = Edit::new(&root, gate, reads, registers).unwrap();
         let error = test_runtime()
             .block_on(edit.execute(&json!({
@@ -1522,7 +1594,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("symlink"));
 
-        let (gate, _) = gate_without_decisions();
+        let (gate, _) = gate_without_decisions(&root);
         let delete = Delete::new(&root, gate).unwrap();
         assert!(delete
             .execute(&json!({"path": "workspace/main/escape.md"}))
@@ -1534,7 +1606,7 @@ mod tests {
         fs::create_dir(&outside_dir).unwrap();
         let linked_dir = workspace.join("linked");
         symlink(&outside_dir, &linked_dir).unwrap();
-        let remover = RemoveDir::new(&root).unwrap();
+        let remover = RemoveDir::new(&root, bypass_gate()).unwrap();
         assert!(remover
             .execute(&json!({"path": "workspace/main/linked"}))
             .returns_err());
@@ -1542,11 +1614,95 @@ mod tests {
         assert!(outside_dir.is_dir());
 
         let (event_sender, _) = event_channel();
-        let (gate, _) = gate_without_decisions();
+        let (gate, _) = gate_without_decisions(&root);
         assert!(Move::new(&root, event_sender, gate)
             .unwrap()
             .execute(&json!({"source": "workspace/main/escape.md", "destination": "workspace/main/copy.md"}))
             .returns_err());
+    }
+
+    #[test]
+    fn auto_mode_requires_approval_for_external_files_and_directories() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(root.join("workspace/main")).unwrap();
+        let outside = tempdir().unwrap();
+        let outside_root = fs::canonicalize(outside.path()).unwrap();
+        let file = outside_root.join("created.txt");
+
+        let (events, mut receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let writer = Write::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Deny).unwrap();
+        let error = test_runtime()
+            .block_on(writer.execute(&json!({"path": file, "content": "outside"})))
+            .unwrap_err();
+        assert!(error.to_string().contains("change denied by user"));
+        assert!(!file.exists());
+        assert!(drain_events(&mut receiver)
+            .into_iter()
+            .any(|event| matches!(event, AgentEvent::Approval(_))));
+
+        let (events, mut receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let writer = Write::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime()
+            .block_on(writer.execute(&json!({"path": file, "content": "outside"})))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "outside");
+        assert!(drain_events(&mut receiver)
+            .into_iter()
+            .any(|event| matches!(event, AgentEvent::Approval(_))));
+
+        let tree = outside_root.join("new/deep/tree");
+        let (events, _receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mkdir = Mkdir::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime()
+            .block_on(mkdir.execute(&json!({"path": tree})))
+            .unwrap();
+        assert!(tree.is_dir());
+
+        let (events, _receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let delete = Delete::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime()
+            .block_on(delete.execute(&json!({"path": file})))
+            .unwrap();
+        assert!(!file.exists());
+
+        let remove_root = outside_root.join("new");
+        let (events, _receiver) = event_channel();
+        let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let remove = RemoveDir::new(
+            &root,
+            gate(PermissionMode::Auto, &root, events, decision_receiver),
+        )
+        .unwrap();
+        decisions.send(ApprovalDecision::Approve).unwrap();
+        test_runtime()
+            .block_on(remove.execute(&json!({"path": remove_root})))
+            .unwrap();
+        assert!(!remove_root.exists());
     }
 
     #[test]
@@ -1558,35 +1714,31 @@ mod tests {
         fs::write(&source, "# Agent export\n").unwrap();
         let output = tempdir().unwrap();
         let output_path = output.path().canonicalize().unwrap();
-        let denied_destination = output_path.join("denied.md");
+        let denied_destination = output_path.join("denied.html");
 
         let (event_sender, mut events) = event_channel();
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let gate = ApprovalGate {
-            bypass: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            events: event_sender,
-            decisions: Arc::new(tokio::sync::Mutex::new(decision_receiver)),
-        };
+        let gate = gate(
+            PermissionMode::Approve,
+            &root,
+            event_sender,
+            decision_receiver,
+        );
         let tool = ExportFile::new(&root, gate).unwrap();
         assert_eq!(
             tool.description(),
-            "Publish one Nole file to a new destination outside Nole as exact original bytes or safe standalone HTML."
+            "Render one Nole Markdown file as safe standalone HTML at a new external destination."
         );
-        assert!(!tool.description().contains("PDF"));
         let schema = tool.input_schema();
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(
-            schema["required"],
-            json!(["source", "destination", "format"])
-        );
+        assert_eq!(schema["required"], json!(["source", "destination"]));
+        assert!(schema["properties"].get("format").is_none());
 
         decision_sender.send(ApprovalDecision::Deny).unwrap();
         let denied = test_runtime()
             .block_on(tool.execute(&json!({
                 "source": "data/note.md",
-                "destination": denied_destination,
-                "format": "original"
+                "destination": denied_destination
             })))
             .unwrap_err();
         assert_eq!(denied.to_string(), "change denied by user");
@@ -1600,15 +1752,14 @@ mod tests {
             .unwrap();
         assert_eq!(approval.title, "Export file");
         assert_eq!(approval.kind, ApprovalKind::Confirm);
-        assert!(approval.message.contains(" as Original to "));
+        assert!(approval.message.contains(" as HTML to "));
 
         let destination = output_path.join("approved.html");
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         let result = test_runtime()
             .block_on(tool.execute(&json!({
                 "source": "data/note.md",
-                "destination": destination,
-                "format": "html"
+                "destination": destination
             })))
             .unwrap();
         assert!(result.starts_with("exported "));
@@ -1619,8 +1770,7 @@ mod tests {
         assert!(tool
             .execute(&json!({
                 "source": "data/note.md",
-                "destination": destination,
-                "format": "html"
+                "destination": destination
             }))
             .returns_err());
     }
