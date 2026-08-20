@@ -393,9 +393,15 @@ for each `explore` and `review` invocation; it is not a tool-call limit, and one
 response may call several tools. A user follow-up received while the Agent is
 running starts a fresh budget after the in-flight tool finishes. At the main
 Agent's limit, Nole rings the terminal bell and asks whether to continue or
-stop. An `explore` or `review` subagent instead stops its work and finalizes
-its report. Stopping keeps the completed conversation and tool history, so a
-later prompt can continue it.
+stop. On an `explore` or `review` subagent's last allowed request, Nole appends
+its finalization prompt and removes all tools. Subagent provider responses stream
+internally so long generations stay active, but their text and thinking deltas
+remain isolated; only the completed report is returned to the parent. If a
+subagent reaches `max_tokens` before that final request, its partial response is
+kept in the isolated history and the next request asks it to complete the report.
+Reaching `max_tokens` again on the final request fails the invocation rather than
+returning a truncated report. Stopping the main Agent keeps its completed
+conversation and tool history, so a later prompt can continue it.
 `context_window_tokens` is the model's total context size. Nole reserves
 `max_tokens` for the next response and, before the remaining input budget is
 exhausted, uses provider token counting when available and replaces a safe prefix

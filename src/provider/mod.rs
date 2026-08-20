@@ -15,7 +15,7 @@ pub mod messages;
 
 pub const DEFAULT_STREAM_BUFFER: usize = 1_024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const HTTP_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const HTTP_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) fn build_agent_http_client() -> reqwest::Result<Client> {
     build_agent_http_client_with_timeouts(HTTP_CONNECT_TIMEOUT, HTTP_READ_IDLE_TIMEOUT)

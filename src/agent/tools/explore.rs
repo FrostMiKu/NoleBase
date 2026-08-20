@@ -107,10 +107,11 @@ impl Tool for Explore {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::bail;
+    use parking_lot::Mutex;
     use tempfile::tempdir;
 
     use super::*;
@@ -128,24 +129,23 @@ mod tests {
     }
 
     impl Provider for ScriptedProvider {
-        fn call<'a>(&'a self, request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
-            Box::pin(async move {
-                self.requests.lock().unwrap().push(request);
-                self.responses
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .context("missing scripted response")
-            })
+        fn call<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
+            Box::pin(async { bail!("explore must use streaming provider calls") })
         }
 
         fn call_streaming(
             &self,
-            _request: ProviderRequest,
+            request: ProviderRequest,
         ) -> Observable<AssistantMessage, ProviderEvent> {
+            self.requests.lock().push(request);
+            let result = self
+                .responses
+                .lock()
+                .pop_front()
+                .context("missing scripted response");
             let (_events, receiver) = tokio::sync::broadcast::channel(DEFAULT_STREAM_BUFFER);
             Observable {
-                output: Box::pin(async { bail!("streaming is not used by explore") }),
+                output: Box::pin(async move { result }),
                 events: receiver,
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
@@ -241,7 +241,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, "Found data/answer.md.");
 
-        let requests = provider.requests.lock().unwrap();
+        let requests = provider.requests.lock();
         assert_eq!(requests.len(), 2);
         let tool_names = requests[0]
             .tools
@@ -307,7 +307,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, "Budget-limited report.");
 
-        let requests = provider.requests.lock().unwrap();
+        let requests = provider.requests.lock();
         assert_eq!(requests.len(), 2);
         assert!(!requests[0].tools.is_empty());
         assert!(requests[1].tools.is_empty());

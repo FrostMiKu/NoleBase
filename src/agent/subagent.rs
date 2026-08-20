@@ -15,8 +15,8 @@ use super::{
 };
 use crate::agent_session::TokenUsage;
 use crate::provider::{
-    is_transient_provider_error, Message, MessagePart, Provider, ProviderRequest, StopReason,
-    SystemBlock, ToolCall, ToolResult, ToolSpec,
+    is_transient_provider_error, Message, MessagePart, Provider, ProviderEvent, ProviderRequest,
+    StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
 };
 
 #[derive(Clone)]
@@ -136,7 +136,6 @@ impl SubagentRunner {
                 messages.push(Message::user(self.profile.final_round_prompt.clone()));
             }
             let response = self.request(&messages, final_round).await?;
-            self.report_usage(response.token_usage);
             let calls = response.message.tool_calls().cloned().collect::<Vec<_>>();
             let text = response.text();
             if !text.trim().is_empty() || !calls.is_empty() {
@@ -182,11 +181,39 @@ impl SubagentRunner {
             tools: if final_round { Vec::new() } else { definitions },
         };
         for attempt in 0..MAX_PROVIDER_REQUEST_ATTEMPTS {
-            let mut request = self.runtime.provider.call(provider_request.clone());
+            let observable = self
+                .runtime
+                .provider
+                .call_streaming(provider_request.clone());
+            let provider_cancel = observable.cancel;
+            let mut events = observable.events;
+            let mut output = observable.output;
+            let mut reported_usage = TokenUsage::default();
+            let mut events_open = true;
             let result = loop {
                 tokio::select! {
-                    response = &mut request => break response,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => self.ensure_active()?,
+                    event = events.recv(), if events_open => match event {
+                        Ok(event) => self.report_provider_event(event, &mut reported_usage),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            events_open = false;
+                        }
+                    },
+                    result = &mut output => {
+                        while let Ok(event) = events.try_recv() {
+                            self.report_provider_event(event, &mut reported_usage);
+                        }
+                        if let Ok(response) = &result {
+                            self.report_usage_delta(&mut reported_usage, response.token_usage);
+                        }
+                        break result;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if let Err(error) = self.ensure_active() {
+                            provider_cancel.cancel();
+                            break Err(error);
+                        }
+                    }
                 }
             };
             match result {
@@ -315,6 +342,32 @@ impl SubagentRunner {
         }
     }
 
+    fn report_provider_event(&self, event: ProviderEvent, reported_usage: &mut TokenUsage) {
+        match event {
+            ProviderEvent::Usage { usage, .. } => {
+                self.report_usage_delta(reported_usage, usage);
+            }
+            ProviderEvent::Retry => {
+                let _ = self.runtime.events.send(AgentEvent::Retry);
+            }
+            ProviderEvent::TextDelta(_)
+            | ProviderEvent::ThinkingDelta(_)
+            | ProviderEvent::ThinkingFinished => {}
+        }
+    }
+
+    fn report_usage_delta(&self, reported_usage: &mut TokenUsage, usage: TokenUsage) {
+        self.report_usage(usage.saturating_sub(*reported_usage));
+        reported_usage.input_tokens = reported_usage.input_tokens.max(usage.input_tokens);
+        reported_usage.output_tokens = reported_usage.output_tokens.max(usage.output_tokens);
+        reported_usage.cache_creation_input_tokens = reported_usage
+            .cache_creation_input_tokens
+            .max(usage.cache_creation_input_tokens);
+        reported_usage.cache_read_input_tokens = reported_usage
+            .cache_read_input_tokens
+            .max(usage.cache_read_input_tokens);
+    }
+
     fn ensure_active(&self) -> Result<()> {
         if self.runtime.cancelled.load(Ordering::Relaxed) {
             bail!("agent task cancelled");
@@ -333,9 +386,10 @@ impl SubagentRunner {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use anyhow::{bail, Context};
+    use parking_lot::Mutex;
     use serde_json::{json, Value};
 
     use super::*;
@@ -351,24 +405,23 @@ mod tests {
     }
 
     impl Provider for ScriptedProvider {
-        fn call<'a>(&'a self, request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
-            Box::pin(async move {
-                self.requests.lock().unwrap().push(request);
-                self.responses
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .context("missing scripted response")
-            })
+        fn call<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
+            Box::pin(async { bail!("subagents must use streaming provider calls") })
         }
 
         fn call_streaming(
             &self,
-            _request: ProviderRequest,
+            request: ProviderRequest,
         ) -> Observable<AssistantMessage, ProviderEvent> {
+            self.requests.lock().push(request);
+            let result = self
+                .responses
+                .lock()
+                .pop_front()
+                .context("missing scripted response");
             let (_events, receiver) = tokio::sync::broadcast::channel(DEFAULT_STREAM_BUFFER);
             Observable {
-                output: Box::pin(async { bail!("streaming is not used by subagents") }),
+                output: Box::pin(async move { result }),
                 events: receiver,
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
@@ -386,28 +439,22 @@ mod tests {
 
     impl Provider for FlakyProvider {
         fn call<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
-            Box::pin(async move {
-                self.requests.fetch_add(1, Ordering::SeqCst);
-                match self
-                    .responses
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("flaky responses lock poisoned"))?
-                    .pop_front()
-                {
-                    Some(Ok(response)) => Ok(response),
-                    Some(Err(error)) => Err(transient_provider_error(error)),
-                    None => bail!("missing flaky response"),
-                }
-            })
+            Box::pin(async { bail!("subagents must use streaming provider calls") })
         }
 
         fn call_streaming(
             &self,
             _request: ProviderRequest,
         ) -> Observable<AssistantMessage, ProviderEvent> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let result = match self.responses.lock().pop_front() {
+                Some(Ok(response)) => Ok(response),
+                Some(Err(error)) => Err(transient_provider_error(error)),
+                None => Err(anyhow::anyhow!("missing flaky response")),
+            };
             let (_events, receiver) = tokio::sync::broadcast::channel(DEFAULT_STREAM_BUFFER);
             Observable {
-                output: Box::pin(async { bail!("streaming is not used by subagents") }),
+                output: Box::pin(async move { result }),
                 events: receiver,
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
@@ -582,6 +629,73 @@ mod tests {
     }
 
     #[test]
+    fn runner_continues_after_length_and_finalizes_without_tools() {
+        let provider = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([
+                response(
+                    vec![MessagePart::Text {
+                        text: "Partial review".to_string(),
+                    }],
+                    StopReason::Length,
+                ),
+                response(
+                    vec![MessagePart::Text {
+                        text: "Complete review".to_string(),
+                    }],
+                    StopReason::End,
+                ),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut runner = SubagentRunner::new(
+            runtime(2, provider.clone(), Arc::new(AtomicBool::new(false))),
+            profile(),
+        );
+        runner.register(EchoTool);
+
+        let output = crate::agent::test_support::test_runtime()
+            .block_on(runner.run("Review"))
+            .unwrap();
+        assert_eq!(output, "Complete review");
+
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
+        assert_eq!(requests[1].messages[1].text(), "Partial review");
+        assert_eq!(requests[1].messages[2].text(), "Return a complete review.");
+        assert_eq!(
+            requests[1].messages[3].text(),
+            "Return the final review now."
+        );
+    }
+
+    #[test]
+    fn runner_rejects_a_length_limited_final_response() {
+        let provider = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([response(
+                vec![MessagePart::Text {
+                    text: "Still incomplete".to_string(),
+                }],
+                StopReason::Length,
+            )])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let runner = SubagentRunner::new(
+            runtime(1, provider, Arc::new(AtomicBool::new(false))),
+            profile(),
+        );
+
+        let error = crate::agent::test_support::test_runtime()
+            .block_on(runner.run("Review"))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "review subagent returned no complete response within its round budget"
+        );
+    }
+
+    #[test]
     fn runner_uses_caller_profile_and_tool_set() {
         let provider = Arc::new(ScriptedProvider {
             responses: Mutex::new(VecDeque::from([
@@ -613,7 +727,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, "Review complete.");
 
-        let requests = provider.requests.lock().unwrap();
+        let requests = provider.requests.lock();
         assert_eq!(requests[0].system.len(), 2);
         assert_eq!(
             requests[0].system[1].text,
@@ -709,7 +823,7 @@ mod tests {
         assert_eq!(output, "Combined result.");
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
 
-        let requests = provider.requests.lock().unwrap();
+        let requests = provider.requests.lock();
         let results = &requests[1].messages[2..];
         assert_eq!(results.len(), 2);
         let contents = results
@@ -756,7 +870,7 @@ mod tests {
             // Take the receiver out of the mutex and drop the guard before
             // the await, so the future stays Send.
             let receiver = self.receiver.as_ref().and_then(|slot| {
-                if let Some(receiver) = slot.lock().unwrap().take() {
+                if let Some(receiver) = slot.lock().take() {
                     Some(receiver)
                 } else {
                     None
@@ -765,7 +879,7 @@ mod tests {
             if let Some(mut receiver) = receiver {
                 let _ = receiver.recv().await;
             }
-            self.completion.lock().unwrap().push(self.label.to_string());
+            self.completion.lock().push(self.label.to_string());
             if let Some(sender) = &self.sender {
                 let _ = sender.send(()).await;
             }
@@ -842,7 +956,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, "Images seen.");
         // Completed out of order (second before first) ...
-        let completion_order = completion.lock().unwrap();
+        let completion_order = completion.lock();
         assert_eq!(completion_order.first().map(String::as_str), Some("second"));
         assert!(
             completion_order
@@ -856,7 +970,7 @@ mod tests {
         );
         // ... yet the subagent conversation carries every text tool result in
         // offset order, then ONE user image message with both images in order.
-        let requests = provider.requests.lock().unwrap();
+        let requests = provider.requests.lock();
         let results = &requests[1].messages[2..];
         assert_eq!(results.len(), 3);
         assert!(
@@ -987,7 +1101,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, "Phases complete.");
         assert!(after.load(Ordering::SeqCst));
-        let requests = provider.requests.lock().unwrap();
+        let requests = provider.requests.lock();
         assert!(requests[1].messages[2..]
             .iter()
             .all(|message| matches!(&message.parts[0], MessagePart::ToolResult(result) if !result.is_error)));

@@ -130,23 +130,23 @@ mod tests {
     }
 
     impl Provider for ScriptedProvider {
-        fn call<'a>(&'a self, request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
-            Box::pin(async move {
-                self.requests.lock().push(request);
-                self.responses
-                    .lock()
-                    .pop_front()
-                    .context("missing scripted response")
-            })
+        fn call<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, AssistantMessage> {
+            Box::pin(async { bail!("review must use streaming provider calls") })
         }
 
         fn call_streaming(
             &self,
-            _request: ProviderRequest,
+            request: ProviderRequest,
         ) -> Observable<AssistantMessage, ProviderEvent> {
+            self.requests.lock().push(request);
+            let result = self
+                .responses
+                .lock()
+                .pop_front()
+                .context("missing scripted response");
             let (_events, receiver) = tokio::sync::broadcast::channel(DEFAULT_STREAM_BUFFER);
             Observable {
-                output: Box::pin(async { bail!("streaming is not used by review") }),
+                output: Box::pin(async move { result }),
                 events: receiver,
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
