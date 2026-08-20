@@ -62,6 +62,7 @@ fn command_approval_lines(
             .fg(theme.markdown_code_label)
             .add_modifier(Modifier::BOLD),
     )));
+    lines.push(Line::default());
     let code = command.map_or("", |command| command.code.as_str());
     for source_line in code.split('\n') {
         let highlighted = shell_highlight_line(source_line, theme);
@@ -76,6 +77,7 @@ fn command_approval_lines(
             );
         }
     }
+    lines.push(Line::default());
     lines
 }
 
@@ -177,9 +179,9 @@ pub(super) fn draw_dialog(
         return Rect::new(root.x, root.y, 0, 0);
     };
     let width = match dialog.mode {
-        DialogMode::Approval | DialogMode::CommandApproval => approval_dialog_width(root.width),
+        DialogMode::Approval => approval_dialog_width(root.width),
         DialogMode::Informational => 92,
-        DialogMode::CommandPalette => DIALOG_WIDTH,
+        DialogMode::CommandApproval | DialogMode::CommandPalette => DIALOG_WIDTH,
         _ => DIALOG_WIDTH,
     }
     .min(root.width.saturating_sub(4).max(root.width.min(1)));

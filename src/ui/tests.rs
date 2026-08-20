@@ -1891,6 +1891,7 @@ fn command_approval_keeps_the_five_row_pty_monitor_above_it() {
     let screen = buffer_string(&terminal);
     let center = app.layout.center.expect("center panel");
     let overlay = app.layout.overlay.expect("approval overlay");
+    assert_eq!(overlay.width, DIALOG_WIDTH);
     assert!(screen.contains("PTY · ssh build-host · running"));
     assert!(!screen.contains("zero"));
     for value in ["one", "two", "three", "four", "five"] {
@@ -1931,6 +1932,55 @@ fn command_approval_keeps_the_five_row_pty_monitor_above_it() {
         "the five-row monitor must not resize the PTY"
     );
     assert!(animations_active(&app, true));
+}
+
+#[test]
+fn command_approval_wraps_long_commands_with_spaced_sections() {
+    let (mut app, _directory) = make_app();
+    let long_argument = "x".repeat(120);
+    app.approval_request = Some(ApprovalRequest {
+        title: "Run shell command".to_string(),
+        message: String::new(),
+        kind: ApprovalKind::Command(CommandApproval {
+            purpose: "Inspect a generated artifact".to_string(),
+            label: "Cmd".to_string(),
+            code: format!("printf {long_argument}"),
+        }),
+    });
+    app.set_overlay(Overlay::Approval);
+
+    let terminal = render(&mut app, 170, 30);
+    let overlay = app.layout.overlay.expect("command approval overlay");
+    let screen = buffer_string(&terminal);
+    let rows = screen.lines().collect::<Vec<_>>();
+    let agent_y = rows
+        .iter()
+        .position(|row| row.contains("Agent: Inspect a generated artifact"))
+        .expect("purpose row");
+    let label_y = rows
+        .iter()
+        .position(|row| row.contains("Cmd:"))
+        .expect("command label row");
+    let command_y = rows
+        .iter()
+        .position(|row| row.contains("printf "))
+        .expect("first command row");
+    assert_eq!(overlay.width, DIALOG_WIDTH);
+    assert_eq!(label_y, agent_y + 2, "purpose needs a trailing blank row");
+    assert_eq!(command_y, label_y + 2, "label needs a trailing blank row");
+
+    let buffer = terminal.backend().buffer();
+    let argument_cells = (overlay.y..overlay.y + overlay.height)
+        .flat_map(|y| (overlay.x..overlay.x + overlay.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| buffer[(x, y)].symbol() == "x")
+        .count();
+    assert_eq!(argument_cells, long_argument.len());
+    let footer_y = overlay.y + overlay.height - 2;
+    assert!(
+        (overlay.x + 2..overlay.x + overlay.width - 2)
+            .all(|x| buffer[(x, footer_y - 1)].symbol() == " "),
+        "command needs a blank row before the footer"
+    );
 }
 
 #[test]
