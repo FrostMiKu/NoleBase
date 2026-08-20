@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
@@ -13,9 +14,9 @@ use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
 
 use super::{
-    build_agent_http_client, parse_tool_input, transient_provider_error, AssistantMessage, Message,
-    MessagePart, MessageRole, Provider, ProviderEvent, ProviderRequest, StopReason, ToolCall,
-    DEFAULT_STREAM_BUFFER,
+    build_agent_http_client, parse_tool_input, transient_provider_error, AssistantMessage,
+    ImageBlock, Message, MessagePart, MessageRole, Provider, ProviderEvent, ProviderRequest,
+    StopReason, ToolCall, DEFAULT_STREAM_BUFFER,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -49,8 +50,8 @@ impl MessagesProvider {
         format!("{}/v1/messages/count_tokens", self.base_url)
     }
 
-    fn body(request: &ProviderRequest, stream: bool) -> Value {
-        json!({
+    fn body(request: &ProviderRequest, stream: bool) -> Result<Value> {
+        Ok(json!({
             "model": request.model,
             "max_tokens": request.max_tokens,
             "system": request.system.iter().map(|block| {
@@ -60,7 +61,7 @@ impl MessagesProvider {
                 }
                 value
             }).collect::<Vec<_>>(),
-            "messages": messages_wire(&request.messages),
+            "messages": messages_wire(&request.messages)?,
             "tools": request.tools.iter().map(|tool| {
                 let mut value = json!({
                     "name": tool.name,
@@ -73,7 +74,7 @@ impl MessagesProvider {
                 value
             }).collect::<Vec<_>>(),
             "stream": stream,
-        })
+        }))
     }
 
     async fn send(
@@ -141,7 +142,7 @@ impl MessagesProvider {
         events: Option<broadcast::Sender<ProviderEvent>>,
         cancel: CancellationToken,
     ) -> Result<AssistantMessage> {
-        let body = Self::body(&request, stream);
+        let body = Self::body(&request, stream)?;
         let response = self
             .send(&self.messages_url(), &body, events.as_ref(), &cancel)
             .await?;
@@ -233,14 +234,17 @@ impl Provider for MessagesProvider {
 
     fn count_tokens<'a>(&'a self, request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
         Box::pin(async move {
-            let body = json!({
+            let body = Self::body(&request, false)?;
+            let request_body = json!({
                 "model": request.model,
-                "system": Self::body(&request, false)["system"],
-                "messages": messages_wire(&request.messages),
-                "tools": Self::body(&request, false)["tools"],
+                "system": body["system"],
+                "messages": body["messages"],
+                "tools": body["tools"],
             });
             let cancel = CancellationToken::new();
-            let response = self.send(&self.count_url(), &body, None, &cancel).await?;
+            let response = self
+                .send(&self.count_url(), &request_body, None, &cancel)
+                .await?;
             let status = response.status();
             let text = response
                 .text()
@@ -487,7 +491,26 @@ fn content_to_parts(content: &[Value]) -> Result<Vec<MessagePart>> {
     Ok(parts)
 }
 
-fn messages_wire(messages: &[Message]) -> Vec<Value> {
+/// Encode a single image block as an Anthropic base64 content block. The
+/// pixels must already be resolved; a missing cache is a local mapping error.
+fn image_block_wire(block: &ImageBlock) -> Result<Value> {
+    let bytes = block.bytes.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "image {:?} is missing its bytes; re-resolve the source before sending",
+            block.source
+        )
+    })?;
+    Ok(json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": block.media_type.mime(),
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()),
+        }
+    }))
+}
+
+fn messages_wire(messages: &[Message]) -> Result<Vec<Value>> {
     let mut output = Vec::<Value>::new();
     for message in messages {
         let (role, blocks) = match message.role {
@@ -497,10 +520,13 @@ fn messages_wire(messages: &[Message]) -> Vec<Value> {
                     .parts
                     .iter()
                     .filter_map(|part| match part {
-                        MessagePart::Text { text } => Some(json!({"type": "text", "text": text})),
+                        MessagePart::Text { text } => {
+                            Some(Ok(json!({"type": "text", "text": text})))
+                        }
+                        MessagePart::Image(block) => Some(image_block_wire(block)),
                         _ => None,
                     })
-                    .collect::<Vec<_>>(),
+                    .collect::<Result<Vec<_>>>()?,
             ),
             MessageRole::Tool => (
                 "user",
@@ -508,15 +534,22 @@ fn messages_wire(messages: &[Message]) -> Vec<Value> {
                     .parts
                     .iter()
                     .filter_map(|part| match part {
-                        MessagePart::ToolResult(result) => Some(json!({
+                        MessagePart::ToolResult(result) => Some(Ok(json!({
                             "type": "tool_result",
                             "tool_use_id": result.tool_use_id,
                             "content": result.content,
                             "is_error": result.is_error,
-                        })),
+                        }))),
+                        // Tool messages never carry pixels (images are moved to
+                        // a trailing user message), so an image here is a
+                        // protocol violation and must surface, not drop.
+                        MessagePart::Image(block) => Some(Err(anyhow::anyhow!(
+                            "tool message for {} contains an image; images must be sent as a user message",
+                            block.label
+                        ))),
                         _ => None,
                     })
-                    .collect::<Vec<_>>(),
+                    .collect::<Result<Vec<_>>>()?,
             ),
             MessageRole::Assistant => {
                 let has_output = message.parts.iter().any(|part| match part {
@@ -532,21 +565,25 @@ fn messages_wire(messages: &[Message]) -> Vec<Value> {
                         }
                         match part {
                             MessagePart::Text { text } if !text.trim().is_empty() => {
-                                Some(json!({"type": "text", "text": text}))
+                                Some(Ok(json!({"type": "text", "text": text})))
                             }
                             MessagePart::Text { .. } => None,
-                            MessagePart::Thinking { thinking, signature } => Some(json!({
+                            MessagePart::Thinking { thinking, signature } => Some(Ok(json!({
                                 "type": "thinking", "thinking": thinking, "signature": signature
-                            })),
-                            MessagePart::RedactedThinking { data } => {
-                                Some(json!({"type": "redacted_thinking", "data": data}))
-                            }
-                            MessagePart::ToolUse(call) => Some(json!({
+                            }))),
+                            MessagePart::RedactedThinking { data } => Some(Ok(json!({
+                                "type": "redacted_thinking", "data": data
+                            }))),
+                            MessagePart::ToolUse(call) => Some(Ok(json!({
                                 "type": "tool_use", "id": call.id, "name": call.name, "input": call.input
-                            })),
+                            }))),
                             MessagePart::ToolResult(_) => None,
+                            MessagePart::Image(block) => Some(Err(anyhow::anyhow!(
+                                "assistant message for {} contains an image; images are only valid in user messages",
+                                block.label
+                            ))),
                         }
-                    }).collect::<Vec<_>>(),
+                    }).collect::<Result<Vec<_>>>()?,
                 )
             }
         };
@@ -585,7 +622,7 @@ fn messages_wire(messages: &[Message]) -> Vec<Value> {
     {
         block["cache_control"] = json!({"type": "ephemeral"});
     }
-    output
+    Ok(output)
 }
 
 fn append_string(block: &mut Value, field: &str, delta: &str) {
@@ -676,9 +713,12 @@ fn retry_delay(attempt: usize, headers: &reqwest::header::HeaderMap) -> Duration
 
 #[cfg(test)]
 mod cache_tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::provider::{
-        Message, MessagePart, ProviderRequest, SystemBlock, ToolResult, ToolSpec,
+        ImageBlock, ImageMediaType, ImageSource, Message, MessagePart, ProviderRequest,
+        SystemBlock, ToolResult, ToolSpec,
     };
 
     fn cache_control_count(value: &Value) -> usize {
@@ -724,7 +764,7 @@ mod cache_tests {
             }],
         };
 
-        let body = MessagesProvider::body(&request, true);
+        let body = MessagesProvider::body(&request, true).unwrap();
         assert_eq!(cache_control_count(&body), 4);
         let messages = body["messages"].as_array().unwrap();
         let content = messages.last().unwrap()["content"].as_array().unwrap();
@@ -746,7 +786,8 @@ mod cache_tests {
                 content: "second".to_string(),
                 is_error: false,
             }),
-        ]);
+        ])
+        .unwrap();
 
         let content = messages[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -764,7 +805,8 @@ mod cache_tests {
             }]),
             Message::user("Provide a non-empty final answer"),
             Message::user("continue"),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
@@ -790,11 +832,79 @@ mod cache_tests {
                     input: json!({"query": "example"}),
                 }),
             ]),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(messages.len(), 2);
         let assistant = messages[1]["content"].as_array().unwrap();
         assert_eq!(assistant[0]["type"], "thinking");
         assert_eq!(assistant[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn messages_wire_encodes_prompt_and_tool_images() {
+        let png: Vec<u8> = {
+            let image = image::DynamicImage::new_rgb8(8, 4);
+            let mut out = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let prompt_image = Message::user_parts(vec![
+            MessagePart::Text {
+                text: "here".to_string(),
+            },
+            MessagePart::Image(ImageBlock {
+                source: ImageSource::Attachment {
+                    uri: "nole://attachment/00000000-0000-4000-8000-000000000000".to_string(),
+                },
+                label: "prompt.png".to_string(),
+                media_type: ImageMediaType::Png,
+                width: 8,
+                height: 4,
+                bytes: Some(Arc::from(png.clone())),
+            }),
+        ]);
+        let tool = Message::tool(ToolResult {
+            tool_use_id: "call-1".to_string(),
+            content: "done".to_string(),
+            is_error: false,
+        });
+
+        let wire = messages_wire(&[tool, prompt_image]).unwrap();
+        let user = wire
+            .iter()
+            .find(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+            })
+            .expect("user image message present");
+        let blocks = user["content"].as_array().unwrap();
+        // tool_result blocks come before the image in the merged user message.
+        let types = blocks
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["tool_result", "text", "image"]);
+        let image_block = blocks.iter().find(|b| b["type"] == "image").unwrap();
+        assert_eq!(image_block["source"]["type"], "base64");
+        assert_eq!(image_block["source"]["media_type"], "image/png");
+        assert_eq!(
+            image_block["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+
+        // Missing bytes is a local mapping error, never a silent drop.
+        let broken = Message::user_parts(vec![MessagePart::Image(ImageBlock {
+            source: ImageSource::Url {
+                url: "https://example.com/x.png".to_string(),
+            },
+            label: "stale.png".to_string(),
+            media_type: ImageMediaType::Png,
+            width: 8,
+            height: 4,
+            bytes: None,
+        })]);
+        assert!(messages_wire(&[broken]).is_err());
     }
 }

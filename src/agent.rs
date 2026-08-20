@@ -19,20 +19,20 @@ use serde_json::json;
 use serde_json::Value;
 
 use crate::agent_session::{AgentConversation, TokenUsage};
+use crate::attachment::AttachmentStore;
 use crate::attachment_usage::AttachmentUsageHandle;
 use crate::observable::Observable;
 use crate::provider::completions::CompletionsProvider;
 use crate::provider::messages::MessagesProvider;
-#[cfg(test)]
-use crate::provider::MessagePart;
 use crate::provider::{
     build_agent_http_client, is_transient_provider_error, ApiFormat, AssistantMessage, Message,
-    Provider, ProviderEvent, ProviderRequest, StopReason, SystemBlock, ToolCall, ToolResult,
-    ToolSpec,
+    MessagePart, Provider, ProviderEvent, ProviderRequest, StopReason, SystemBlock, ToolCall,
+    ToolResult, ToolSpec,
 };
 use crate::skill::{load_skill_catalog, SkillCatalog};
 #[cfg(test)]
 use crate::storage::Storage;
+use crate::storage::ATTACHMENTS_DIR;
 #[cfg(test)]
 use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
@@ -41,6 +41,7 @@ mod activity;
 mod config;
 mod context;
 pub(crate) mod hashline;
+pub(crate) mod images;
 mod prompts;
 mod snapshots;
 mod subagent;
@@ -58,6 +59,10 @@ pub(crate) use self::snapshots::*;
 pub use self::types::*;
 
 use tools::*;
+
+use self::images::{
+    append_user_parts, parse_user_message, prepare_provider_messages, DISABLED_IMAGE_ERROR,
+};
 
 const MAX_PROVIDER_REQUEST_ATTEMPTS: usize = 3;
 
@@ -275,6 +280,24 @@ async fn recv_while_active<T>(
     }
 }
 
+/// A tool execution result: the human/model text plus any native image blocks
+/// the tool produced (currently only `read`). Images travel alongside the text
+/// so the caller can place them protocol-safe in outgoing messages.
+#[derive(Clone, Debug)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<crate::provider::ImageBlock>,
+}
+
+impl ToolOutput {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
 /// The minimal interface needed to expose a new tool to the model.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -285,6 +308,12 @@ pub trait Tool: Send + Sync {
         ToolExecutionPolicy::Exclusive
     }
     async fn execute(&self, input: &Value) -> Result<String>;
+    /// Execute returning text plus any native image blocks. The default wraps
+    /// [`Tool::execute`], so pure-text tools need no changes; only tools that
+    /// produce images override it.
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        Ok(ToolOutput::text(self.execute(input).await?))
+    }
 }
 pub(crate) fn tool_error_message(error: &anyhow::Error) -> String {
     format!("{error:#}")
@@ -311,11 +340,11 @@ impl RegisteredTool {
         self.tool.execution_policy()
     }
 
-    pub(crate) async fn execute(&self, input: &Value) -> Result<String> {
+    pub(crate) async fn execute(&self, input: &Value) -> Result<ToolOutput> {
         self.validator.validate(input).map_err(|error| {
             anyhow::anyhow!("invalid input for tool {}: {error}", self.tool.name())
         })?;
-        self.tool.execute(input).await
+        self.tool.execute_output(input).await
     }
 }
 
@@ -330,6 +359,12 @@ pub struct Agent {
     input_buffer: Arc<Mutex<Vec<String>>>,
     cancelled: Arc<AtomicBool>,
     concurrency: ToolConcurrencyLimits,
+    /// Shared attachment store used to materialize embedded and tool image
+    /// sources at request time (weak references on disk, pixels in memory).
+    attachments: AttachmentStore,
+    /// HTTP client shared with the read tools; used to resolve URL image
+    /// sources with the exact same network policy as the read tool.
+    client: Client,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -609,6 +644,8 @@ impl Agent {
             )?),
         };
         let concurrency = ToolConcurrencyLimits::from_config(&config);
+        let agent_client = client.clone();
+        let attachments = AttachmentStore::new(nole_root.join(ATTACHMENTS_DIR));
         let mut agent = Self {
             config,
             provider,
@@ -620,6 +657,8 @@ impl Agent {
             input_buffer,
             cancelled: cancelled.clone(),
             concurrency,
+            attachments,
+            client: agent_client,
         };
         let gate = ApprovalGate::new(
             permission_mode,
@@ -751,7 +790,9 @@ impl Agent {
         conversation: &mut AgentConversation,
     ) -> Result<AgentRunCompletion> {
         let prompt = prompt_with_datetime(prompt, Local::now());
-        conversation.messages.push(Message::user(prompt));
+        let parsed =
+            parse_user_message(prompt, &self.attachments, self.config.supports_images).await?;
+        conversation.messages.push(parsed);
         self.checkpoint_conversation(conversation);
         let definitions = &self.definitions;
         let mut empty_response_retries = 0usize;
@@ -763,10 +804,13 @@ impl Agent {
         loop {
             let buffered = self.take_buffered_prompts()?;
             if !buffered.is_empty() {
-                append_user_text(
-                    &mut conversation.messages,
-                    format_buffered_prompts(buffered),
-                );
+                for raw_prompt in buffered {
+                    let dated = prompt_with_datetime(&raw_prompt, Local::now());
+                    let parsed =
+                        parse_user_message(dated, &self.attachments, self.config.supports_images)
+                            .await?;
+                    append_user_parts(&mut conversation.messages, parsed.parts);
+                }
                 self.checkpoint_conversation(conversation);
                 round = 0;
                 round_limit = self.config.max_rounds;
@@ -793,7 +837,7 @@ impl Agent {
                 self.checkpoint_conversation(conversation);
             }
             let response = self
-                .request_message(&conversation.messages, definitions)
+                .request_message(&mut conversation.messages, definitions)
                 .await?;
             let content = response.message.parts.clone();
             let stop_reason = response.stop_reason.clone();
@@ -934,7 +978,7 @@ impl Agent {
 
     async fn request_message(
         &self,
-        messages: &[Message],
+        messages: &mut [Message],
         definitions: &[ToolSpec],
     ) -> Result<AssistantMessage> {
         for attempt in 0..MAX_PROVIDER_REQUEST_ATTEMPTS {
@@ -954,9 +998,20 @@ impl Agent {
 
     async fn request_message_once(
         &self,
-        messages: &[Message],
+        messages: &mut [Message],
         definitions: &[ToolSpec],
     ) -> Result<AssistantMessage> {
+        if !self.config.supports_images
+            && messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .any(|part| matches!(part, MessagePart::Image(_)))
+        {
+            bail!("{DISABLED_IMAGE_ERROR}");
+        }
+        // Materialize weak image sources before the first request and before
+        // any retry; cached `Arc` pixels are reused so retries do not re-read.
+        prepare_provider_messages(messages, &self.attachments, &self.client).await?;
         let observable = self.provider.call_streaming(ProviderRequest {
             model: self.config.model.clone(),
             max_tokens: self.config.max_tokens,
@@ -1104,9 +1159,24 @@ impl Agent {
 
     async fn count_input_tokens(
         &self,
-        messages: &[Message],
+        messages: &mut [Message],
         definitions: &[ToolSpec],
     ) -> Result<u64> {
+        if !self.config.supports_images
+            && messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .any(|part| matches!(part, MessagePart::Image(_)))
+        {
+            bail!("{DISABLED_IMAGE_ERROR}");
+        }
+        if self.config.api_format == ApiFormat::Completions {
+            return Ok(estimate_request_tokens(&self.system, messages, definitions));
+        }
+        // Messages has an exact count endpoint and therefore needs resolved
+        // pixels. Completions has no count endpoint and stays on the metadata-
+        // only estimate above, avoiding unnecessary source reads.
+        prepare_provider_messages(messages, &self.attachments, &self.client).await?;
         let request = ProviderRequest {
             model: self.config.model.clone(),
             max_tokens: self.config.max_tokens,
@@ -1176,7 +1246,7 @@ impl Agent {
         tool_uses: &[ToolCall],
         tool_input_errors: &HashMap<String, String>,
     ) -> Result<ToolBatchExecution> {
-        let mut results = Vec::with_capacity(tool_uses.len() + 1);
+        let mut outputs = Vec::with_capacity(tool_uses.len());
         let mut retry_after_error = false;
         let mut buffered = Vec::new();
         let mut index = 0usize;
@@ -1184,11 +1254,12 @@ impl Agent {
             let pending = self.take_buffered_prompts()?;
             if !pending.is_empty() {
                 buffered.extend(pending);
-                results.extend(
-                    tool_uses[index..]
-                        .iter()
-                        .map(|call| Message::tool(deferred_tool_result(call))),
-                );
+                outputs.extend(tool_uses[index..].iter().enumerate().map(|(offset, call)| {
+                    (
+                        index + offset,
+                        ToolCallOutput::text(deferred_tool_result(call)),
+                    )
+                }));
                 break;
             }
 
@@ -1208,7 +1279,7 @@ impl Agent {
                     let execution = self
                         .execute_scheduled_tool_call(call, tool_input_errors.get(&call.id))
                         .await;
-                    (offset, execution)
+                    (index + offset, execution)
                 })
                 .buffer_unordered(wave.len().max(1))
                 .collect::<Vec<_>>()
@@ -1217,39 +1288,111 @@ impl Agent {
             let denied = executions
                 .iter()
                 .any(|(_, execution)| matches!(execution, ToolCallExecution::Denied(_)));
-            for (_, execution) in executions {
-                let result = match execution {
-                    ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => {
-                        result
+            for (global_offset, execution) in executions {
+                let output = match execution {
+                    ToolCallExecution::Completed(output) | ToolCallExecution::Denied(output) => {
+                        output
                     }
                 };
-                retry_after_error |=
-                    result.is_error || result.content.contains(REPAIR_REQUIRED_MARKER);
-                results.push(Message::tool(result));
+                retry_after_error |= output.result.is_error
+                    || output.result.content.contains(REPAIR_REQUIRED_MARKER);
+                outputs.push((global_offset, output));
             }
             if denied {
-                results.extend(
-                    tool_uses[end..]
-                        .iter()
-                        .map(|call| Message::tool(skipped_after_denial_tool_result(call))),
-                );
-                return Ok(ToolBatchExecution::Denied(results));
+                outputs.extend(tool_uses[end..].iter().enumerate().map(|(offset, call)| {
+                    (
+                        end + offset,
+                        ToolCallOutput::text(skipped_after_denial_tool_result(call)),
+                    )
+                }));
+                let messages = self
+                    .finalize_tool_messages(tool_uses, outputs, buffered)
+                    .await?;
+                return Ok(ToolBatchExecution::Denied(messages));
             }
             index = end;
         }
         buffered.extend(self.take_buffered_prompts()?);
         let turn_boundary = !buffered.is_empty();
-        if turn_boundary {
-            results.push(Message::user(format!(
-                "Additional user input received while you were working:\n\n{}",
-                format_buffered_prompts(buffered)
-            )));
-        }
+        let messages = self
+            .finalize_tool_messages(tool_uses, outputs, buffered)
+            .await?;
         Ok(ToolBatchExecution::Completed {
-            messages: results,
+            messages,
             turn_boundary,
             retry_after_error,
         })
+    }
+
+    /// Assemble a tool batch's conversation messages: every text `tool_result`
+    /// in original offset order, followed by a single trailing user message
+    /// carrying all image parts (each prefixed with its tool label) and any
+    /// buffered user input parsed after the images.
+    async fn finalize_tool_messages(
+        &self,
+        tool_uses: &[ToolCall],
+        mut outputs: Vec<(usize, ToolCallOutput)>,
+        buffered: Vec<String>,
+    ) -> Result<Vec<Message>> {
+        outputs.sort_by_key(|(offset, _)| *offset);
+        let mut messages = Vec::with_capacity(outputs.len() + 1);
+        for (_, output) in &outputs {
+            messages.push(Message::tool(output.result.clone()));
+        }
+        let mut trailing = Vec::new();
+        for (offset, output) in &outputs {
+            let name = tool_uses
+                .get(*offset)
+                .map(|call| call.name.as_str())
+                .unwrap_or("");
+            for block in &output.images {
+                trailing.push(MessagePart::Text {
+                    text: format!("Image returned by tool {name}: {}", block.label),
+                });
+                trailing.push(MessagePart::Image(block.clone()));
+            }
+        }
+        let mut buffered_parts = Vec::new();
+        let mut has_buffered_image = false;
+        for raw in buffered {
+            let dated = prompt_with_datetime(&raw, Local::now());
+            let parsed =
+                parse_user_message(dated, &self.attachments, self.config.supports_images).await?;
+            has_buffered_image |= parsed
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Image(_)));
+            buffered_parts.extend(parsed.parts);
+        }
+        if !buffered_parts.is_empty() {
+            if trailing.is_empty() && !has_buffered_image {
+                let text = buffered_parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                messages.push(Message::user(format!(
+                    "Additional user input received while you were working:\n\n{text}"
+                )));
+            } else {
+                if !trailing.is_empty() {
+                    trailing.push(MessagePart::Text {
+                        text: "\n".to_string(),
+                    });
+                }
+                trailing.push(MessagePart::Text {
+                    text: "Additional user input received while you were working:".to_string(),
+                });
+                trailing.extend(buffered_parts);
+            }
+        }
+        if !trailing.is_empty() {
+            messages.push(Message::user_parts(trailing));
+        }
+        Ok(messages)
     }
 
     fn tool_execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
@@ -1274,12 +1417,15 @@ impl Agent {
             message: tool_start_activity(&tool_call_value(call)),
         });
         let execution = match input_error {
-            Some(error) => ToolCallExecution::Completed(failed_tool_result(call, error)),
+            Some(error) => {
+                ToolCallExecution::Completed(ToolCallOutput::text(failed_tool_result(call, error)))
+            }
             None => self.execute_tool_call(call).await,
         };
-        let result = match &execution {
-            ToolCallExecution::Completed(result) | ToolCallExecution::Denied(result) => result,
+        let output = match &execution {
+            ToolCallExecution::Completed(output) | ToolCallExecution::Denied(output) => output,
         };
+        let result = &output.result;
         let error = result.is_error.then_some(result.content.as_str());
         // Ask's answer already lands in the activity text, so it is not
         // duplicated as a preview line.
@@ -1299,11 +1445,11 @@ impl Agent {
         let name = call.name.as_str();
         let input = &call.input;
         if let Err(error) = self.ensure_active() {
-            return ToolCallExecution::Completed(ToolResult {
+            return ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
                 tool_use_id: id.to_string(),
                 content: error.to_string(),
                 is_error: true,
-            });
+            }));
         }
         let result = self.tools.get(name).cloned().context("unknown tool");
         let result = match result {
@@ -1311,18 +1457,31 @@ impl Agent {
             Err(error) => Err(error),
         };
         match result {
-            Ok(content) => ToolCallExecution::Completed(ToolResult {
-                tool_use_id: id.to_string(),
-                content,
-                is_error: false,
-            }),
+            Ok(output) => {
+                if !output.images.is_empty() && !self.config.supports_images {
+                    ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                        tool_use_id: id.to_string(),
+                        content: DISABLED_IMAGE_ERROR.to_string(),
+                        is_error: true,
+                    }))
+                } else {
+                    ToolCallExecution::Completed(ToolCallOutput::with_images(
+                        ToolResult {
+                            tool_use_id: id.to_string(),
+                            content: output.text,
+                            is_error: false,
+                        },
+                        output.images,
+                    ))
+                }
+            }
             Err(error) => {
                 let denied = error.downcast_ref::<ApprovalDenied>().is_some();
-                let result = ToolResult {
+                let result = ToolCallOutput::text(ToolResult {
                     tool_use_id: id.to_string(),
                     content: tool_error_message(&error),
                     is_error: true,
-                };
+                });
                 if denied {
                     ToolCallExecution::Denied(result)
                 } else {

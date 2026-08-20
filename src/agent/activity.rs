@@ -44,6 +44,7 @@ pub(crate) fn empty_response_diagnostic(
             MessagePart::RedactedThinking { .. } => "redacted_thinking",
             MessagePart::ToolUse(_) => "tool_use",
             MessagePart::ToolResult(_) => "tool_result",
+            MessagePart::Image(_) => "image",
         })
         .collect::<Vec<_>>();
     block_types.sort_unstable();

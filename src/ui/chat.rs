@@ -518,6 +518,34 @@ mod tests {
     }
 
     #[test]
+    fn chat_prompt_image_embed_produces_image_placement() {
+        let uri = "nole://attachment/00000000-0000-4000-8000-000000000000";
+        let (lines, _links, images) = render_chat_entry(
+            &AgentPanelEntry::Prompt {
+                text: format!("before ![scan]({uri}) after"),
+                muted: false,
+            },
+            160,
+            Theme::default(),
+        );
+        // The prompt bar keeps rendering the explicit embed as an inline image
+        // placement for ImageService, with row/column offsets into the bar.
+        let placement = images
+            .iter()
+            .find(|image| image.source.contains(uri))
+            .expect("prompt image embed must produce an image placement");
+        assert!(placement.row >= 1, "image must be placed inside the bar");
+        assert!(!lines.is_empty());
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("before"));
+        assert!(text.contains("after"));
+    }
+
+    #[test]
     fn assistant_streaming_and_completed_share_plain_shape() {
         let theme = Theme::default();
         let width = 160;

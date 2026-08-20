@@ -1786,3 +1786,989 @@
             .count();
         assert_eq!(activities, 1);
     }
+
+    use base64::Engine as _;
+    use crate::provider::{ImageBlock, ImageMediaType, ImageSource, MessageRole};
+
+    fn message_content_blocks(message: &Value) -> Vec<&Value> {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|blocks| blocks.iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    /// Loopback provider mock serving one scripted JSON response per request.
+    /// Tolerates connection churn (client keep-alive reuse, retries) by
+    /// accepting up to a fixed number of connections and skipping connections
+    /// that close before a full request arrives.
+    fn spawn_provider_mock(
+        responses: Vec<Value>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Value>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = requests.clone();
+        let server = std::thread::spawn(move || {
+            let mut response_iter = responses.into_iter();
+            for _ in 0..64 {
+                let (stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                let mut headers_ok = true;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        headers_ok = false;
+                        break;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) =
+                        line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                if !headers_ok {
+                    continue;
+                }
+                let mut request_body = vec![0; content_length];
+                if reader.read_exact(&mut request_body).is_err() {
+                    continue;
+                }
+                requests_for_thread
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&request_body).unwrap());
+                let Some(response) = response_iter.next() else {
+                    eprintln!("provider mock received an unexpected request");
+                    break;
+                };
+                let body = serde_json::to_vec(&response).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                reader.get_mut().write_all(&body).unwrap();
+                reader.get_mut().flush().unwrap();
+                if response_iter.len() == 0 {
+                    break;
+                }
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    struct ImageOrderProbe {
+        name: &'static str,
+        label: &'static str,
+        receiver: Option<Arc<Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>>,
+        sender: Option<tokio::sync::mpsc::Sender<()>>,
+        completion: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ImageOrderProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool returning a native image block"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Subagent
+        }
+
+        async fn execute(&self, _input: &Value) -> Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn execute_output(&self, _input: &Value) -> Result<ToolOutput> {
+            // Take the receiver out of the mutex and drop the guard before
+            // the await, so the future stays Send.
+            let receiver = self.receiver.as_ref().and_then(|slot| {
+                if let Some(receiver) = slot.lock().unwrap().take() {
+                    Some(receiver)
+                } else {
+                    None
+                }
+            });
+            if let Some(mut receiver) = receiver {
+                let _ = receiver.recv().await;
+            }
+            self.completion.lock().unwrap().push(self.label.to_string());
+            if let Some(sender) = &self.sender {
+                let _ = sender.send(()).await;
+            }
+            Ok(ToolOutput {
+                text: format!("read {}", self.label),
+                images: vec![ImageBlock {
+                    source: ImageSource::LocalFile {
+                        path: PathBuf::from(format!("{}.png", self.label)),
+                    },
+                    label: format!("{}.png", self.label),
+                    media_type: ImageMediaType::Png,
+                    width: 8,
+                    height: 4,
+                    bytes: Some(Arc::from(vec![0xAAu8; 16])),
+                }],
+            })
+        }
+    }
+
+    struct TextProbe;
+
+    #[async_trait::async_trait]
+    impl Tool for TextProbe {
+        fn name(&self) -> &'static str {
+            "text_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test-only text tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Subagent
+        }
+
+        async fn execute(&self, _input: &Value) -> Result<String> {
+            Ok("plain text result".to_string())
+        }
+    }
+
+    #[test]
+    fn tool_batch_places_images_after_all_tool_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!("{TEST_MESSAGES_CONFIG}supports_images = true\n"),
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel::<()>(1);
+        let completion = Arc::new(Mutex::new(Vec::new()));
+        agent.register(ImageOrderProbe {
+            name: "image_probe_a",
+            label: "first", // offset 0: waits for the second probe to finish
+            receiver: Some(Arc::new(Mutex::new(Some(receiver)))),
+            sender: None,
+            completion: completion.clone(),
+        });
+        agent.register(ImageOrderProbe {
+            name: "image_probe_b",
+            label: "second", // offset 1: signals completion before returning
+            receiver: None,
+            sender: Some(sender),
+            completion: completion.clone(),
+        });
+        agent.register(TextProbe);
+        let calls = [
+            ToolCall {
+                id: "a".to_string(),
+                name: "image_probe_a".to_string(),
+                input: json!({"label": "first"}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "image_probe_b".to_string(),
+                input: json!({"label": "second"}),
+            },
+            ToolCall {
+                id: "c".to_string(),
+                name: "text_probe".to_string(),
+                input: json!({}),
+            },
+        ];
+
+        let messages = completed_tool_results(
+            test_runtime()
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        agent.execute_tool_batch(&calls, &HashMap::new()),
+                    )
+                    .await
+                    .expect("image tool wave timed out")
+                    .unwrap()
+                }),
+        );
+        // The concurrent probes complete out of order (second before first),
+        // yet the conversation preserves tool-call offset order: three text
+        // tool results, then a single trailing user message carrying all the
+        // images in offset order.
+        let completion_order = completion.lock().unwrap();
+        assert_eq!(completion_order.first().map(String::as_str), Some("second"));
+        assert!(
+            completion_order
+                .iter()
+                .position(|label| label == "second")
+                .unwrap()
+                < completion_order
+                    .iter()
+                    .position(|label| label == "first")
+                    .unwrap()
+        );
+        assert_eq!(messages.len(), 4);
+        let contents = messages[..3]
+            .iter()
+            .map(|message| match &message.parts[0] {
+                MessagePart::ToolResult(result) => result.content.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["read first", "read second", "plain text result"]);
+        let user = &messages[3];
+        assert_eq!(user.role, MessageRole::User);
+        let parts = &user.parts;
+        assert_eq!(parts.len(), 4);
+        match &parts[0] {
+            MessagePart::Text { text } => {
+                assert_eq!(text, "Image returned by tool image_probe_a: first.png")
+            }
+            _ => panic!("expected image label"),
+        }
+        match &parts[1] {
+            MessagePart::Image(block) => {
+                assert_eq!(block.label, "first.png");
+                assert!(block.bytes.is_some());
+            }
+            _ => panic!("expected image block"),
+        }
+        match &parts[2] {
+            MessagePart::Text { text } => {
+                assert_eq!(text, "Image returned by tool image_probe_b: second.png")
+            }
+            _ => panic!("expected image label"),
+        }
+        match &parts[3] {
+            MessagePart::Image(block) => assert_eq!(block.label, "second.png"),
+            _ => panic!("expected image block"),
+        }
+    }
+
+    #[test]
+    fn tool_batch_gates_images_when_capability_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        // supports_images defaults to false.
+        fs::write(&storage.ai_config_path, TEST_MESSAGES_CONFIG).unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        agent.register(ImageOrderProbe {
+            name: "image_probe",
+            label: "one",
+            receiver: None,
+            sender: None,
+            completion: Arc::new(Mutex::new(Vec::new())),
+        });
+        let calls = [ToolCall {
+            id: "a".to_string(),
+            name: "image_probe".to_string(),
+            input: json!({}),
+        }];
+        let messages = completed_tool_results(
+            test_runtime()
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        agent.execute_tool_batch(&calls, &HashMap::new()),
+                    )
+                    .await
+                    .expect("gated image tool timed out")
+                    .unwrap()
+                }),
+        );
+        // Capability disabled: only the exact is_error text is produced, and
+        // no image parts ever reach the conversation.
+        assert_eq!(messages.len(), 1);
+        match &messages[0].parts[0] {
+            MessagePart::ToolResult(result) => {
+                assert!(result.is_error);
+                assert_eq!(result.content, crate::agent::images::DISABLED_IMAGE_ERROR);
+            }
+            _ => panic!("expected tool result"),
+        }
+        assert!(messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .all(|part| !matches!(part, MessagePart::Image(_))));
+    }
+
+    struct DeniedProbe;
+
+    #[async_trait::async_trait]
+    impl Tool for DeniedProbe {
+        fn name(&self) -> &'static str {
+            "denied_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test-only denial tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Subagent
+        }
+
+        async fn execute(&self, _input: &Value) -> Result<String> {
+            Err(ApprovalDenied.into())
+        }
+    }
+
+    #[test]
+    fn denied_tool_batch_still_assembles_trailing_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!("{TEST_MESSAGES_CONFIG}supports_images = true\n"),
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        agent.register(ImageOrderProbe {
+            name: "image_probe",
+            label: "scan",
+            receiver: None,
+            sender: None,
+            completion: Arc::new(Mutex::new(Vec::new())),
+        });
+        agent.register(DeniedProbe);
+        let calls = [
+            ToolCall {
+                id: "a".to_string(),
+                name: "image_probe".to_string(),
+                input: json!({}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "denied_probe".to_string(),
+                input: json!({}),
+            },
+        ];
+        let messages = test_runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    agent.execute_tool_batch(&calls, &HashMap::new()),
+                )
+                .await
+                .expect("denied tool wave timed out")
+                .unwrap()
+            });
+        let messages = match messages {
+            ToolBatchExecution::Denied(messages) => messages,
+            _ => panic!("expected a denied batch"),
+        };
+        // The image produced before the denial is not dropped: the early
+        // denial return still goes through the same finalizer.
+        assert_eq!(messages.len(), 3);
+        match &messages[0].parts[0] {
+            MessagePart::ToolResult(result) => assert_eq!(result.content, "read scan"),
+            _ => panic!("expected image tool result"),
+        }
+        match &messages[1].parts[0] {
+            MessagePart::ToolResult(result) => {
+                assert!(result.is_error);
+                assert!(result.content.contains("denied by user"));
+            }
+            _ => panic!("expected denied result"),
+        }
+        let user = &messages[2];
+        assert_eq!(user.role, MessageRole::User);
+        assert_eq!(user.parts.len(), 2);
+        match &user.parts[0] {
+            MessagePart::Text { text } => {
+                assert_eq!(text, "Image returned by tool image_probe: scan.png")
+            }
+            _ => panic!("expected image label"),
+        }
+        match &user.parts[1] {
+            MessagePart::Image(block) => assert_eq!(block.label, "scan.png"),
+            _ => panic!("expected image block"),
+        }
+    }
+
+    struct BufferedImageProbe {
+        name: &'static str,
+        label: &'static str,
+        buffer: Arc<Mutex<Vec<String>>>,
+        push: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BufferedImageProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "Test image tool that queues user input while running"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Subagent
+        }
+
+        async fn execute(&self, _input: &Value) -> Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn execute_output(&self, _input: &Value) -> Result<ToolOutput> {
+            if self.push {
+                self.buffer.lock().unwrap().push("Squeeze extra".to_string());
+            }
+            Ok(ToolOutput {
+                text: format!("read {}", self.label),
+                images: vec![ImageBlock {
+                    source: ImageSource::Url {
+                        url: format!("https://example.test/{}.png", self.label),
+                    },
+                    label: format!("{}.png", self.label),
+                    media_type: ImageMediaType::Png,
+                    width: 8,
+                    height: 4,
+                    bytes: Some(Arc::from(vec![0xBBu8; 16])),
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn tool_batch_appends_buffered_input_after_trailing_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!("{TEST_MESSAGES_CONFIG}supports_images = true\n"),
+        )
+        .unwrap();
+        let input_buffer = Arc::new(Mutex::new(Vec::new()));
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                input_buffer.clone(),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        agent.register(BufferedImageProbe {
+            name: "image_probe_a",
+            label: "a",
+            buffer: input_buffer.clone(),
+            push: true,
+        });
+        agent.register(BufferedImageProbe {
+            name: "image_probe_b",
+            label: "b",
+            buffer: input_buffer.clone(),
+            push: false,
+        });
+        let calls = [
+            ToolCall {
+                id: "a".to_string(),
+                name: "image_probe_a".to_string(),
+                input: json!({}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "image_probe_b".to_string(),
+                input: json!({}),
+            },
+        ];
+        let (messages, turn_boundary) = match test_runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    agent.execute_tool_batch(&calls, &HashMap::new()),
+                )
+                .await
+                .expect("buffered image tool wave timed out")
+                .unwrap()
+            }) {
+            ToolBatchExecution::Completed {
+                messages,
+                turn_boundary,
+                ..
+            } => (messages, turn_boundary),
+            _ => panic!("expected a completed batch"),
+        };
+        assert!(turn_boundary);
+        // tool results, then ONE trailing user message with every image
+        // followed by the buffered (datetime-prefixed) user text appended in
+        // the same message.
+        assert_eq!(messages.len(), 3);
+        let parts = &messages[2].parts;
+        let kinds = parts
+            .iter()
+            .map(|part| match part {
+                MessagePart::Text { .. } => "text",
+                MessagePart::Image(_) => "image",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["text", "image", "text", "image", "text", "text", "text"]);
+        match &parts[0] {
+            MessagePart::Text { text } => {
+                assert_eq!(text, "Image returned by tool image_probe_a: a.png")
+            }
+            _ => panic!("expected image label"),
+        }
+        assert!(matches!(&parts[1], MessagePart::Image(block) if block.label == "a.png"));
+        match &parts[2] {
+            MessagePart::Text { text } => {
+                assert_eq!(text, "Image returned by tool image_probe_b: b.png")
+            }
+            _ => panic!("expected image label"),
+        }
+        assert!(matches!(&parts[3], MessagePart::Image(block) if block.label == "b.png"));
+        match &parts[4] {
+            MessagePart::Text { text } => assert_eq!(text, "\n"),
+            _ => panic!("expected separator text"),
+        }
+        match &parts[5] {
+            MessagePart::Text { text } => {
+                assert_eq!(text, "Additional user input received while you were working:")
+            }
+            _ => panic!("expected buffered marker"),
+        }
+        match &parts[6] {
+            MessagePart::Text { text } => {
+                assert!(text.contains("Current local date and time"));
+                assert!(text.contains("Squeeze extra"));
+            }
+            _ => panic!("expected buffered prompt text"),
+        }
+    }
+
+    #[test]
+    fn tool_batch_defers_calls_when_buffered_input_is_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!("{TEST_MESSAGES_CONFIG}supports_images = true\n"),
+        )
+        .unwrap();
+        let input_buffer = Arc::new(Mutex::new(vec!["Hold on".to_string()]));
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let mut agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                input_buffer.clone(),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        agent.register(BufferedImageProbe {
+            name: "image_probe_a",
+            label: "a",
+            buffer: input_buffer.clone(),
+            push: true,
+        });
+        let calls = [ToolCall {
+            id: "a".to_string(),
+            name: "image_probe_a".to_string(),
+            input: json!({}),
+        }];
+        let (messages, turn_boundary) = match test_runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    agent.execute_tool_batch(&calls, &HashMap::new()),
+                )
+                .await
+                .expect("deferred tool wave timed out")
+                .unwrap()
+            }) {
+            ToolBatchExecution::Completed {
+                messages,
+                turn_boundary,
+                ..
+            } => (messages, turn_boundary),
+            _ => panic!("expected a completed batch"),
+        };
+        assert!(turn_boundary);
+        assert_eq!(messages.len(), 2);
+        match &messages[0].parts[0] {
+            MessagePart::ToolResult(result) => {
+                assert!(result.content.contains("deferred because new user input"))
+            }
+            _ => panic!("expected deferred tool result"),
+        }
+        match &messages[1].parts[0] {
+            MessagePart::Text { text } => assert!(text.contains("Hold on")),
+            _ => panic!("expected buffered user message"),
+        }
+        assert!(messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .all(|part| !matches!(part, MessagePart::Image(_))));
+    }
+
+    #[test]
+    fn completions_token_estimate_does_not_resolve_image_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            "api_format = 'completions'\napi_key = ''\nmodel = 'test-model'\nbase_url = 'http://127.0.0.1:1'\nsupports_images = true\n",
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        let mut messages = vec![Message::user_parts(vec![MessagePart::Image(ImageBlock {
+            source: ImageSource::LocalFile {
+                path: directory.path().join("missing.png"),
+            },
+            label: "missing".to_string(),
+            media_type: ImageMediaType::Png,
+            width: 28,
+            height: 28,
+            bytes: None,
+        })])];
+
+        let count = test_runtime()
+            .block_on(agent.count_input_tokens(&mut messages, &[]))
+            .unwrap();
+
+        assert!(count > 0);
+        assert!(matches!(
+            &messages[0].parts[0],
+            MessagePart::Image(block) if block.bytes.is_none()
+        ));
+    }
+
+    #[test]
+    fn agent_autonomously_reads_local_image_for_both_api_formats() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let image = image::DynamicImage::new_rgb8(8, 4);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let png = buf.into_inner();
+        let path = directory.path().join("diagram.png");
+        fs::write(&path, &png).unwrap();
+
+        for api_format in ["messages", "completions"] {
+            let responses = if api_format == "messages" {
+                vec![
+                    json!({
+                        "content": [{
+                            "type": "tool_use", "id": "read-diagram", "name": "read",
+                            "input": {"path": "diagram.png"}
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 10, "output_tokens": 3}
+                    }),
+                    json!({
+                        "content": [{"type": "text", "text": "Saw the diagram"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 22, "output_tokens": 5}
+                    }),
+                ]
+            } else {
+                vec![
+                    json!({
+                        "choices": [{
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "read-diagram",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read",
+                                        "arguments": "{\"path\":\"diagram.png\"}"
+                                    }
+                                }]
+                            }
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 3}
+                    }),
+                    json!({
+                        "choices": [{
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "Saw the diagram"}
+                        }],
+                        "usage": {"prompt_tokens": 22, "completion_tokens": 5}
+                    }),
+                ]
+            };
+            let (base_url, requests_handle, server) = spawn_provider_mock(responses);
+            let config = format!(
+                "api_format = '{api_format}'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = '{base_url}'\nsupports_images = true\n"
+            );
+            fs::write(&storage.ai_config_path, config).unwrap();
+            let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (event_sender, _event_receiver) = event_channel();
+            let agent = Agent::from_config(
+                &storage.ai_config_path,
+                &storage.root,
+                AgentRuntime::new(
+                    event_sender,
+                    approval_receiver,
+                    user_receiver,
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            )
+            .unwrap();
+
+            let output = run_agent(
+                &agent,
+                "Inspect the diagram",
+                &mut AgentConversation::default(),
+            )
+            .unwrap();
+            assert_eq!(output, "Saw the diagram");
+            server.join().unwrap();
+            let requests = requests_handle.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            let messages = requests[1]["messages"].as_array().unwrap();
+            if api_format == "messages" {
+                let image_block = messages
+                    .iter()
+                    .flat_map(message_content_blocks)
+                    .find(|block| block["type"] == "image")
+                    .expect("second Messages request must contain an image block");
+                assert_eq!(image_block["source"]["media_type"], "image/png");
+                assert_eq!(
+                    image_block["source"]["data"],
+                    base64::engine::general_purpose::STANDARD.encode(&png)
+                );
+            } else {
+                let user = messages
+                    .iter()
+                    .find(|message| {
+                        message["role"] == "user"
+                            && message["content"].as_array().is_some_and(|content| {
+                                content.iter().any(|block| block["type"] == "image_url")
+                            })
+                    })
+                    .expect("second Completions request must contain a user image_url message");
+                let image_url = user["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|block| block["type"] == "image_url")
+                    .unwrap();
+                let url = image_url["image_url"]["url"].as_str().unwrap();
+                assert!(url.starts_with("data:image/png;base64,"));
+                assert_eq!(
+                    url.split("base64,").nth(1).unwrap(),
+                    base64::engine::general_purpose::STANDARD.encode(&png)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_autonomously_reads_url_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        let image = image::DynamicImage::new_rgb8(6, 3);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let png = buf.into_inner();
+
+        // Loopback image server serving the PNG exactly once. If the provider
+        // request re-resolved the URL instead of reusing the cached pixels,
+        // the second fetch would fail (the listener drops after the first
+        // response) and the agent run would error.
+        let image_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let image_address = image_listener.local_addr().unwrap();
+        let png_len = png.len();
+        let png_for_server = png.clone();
+        let image_server = std::thread::spawn(move || {
+            let (mut stream, _) = image_listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {png_len}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(&png_for_server).unwrap();
+            stream.flush().unwrap();
+        });
+        let url = format!("http://{image_address}/diagram.png");
+
+        let (base_url, requests_handle, provider_server) = spawn_provider_mock(vec![
+            json!({
+                "content": [{
+                    "type": "tool_use", "id": "read-url", "name": "read",
+                    "input": {"path": url.clone()}
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 12, "output_tokens": 3}
+            }),
+            json!({
+                "content": [{"type": "text", "text": "Saw the remote diagram"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 26, "output_tokens": 6}
+            }),
+        ]);
+        let config = format!(
+            "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = '{base_url}'\nsupports_images = true\n"
+        );
+        fs::write(&storage.ai_config_path, config).unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+
+        let output = run_agent(
+            &agent,
+            "Look at the URL image",
+            &mut AgentConversation::default(),
+        )
+        .unwrap();
+        assert_eq!(output, "Saw the remote diagram");
+        provider_server.join().unwrap();
+        image_server.join().unwrap();
+        let requests = requests_handle.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let image_block = messages
+            .iter()
+            .flat_map(message_content_blocks)
+            .find(|block| block["type"] == "image")
+            .expect("second request must contain the URL image pixels");
+        assert_eq!(
+            image_block["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+    }

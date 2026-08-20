@@ -597,6 +597,8 @@ impl Storage {
             "max_concurrent_local_reads = 8\n",
             "max_concurrent_network_tools = 8\n",
             "max_concurrent_subagents = 4\n",
+            "# Enable only for a vision-capable model: native image input.\n",
+            "supports_images = false\n",
         );
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);

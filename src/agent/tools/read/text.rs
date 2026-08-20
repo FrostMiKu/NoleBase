@@ -7,13 +7,23 @@
 //! through the shared `SnapshotStore`.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use tokio::fs as async_fs;
+use tokio::io::AsyncReadExt as _;
+
+use crate::agent::images::image_block_from_bytes;
+use crate::image_data::{detect_image_format, MAX_IMAGE_BYTES};
+use crate::provider::ImageSource;
 
 use super::paging::{continuation_selector, line_window, plain_response_len, read_utf8_page};
 use super::{listed_path, ParseContext, ReadParser, ReadPayload, Target};
+
+/// Number of leading bytes read to detect an image magic before committing to
+/// a full read; covers every format signature the image crate recognizes.
+const IMAGE_DETECT_PREFIX: usize = 32;
 
 pub(crate) struct TextFileParser;
 
@@ -41,6 +51,37 @@ impl ReadParser for TextFileParser {
             .with_context(|| format!("reading {}", path.display()))?;
         if !metadata.is_file() {
             bail!("path is not a regular file: {}", path.display());
+        }
+        let prefix = read_prefix(path, IMAGE_DETECT_PREFIX).await?;
+        if detect_image_format(&prefix).is_some() {
+            if range.is_some() {
+                bail!("line selectors are not supported for image targets");
+            }
+            if metadata.len() > MAX_IMAGE_BYTES {
+                bail!(
+                    "image file {} is {} bytes, exceeding the {MAX_IMAGE_BYTES} byte limit",
+                    path.display(),
+                    metadata.len()
+                );
+            }
+            let read_path = path.clone();
+            let display_path = path.display().to_string();
+            let bytes = tokio::task::spawn_blocking(move || std::fs::read(&read_path))
+                .await
+                .context("joining image file read")?
+                .with_context(|| format!("reading image {display_path}"))?;
+            let block_path = path.clone();
+            let label = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let block = tokio::task::spawn_blocking(move || {
+                image_block_from_bytes(ImageSource::LocalFile { path: block_path }, label, bytes)
+            })
+            .await
+            .context("joining image file decode")??;
+            return Ok(ReadPayload::Image(block));
         }
         let (offset, limit) = line_window(*range, input)?;
         let page_path = path.clone();
@@ -95,6 +136,21 @@ impl ReadParser for TextFileParser {
         }
         Ok(ReadPayload::Text(output))
     }
+}
+
+/// Read up to `limit` leading bytes without loading the whole file, used to
+/// detect an image magic prefix before deciding the full-read strategy.
+async fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let mut file = async_fs::File::open(path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut prefix = vec![0u8; limit];
+    let read = file
+        .read(&mut prefix)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    prefix.truncate(read);
+    Ok(prefix)
 }
 
 #[cfg(test)]

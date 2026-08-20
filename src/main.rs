@@ -11,6 +11,7 @@ mod clipboard;
 mod document_index;
 mod embedded_terminal;
 mod export;
+mod image_data;
 mod markdown;
 mod media;
 mod model;

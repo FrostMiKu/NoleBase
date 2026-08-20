@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::agent_session::{AgentConversation, TokenUsage};
-use crate::provider::{Message, ToolResult};
+use crate::provider::{ImageBlock, Message, ToolResult};
 
 /// How the agent runtime decides whether a proposed change needs user approval.
 ///
@@ -158,9 +158,31 @@ impl std::fmt::Display for ApprovalDenied {
 
 impl std::error::Error for ApprovalDenied {}
 
+/// A tool call outcome: the text result that feeds the conversation plus any
+/// native image blocks the tool produced. Failure, denial, deferred, and
+/// skipped outcomes always have empty images.
+#[derive(Clone)]
+pub(crate) struct ToolCallOutput {
+    pub(crate) result: ToolResult,
+    pub(crate) images: Vec<ImageBlock>,
+}
+
+impl ToolCallOutput {
+    pub(crate) fn text(result: ToolResult) -> Self {
+        Self {
+            result,
+            images: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_images(result: ToolResult, images: Vec<ImageBlock>) -> Self {
+        Self { result, images }
+    }
+}
+
 pub(crate) enum ToolCallExecution {
-    Completed(ToolResult),
-    Denied(ToolResult),
+    Completed(ToolCallOutput),
+    Denied(ToolCallOutput),
 }
 
 pub(crate) enum ToolBatchExecution {

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
@@ -13,9 +14,9 @@ use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
 
 use super::{
-    build_agent_http_client, parse_tool_input, transient_provider_error, AssistantMessage, Message,
-    MessagePart, MessageRole, Provider, ProviderEvent, ProviderRequest, StopReason, ToolCall,
-    DEFAULT_STREAM_BUFFER,
+    build_agent_http_client, parse_tool_input, transient_provider_error, AssistantMessage,
+    ImageBlock, Message, MessagePart, MessageRole, Provider, ProviderEvent, ProviderRequest,
+    StopReason, ToolCall, DEFAULT_STREAM_BUFFER,
 };
 
 const MAX_HTTP_ATTEMPTS: usize = 3;
@@ -44,7 +45,7 @@ impl CompletionsProvider {
         format!("{}/v1/chat/completions", self.base_url)
     }
 
-    fn body(request: &ProviderRequest, stream: bool) -> Value {
+    fn body(request: &ProviderRequest, stream: bool) -> Result<Value> {
         let mut messages = Vec::new();
         if !request.system.is_empty() {
             messages.push(json!({
@@ -53,7 +54,7 @@ impl CompletionsProvider {
             }));
         }
         for message in &request.messages {
-            messages.extend(message_wire(message));
+            messages.extend(message_wire(message)?);
         }
         let mut body = Map::new();
         body.insert("model".to_string(), json!(request.model));
@@ -84,7 +85,7 @@ impl CompletionsProvider {
                 ),
             );
         }
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 
     async fn send(
@@ -149,9 +150,8 @@ impl CompletionsProvider {
         events: Option<broadcast::Sender<ProviderEvent>>,
         cancel: CancellationToken,
     ) -> Result<AssistantMessage> {
-        let response = self
-            .send(&Self::body(&request, stream), events.as_ref(), &cancel)
-            .await?;
+        let body = Self::body(&request, stream)?;
+        let response = self.send(&body, events.as_ref(), &cancel).await?;
         let started = Instant::now();
         let status = response.status();
         if !status.is_success() {
@@ -465,21 +465,70 @@ fn parse_response(value: Value, duration: Duration) -> Result<AssistantMessage> 
     })
 }
 
-fn message_wire(message: &Message) -> Vec<Value> {
+/// Encode an image block as a Chat Completions `image_url` content item. The
+/// pixels must already be resolved; a missing cache is a local mapping error.
+fn image_url_wire(block: &ImageBlock) -> Result<Value> {
+    let bytes = block.bytes.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "image {:?} is missing its bytes; re-resolve the source before sending",
+            block.source
+        )
+    })?;
+    Ok(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": format!(
+                "data:{};base64,{}",
+                block.media_type.mime(),
+                base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())
+            ),
+            "detail": "auto",
+        }
+    }))
+}
+
+fn message_wire(message: &Message) -> Result<Vec<Value>> {
     match message.role {
-        MessageRole::User => vec![json!({"role": "user", "content": message.text()})],
+        MessageRole::User => {
+            let has_image = message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Image(_)));
+            if has_image {
+                let content = message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::Text { text } => {
+                            Some(Ok(json!({"type": "text", "text": text})))
+                        }
+                        MessagePart::Image(block) => Some(image_url_wire(block)),
+                        _ => None,
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(vec![json!({"role": "user", "content": content})])
+            } else {
+                Ok(vec![json!({"role": "user", "content": message.text()})])
+            }
+        }
         MessageRole::Tool => message
             .parts
             .iter()
             .filter_map(|part| match part {
-                MessagePart::ToolResult(result) => Some(json!({
+                MessagePart::ToolResult(result) => Some(Ok(json!({
                     "role": "tool",
                     "tool_call_id": result.tool_use_id,
                     "content": result.content,
-                })),
+                }))),
+                // Chat Completions tool messages are text-only; images here are
+                // a protocol violation and must surface, not drop.
+                MessagePart::Image(block) => Some(Err(anyhow::anyhow!(
+                    "tool message for {} contains an image; images must be sent as a user message",
+                    block.label
+                ))),
                 _ => None,
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>(),
         MessageRole::Assistant => {
             let calls = message
                 .tool_calls()
@@ -499,7 +548,19 @@ fn message_wire(message: &Message) -> Vec<Value> {
             if !calls.is_empty() {
                 value["tool_calls"] = Value::Array(calls);
             }
-            vec![value]
+            if let Some(block) = message.parts.iter().find_map(|part| match part {
+                MessagePart::Image(_) => Some(part),
+                _ => None,
+            }) {
+                let MessagePart::Image(block) = block else {
+                    unreachable!()
+                };
+                bail!(
+                    "assistant message for {} contains an image; images are only valid in user messages",
+                    block.label
+                );
+            }
+            Ok(vec![value])
         }
     }
 }
@@ -603,8 +664,7 @@ mod tests {
 
     #[test]
     fn body_uses_chat_completions_wire_format() {
-        let body = CompletionsProvider::body(&request(), true);
-
+        let body = CompletionsProvider::body(&request(), true).unwrap();
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["max_tokens"], 321);
         assert_eq!(body["stream_options"]["include_usage"], true);
@@ -612,6 +672,72 @@ mod tests {
         assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call-1");
         assert_eq!(body["messages"][3]["tool_call_id"], "call-1");
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn completions_wire_encodes_prompt_and_tool_images() {
+        let png: Vec<u8> = {
+            let image = image::DynamicImage::new_rgb8(8, 4);
+            let mut out = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let tool = Message::tool(ToolResult {
+            tool_use_id: "call-1".to_string(),
+            content: "done".to_string(),
+            is_error: false,
+        });
+        let prompt_image = Message::user_parts(vec![
+            MessagePart::Text {
+                text: "here".to_string(),
+            },
+            MessagePart::Image(crate::provider::ImageBlock {
+                source: crate::provider::ImageSource::Attachment {
+                    uri: "nole://attachment/00000000-0000-4000-8000-000000000000".to_string(),
+                },
+                label: "prompt.png".to_string(),
+                media_type: crate::provider::ImageMediaType::Png,
+                width: 8,
+                height: 4,
+                bytes: Some(std::sync::Arc::from(png.clone())),
+            }),
+        ]);
+
+        let wire = message_wire(&tool).unwrap();
+        // Chat Completions tool messages stay text-only.
+        assert!(wire
+            .iter()
+            .all(|message| message["role"] == "tool" && message["content"].is_string()));
+
+        let user = message_wire(&prompt_image).unwrap();
+        assert_eq!(user[0]["role"], "user");
+        let content = user[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        let encoded = url.split("base64,").nth(1).unwrap();
+        assert_eq!(
+            encoded,
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+
+        // A plain-text user message stays a string, never an array.
+        let plain = message_wire(&Message::user("Hello")).unwrap();
+        assert!(plain[0]["content"].is_string());
+
+        // Missing bytes is a local mapping error: never a silent drop to text.
+        let broken = Message::user_parts(vec![MessagePart::Image(crate::provider::ImageBlock {
+            source: crate::provider::ImageSource::Url {
+                url: "https://example.com/x.png".to_string(),
+            },
+            label: "stale.png".to_string(),
+            media_type: crate::provider::ImageMediaType::Png,
+            width: 8,
+            height: 4,
+            bytes: None,
+        })]);
+        assert!(message_wire(&broken).is_err());
     }
 
     #[test]

@@ -79,6 +79,12 @@ pub struct AgentConfig {
     pub max_concurrent_network_tools: usize,
     #[serde(default = "default_max_concurrent_subagents")]
     pub max_concurrent_subagents: usize,
+    /// Whether the configured model accepts native image input. Defaults to
+    /// false; vision capability is never guessed from the model name or
+    /// protocol, so the user must enable it explicitly for a vision-capable
+    /// model.
+    #[serde(default)]
+    pub supports_images: bool,
 }
 
 const fn default_max_tokens() -> u32 {

@@ -184,6 +184,7 @@ mod tests {
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,
+            supports_images: false,
         };
         SubagentRuntime::new(
             &config,

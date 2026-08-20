@@ -33,8 +33,9 @@ use tokio::fs as async_fs;
 use tokio::io::AsyncReadExt as _;
 
 use super::util::{portable_path, range_schema, required_string};
-use crate::agent::{canonical_root, SnapshotStore, Tool, ToolExecutionPolicy};
+use crate::agent::{canonical_root, SnapshotStore, Tool, ToolExecutionPolicy, ToolOutput};
 use crate::attachment::{AttachmentStore, AttachmentUri};
+use crate::provider::ImageBlock;
 use crate::storage::ATTACHMENTS_DIR;
 
 use self::attachments::AttachmentParser;
@@ -46,6 +47,7 @@ use self::text::TextFileParser;
 use self::web::WebParser;
 
 pub use self::notes::{ListNotes, SearchFiles};
+pub(crate) use self::web::fetch_web_response;
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
@@ -110,6 +112,7 @@ pub(crate) struct ParseContext {
 pub(crate) enum ReadPayload {
     Text(String),
     Structured(Value),
+    Image(ImageBlock),
 }
 
 /// A reader for one kind of target. Implementations are tried in registration
@@ -179,7 +182,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options. To fetch the raw unprocessed response body instead, use `http_request`."
+        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options. To fetch the raw unprocessed response body instead, use `http_request`."
     }
 
     fn input_schema(&self) -> Value {
@@ -212,16 +215,44 @@ impl Tool for Read {
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
+        Ok(self.read_output(input).await?.text)
+    }
+
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        self.read_output(input).await
+    }
+}
+
+impl Read {
+    /// Dispatch a target to its parser and return the full tool output: text
+    /// for text/document targets, or a native image block plus its summary.
+    pub(crate) async fn read_output(&self, input: &Value) -> Result<ToolOutput> {
         let target = resolve_target(&self.ctx, input).await?;
         for parser in &self.parsers {
             if parser.matches(&target) {
-                return match parser.parse(&self.ctx, &target, input).await? {
-                    ReadPayload::Text(text) => Ok(text),
+                let payload = parser.parse(&self.ctx, &target, input).await?;
+                return match payload {
+                    ReadPayload::Text(text) => Ok(ToolOutput::text(text)),
+                    ReadPayload::Image(block) => {
+                        let target_display = target.display(&self.ctx.root);
+                        let byte_count = block.bytes.as_ref().map_or(0, |bytes| bytes.len());
+                        let summary = format!(
+                            "Read image {target_display} ({}x{}, {}, {byte_count} bytes).",
+                            block.width,
+                            block.height,
+                            block.media_type.mime(),
+                        );
+                        Ok(ToolOutput {
+                            text: summary,
+                            images: vec![block],
+                        })
+                    }
                     ReadPayload::Structured(Value::Object(mut payload)) => {
                         payload.insert("kind".into(), json!(target.kind()));
                         payload.insert("target".into(), json!(target.display(&self.ctx.root)));
-                        serde_json::to_string_pretty(&Value::Object(payload))
-                            .context("encoding read result")
+                        let text = serde_json::to_string_pretty(&Value::Object(payload))
+                            .context("encoding read result")?;
+                        Ok(ToolOutput::text(text))
                     }
                     ReadPayload::Structured(_) => {
                         bail!("parser {} returned non-object payload", parser.name())
@@ -405,5 +436,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("attachment internals"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_and_attachment_images_return_native_tool_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(directory.path().join(ATTACHMENTS_DIR));
+        store.ensure_layout().unwrap();
+        let image = image::DynamicImage::new_rgb8(8, 4);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let png = buf.into_inner();
+        let path = directory.path().join("diagram.png");
+        fs::write(&path, &png).unwrap();
+        let uri = store
+            .import_bytes(&png, Some("diagram.png"))
+            .unwrap()
+            .uri()
+            .to_string();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // Absolute local path.
+        let output = read
+            .execute_output(&json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(output
+            .text
+            .starts_with("Read image diagram.png (8x4, image/png, "));
+        assert_eq!(output.images.len(), 1);
+        assert!(output.images[0].bytes.is_some());
+
+        // Relative local path resolves against the nole root.
+        let output = read
+            .execute_output(&json!({ "path": "diagram.png" }))
+            .await
+            .unwrap();
+        assert_eq!(output.images.len(), 1);
+        assert!(matches!(
+            &output.images[0].source,
+            crate::provider::ImageSource::LocalFile { .. }
+        ));
+
+        // Attachment URI.
+        let output = read.execute_output(&json!({ "path": uri })).await.unwrap();
+        assert_eq!(output.images.len(), 1);
+        assert!(matches!(
+            &output.images[0].source,
+            crate::provider::ImageSource::Attachment { .. }
+        ));
+
+        // Line selectors are rejected for image targets.
+        let error = read
+            .execute_output(&json!({ "path": format!("{uri}:1-2") }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "line selectors are not supported for image targets"
+        );
+
+        // Corrupted image bytes fail explicitly, not as a UTF-8 error.
+        let bad = directory.path().join("broken.png");
+        fs::write(&bad, b"\x89PNG\r\n\x1a\nnot-a-real-png").unwrap();
+        let error = read
+            .execute_output(&json!({ "path": bad.to_str().unwrap() }))
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("not valid UTF-8"));
     }
 }

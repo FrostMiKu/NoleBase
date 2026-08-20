@@ -15,6 +15,9 @@ use super::super::web::{read_http_body_with_limit, web_fetch_content};
 use super::document::{self, DocumentFormat, DocumentSourceKey};
 use super::paging::{add_structured_page, json_response_len, line_window, page_extracted_text};
 use super::{ParseContext, ReadParser, ReadPayload, Target};
+use crate::agent::images::image_block_from_bytes;
+use crate::image_data::{detect_image_format, MAX_IMAGE_BYTES};
+use crate::provider::ImageSource;
 
 const MAX_WEB_READ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_WEB_ERROR_PREVIEW_BYTES: usize = 2 * 1024;
@@ -41,23 +44,40 @@ impl ReadParser for WebParser {
             bail!("web parser received non-web target");
         };
         let (offset, limit) = line_window(*range, input)?;
-        let response = ctx
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(web_request_error)?;
-        if !response.status().is_success() {
-            return Err(web_http_status_error(response).await);
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let bytes = read_http_body_with_limit(response, "response", MAX_WEB_READ_BYTES)
+        let (response, final_url, content_type) = fetch_web_response(&ctx.client, url).await?;
+        let is_image_content_type = content_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("image/"));
+        let body_limit = if is_image_content_type {
+            MAX_IMAGE_BYTES
+        } else {
+            MAX_WEB_READ_BYTES
+        };
+        let bytes = read_http_body_with_limit(response, "response", body_limit)
             .await
             .context("web fetch failed during response_body")?;
+        let magic_format = detect_image_format(&bytes);
+        if is_image_content_type || magic_format.is_some() {
+            // A declared image content type must decode as an image; a faked
+            // content type or corrupted payload fails here explicitly instead
+            // of falling through to document/UTF-8 parsing.
+            magic_format.ok_or_else(|| anyhow::anyhow!("web fetch failed during image_decode"))?;
+            if range.is_some() {
+                bail!("line selectors are not supported for image targets");
+            }
+            let block = tokio::task::spawn_blocking(move || {
+                image_block_from_bytes(
+                    ImageSource::Url {
+                        url: final_url.clone(),
+                    },
+                    final_url.clone(),
+                    bytes,
+                )
+            })
+            .await
+            .context("web fetch failed during image_decode")??;
+            return Ok(ReadPayload::Image(block));
+        }
         let url_path = Path::new(url.split(['?', '#']).next().unwrap_or(url));
         let detected = DocumentFormat::from_bytes_or_path(&bytes, url_path);
         let (content, format) = if let Some(format) = detected {
@@ -87,6 +107,27 @@ impl ReadParser for WebParser {
         add_structured_page(&mut payload, page, url, offset, limit);
         Ok(ReadPayload::Structured(payload))
     }
+}
+
+/// Extract the shared fetch boundary used by both the `read` web parser and
+/// the agent's image source resolver: request send with transport phase
+/// classification, HTTP status errors with a bounded preview, and the final
+/// (post-redirect) URL plus response content type on success.
+pub(crate) async fn fetch_web_response(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(reqwest::Response, String, Option<String>)> {
+    let response = client.get(url).send().await.map_err(web_request_error)?;
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if !response.status().is_success() {
+        return Err(web_http_status_error(response).await);
+    }
+    Ok((response, final_url, content_type))
 }
 
 fn web_request_error(error: reqwest::Error) -> anyhow::Error {
@@ -186,6 +227,7 @@ mod tests {
     use super::super::Read;
     use super::MAX_WEB_ERROR_PREVIEW_BYTES;
     use crate::agent::{SnapshotStore, Tool};
+    use crate::provider::ImageSource;
 
     #[tokio::test(flavor = "current_thread")]
     async fn url_selectors_page_reader_mode_text() {
@@ -307,5 +349,176 @@ mod tests {
             .unwrap()
             .iter()
             .any(|line| line.as_str().unwrap().contains("Remote PDF marker")));
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::new_rgb8(width, height);
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_images_return_native_tool_output_without_utf8_error() {
+        let png = png_bytes(4, 2);
+        let (url, server) = serve_once("image/png", png);
+        let read = Read::new(
+            tempfile::tempdir().unwrap().path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let output = read
+            .execute_output(&json!({"path": url.clone()}))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(output.images.len(), 1);
+        let block = &output.images[0];
+        assert!(block.bytes.is_some());
+        let final_url = reqwest::Url::parse(&url).unwrap().to_string();
+        assert!(
+            matches!(&block.source, ImageSource::Url { url: resolved } if resolved == &final_url)
+        );
+        assert!(!output.text.contains("base64"));
+        assert!(output
+            .text
+            .starts_with(&format!("Read image {url} (4x2, image/png, ")));
+
+        // A real image served with a non-image content type is still detected
+        // by magic bytes and returned natively.
+        let (url, server) = serve_once("text/plain", png_bytes(4, 2));
+        let output = read.execute_output(&json!({"path": url})).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(output.images.len(), 1);
+        assert!(output.images[0].bytes.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_image_reads_preserve_existing_network_policy() {
+        let read = Read::new(
+            tempfile::tempdir().unwrap().path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        // Redirect: the final URL becomes the image source.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = png_bytes(4, 2);
+        let png_for_thread = png.clone();
+        let redirect_location = format!("http://{address}/real.png");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {redirect_location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            drop((stream, reader));
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png_for_thread.len()
+            )
+            .unwrap();
+            stream.write_all(&png_for_thread).unwrap();
+            stream.flush().unwrap();
+        });
+        let output = read
+            .execute_output(&json!({"path": format!("http://{address}/start")}))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(output.images.len(), 1);
+        let final_url = format!("http://{address}/real.png");
+        assert!(matches!(&output.images[0].source, ImageSource::Url { url } if url == &final_url));
+
+        // Fake image content type (no real image bytes) errors explicitly.
+        let (url, server) = serve_once("image/png", b"this is not an image".to_vec());
+        let error = read
+            .execute_output(&json!({"path": url}))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error
+            .to_string()
+            .contains("web fetch failed during image_decode"));
+
+        // Error status still reports the HTTP status preview.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Type: image/png\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmissing file"
+            )
+            .unwrap();
+        });
+        let error = read
+            .execute_output(&json!({"path": format!("http://{address}/missing.png")}))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("HTTP: 404 Not Found"));
+        assert!(error
+            .to_string()
+            .contains("web fetch failed during http_status"));
+
+        // Oversized image payload fails the bounded read, not UTF-8 decoding.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let big_len = (8 * 1024 * 1024) + 1024;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {big_len}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let error = read
+            .execute_output(&json!({"path": format!("http://{address}/big.png")}))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(format!("{error:#}").contains("web fetch failed during response_body"));
+        assert!(!format!("{error:#}").contains("not valid UTF-8"));
     }
 }

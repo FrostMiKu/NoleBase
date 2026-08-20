@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -70,6 +72,15 @@ impl Message {
         }
     }
 
+    /// A user message from an explicit part list, preserving exact ordering
+    /// (for example interleaved text and embedded image parts).
+    pub fn user_parts(parts: Vec<MessagePart>) -> Self {
+        Self {
+            role: MessageRole::User,
+            parts,
+        }
+    }
+
     pub fn assistant(parts: Vec<MessagePart>) -> Self {
         Self {
             role: MessageRole::Assistant,
@@ -128,6 +139,53 @@ pub enum MessagePart {
     },
     ToolUse(ToolCall),
     ToolResult(ToolResult),
+    Image(ImageBlock),
+}
+
+/// Media types that the agent may send to a model as native image input.
+/// GIF is normalized to PNG during validation, so the wire types never carry
+/// GIF; this is the single MIME source for both providers.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageMediaType {
+    Jpeg,
+    Png,
+    Webp,
+}
+
+impl ImageMediaType {
+    pub fn mime(self) -> &'static str {
+        match self {
+            ImageMediaType::Jpeg => "image/jpeg",
+            ImageMediaType::Png => "image/png",
+            ImageMediaType::Webp => "image/webp",
+        }
+    }
+}
+
+/// A persistent weak reference to image content. This source metadata is stored
+/// on disk so pixels can be re-read after session restore; raw bytes remain an
+/// in-process cache on [`ImageBlock`] and are never serialized.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageSource {
+    Attachment { uri: String },
+    LocalFile { path: PathBuf },
+    Url { url: String },
+}
+
+/// A pixel-carrying image content block for user messages and tool output.
+/// `bytes` is skipped by serde so sessions never persist base64 or pixels, and
+/// clones share the underlying pixels through `Arc` without copying.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageBlock {
+    pub source: ImageSource,
+    pub label: String,
+    pub media_type: ImageMediaType,
+    pub width: u32,
+    pub height: u32,
+    #[serde(skip, default)]
+    pub bytes: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

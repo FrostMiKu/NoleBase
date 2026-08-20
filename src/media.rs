@@ -2,14 +2,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use image::ImageReader;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -21,12 +20,10 @@ use ratatui_image::Resize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::{AttachmentStore, AttachmentUri};
+use crate::image_data::{decode_image, MAX_IMAGE_BYTES};
 use crate::storage::ATTACHMENTS_DIR;
 use crate::theme::Theme;
 
-const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_IMAGE_DIMENSION: u32 = 4096;
-const MAX_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
 const MAX_CACHED_IMAGES: usize = 64;
 const MAX_CACHED_REMOTE_SOURCES: usize = 16;
 const MAX_IMAGE_REDIRECTS: usize = 5;
@@ -357,7 +354,7 @@ fn load_protocol(
                 .with_context(|| format!("reading attachment {uri}"))?,
         ),
     };
-    let image = decode_image(bytes.as_ref())?;
+    let (image, _format) = decode_image(bytes.as_ref())?;
     SlicedProtocol::new_with_resize(picker, image, size, Resize::Fit(None))
         .context("encoding image for the terminal")
 }
@@ -564,18 +561,6 @@ fn is_retryable_image_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
 }
 
-fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
-    let mut reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("detecting image format")?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
-    reader.limits(limits);
-    reader.decode().context("decoding image")
-}
-
 fn draw_image_placeholder(
     frame: &mut Frame,
     viewport: Rect,
@@ -742,7 +727,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -879,7 +864,7 @@ mod tests {
         let image = image::DynamicImage::new_rgb8(8, 4);
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        let decoded = decode_image(&bytes.into_inner()).unwrap();
+        let (decoded, _format) = decode_image(&bytes.into_inner()).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (8, 4));
     }
 

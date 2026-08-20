@@ -2,7 +2,7 @@
 //!
 //! Attachment reads are read-only: they never register an edit snapshot.
 //! Physical object paths stay private; the URI is the only address exposed to
-//! the model. Images return header-only dimensions, documents extract markdown,
+//! the model. Images return native validated pixels, documents extract Markdown,
 //! textual content pages like a file, and everything else returns metadata.
 
 use std::path::Path;
@@ -11,7 +11,10 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::fs as async_fs;
 
-use crate::attachment::{AttachmentId, AttachmentMetadata, AttachmentStore, AttachmentUri};
+use crate::agent::images::image_block_from_bytes;
+use crate::attachment::{AttachmentMetadata, AttachmentUri};
+use crate::image_data::MAX_IMAGE_BYTES;
+use crate::provider::ImageSource;
 
 use super::document::{self, DocumentFormat, DocumentSourceKey};
 use super::paging::{
@@ -46,13 +49,28 @@ impl ReadParser for AttachmentParser {
             .with_context(|| format!("reading attachment {uri}"))?;
         let mime = metadata.mime_type.as_deref().unwrap_or("");
         if mime.starts_with("image/") {
-            let mut payload = attachment_metadata_json(*uri, &metadata);
-            if let Ok((width, height, format)) = image_dimensions(&ctx.attachments, uri.id()) {
-                payload["width"] = json!(width);
-                payload["height"] = json!(height);
-                payload["format"] = json!(format);
+            if range.is_some() {
+                bail!("line selectors are not supported for image targets");
             }
-            return Ok(ReadPayload::Structured(payload));
+            let store = ctx.attachments.clone();
+            let id = uri.id();
+            let bytes =
+                tokio::task::spawn_blocking(move || store.read_limited(id, MAX_IMAGE_BYTES))
+                    .await
+                    .context("joining attachment image read")?
+                    .with_context(|| format!("reading attachment image {uri}"))?;
+            let display_name = metadata.display_name.clone();
+            let uri_string = uri.to_string();
+            let block = tokio::task::spawn_blocking(move || {
+                image_block_from_bytes(
+                    ImageSource::Attachment { uri: uri_string },
+                    display_name,
+                    bytes,
+                )
+            })
+            .await
+            .context("joining attachment image decode")??;
+            return Ok(ReadPayload::Image(block));
         }
         let attachment_path = Path::new(&metadata.display_name);
         if DocumentFormat::from_path(attachment_path).is_some() {
@@ -142,25 +160,6 @@ fn attachment_metadata_json(uri: AttachmentUri, metadata: &AttachmentMetadata) -
     })
 }
 
-/// Decode image dimensions from the file header only, without loading the
-/// object bytes into memory. The store's `open` path is the sanctioned way to
-/// reach the real content file for decoding.
-fn image_dimensions(store: &AttachmentStore, id: AttachmentId) -> Result<(u32, u32, String)> {
-    let path = store.open(id)?;
-    let reader = image::ImageReader::open(&path)
-        .with_context(|| format!("opening image {}", path.display()))?
-        .with_guessed_format()
-        .context("detecting image format")?;
-    let format = reader
-        .format()
-        .map(|format| format!("{format:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string());
-    let (width, height) = reader
-        .into_dimensions()
-        .context("reading image dimensions")?;
-    Ok((width, height, format))
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -172,6 +171,7 @@ mod tests {
     use super::super::{Read, ATTACHMENTS_DIR};
     use crate::agent::{SnapshotStore, Tool};
     use crate::attachment::AttachmentStore;
+    use crate::provider::ImageSource;
 
     #[tokio::test(flavor = "current_thread")]
     async fn attachment_pdf_uris_extract_selected_text_lines() {
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn image_attachments_return_dimensions() {
+    async fn attachment_images_return_a_native_image_block() {
         let directory = tempfile::tempdir().unwrap();
         let store = AttachmentStore::new(directory.path().join(ATTACHMENTS_DIR));
         store.ensure_layout().unwrap();
@@ -295,13 +295,19 @@ mod tests {
         )
         .unwrap();
 
-        let parsed: Value =
-            serde_json::from_str(&read.execute(&json!({ "path": uri })).await.unwrap()).unwrap();
-        assert_eq!(parsed["kind"], "attachment");
-        assert_eq!(parsed["mime_type"], "image/png");
-        assert_eq!(parsed["width"], 8);
-        assert_eq!(parsed["height"], 4);
-        assert_eq!(parsed["format"], "png");
+        let output = read.execute_output(&json!({ "path": uri })).await.unwrap();
+        assert!(output
+            .text
+            .starts_with(&format!("Read image {uri} (8x4, image/png, ")));
+        assert_eq!(output.images.len(), 1);
+        let block = &output.images[0];
+        assert_eq!(block.width, 8);
+        assert_eq!(block.height, 4);
+        assert!(block.bytes.is_some());
+        assert_eq!(
+            matches!(&block.source, ImageSource::Attachment { .. }),
+            true
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

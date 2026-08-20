@@ -9,14 +9,14 @@ use anyhow::{bail, Context, Result};
 use futures_util::stream::{self, StreamExt};
 
 use super::{
-    prompt_with_datetime, wait_for_provider_retry, AgentConfig, AgentEvent, AgentEventSender,
-    RegisteredTool, Tool, ToolConcurrencyLimits, ToolExecutionPolicy,
-    MAX_PROVIDER_REQUEST_ATTEMPTS,
+    images::DISABLED_IMAGE_ERROR, prompt_with_datetime, wait_for_provider_retry, AgentConfig,
+    AgentEvent, AgentEventSender, RegisteredTool, Tool, ToolCallOutput, ToolConcurrencyLimits,
+    ToolExecutionPolicy, MAX_PROVIDER_REQUEST_ATTEMPTS,
 };
 use crate::agent_session::TokenUsage;
 use crate::provider::{
-    is_transient_provider_error, Message, Provider, ProviderRequest, StopReason, SystemBlock,
-    ToolCall, ToolResult, ToolSpec,
+    is_transient_provider_error, Message, MessagePart, Provider, ProviderRequest, StopReason,
+    SystemBlock, ToolCall, ToolResult, ToolSpec,
 };
 
 #[derive(Clone)]
@@ -24,6 +24,7 @@ pub(crate) struct SubagentRuntime {
     model: String,
     max_tokens: u32,
     max_rounds: u32,
+    supports_images: bool,
     provider: Arc<dyn Provider>,
     system: Vec<SystemBlock>,
     events: AgentEventSender,
@@ -44,6 +45,7 @@ impl SubagentRuntime {
             model: config.model.clone(),
             max_tokens: config.max_tokens,
             max_rounds: config.max_rounds,
+            supports_images: config.supports_images,
             provider,
             system,
             events,
@@ -158,7 +160,7 @@ impl SubagentRunner {
             let results = self
                 .execute_tool_batch(&calls, &response.tool_input_errors)
                 .await;
-            messages.extend(results.into_iter().map(Message::tool));
+            messages.extend(results);
         }
         bail!("{} subagent exhausted its round budget", self.profile.name)
     }
@@ -205,8 +207,8 @@ impl SubagentRunner {
         &self,
         calls: &[ToolCall],
         input_errors: &HashMap<String, String>,
-    ) -> Vec<ToolResult> {
-        let mut results = Vec::with_capacity(calls.len());
+    ) -> Vec<Message> {
+        let mut outputs = Vec::with_capacity(calls.len());
         let mut index = 0;
         while index < calls.len() {
             let policy = self.tool_execution_policy(&calls[index]);
@@ -222,16 +224,37 @@ impl SubagentRunner {
             let mut executions = stream::iter(wave.iter().cloned().enumerate())
                 .map(|(offset, call)| async move {
                     let result = self.execute_call(&call, input_errors.get(&call.id)).await;
-                    (offset, result)
+                    (index + offset, result)
                 })
                 .buffer_unordered(wave.len().max(1))
                 .collect::<Vec<_>>()
                 .await;
             executions.sort_by_key(|(offset, _)| *offset);
-            results.extend(executions.into_iter().map(|(_, result)| result));
+            outputs.extend(executions);
             index = end;
         }
-        results
+        outputs.sort_by_key(|(offset, _)| *offset);
+        let mut messages = Vec::with_capacity(outputs.len() + 1);
+        let mut trailing = Vec::new();
+        for (offset, output) in outputs {
+            messages.push(Message::tool(output.result));
+            if !output.images.is_empty() {
+                let name = calls
+                    .get(offset)
+                    .map(|call| call.name.as_str())
+                    .unwrap_or("");
+                for block in output.images {
+                    trailing.push(MessagePart::Text {
+                        text: format!("Image returned by tool {name}: {}", block.label),
+                    });
+                    trailing.push(MessagePart::Image(block));
+                }
+            }
+        }
+        if !trailing.is_empty() {
+            messages.push(Message::user_parts(trailing));
+        }
+        messages
     }
 
     fn tool_execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
@@ -242,7 +265,7 @@ impl SubagentRunner {
             })
     }
 
-    async fn execute_call(&self, call: &ToolCall, input_error: Option<&String>) -> ToolResult {
+    async fn execute_call(&self, call: &ToolCall, input_error: Option<&String>) -> ToolCallOutput {
         let result = match input_error {
             Some(error) => Err(anyhow::anyhow!(error.clone())),
             None => match self
@@ -266,16 +289,29 @@ impl SubagentRunner {
             },
         };
         match result {
-            Ok(content) => ToolResult {
-                tool_use_id: call.id.clone(),
-                content,
-                is_error: false,
-            },
-            Err(error) => ToolResult {
+            Ok(output) => {
+                if !output.images.is_empty() && !self.runtime.supports_images {
+                    ToolCallOutput::text(ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: DISABLED_IMAGE_ERROR.to_string(),
+                        is_error: true,
+                    })
+                } else {
+                    ToolCallOutput::with_images(
+                        ToolResult {
+                            tool_use_id: call.id.clone(),
+                            content: output.text,
+                            is_error: false,
+                        },
+                        output.images,
+                    )
+                }
+            }
+            Err(error) => ToolCallOutput::text(ToolResult {
                 tool_use_id: call.id.clone(),
                 content: super::tool_error_message(&error),
                 is_error: true,
-            },
+            }),
         }
     }
 
@@ -409,6 +445,7 @@ mod tests {
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,
+            supports_images: false,
         };
         let (events, _receiver) = tokio::sync::broadcast::channel(16);
         SubagentRuntime::new(
@@ -430,6 +467,39 @@ mod tests {
             "Review the supplied implementation.",
             "Return the final review now.",
             "Return a complete review.",
+        )
+    }
+
+    fn image_support_runtime(
+        max_rounds: u32,
+        provider: Arc<dyn Provider>,
+        cancelled: Arc<AtomicBool>,
+    ) -> SubagentRuntime {
+        let config = AgentConfig {
+            api_format: ApiFormat::Messages,
+            api_key: "test".to_string(),
+            tavily_api_key: String::new(),
+            model: "test-model".to_string(),
+            base_url: "https://example.com".to_string(),
+            max_tokens: 1_024,
+            context_window_tokens: 8_192,
+            max_rounds,
+            max_concurrent_local_reads: 8,
+            max_concurrent_network_tools: 8,
+            max_concurrent_subagents: 4,
+            supports_images: true,
+        };
+        let (events, _receiver) = tokio::sync::broadcast::channel(16);
+        SubagentRuntime::new(
+            &config,
+            provider,
+            vec![SystemBlock {
+                text: "shared parent context".to_string(),
+                cache: true,
+            }],
+            events,
+            cancelled,
+            ToolConcurrencyLimits::new(8, 8, 4),
         )
     }
 
@@ -650,6 +720,162 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(contents, ["first", "second"]);
+    }
+
+    struct SubagentImageProbe {
+        name: &'static str,
+        label: &'static str,
+        receiver: Option<Arc<Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>>,
+        sender: Option<tokio::sync::mpsc::Sender<()>>,
+        completion: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SubagentImageProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool returning a native image block"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn execution_policy(&self) -> ToolExecutionPolicy {
+            ToolExecutionPolicy::Network
+        }
+
+        async fn execute(&self, _input: &Value) -> Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn execute_output(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+            // Take the receiver out of the mutex and drop the guard before
+            // the await, so the future stays Send.
+            let receiver = self.receiver.as_ref().and_then(|slot| {
+                if let Some(receiver) = slot.lock().unwrap().take() {
+                    Some(receiver)
+                } else {
+                    None
+                }
+            });
+            if let Some(mut receiver) = receiver {
+                let _ = receiver.recv().await;
+            }
+            self.completion.lock().unwrap().push(self.label.to_string());
+            if let Some(sender) = &self.sender {
+                let _ = sender.send(()).await;
+            }
+            Ok(crate::agent::ToolOutput {
+                text: format!("read {}", self.label),
+                images: vec![crate::provider::ImageBlock {
+                    source: crate::provider::ImageSource::Url {
+                        url: format!("https://example.test/{}.png", self.label),
+                    },
+                    label: format!("{}.png", self.label),
+                    media_type: crate::provider::ImageMediaType::Png,
+                    width: 8,
+                    height: 4,
+                    bytes: Some(Arc::from(vec![0xCDu8; 16])),
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn runner_places_tool_images_after_all_tool_results() {
+        let provider = Arc::new(ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([
+                response(
+                    vec![
+                        MessagePart::ToolUse(ToolCall {
+                            id: "a".to_string(),
+                            name: "image_probe_a".to_string(),
+                            input: json!({"label": "first"}),
+                        }),
+                        MessagePart::ToolUse(ToolCall {
+                            id: "b".to_string(),
+                            name: "image_probe_b".to_string(),
+                            input: json!({"label": "second"}),
+                        }),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                response(
+                    vec![MessagePart::Text {
+                        text: "Images seen.".to_string(),
+                    }],
+                    StopReason::End,
+                ),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel::<()>(1);
+        let completion = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = SubagentRunner::new(
+            image_support_runtime(3, provider.clone(), Arc::new(AtomicBool::new(false))),
+            profile(),
+        );
+        runner.register(SubagentImageProbe {
+            name: "image_probe_a",
+            label: "first", // offset 0: waits for the second probe to finish
+            receiver: Some(Arc::new(Mutex::new(Some(receiver)))),
+            sender: None,
+            completion: completion.clone(),
+        });
+        runner.register(SubagentImageProbe {
+            name: "image_probe_b",
+            label: "second", // offset 1: signals completion before returning
+            receiver: None,
+            sender: Some(sender),
+            completion: completion.clone(),
+        });
+
+        let output = crate::agent::test_support::test_runtime()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), runner.run("Compare inputs")).await
+            })
+            .expect("concurrent subagent image tools timed out")
+            .unwrap();
+        assert_eq!(output, "Images seen.");
+        // Completed out of order (second before first) ...
+        let completion_order = completion.lock().unwrap();
+        assert_eq!(completion_order.first().map(String::as_str), Some("second"));
+        assert!(
+            completion_order
+                .iter()
+                .position(|label| label == "second")
+                .unwrap()
+                < completion_order
+                    .iter()
+                    .position(|label| label == "first")
+                    .unwrap()
+        );
+        // ... yet the subagent conversation carries every text tool result in
+        // offset order, then ONE user image message with both images in order.
+        let requests = provider.requests.lock().unwrap();
+        let results = &requests[1].messages[2..];
+        assert_eq!(results.len(), 3);
+        assert!(
+            matches!(&results[0].parts[0], MessagePart::ToolResult(result) if result.content == "read first")
+        );
+        assert!(
+            matches!(&results[1].parts[0], MessagePart::ToolResult(result) if result.content == "read second")
+        );
+        assert_eq!(results[2].role, crate::provider::MessageRole::User);
+        let parts = &results[2].parts;
+        assert_eq!(parts.len(), 4);
+        assert!(
+            matches!(&parts[0], MessagePart::Text { text } if text == "Image returned by tool image_probe_a: first.png")
+        );
+        assert!(matches!(&parts[1], MessagePart::Image(block) if block.label == "first.png"));
+        assert!(
+            matches!(&parts[2], MessagePart::Text { text } if text == "Image returned by tool image_probe_b: second.png")
+        );
+        assert!(matches!(&parts[3], MessagePart::Image(block) if block.label == "second.png"));
     }
 
     struct PhaseTool {

@@ -2011,7 +2011,8 @@
         assert_eq!(
             runtime
                 .block_on(registered.execute(&json!({"message": "valid"})))
-                .unwrap(),
+                .unwrap()
+                .text,
             "notification shown"
         );
         assert!(matches!(
