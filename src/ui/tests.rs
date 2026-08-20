@@ -1864,8 +1864,9 @@ fn approval_panel_with_empty_diff_keeps_body_and_footer() {
 }
 
 #[test]
-fn command_approval_keeps_the_five_row_pty_monitor_above_it() {
+fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
     let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Chat;
     app.agent_terminal
         .set_monitor_snapshot_for_test(AgentTerminalSnapshot {
             title: "ssh build-host".to_string(),
@@ -1887,27 +1888,27 @@ fn command_approval_keeps_the_five_row_pty_monitor_above_it() {
     });
     app.set_overlay(Overlay::Approval);
 
-    let terminal = render(&mut app, 170, 32);
+    let terminal = render(&mut app, 220, 32);
     let screen = buffer_string(&terminal);
     let center = app.layout.center.expect("center panel");
+    let compose = app.layout.compose.expect("Agent compose");
+    let chat = inset_horizontal(center_content_axis(center), 2);
     let overlay = app.layout.overlay.expect("approval overlay");
-    let monitor_width = DIALOG_WIDTH.min(center.width.saturating_sub(4));
-    let monitor_x = center.x + center.width.saturating_sub(monitor_width) / 2;
     assert_eq!(overlay.width, DIALOG_WIDTH);
-    assert_eq!(monitor_width, DIALOG_WIDTH);
+    assert_eq!(compose.x, chat.x + 2);
+    assert_eq!(compose.width + 4, chat.width);
     assert!(screen.contains("PTY · ssh build-host · running"));
     assert!(!screen.contains("zero"));
     for value in ["one", "two", "three", "four", "five"] {
         assert!(screen.contains(value), "missing monitor row {value}");
     }
     assert_eq!(
-        terminal.backend().buffer()[(monitor_x, center.y + AGENT_TERMINAL_MONITOR_ROWS - 1)]
-            .symbol(),
+        terminal.backend().buffer()[(chat.x, center.y + AGENT_TERMINAL_MONITOR_ROWS - 1)].symbol(),
         "└"
     );
     assert_eq!(
         terminal.backend().buffer()[(
-            monitor_x + monitor_width - 1,
+            chat.x + chat.width - 1,
             center.y + AGENT_TERMINAL_MONITOR_ROWS - 1,
         )]
             .symbol(),
@@ -2129,28 +2130,176 @@ fn agent_diff_approval_switches_layout_with_terminal_width() {
         .expect("changed row");
     let content_start = wide_overlay.x + 2;
     let column_boundary = content_start + (wide_overlay.width - 4) / 2;
-    assert!((content_start..column_boundary)
-        .all(|x| buffer[(x, changed_y)].bg == app.theme.diff_deletion_background));
+    assert!((content_start..column_boundary).all(|x| matches!(
+        buffer[(x, changed_y)].bg,
+        color if color == app.theme.diff_deletion_background || color == app.theme.ui_error
+    )));
+    assert!(
+        (content_start..column_boundary).any(|x| buffer[(x, changed_y)].bg == app.theme.ui_error)
+    );
+    assert!(
+        (column_boundary..wide_overlay.x + wide_overlay.width - 2).all(|x| matches!(
+            buffer[(x, changed_y)].bg,
+            color if color == app.theme.diff_addition_background || color == app.theme.ui_task_done
+        ))
+    );
     assert!((column_boundary..wide_overlay.x + wide_overlay.width - 2)
-        .all(|x| buffer[(x, changed_y)].bg == app.theme.diff_addition_background));
+        .any(|x| buffer[(x, changed_y)].bg == app.theme.ui_task_done));
 }
 
 #[test]
-fn unified_diff_uses_full_width_change_backgrounds() {
+fn unified_diff_uses_full_width_backgrounds_with_intraline_emphasis() {
     let theme = Theme::default();
     let lines = unified_diff_lines("@@ -1 +1 @@\n-old\n+new\n", 12, theme);
 
     assert_eq!(lines.len(), 3);
-    assert!(lines[1]
-        .spans
-        .iter()
-        .all(|span| span.style.bg == Some(theme.diff_deletion_background)));
+    assert_eq!(
+        lines[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme.ui_error))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "old"
+    );
     assert_eq!(lines[1].width(), 12);
-    assert!(lines[2]
+    assert_eq!(
+        lines[2]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme.ui_task_done))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "new"
+    );
+    assert_eq!(lines[2].width(), 12);
+    assert_eq!(
+        lines[1].spans.last().unwrap().style.bg,
+        Some(theme.diff_deletion_background)
+    );
+    assert_eq!(
+        lines[2].spans.last().unwrap().style.bg,
+        Some(theme.diff_addition_background)
+    );
+}
+
+#[test]
+fn diff_views_emphasize_the_exact_unicode_replacement() {
+    let theme = Theme::default();
+    let diff = "@@ -7 +7 @@\n-let title = \"你好世界\";\n+let title = \"你好 Rust\";\n";
+
+    let unified = unified_diff_lines(diff, 50, theme);
+    assert_eq!(
+        unified[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme.ui_error))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "世界"
+    );
+    assert_eq!(
+        unified[2]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme.ui_task_done))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        " Rust"
+    );
+
+    let wrapped = unified_diff_lines(diff, 12, theme);
+    assert_eq!(
+        wrapped
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.bg == Some(theme.ui_error))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "世界"
+    );
+    assert_eq!(
+        wrapped
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.bg == Some(theme.ui_task_done))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        " Rust"
+    );
+
+    let side_by_side = side_by_side_diff_lines(diff, 100, theme);
+    assert_eq!(
+        side_by_side[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme.ui_error))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "世界"
+    );
+    assert_eq!(
+        side_by_side[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme.ui_task_done))
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        " Rust"
+    );
+}
+
+#[test]
+fn diff_alignment_pairs_the_most_similar_lines_and_leaves_insertions_unemphasized() {
+    let rows = side_by_side_diff_rows(
+        "@@ -4,2 +4 @@\n-obsolete setting\n-let value = old\n+let value = new\n",
+    );
+    assert_eq!(
+        rows[1],
+        SideBySideDiffRow::Columns {
+            before: Some(SideBySideDiffCell::new(
+                "-obsolete setting",
+                DiffLineKind::Deletion,
+                Some(4),
+            )),
+            after: None,
+        }
+    );
+    assert_eq!(
+        rows[2],
+        SideBySideDiffRow::Columns {
+            before: Some(SideBySideDiffCell::new(
+                "-let value = old",
+                DiffLineKind::Deletion,
+                Some(5),
+            )),
+            after: Some(SideBySideDiffCell::new(
+                "+let value = new",
+                DiffLineKind::Addition,
+                Some(4),
+            )),
+        }
+    );
+
+    let theme = Theme::default();
+    let insertion = unified_diff_lines("@@ -0,0 +1 @@\n+entirely new\n", 24, theme);
+    assert!(insertion[1]
         .spans
         .iter()
         .all(|span| span.style.bg == Some(theme.diff_addition_background)));
-    assert_eq!(lines[2].width(), 12);
+
+    let long_old = "a".repeat(MAX_INTRALINE_BYTES + 1);
+    let long_new = "b".repeat(MAX_INTRALINE_BYTES + 1);
+    let oversized = unified_diff_lines(
+        &format!("@@ -1 +1 @@\n-{long_old}\n+{long_new}\n"),
+        80,
+        theme,
+    );
+    assert!(oversized
+        .iter()
+        .flat_map(|line| &line.spans)
+        .all(|span| span.style.bg != Some(theme.ui_error)
+            && span.style.bg != Some(theme.ui_task_done)));
 }
 
 #[test]

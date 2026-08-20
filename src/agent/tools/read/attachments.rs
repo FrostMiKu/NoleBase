@@ -304,10 +304,7 @@ mod tests {
         assert_eq!(block.width, 8);
         assert_eq!(block.height, 4);
         assert!(block.bytes.is_some());
-        assert_eq!(
-            matches!(&block.source, ImageSource::Attachment { .. }),
-            true
-        );
+        assert!(matches!(&block.source, ImageSource::Attachment { .. }));
     }
 
     #[tokio::test(flavor = "current_thread")]

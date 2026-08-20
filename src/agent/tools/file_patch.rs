@@ -523,8 +523,8 @@ fn append_edit_windows(out: &mut CappedResult, planned: &PlannedFile, lines: &[S
         if index > 0 {
             out.push("\n");
         }
-        for line_index in *start..*end {
-            out.push(&format!("{}:{}\n", line_index + 1, lines[line_index]));
+        for (line_index, line) in lines.iter().enumerate().take(*end).skip(*start) {
+            out.push(&format!("{}:{line}\n", line_index + 1));
         }
     }
 }

@@ -305,7 +305,7 @@ fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// line index before applying the replacement there. Insertions at the
 /// exclusive end of a replacement sort after it, where the applier's
 /// loop-top drain picks them up next.
-fn sort_and_validate(edits: &mut Vec<LocatedEdit>) -> Result<()> {
+fn sort_and_validate(edits: &mut [LocatedEdit]) -> Result<()> {
     edits.sort_by_key(|located| (located.edit.start_line, located.edit.end_line_exclusive));
 
     let mut previous_span: Option<&LocatedEdit> = None;

@@ -538,42 +538,6 @@ impl DiffPreview {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    use super::*;
-
-    #[test]
-    fn diff_preview_includes_context_around_insertions_and_deletions() {
-        let edits = vec![
-            LineEdit {
-                start_line: 1,
-                end_line_exclusive: 1,
-                lines: vec!["插入一行".to_string()],
-                insertion: true,
-                anchor_line: 2,
-            },
-            LineEdit {
-                start_line: 2,
-                end_line_exclusive: 3,
-                lines: Vec::new(),
-                insertion: false,
-                anchor_line: 3,
-            },
-        ];
-        let source = "测试文本\n第二行\n第三行\n";
-
-        let (preview, _) =
-            build_diff_preview_from_reader(Cursor::new(source), "note.md", &edits, 3).unwrap();
-
-        assert_eq!(
-            preview,
-            "--- note.md\n+++ note.md\n@@ -1,3 +1,3 @@\n 测试文本\n+插入一行\n 第二行\n-第三行\n"
-        );
-    }
-}
-
 #[cfg(not(windows))]
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     fs::rename(source, destination).with_context(|| {
@@ -627,4 +591,40 @@ fn sync_parent(path: &Path) -> Result<()> {
             .with_context(|| format!("syncing {}", parent.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn diff_preview_includes_context_around_insertions_and_deletions() {
+        let edits = vec![
+            LineEdit {
+                start_line: 1,
+                end_line_exclusive: 1,
+                lines: vec!["插入一行".to_string()],
+                insertion: true,
+                anchor_line: 2,
+            },
+            LineEdit {
+                start_line: 2,
+                end_line_exclusive: 3,
+                lines: Vec::new(),
+                insertion: false,
+                anchor_line: 3,
+            },
+        ];
+        let source = "测试文本\n第二行\n第三行\n";
+
+        let (preview, _) =
+            build_diff_preview_from_reader(Cursor::new(source), "note.md", &edits, 3).unwrap();
+
+        assert_eq!(
+            preview,
+            "--- note.md\n+++ note.md\n@@ -1,3 +1,3 @@\n 测试文本\n+插入一行\n 第二行\n-第三行\n"
+        );
+    }
 }

@@ -678,8 +678,9 @@ exists; the underlying virtual terminal remains 24 rows. In `APPROVE` and
 showing the Agent's purpose and the complete command or input. `YOLO` skips
 these approvals. Text sent through `terminal_input` presses Enter by default;
 `submit=false` types the text without submitting it. An exited PTY keeps its
-final screen until `terminal_close` removes it; cancelling the Agent, denying an
-approval, or clearing the Agent session terminates and removes a live PTY
+final screen until `terminal_close` removes it. Denying an approval blocks that
+action but preserves an existing PTY; cancelling the Agent or clearing the Agent
+session terminates and removes a live PTY
 immediately.
 
 The system prompt requires the Agent to use `ask` when it needs an answer before
@@ -697,7 +698,9 @@ updates use the normal read-before-`edit` approval flow.
 In `APPROVE` mode, filesystem mutations and other sensitive updates always pause
 for a diff or confirmation. `AUTO` approves mutations under `${NOLE_DIR}`
 automatically but requires explicit approval for paths elsewhere. `YOLO` skips
-all permission dialogs. Every mode retains path, symlink, identity,
+all permission dialogs. Diff approvals emphasize the exact changed graphemes
+inside paired replacement lines in both unified and side-by-side views. Every
+mode retains path, symlink, identity,
 read-before-update, and non-overwrite validation.
 Adding a new card never requires approval. Note listings return at
 most 2,000 entries per call; file and web responses are capped at 1 MB.

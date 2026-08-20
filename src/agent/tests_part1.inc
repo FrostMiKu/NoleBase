@@ -1925,13 +1925,10 @@
         async fn execute_output(&self, _input: &Value) -> Result<ToolOutput> {
             // Take the receiver out of the mutex and drop the guard before
             // the await, so the future stays Send.
-            let receiver = self.receiver.as_ref().and_then(|slot| {
-                if let Some(receiver) = slot.lock().unwrap().take() {
-                    Some(receiver)
-                } else {
-                    None
-                }
-            });
+            let receiver = self
+                .receiver
+                .as_ref()
+                .and_then(|slot| slot.lock().unwrap().take());
             if let Some(mut receiver) = receiver {
                 let _ = receiver.recv().await;
             }

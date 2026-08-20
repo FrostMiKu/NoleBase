@@ -40,7 +40,7 @@ fn purpose_schema() -> Value {
     })
 }
 
-fn required_purpose<'a>(input: &'a Value) -> Result<&'a str> {
+fn required_purpose(input: &Value) -> Result<&str> {
     let purpose = required_string(input, "purpose")?.trim();
     if purpose.is_empty() {
         anyhow::bail!("field purpose must contain a concrete purpose");

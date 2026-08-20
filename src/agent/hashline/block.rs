@@ -185,9 +185,7 @@ fn sweep_attributes(lines: &[String], anchor: usize) -> Option<usize> {
     let mut lexer = Lexer::new();
     let mut pending = false;
     loop {
-        let Some(line) = lines.get(idx - 1) else {
-            return None;
-        };
+        let line = lines.get(idx - 1)?;
         if pending {
             lexer.scan_line(line);
             idx += 1;
@@ -259,10 +257,10 @@ fn is_list_item(line: &str) -> bool {
         Some(b) if b.is_ascii_digit() => {
             let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
             let rest = &t[digits..];
-            match (rest.as_bytes().first(), rest.as_bytes().get(1)) {
-                (Some(b'.' | b')'), Some(b' ' | b'\t')) => true,
-                _ => false,
-            }
+            matches!(
+                (rest.as_bytes().first(), rest.as_bytes().get(1)),
+                (Some(b'.' | b')'), Some(b' ' | b'\t'))
+            )
         }
         _ => false,
     }

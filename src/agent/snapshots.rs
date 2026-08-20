@@ -39,9 +39,9 @@ const MAX_TOTAL_RETAINED_TEXT: usize = 16 * 1024 * 1024;
 pub(crate) fn normalize_hash_line(line: &str) -> Cow<'_, str> {
     let Some(body) = line.strip_suffix('\n') else {
         // No trailing LF: strip trailing spaces, tabs, and CR at the end.
-        return Cow::Borrowed(line.trim_end_matches(|c| c == ' ' || c == '\t' || c == '\r'));
+        return Cow::Borrowed(line.trim_end_matches([' ', '\t', '\r']));
     };
-    let trimmed = body.trim_end_matches(|c| c == ' ' || c == '\t' || c == '\r');
+    let trimmed = body.trim_end_matches([' ', '\t', '\r']);
     if trimmed.len() == body.len() {
         // Nothing stripped before the LF, so the line is already normalized.
         Cow::Borrowed(line)

@@ -548,13 +548,11 @@ fn message_wire(message: &Message) -> Result<Vec<Value>> {
             if !calls.is_empty() {
                 value["tool_calls"] = Value::Array(calls);
             }
-            if let Some(block) = message.parts.iter().find_map(|part| match part {
-                MessagePart::Image(_) => Some(part),
-                _ => None,
-            }) {
-                let MessagePart::Image(block) = block else {
-                    unreachable!()
-                };
+            if let Some(MessagePart::Image(block)) = message
+                .parts
+                .iter()
+                .find(|part| matches!(part, MessagePart::Image(_)))
+            {
                 bail!(
                     "assistant message for {} contains an image; images are only valid in user messages",
                     block.label

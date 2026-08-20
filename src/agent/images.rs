@@ -231,7 +231,7 @@ fn collect_attachment_image_spans(
                             .position(|item| matches!(item.event, Event::End(ContainerEnd::Image)))
                             .map(|end_offset| index + end_offset);
                         if let Some(end_index) = relative_end {
-                            if let Ok(uri) = AttachmentUri::parse(&target.to_string()) {
+                            if let Ok(uri) = AttachmentUri::parse(target.as_ref()) {
                                 let start = offset + events[index].span.start;
                                 let end = offset + events[end_index].span.end;
                                 let alt = alt_text(&events[index + 1..end_index]);

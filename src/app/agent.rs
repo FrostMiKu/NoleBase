@@ -303,9 +303,6 @@ impl App {
                     }
                     self.ai_running = false;
                     self.ai_cancel = None;
-                    if reason == AgentStopReason::ToolApprovalDenied {
-                        self.agent_terminal.terminate();
-                    }
                     let (notification, status) = match reason {
                         AgentStopReason::RequestRoundLimit => (
                             "Agent stopped at the request-round limit",
@@ -874,9 +871,6 @@ impl App {
         sender
             .send(decision)
             .context("sending Agent approval decision")?;
-        if decision == ApprovalDecision::Deny {
-            self.agent_terminal.terminate();
-        }
         self.set_status(match decision {
             ApprovalDecision::Approve => "Change approved",
             ApprovalDecision::Deny => "Change denied",

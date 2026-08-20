@@ -285,12 +285,15 @@ fn draw_center(
     interactive: bool,
     cursor_position: &mut Option<Position>,
 ) {
-    let area = if app.agent_terminal.is_active() && area.height >= AGENT_TERMINAL_RESERVED_ROWS {
-        let monitor_width = DIALOG_WIDTH.min(area.width.saturating_sub(4).max(area.width.min(1)));
+    let monitor_axis = inset_horizontal(center_content_axis(area), 2);
+    let area = if app.agent_terminal.is_active()
+        && area.height >= AGENT_TERMINAL_RESERVED_ROWS
+        && monitor_axis.width > 0
+    {
         let monitor = Rect::new(
-            area.x + area.width.saturating_sub(monitor_width) / 2,
+            monitor_axis.x,
             area.y,
-            monitor_width,
+            monitor_axis.width,
             AGENT_TERMINAL_MONITOR_ROWS,
         );
         draw_agent_terminal_monitor(frame, app, monitor);

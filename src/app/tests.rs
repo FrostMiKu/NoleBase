@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
+use crate::agent::CommandApproval;
 use crate::attachment::AttachmentStore;
 
 use super::*;
@@ -1336,12 +1337,16 @@ fn approval_overlay_sends_the_user_decision() {
     app.approval_request = Some(ApprovalRequest {
         title: "Send terminal input".to_string(),
         message: String::new(),
-        kind: ApprovalKind::Confirm,
+        kind: ApprovalKind::Command(CommandApproval {
+            purpose: "Answer the prompt".to_string(),
+            label: "Input".to_string(),
+            code: "yes + Enter".to_string(),
+        }),
     });
     app.set_overlay(Overlay::Approval);
     app.handle_key(key(KeyCode::Char('n')));
     assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Deny);
-    assert!(!app.agent_terminal.is_active());
+    assert!(app.agent_terminal.is_active());
 }
 
 #[test]
@@ -1780,6 +1785,7 @@ fn agent_terminal_outcomes_send_distinct_notifications() {
 
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
+    install_agent_terminal_snapshot(&mut app);
     sender
         .send(AgentEvent::Stopped(AgentStopReason::ToolApprovalDenied))
         .unwrap();
@@ -1791,6 +1797,7 @@ fn agent_terminal_outcomes_send_distinct_notifications() {
         Some("Agent stopped after tool approval was denied")
     );
     assert_eq!(app.notifications.take_bells(), 1);
+    assert!(app.agent_terminal.is_active());
 
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
