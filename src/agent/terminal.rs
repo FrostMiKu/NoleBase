@@ -1,0 +1,572 @@
+//! Shared Agent PTY session and non-interactive Brush command runner.
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+
+use crate::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
+
+use super::{shell_helper_command, NONINTERACTIVE_ENVIRONMENT};
+
+const TERMINAL_ROWS: u16 = 24;
+const INITIAL_COLS: u16 = 80;
+const OUTPUT_LIMIT: usize = 1024 * 1024;
+const SETTLE_INTERVAL: Duration = Duration::from_millis(150);
+const POLL_INTERVAL: Duration = Duration::from_millis(40);
+const MAX_SETTLE_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentTerminalStatus {
+    Running,
+    Exited(u32),
+}
+
+impl AgentTerminalStatus {
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Running => "running".to_string(),
+            Self::Exited(code) => format!("exited {code}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentTerminalSnapshot {
+    pub(crate) title: String,
+    pub(crate) status: AgentTerminalStatus,
+    pub(crate) terminal: TerminalSnapshot,
+}
+
+struct AgentTerminalSession {
+    id: String,
+    title: String,
+    terminal: EmbeddedTerminal,
+    status: AgentTerminalStatus,
+}
+
+#[derive(Default)]
+struct AgentTerminalState {
+    next_id: u64,
+    session: Option<AgentTerminalSession>,
+    #[cfg(test)]
+    monitor_override: Option<AgentTerminalSnapshot>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct AgentTerminalHandle {
+    inner: Arc<Mutex<AgentTerminalState>>,
+}
+
+impl AgentTerminalHandle {
+    pub(crate) fn is_active(&self) -> bool {
+        let Ok(state) = self.inner.lock() else {
+            return false;
+        };
+        if state.session.is_some() {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            state.monitor_override.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        let Ok(mut state) = self.inner.lock() else {
+            return false;
+        };
+        if let Some(session) = state.session.as_mut() {
+            let _ = refresh_status(session);
+            return matches!(session.status, AgentTerminalStatus::Running);
+        }
+        #[cfg(test)]
+        {
+            state
+                .monitor_override
+                .as_ref()
+                .is_some_and(|snapshot| matches!(snapshot.status, AgentTerminalStatus::Running))
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn open(&self, root: &Path, command: &str) -> Result<String> {
+        if command.contains('\0') {
+            bail!("terminal command cannot contain NUL bytes");
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        if state.session.is_some() {
+            bail!("an Agent terminal session is already active");
+        }
+        let helper = shell_helper_command("interactive")?;
+        let mut terminal = EmbeddedTerminal::spawn_command(root, helper)?;
+        terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
+        let mut bytes = command.as_bytes().to_vec();
+        bytes.push(b'\r');
+        terminal.write_raw(&bytes)?;
+
+        state.next_id = state.next_id.saturating_add(1);
+        let id = format!("terminal-{}", state.next_id);
+        state.session = Some(AgentTerminalSession {
+            id: id.clone(),
+            title: compact_title(command),
+            terminal,
+            status: AgentTerminalStatus::Running,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn write(&self, session_id: &str, bytes: &[u8]) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        let session = state
+            .session
+            .as_mut()
+            .context("no active Agent terminal session")?;
+        ensure_session(session, session_id)?;
+        refresh_status(session)?;
+        if !matches!(session.status, AgentTerminalStatus::Running) {
+            bail!("terminal session has exited");
+        }
+        session.terminal.write_raw(bytes)
+    }
+
+    pub(crate) fn observation(&self, session_id: &str) -> Result<Value> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        let session = state
+            .session
+            .as_mut()
+            .context("no active Agent terminal session")?;
+        ensure_session(session, session_id)?;
+        refresh_status(session)?;
+        Ok(observation_value(session))
+    }
+
+    pub(crate) fn wait_until_settled(
+        &self,
+        session_id: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + MAX_SETTLE_WAIT;
+        let mut last = self.observation(session_id)?;
+        let mut stable_since = Instant::now();
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("agent task cancelled");
+            }
+            if Instant::now() >= deadline || stable_since.elapsed() >= SETTLE_INTERVAL {
+                return Ok(last);
+            }
+            std::thread::sleep(POLL_INTERVAL);
+            let current = self.observation(session_id)?;
+            if current != last {
+                last = current;
+                stable_since = Instant::now();
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_change(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
+        let initial = self.observation(session_id)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("agent task cancelled");
+            }
+            let current = self.observation(session_id)?;
+            if current != initial || Instant::now() >= deadline {
+                return Ok(current);
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    pub(crate) fn close_exited(&self, session_id: &str) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        let session = state
+            .session
+            .as_mut()
+            .context("no active Agent terminal session")?;
+        ensure_session(session, session_id)?;
+        refresh_status(session)?;
+        if matches!(session.status, AgentTerminalStatus::Running) {
+            bail!("terminal session is still running");
+        }
+        state.session = None;
+        Ok(())
+    }
+
+    pub(crate) fn terminate(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.session = None;
+            #[cfg(test)]
+            {
+                state.monitor_override = None;
+            }
+        }
+    }
+
+    pub(crate) fn monitor_snapshot(&self, cols: u16) -> Option<AgentTerminalSnapshot> {
+        let mut state = self.inner.lock().ok()?;
+        #[cfg(test)]
+        if let Some(snapshot) = &state.monitor_override {
+            return Some(snapshot.clone());
+        }
+        let session = state.session.as_mut()?;
+        let _ = session.terminal.resize(TERMINAL_ROWS, cols.max(1));
+        let _ = refresh_status(session);
+        Some(AgentTerminalSnapshot {
+            title: session.title.clone(),
+            status: session.status.clone(),
+            terminal: session.terminal.snapshot(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_monitor_snapshot_for_test(&self, snapshot: AgentTerminalSnapshot) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.monitor_override = Some(snapshot);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn open_process_for_test(&self, root: &Path, script: &str) -> Result<String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        if state.session.is_some() {
+            bail!("an Agent terminal session is already active");
+        }
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg(script);
+        let mut terminal = EmbeddedTerminal::spawn_command(root, command)?;
+        terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
+        state.next_id = state.next_id.saturating_add(1);
+        let id = format!("terminal-{}", state.next_id);
+        state.session = Some(AgentTerminalSession {
+            id: id.clone(),
+            title: compact_title(script),
+            terminal,
+            status: AgentTerminalStatus::Running,
+        });
+        Ok(id)
+    }
+}
+
+fn ensure_session(session: &AgentTerminalSession, session_id: &str) -> Result<()> {
+    if session.id == session_id {
+        Ok(())
+    } else {
+        bail!("unknown terminal session {session_id}")
+    }
+}
+
+fn refresh_status(session: &mut AgentTerminalSession) -> Result<()> {
+    if matches!(session.status, AgentTerminalStatus::Running) {
+        if let Some(status) = session.terminal.try_wait()? {
+            session.status = AgentTerminalStatus::Exited(status.exit_code());
+        }
+    }
+    Ok(())
+}
+
+fn observation_value(session: &AgentTerminalSession) -> Value {
+    json!({
+        "session_id": session.id,
+        "status": session.status.label(),
+        "screen": session.terminal.snapshot().plain_text(),
+    })
+}
+
+fn compact_title(command: &str) -> String {
+    let title = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = title.chars();
+    let compact = chars.by_ref().take(48).collect::<String>();
+    if chars.next().is_some() {
+        format!("{compact}...")
+    } else {
+        compact
+    }
+}
+
+pub(crate) fn resolve_shell_cwd(root: &Path, input: Option<&str>) -> Result<PathBuf> {
+    let path = match input.map(str::trim).filter(|value| !value.is_empty()) {
+        None => root.to_path_buf(),
+        Some("~") => dirs::home_dir().context("home directory is unavailable")?,
+        Some(value) if value.starts_with("~/") || value.starts_with("~\\") => dirs::home_dir()
+            .context("home directory is unavailable")?
+            .join(&value[2..]),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        }
+    };
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolving shell working directory {}", path.display()))?;
+    if !path.is_dir() {
+        bail!(
+            "shell working directory is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+pub(crate) fn run_noninteractive_shell(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Value> {
+    if command.contains('\0') {
+        bail!("shell command cannot contain NUL bytes");
+    }
+    let executable = std::env::current_exe().context("locating the Nole executable")?;
+    let mut process = Command::new(executable);
+    process
+        .arg("--agent-shell-helper")
+        .arg("command")
+        .arg(command)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_noninteractive_process(&mut process);
+    let mut child = process.spawn().context("starting Brush command")?;
+
+    let stdout = child.stdout.take().context("capturing shell stdout")?;
+    let stderr = child.stderr.take().context("capturing shell stderr")?;
+    let stdout_reader = std::thread::spawn(move || read_limited(stdout));
+    let stderr_reader = std::thread::spawn(move || read_limited(stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("agent task cancelled");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "shell command timed out after {} seconds",
+                timeout.as_secs()
+            );
+        }
+        if let Some(status) = child.try_wait().context("waiting for Brush command")? {
+            break status;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("shell stdout reader panicked"))??;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("shell stderr reader panicked"))??;
+    Ok(json!({
+        "exit_code": status.code().unwrap_or(1),
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+        "truncated": stdout_truncated || stderr_truncated,
+    }))
+}
+
+fn configure_noninteractive_process(command: &mut Command) {
+    command.stdin(Stdio::null());
+    for (name, value) in NONINTERACTIVE_ENVIRONMENT {
+        command.env(name, value);
+    }
+}
+
+fn read_limited(mut reader: impl Read) -> Result<(Vec<u8>, bool)> {
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = OUTPUT_LIMIT.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..count.min(remaining)]);
+        truncated |= count > remaining;
+    }
+    Ok((output, truncated))
+}
+
+pub(crate) fn terminal_input_bytes(
+    text: Option<&str>,
+    submit: bool,
+    key: Option<&str>,
+) -> Result<Vec<u8>> {
+    match (text, key) {
+        (Some(text), None) => {
+            let mut bytes = text.as_bytes().to_vec();
+            if submit {
+                bytes.push(b'\r');
+            }
+            Ok(bytes)
+        }
+        (None, Some(key)) if !submit => terminal_key_bytes(key),
+        _ => bail!("provide either text (optionally submitted) or one key"),
+    }
+}
+
+fn terminal_key_bytes(key: &str) -> Result<Vec<u8>> {
+    let bytes: &[u8] = match key {
+        "enter" => b"\r",
+        "tab" => b"\t",
+        "escape" => b"\x1b",
+        "ctrl-c" => b"\x03",
+        "ctrl-d" => b"\x04",
+        "backspace" => b"\x7f",
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        "home" => b"\x1b[H",
+        "end" => b"\x1b[F",
+        "delete" => b"\x1b[3~",
+        "page-up" => b"\x1b[5~",
+        "page-down" => b"\x1b[6~",
+        _ => bail!("unsupported terminal key {key}"),
+    };
+    Ok(bytes.to_vec())
+}
+
+pub(crate) fn terminal_input_display(
+    text: Option<&str>,
+    submit: bool,
+    key: Option<&str>,
+) -> Result<String> {
+    match (text, key) {
+        (Some(text), None) => Ok(if submit {
+            format!("{text} ↵")
+        } else {
+            text.to_string()
+        }),
+        (None, Some(key)) if !submit => Ok(match key {
+            "enter" => "Enter".to_string(),
+            "tab" => "Tab".to_string(),
+            "escape" => "Escape".to_string(),
+            key if key.starts_with("ctrl-") => key.to_uppercase(),
+            key => key.to_string(),
+        }),
+        _ => bail!("provide either text (optionally submitted) or one key"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_input_is_exact_and_visible() {
+        assert_eq!(
+            terminal_input_bytes(Some("yes"), true, None).unwrap(),
+            b"yes\r"
+        );
+        assert_eq!(
+            terminal_input_display(Some("yes"), true, None).unwrap(),
+            "yes ↵"
+        );
+        assert_eq!(
+            terminal_input_bytes(None, false, Some("ctrl-c")).unwrap(),
+            b"\x03"
+        );
+        assert!(terminal_input_bytes(Some("x"), false, Some("enter")).is_err());
+    }
+
+    #[test]
+    fn noninteractive_process_has_the_fixed_environment() {
+        let mut command = Command::new("unused");
+        configure_noninteractive_process(&mut command);
+        let environment = command
+            .get_envs()
+            .filter_map(|(name, value)| Some((name.to_str()?, value?.to_str()?)))
+            .collect::<std::collections::HashMap<_, _>>();
+        for (name, value) in NONINTERACTIVE_ENVIRONMENT {
+            assert_eq!(environment.get(name), Some(&value), "missing {name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noninteractive_process_receives_immediate_stdin_eof() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("if IFS= read -r value; then exit 1; fi");
+        configure_noninteractive_process(&mut command);
+        assert!(command.status().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_handle_allows_one_session_and_closes_only_after_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = AgentTerminalHandle::default();
+        let running = terminal
+            .open_process_for_test(directory.path(), "sleep 5")
+            .unwrap();
+        assert!(terminal
+            .open_process_for_test(directory.path(), "exit 0")
+            .is_err());
+        assert!(terminal.close_exited(&running).is_err());
+        terminal.terminate();
+        assert!(!terminal.is_active());
+
+        let exited = terminal
+            .open_process_for_test(directory.path(), "exit 7")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observation = terminal.observation(&exited).unwrap();
+            if observation["status"] == "exited 7" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal did not exit: {observation}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        terminal.close_exited(&exited).unwrap();
+        assert!(!terminal.is_active());
+    }
+}

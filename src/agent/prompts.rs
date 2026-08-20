@@ -93,7 +93,9 @@ Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`
 ## Workspace
 Root: {root}
 - `MEMORY.md` at the Nole root is persistent Agent memory. Read it when useful and update it with focused edits when durable user preferences, project facts, or workflow decisions should survive future tasks. Do not store secrets or transient task details there.
-- Never read or expose `config/ai.toml`, and access attachments only through attachment tools."#,
+- Never read or expose `config/ai.toml`, and access attachments only through attachment tools.
+
+Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."#,
         root = root.display(),
     )
 }

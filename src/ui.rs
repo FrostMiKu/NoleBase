@@ -133,6 +133,7 @@ pub(crate) fn animations_active(app: &App, focused: bool) -> bool {
             || app.ai_running
             || app.export_in_progress
             || app.overlay == Some(Overlay::Terminal)
+            || app.agent_terminal.is_running()
             || app.permission_mode == PermissionMode::Yolo
             || app.focus == Focus::Compose
             || matches!(app.center_view, CenterView::Daily | CenterView::Tags))
@@ -284,6 +285,18 @@ fn draw_center(
     interactive: bool,
     cursor_position: &mut Option<Position>,
 ) {
+    let area = if app.agent_terminal.is_active() && area.height >= AGENT_TERMINAL_MONITOR_ROWS {
+        let monitor = Rect::new(area.x, area.y, area.width, AGENT_TERMINAL_MONITOR_ROWS);
+        draw_agent_terminal_monitor(frame, app, monitor);
+        Rect::new(
+            area.x,
+            area.y.saturating_add(AGENT_TERMINAL_MONITOR_ROWS),
+            area.width,
+            area.height.saturating_sub(AGENT_TERMINAL_MONITOR_ROWS),
+        )
+    } else {
+        area
+    };
     let content = center_content_axis(area);
     match app.center_view {
         CenterView::Daily => draw_daily(frame, app, area, content, interactive, cursor_position),
@@ -307,6 +320,20 @@ fn draw_overlay(
     overlay: Overlay,
     cursor_position: &mut Option<Position>,
 ) -> Rect {
+    let root = if overlay == Overlay::Approval
+        && app.agent_terminal.is_active()
+        && app.layout.center.is_some()
+        && root.height > AGENT_TERMINAL_MONITOR_ROWS
+    {
+        Rect::new(
+            root.x,
+            root.y.saturating_add(AGENT_TERMINAL_MONITOR_ROWS),
+            root.width,
+            root.height.saturating_sub(AGENT_TERMINAL_MONITOR_ROWS),
+        )
+    } else {
+        root
+    };
     match overlay {
         Overlay::Terminal => draw_terminal(frame, app, root, cursor_position),
         _ => draw_dialog(frame, app, root, cursor_position),

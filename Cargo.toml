@@ -22,6 +22,9 @@ mbtui = "0.1.4"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 clipboard-rs = { version = "0.3.5", features = ["image"] }
 base64 = "0.22"
+brush-builtins = "0.2.0"
+brush-core = "0.5.0"
+brush-interactive = { version = "0.4.0", features = ["basic"] }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 anyhow = "1"
 anydoc = "0.2.0"

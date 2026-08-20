@@ -53,7 +53,7 @@ impl PermissionMode {
 }
 
 /// How an approval request is presented to the user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApprovalKind {
     /// Show the request as a scrollable unified/side-by-side diff panel.
     Diff,
@@ -61,6 +61,15 @@ pub enum ApprovalKind {
     Confirm,
     /// Show an irreversible or data-removing action as an error-colored confirmation.
     DestructiveConfirm,
+    /// Show an Agent-provided purpose and the exact command or PTY input.
+    Command(CommandApproval),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandApproval {
+    pub purpose: String,
+    pub label: String,
+    pub code: String,
 }
 
 #[derive(Clone, Debug)]

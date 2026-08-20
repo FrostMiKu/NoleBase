@@ -10,6 +10,7 @@ pub enum DialogMode {
     SelectOrInput,
     FreeText,
     Approval,
+    CommandApproval,
     Informational,
     CommandPalette,
 }
@@ -51,6 +52,12 @@ pub struct DialogOption {
     pub hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogCommand {
+    pub label: String,
+    pub code: String,
+}
+
 impl DialogOption {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
@@ -82,6 +89,7 @@ pub struct DialogState {
     pub input: String,
     pub cursor: usize,
     pub scroll: u16,
+    pub command: Option<DialogCommand>,
 }
 
 impl DialogState {
@@ -104,6 +112,7 @@ impl DialogState {
             input: String::new(),
             cursor: 0,
             scroll: 0,
+            command: None,
         }
     }
 

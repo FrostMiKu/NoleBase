@@ -150,7 +150,7 @@ impl App {
             DialogMode::SelectOrInput => return self.handle_custom_select_or_input(key),
             DialogMode::SingleLine | DialogMode::FreeText => return self.handle_text_dialog(key),
             DialogMode::CommandPalette => return self.handle_command_palette(key),
-            DialogMode::Approval | DialogMode::Informational => {}
+            DialogMode::Approval | DialogMode::CommandApproval | DialogMode::Informational => {}
         }
         None
     }

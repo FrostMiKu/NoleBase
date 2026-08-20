@@ -355,6 +355,7 @@ pub struct App {
     terminal: Option<EmbeddedTerminal>,
     terminal_return_overlay: Option<Overlay>,
     terminal_return_dialog: Option<DialogState>,
+    pub(crate) agent_terminal: crate::agent::AgentTerminalHandle,
 
     active_agent: Option<Observable<crate::agent::AgentRunOutput, AgentEvent>>,
     ai_approval_sender: Option<tokio::sync::mpsc::UnboundedSender<ApprovalDecision>>,
@@ -449,6 +450,7 @@ impl App {
         let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
         let permission_mode_atomic = Arc::new(AtomicU8::new(PermissionMode::Approve.code()));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let agent_terminal = crate::agent::AgentTerminalHandle::default();
         let (event_sender, _) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
         let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -463,6 +465,7 @@ impl App {
                 permission_mode_atomic.clone(),
                 cancelled.clone(),
             )
+            .with_terminal(agent_terminal.clone())
             .with_workspace_index(workspace_index.clone())
             .with_wiki_link_index(wiki_links.clone()),
             attachment_usage.clone(),
@@ -575,6 +578,7 @@ impl App {
             terminal: None,
             terminal_return_overlay: None,
             terminal_return_dialog: None,
+            agent_terminal,
             active_agent: None,
             ai_approval_sender: Some(approval_sender),
             ai_user_sender: Some(user_sender),

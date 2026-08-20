@@ -525,6 +525,13 @@ where
 }
 
 fn main() -> Result<()> {
+    if let Some(mode) = agent::shell_helper_mode(std::env::args()) {
+        let code = agent::run_shell_helper(mode).unwrap_or_else(|error| {
+            eprintln!("Nole shell helper error: {error:#}");
+            1
+        });
+        std::process::exit(i32::from(code));
+    }
     if wants_version(std::env::args()) {
         println!("nole {}", env!("CARGO_PKG_VERSION"));
         return Ok(());

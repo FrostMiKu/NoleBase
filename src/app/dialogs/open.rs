@@ -334,10 +334,26 @@ impl App {
             }
             Overlay::Approval => {
                 let request = self.approval_request.as_ref();
-                let mut dialog = match request.map(|request| request.kind) {
+                let mut dialog = match request.map(|request| request.kind.clone()) {
+                    Some(ApprovalKind::Command(command)) => {
+                        let mut dialog = DialogState::new(
+                            request
+                                .map(|request| request.title.clone())
+                                .unwrap_or_else(|| "Approve command".to_string()),
+                            command.purpose,
+                            DialogMode::CommandApproval,
+                            DialogPurpose::AgentApproval,
+                            Vec::new(),
+                        );
+                        dialog.command = Some(DialogCommand {
+                            label: command.label,
+                            code: command.code,
+                        });
+                        dialog
+                    }
                     Some(ApprovalKind::Confirm | ApprovalKind::DestructiveConfirm) => {
                         let destructive = request.is_some_and(|request| {
-                            request.kind == ApprovalKind::DestructiveConfirm
+                            matches!(request.kind, ApprovalKind::DestructiveConfirm)
                         });
                         DialogState::new(
                             request

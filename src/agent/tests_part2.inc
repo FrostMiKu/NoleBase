@@ -627,6 +627,16 @@
     }
 
     #[test]
+    fn system_prompt_prefers_built_in_tools_before_shells() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains(
+            "Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."
+        ));
+        assert!(!prompt.contains("every shell command"));
+        assert!(!prompt.contains("terminal input"));
+    }
+
+    #[test]
     fn system_prompt_cache_sections_isolate_dynamic_memory() {
         let first = system_prompt_sections(
             Path::new("/tmp/nole"),
@@ -2074,6 +2084,41 @@
         let yolo_external = gate(PermissionMode::Yolo, &root, events, decision_receiver);
         test_runtime()
             .block_on(yolo_external.request_for_paths(request(), &[&external]))
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn host_actions_ask_in_approve_and_auto_but_not_yolo() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root_dir.path()).unwrap();
+        let request = || ApprovalRequest {
+            title: "Run shell command".to_string(),
+            message: String::new(),
+            kind: ApprovalKind::Command(CommandApproval {
+                purpose: "Check formatting".to_string(),
+                label: "Cmd".to_string(),
+                code: "markdownlint data/note.md".to_string(),
+            }),
+        };
+
+        for mode in [PermissionMode::Approve, PermissionMode::Auto] {
+            let (events, mut receiver) = event_channel();
+            let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+            decisions.send(ApprovalDecision::Approve).unwrap();
+            test_runtime()
+                .block_on(gate(mode, &root, events, decision_receiver).request_host_action(request()))
+                .unwrap();
+            assert!(matches!(receiver.try_recv(), Ok(AgentEvent::Approval(_))));
+        }
+
+        let (events, mut receiver) = event_channel();
+        let (_decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        test_runtime()
+            .block_on(
+                gate(PermissionMode::Yolo, &root, events, decision_receiver)
+                    .request_host_action(request()),
+            )
             .unwrap();
         assert!(receiver.try_recv().is_err());
     }

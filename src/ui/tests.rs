@@ -151,7 +151,9 @@ fn animated_color(position: usize, tick: u64) -> Color {
     super::animated_color(position, tick, Theme::default())
 }
 use crate::agent::AskUserKind;
-use crate::agent::{ApprovalKind, ApprovalRequest};
+use crate::agent::{
+    AgentTerminalSnapshot, AgentTerminalStatus, ApprovalKind, ApprovalRequest, CommandApproval,
+};
 use crate::agent_session::AgentPanelEntry;
 use crate::app::{Document, DocumentKind, DocumentReturn};
 use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate, WikiLinkLocation};
@@ -1859,6 +1861,88 @@ fn approval_panel_with_empty_diff_keeps_body_and_footer() {
 
     let wide = render(&mut app, 180, 24);
     assert!(buffer_string(&wide).contains("No changes to display"));
+}
+
+#[test]
+fn command_approval_keeps_the_five_row_pty_monitor_above_it() {
+    let (mut app, _directory) = make_app();
+    app.agent_terminal
+        .set_monitor_snapshot_for_test(AgentTerminalSnapshot {
+            title: "ssh build-host".to_string(),
+            status: AgentTerminalStatus::Running,
+            terminal: TerminalSnapshot::from_bytes(
+                24,
+                80,
+                b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive",
+            ),
+        });
+    app.approval_request = Some(ApprovalRequest {
+        title: "Run shell command".to_string(),
+        message: String::new(),
+        kind: ApprovalKind::Command(CommandApproval {
+            purpose: "Run Markdown format checks and report problems".to_string(),
+            label: "Cmd".to_string(),
+            code: "markdownlint data/note.md\nprintf '%s\\n' done".to_string(),
+        }),
+    });
+    app.set_overlay(Overlay::Approval);
+
+    let terminal = render(&mut app, 170, 32);
+    let screen = buffer_string(&terminal);
+    let center = app.layout.center.expect("center panel");
+    let overlay = app.layout.overlay.expect("approval overlay");
+    assert!(screen.contains("PTY · ssh build-host · running"));
+    assert!(!screen.contains("zero"));
+    for value in ["one", "two", "three", "four", "five"] {
+        assert!(screen.contains(value), "missing monitor row {value}");
+    }
+    assert_eq!(
+        terminal.backend().buffer()[(center.x, center.y + AGENT_TERMINAL_MONITOR_ROWS - 1)]
+            .symbol(),
+        "└"
+    );
+    assert!(
+        overlay.y >= center.y + AGENT_TERMINAL_MONITOR_ROWS,
+        "approval must start below the PTY monitor"
+    );
+    assert!(screen.contains("Agent: Run Markdown format checks and report problems"));
+    assert!(screen.contains("Cmd:"));
+    assert!(screen.contains("markdownlint data/note.md"));
+    assert!(screen.contains("printf '%s\\n' done"));
+    assert!(screen.contains("Enter/Y approve"));
+    let (command_y, command_x) = screen
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| {
+            line.find("markdownlint")
+                .map(|byte| (y as u16, UnicodeWidthStr::width(&line[..byte]) as u16))
+        })
+        .expect("highlighted command");
+    let command_cell = &terminal.backend().buffer()[(command_x, command_y)];
+    assert_eq!(command_cell.fg, app.theme.markdown_link);
+    assert_eq!(command_cell.bg, app.theme.markdown_code_block_background);
+    assert_eq!(
+        app.agent_terminal
+            .monitor_snapshot(80)
+            .expect("monitor snapshot")
+            .terminal
+            .size(),
+        (24, 80),
+        "the five-row monitor must not resize the PTY"
+    );
+    assert!(animations_active(&app, true));
+}
+
+#[test]
+fn command_highlighting_treats_embedded_hashes_as_word_content() {
+    let spans = shell_highlight_line("printf %s foo#bar", Theme::default());
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        "printf %s foo#bar"
+    );
 }
 
 #[test]

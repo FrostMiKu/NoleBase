@@ -303,6 +303,9 @@ impl App {
                     }
                     self.ai_running = false;
                     self.ai_cancel = None;
+                    if reason == AgentStopReason::ToolApprovalDenied {
+                        self.agent_terminal.terminate();
+                    }
                     let (notification, status) = match reason {
                         AgentStopReason::RequestRoundLimit => (
                             "Agent stopped at the request-round limit",
@@ -381,6 +384,7 @@ impl App {
             }
         }
         if disconnected && self.ai_running {
+            self.agent_terminal.terminate();
             self.ai_running = false;
             self.ai_cancel = None;
             self.agent_panel.push(Arc::new(AgentPanelEntry::Error(
@@ -707,6 +711,7 @@ impl App {
         }
         self.ai_running = false;
         self.ai_cancelling = true;
+        self.agent_terminal.terminate();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }
@@ -743,6 +748,7 @@ impl App {
         if was_running {
             self.cancel_agent();
         }
+        self.agent_terminal.terminate();
         let had_saved_session = match self.storage.clear_agent_session() {
             Ok(had_saved_session) => had_saved_session,
             Err(error) => {
@@ -868,6 +874,9 @@ impl App {
         sender
             .send(decision)
             .context("sending Agent approval decision")?;
+        if decision == ApprovalDecision::Deny {
+            self.agent_terminal.terminate();
+        }
         self.set_status(match decision {
             ApprovalDecision::Approve => "Change approved",
             ApprovalDecision::Deny => "Change denied",

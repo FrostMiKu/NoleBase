@@ -43,8 +43,10 @@ mod context;
 pub(crate) mod hashline;
 pub(crate) mod images;
 mod prompts;
+mod shell_helper;
 mod snapshots;
 mod subagent;
+mod terminal;
 #[cfg(test)]
 mod test_support;
 mod tools;
@@ -55,7 +57,9 @@ pub(crate) use self::config::*;
 pub(crate) use self::context::*;
 pub(crate) use self::hashline::*;
 pub(crate) use self::prompts::*;
+pub(crate) use self::shell_helper::*;
 pub(crate) use self::snapshots::*;
+pub(crate) use self::terminal::*;
 pub use self::types::*;
 
 use tools::*;
@@ -128,6 +132,7 @@ pub struct AgentRuntime {
     input_buffer: Arc<Mutex<Vec<String>>>,
     permission_mode: Arc<AtomicU8>,
     cancelled: Arc<AtomicBool>,
+    terminal: AgentTerminalHandle,
     workspace_index: WorkspaceIndexHandle,
     wiki_links: crate::wiki_link_index::WikiLinkIndexHandle,
 }
@@ -148,9 +153,15 @@ impl AgentRuntime {
             input_buffer,
             permission_mode,
             cancelled,
+            terminal: AgentTerminalHandle::default(),
             workspace_index: WorkspaceIndexHandle::default(),
             wiki_links: crate::wiki_link_index::WikiLinkIndexHandle::default(),
         }
+    }
+
+    pub fn with_terminal(mut self, terminal: AgentTerminalHandle) -> Self {
+        self.terminal = terminal;
+        self
     }
 
     pub fn with_workspace_index(mut self, workspace_index: WorkspaceIndexHandle) -> Self {
@@ -227,6 +238,15 @@ impl ApprovalGate {
                     Ok(())
                 }
             }
+            PermissionMode::Yolo => Ok(()),
+        }
+    }
+
+    /// Host shell execution and PTY input always ask in Approve and Auto.
+    /// Yolo remains the explicit escape hatch that skips every permission gate.
+    async fn request_host_action(&self, request: ApprovalRequest) -> Result<()> {
+        match self.mode() {
+            PermissionMode::Approve | PermissionMode::Auto => self.request_impl(request).await,
             PermissionMode::Yolo => Ok(()),
         }
     }
@@ -620,6 +640,7 @@ impl Agent {
             input_buffer,
             permission_mode,
             cancelled,
+            terminal,
             workspace_index,
             wiki_links,
         } = runtime;
@@ -674,6 +695,20 @@ impl Agent {
         }
         agent.register(LoadSkill::new(&skills));
         agent.register(Calculate);
+        agent.register(Shell::new(nole_root, gate.clone(), cancelled.clone()));
+        agent.register(TerminalOpen::new(
+            nole_root,
+            gate.clone(),
+            terminal.clone(),
+            cancelled.clone(),
+        ));
+        agent.register(TerminalInput::new(
+            gate.clone(),
+            terminal.clone(),
+            cancelled.clone(),
+        ));
+        agent.register(TerminalRead::new(terminal.clone(), cancelled.clone()));
+        agent.register(TerminalClose::new(terminal));
         agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
         agent.register(HttpRequest::new(nole_root, client.clone())?);
         agent.register(ListNotes::new(nole_root)?);

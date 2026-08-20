@@ -16,6 +16,15 @@ fn install_agent_observable(app: &mut App) -> tokio::sync::broadcast::Sender<Age
     sender
 }
 
+fn install_agent_terminal_snapshot(app: &mut App) {
+    app.agent_terminal
+        .set_monitor_snapshot_for_test(crate::agent::AgentTerminalSnapshot {
+            title: "ssh build-host".to_string(),
+            status: crate::agent::AgentTerminalStatus::Running,
+            terminal: crate::embedded_terminal::TerminalSnapshot::from_bytes(24, 80, b"ready"),
+        });
+}
+
 fn make_app() -> (App, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();
@@ -281,11 +290,13 @@ fn conversation_update_overwrites_the_saved_agent_session() {
 fn failed_session_delete_keeps_the_in_memory_session() {
     let (mut app, _directory) = make_app();
     app.agent_conversation = AgentConversation::seeded_for_test();
+    install_agent_terminal_snapshot(&mut app);
     fs::create_dir(&app.storage.agent_session_path).unwrap();
 
     app.clear_agent_session();
 
     assert!(app.agent_conversation.clear());
+    assert!(!app.agent_terminal.is_active());
     assert!(app.status.starts_with("Agent session clear error:"));
     assert!(app.notifications.visible().is_some());
 }
@@ -1320,6 +1331,17 @@ fn approval_overlay_sends_the_user_decision() {
     assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Approve);
     assert_eq!(app.overlay, None);
     assert!(app.approval_request.is_none());
+
+    install_agent_terminal_snapshot(&mut app);
+    app.approval_request = Some(ApprovalRequest {
+        title: "Send terminal input".to_string(),
+        message: String::new(),
+        kind: ApprovalKind::Confirm,
+    });
+    app.set_overlay(Overlay::Approval);
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Deny);
+    assert!(!app.agent_terminal.is_active());
 }
 
 #[test]
@@ -1585,6 +1607,7 @@ fn cancelling_agent_finishes_streaming_thinking_entry() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
+    install_agent_terminal_snapshot(&mut app);
     sender
         .send(AgentEvent::ThinkingDelta("Still reasoning".to_string()))
         .unwrap();
@@ -1600,6 +1623,7 @@ fn cancelling_agent_finishes_streaming_thinking_entry() {
     app.cancel_agent();
 
     assert!(!app.ai_running);
+    assert!(!app.agent_terminal.is_active());
     assert!(app.agent_panel.iter().all(|entry| !matches!(
         entry.as_ref(),
         AgentPanelEntry::Thinking {

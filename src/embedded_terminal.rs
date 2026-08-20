@@ -225,6 +225,24 @@ impl TerminalSnapshot {
         self.hide_cursor
     }
 
+    pub fn plain_text(&self) -> String {
+        let mut lines = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let mut line = String::new();
+            for col in 0..self.cols {
+                let cell = &self.cells[row as usize * self.cols as usize + col as usize];
+                if !cell.is_wide_continuation() {
+                    line.push_str(cell.contents());
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     #[cfg(test)]
     pub(crate) fn from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> Self {
         let size = TerminalSize::new(rows, cols);
@@ -271,7 +289,7 @@ impl EmbeddedTerminal {
         Self::spawn_command(root, command)
     }
 
-    fn spawn_command(root: &Path, mut command: CommandBuilder) -> Result<Self> {
+    pub(crate) fn spawn_command(root: &Path, mut command: CommandBuilder) -> Result<Self> {
         let size = PtySize {
             rows: INITIAL_ROWS,
             cols: INITIAL_COLS,
@@ -416,6 +434,17 @@ impl EmbeddedTerminal {
         } else {
             self.write_bytes(text.as_bytes())
         }
+    }
+
+    pub(crate) fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        {
+            let mut terminal = self
+                .terminal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            terminal.scroll_display(Scroll::Bottom);
+        }
+        self.write_bytes(bytes)
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {

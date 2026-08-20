@@ -30,6 +30,140 @@ fn approval_content_lines(message: &str, content_width: u16, theme: Theme) -> Ve
     ))]
 }
 
+fn command_approval_lines(
+    dialog: &DialogState,
+    content_width: u16,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let width = content_width.max(1) as usize;
+    let mut lines = wrap_spans_to_width(
+        &[
+            Span::styled(
+                "Agent: ",
+                Style::default()
+                    .fg(theme.ui_action_ai)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(dialog.message.clone()),
+        ],
+        width,
+    )
+    .into_iter()
+    .map(Line::from)
+    .collect::<Vec<_>>();
+    lines.push(Line::default());
+    let command = dialog.command.as_ref();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{}:",
+            command.map_or("Cmd", |command| command.label.as_str())
+        ),
+        Style::default()
+            .fg(theme.markdown_code_label)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let code = command.map_or("", |command| command.code.as_str());
+    for source_line in code.split('\n') {
+        let highlighted = shell_highlight_line(source_line, theme);
+        let wrapped = wrap_spans_to_width(&highlighted, width);
+        if wrapped.is_empty() {
+            lines.push(code_background_line(Vec::new(), width, theme));
+        } else {
+            lines.extend(
+                wrapped
+                    .into_iter()
+                    .map(|spans| code_background_line(spans, width, theme)),
+            );
+        }
+    }
+    lines
+}
+
+fn code_background_line(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    for span in &mut spans {
+        span.style = span.style.bg(theme.markdown_code_block_background);
+    }
+    let used = spans.iter().map(|span| span.content.width()).sum::<usize>();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(theme.markdown_code_block_background),
+        ));
+    }
+    Line::from(spans)
+}
+
+pub(super) fn shell_highlight_line(line: &str, theme: Theme) -> Vec<Span<'static>> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    let mut command_word = true;
+    while index < chars.len() {
+        let start = index;
+        let character = chars[index];
+        let color = if character.is_whitespace() {
+            while index < chars.len() && chars[index].is_whitespace() {
+                index += 1;
+            }
+            theme.markdown_code_block_text
+        } else if character == '#' && (start == 0 || chars[start - 1].is_whitespace()) {
+            index = chars.len();
+            theme.text_muted
+        } else if character == '\'' || character == '"' {
+            let quote = character;
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == '\\' && quote == '"' {
+                    index = (index + 2).min(chars.len());
+                } else if chars[index] == quote {
+                    index += 1;
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+            command_word = false;
+            theme.markdown_hashtag
+        } else if character == '$' {
+            index += 1;
+            while index < chars.len()
+                && (chars[index].is_alphanumeric() || "_{}()?@*#-".contains(chars[index]))
+            {
+                index += 1;
+            }
+            command_word = false;
+            theme.ui_action_ai
+        } else if "|&;<>".contains(character) {
+            while index < chars.len() && "|&;<>".contains(chars[index]) {
+                index += 1;
+            }
+            command_word = true;
+            theme.ui_warning
+        } else {
+            while index < chars.len()
+                && !chars[index].is_whitespace()
+                && !"'\"$|&;<>".contains(chars[index])
+            {
+                index += 1;
+            }
+            let color = if command_word {
+                theme.markdown_link
+            } else {
+                theme.markdown_code_block_text
+            };
+            command_word = false;
+            color
+        };
+        let text = chars[start..index].iter().collect::<String>();
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    spans
+}
+
 /// Render every modal interaction through one fixed-width, bounded-height
 /// command surface. The body changes by mode, but title, scrolling, option
 /// selection, input and footer geometry remain identical.
@@ -43,7 +177,7 @@ pub(super) fn draw_dialog(
         return Rect::new(root.x, root.y, 0, 0);
     };
     let width = match dialog.mode {
-        DialogMode::Approval => approval_dialog_width(root.width),
+        DialogMode::Approval | DialogMode::CommandApproval => approval_dialog_width(root.width),
         DialogMode::Informational => 92,
         DialogMode::CommandPalette => DIALOG_WIDTH,
         _ => DIALOG_WIDTH,
@@ -52,6 +186,10 @@ pub(super) fn draw_dialog(
     let text_width = width.saturating_sub(4).max(1) as usize;
     let approval_rows = (dialog.mode == DialogMode::Approval).then(|| {
         u16::try_from(approval_content_lines(&dialog.message, text_width as u16, app.theme).len())
+            .unwrap_or(u16::MAX)
+    });
+    let command_approval_rows = (dialog.mode == DialogMode::CommandApproval).then(|| {
+        u16::try_from(command_approval_lines(&dialog, text_width as u16, app.theme).len())
             .unwrap_or(u16::MAX)
     });
     let message_rows = if dialog.purpose == DialogPurpose::Help {
@@ -89,6 +227,10 @@ pub(super) fn draw_dialog(
             .unwrap_or_default()
             .saturating_add(3)
             .min(root.height.saturating_sub(4).min(36)),
+        DialogMode::CommandApproval => command_approval_rows
+            .unwrap_or_default()
+            .saturating_add(3)
+            .min(root.height.saturating_sub(4).min(36)),
         DialogMode::Informational => root.height.saturating_sub(2).min(30),
         DialogMode::CommandPalette => selection_list_height(option_count.min(8), 3)
             .saturating_add(6)
@@ -123,7 +265,7 @@ pub(super) fn draw_dialog(
     let border = match dialog.mode {
         _ if destructive => app.theme.ui_error,
         _ if warning => app.theme.ui_warning,
-        DialogMode::Approval => app.theme.ui_warning,
+        DialogMode::Approval | DialogMode::CommandApproval => app.theme.ui_warning,
         DialogMode::SingleLine | DialogMode::FreeText => app.theme.ui_dialog_input,
         DialogMode::SelectOrInput
         | DialogMode::SingleSelect
@@ -236,6 +378,30 @@ pub(super) fn draw_dialog(
         DialogMode::Approval => {
             let (content, footer) = split_last_row(inner);
             let lines = approval_content_lines(&dialog.message, content.width, app.theme);
+            let maximum = lines.len().saturating_sub(content.height as usize);
+            let scroll = dialog.scroll.min(maximum as u16);
+            if let Some(state) = app.dialog.as_mut() {
+                state.scroll = scroll;
+            }
+            app.approval_scroll = scroll;
+            frame.render_widget(
+                Paragraph::new(visible_line_window(
+                    &lines,
+                    scroll as usize,
+                    content.height as usize,
+                )),
+                content,
+            );
+            draw_dialog_footer(
+                frame,
+                footer,
+                "Enter/Y approve · N/Esc deny · ↑↓ scroll · Tab mode",
+                app.theme,
+            );
+        }
+        DialogMode::CommandApproval => {
+            let (content, footer) = split_last_row(inner);
+            let lines = command_approval_lines(&dialog, content.width, app.theme);
             let maximum = lines.len().saturating_sub(content.height as usize);
             let scroll = dialog.scroll.min(maximum as u16);
             if let Some(state) = app.dialog.as_mut() {

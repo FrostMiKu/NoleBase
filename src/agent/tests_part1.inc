@@ -947,6 +947,29 @@
             "Calling Review...\nCritique the draft migration plan"
         );
 
+        let shell = json!({
+            "name": "shell",
+            "input": {"purpose": "Check Markdown", "command": "markdownlint data/note.md"}
+        });
+        assert_eq!(
+            tool_start_activity(&shell),
+            "Calling Shell...\nmarkdownlint data/note.md"
+        );
+
+        let terminal_input = json!({
+            "name": "terminal_input",
+            "input": {
+                "session_id": "terminal-1",
+                "purpose": "Answer the prompt",
+                "text": "yes",
+                "submit": true
+            }
+        });
+        assert_eq!(
+            tool_start_activity(&terminal_input),
+            "Calling Terminal Input...\nterminal-1: yes ↵"
+        );
+
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
             "Failed Read: file not found\ndata/project notes.md:101-300"

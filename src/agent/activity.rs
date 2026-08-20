@@ -99,6 +99,25 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
         "explore" => text("task"),
         "review" => text("task"),
         "calculate" => text("expression"),
+        "shell" | "terminal_open" => text("command"),
+        "terminal_input" => {
+            let session = text("session_id")?;
+            let input = text("text")
+                .map(|text| {
+                    if input
+                        .get("submit")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        format!("{text} ↵")
+                    } else {
+                        text
+                    }
+                })
+                .or_else(|| text("key").map(|key| format!("<{key}>")))?;
+            Some(format!("{session}: {input}"))
+        }
+        "terminal_read" | "terminal_close" => text("session_id"),
         "read" => text("path").map(|path| {
             if is_url(&path) {
                 web_base_url(&path)

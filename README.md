@@ -663,6 +663,23 @@ or type a different free-text response. Esc cancels the question. Questions
 are interactive requests rather than permission checks, so permission mode does
 not skip them.
 
+The `shell` tool runs a non-interactive command through Brush with the user's
+login profile, interactive rc files, aliases, and shell functions loaded. Its
+stdin is closed, and `PAGER=cat`, `GIT_PAGER=cat`, `SYSTEMD_PAGER=cat`,
+`TERM=dumb`, `GIT_TERMINAL_PROMPT=0`, `CI=true`, and `NO_COLOR=1` are injected
+to prevent routine commands from waiting for interaction. Shell commands have
+full host access and are not sandboxed.
+
+For genuinely interactive work, `terminal_open`, `terminal_input`,
+`terminal_read`, and `terminal_close` manage one persistent Agent PTY. A
+five-row monitor remains at the top of the center panel while the session
+exists; the underlying virtual terminal remains 24 rows. In `APPROVE` and
+`AUTO`, every shell command and every Agent PTY input opens an approval dialog
+showing the Agent's purpose and the complete command or input. `YOLO` skips
+these approvals. An exited PTY keeps its final screen until `terminal_close`
+removes it; cancelling the Agent, denying an approval, or clearing the Agent
+session terminates and removes a live PTY immediately.
+
 The system prompt requires the Agent to use `ask` when it needs an answer before
 it can complete the current task. Later `Ctrl+Enter` prompts remain part
 of the same conversation until `C` is pressed or `Agent: Clear session` is run.
