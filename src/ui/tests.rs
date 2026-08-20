@@ -1891,20 +1891,38 @@ fn command_approval_keeps_the_five_row_pty_monitor_above_it() {
     let screen = buffer_string(&terminal);
     let center = app.layout.center.expect("center panel");
     let overlay = app.layout.overlay.expect("approval overlay");
+    let monitor_width = DIALOG_WIDTH.min(center.width.saturating_sub(4));
+    let monitor_x = center.x + center.width.saturating_sub(monitor_width) / 2;
     assert_eq!(overlay.width, DIALOG_WIDTH);
+    assert_eq!(monitor_width, DIALOG_WIDTH);
     assert!(screen.contains("PTY · ssh build-host · running"));
     assert!(!screen.contains("zero"));
     for value in ["one", "two", "three", "four", "five"] {
         assert!(screen.contains(value), "missing monitor row {value}");
     }
     assert_eq!(
-        terminal.backend().buffer()[(center.x, center.y + AGENT_TERMINAL_MONITOR_ROWS - 1)]
+        terminal.backend().buffer()[(monitor_x, center.y + AGENT_TERMINAL_MONITOR_ROWS - 1)]
             .symbol(),
         "└"
     );
+    assert_eq!(
+        terminal.backend().buffer()[(
+            monitor_x + monitor_width - 1,
+            center.y + AGENT_TERMINAL_MONITOR_ROWS - 1,
+        )]
+            .symbol(),
+        "┘"
+    );
     assert!(
-        overlay.y >= center.y + AGENT_TERMINAL_MONITOR_ROWS,
-        "approval must start below the PTY monitor"
+        (center.x..center.x + center.width).all(|x| terminal.backend().buffer()
+            [(x, center.y + AGENT_TERMINAL_MONITOR_ROWS)]
+            .symbol()
+            == " "),
+        "PTY monitor needs a blank row below its border"
+    );
+    assert!(
+        overlay.y >= center.y + AGENT_TERMINAL_RESERVED_ROWS,
+        "approval must start below the PTY monitor and its trailing blank row"
     );
     assert!(screen.contains("Agent: Run Markdown format checks and report problems"));
     assert!(screen.contains("Cmd:"));

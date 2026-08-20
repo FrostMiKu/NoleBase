@@ -285,14 +285,20 @@ fn draw_center(
     interactive: bool,
     cursor_position: &mut Option<Position>,
 ) {
-    let area = if app.agent_terminal.is_active() && area.height >= AGENT_TERMINAL_MONITOR_ROWS {
-        let monitor = Rect::new(area.x, area.y, area.width, AGENT_TERMINAL_MONITOR_ROWS);
+    let area = if app.agent_terminal.is_active() && area.height >= AGENT_TERMINAL_RESERVED_ROWS {
+        let monitor_width = DIALOG_WIDTH.min(area.width.saturating_sub(4).max(area.width.min(1)));
+        let monitor = Rect::new(
+            area.x + area.width.saturating_sub(monitor_width) / 2,
+            area.y,
+            monitor_width,
+            AGENT_TERMINAL_MONITOR_ROWS,
+        );
         draw_agent_terminal_monitor(frame, app, monitor);
         Rect::new(
             area.x,
-            area.y.saturating_add(AGENT_TERMINAL_MONITOR_ROWS),
+            area.y.saturating_add(AGENT_TERMINAL_RESERVED_ROWS),
             area.width,
-            area.height.saturating_sub(AGENT_TERMINAL_MONITOR_ROWS),
+            area.height.saturating_sub(AGENT_TERMINAL_RESERVED_ROWS),
         )
     } else {
         area
@@ -323,13 +329,13 @@ fn draw_overlay(
     let root = if overlay == Overlay::Approval
         && app.agent_terminal.is_active()
         && app.layout.center.is_some()
-        && root.height > AGENT_TERMINAL_MONITOR_ROWS
+        && root.height > AGENT_TERMINAL_RESERVED_ROWS
     {
         Rect::new(
             root.x,
-            root.y.saturating_add(AGENT_TERMINAL_MONITOR_ROWS),
+            root.y.saturating_add(AGENT_TERMINAL_RESERVED_ROWS),
             root.width,
-            root.height.saturating_sub(AGENT_TERMINAL_MONITOR_ROWS),
+            root.height.saturating_sub(AGENT_TERMINAL_RESERVED_ROWS),
         )
     } else {
         root

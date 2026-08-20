@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) const AGENT_TERMINAL_MONITOR_ROWS: u16 = 7;
+pub(super) const AGENT_TERMINAL_RESERVED_ROWS: u16 = AGENT_TERMINAL_MONITOR_ROWS + 1;
 const AGENT_TERMINAL_CONTENT_ROWS: u16 = 5;
 
 pub(super) fn draw_agent_terminal_monitor(frame: &mut Frame, app: &mut App, area: Rect) {
