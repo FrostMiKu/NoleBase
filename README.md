@@ -676,9 +676,11 @@ five-row monitor remains at the top of the center panel while the session
 exists; the underlying virtual terminal remains 24 rows. In `APPROVE` and
 `AUTO`, every shell command and every Agent PTY input opens an approval dialog
 showing the Agent's purpose and the complete command or input. `YOLO` skips
-these approvals. An exited PTY keeps its final screen until `terminal_close`
-removes it; cancelling the Agent, denying an approval, or clearing the Agent
-session terminates and removes a live PTY immediately.
+these approvals. Text sent through `terminal_input` presses Enter by default;
+`submit=false` types the text without submitting it. An exited PTY keeps its
+final screen until `terminal_close` removes it; cancelling the Agent, denying an
+approval, or clearing the Agent session terminates and removes a live PTY
+immediately.
 
 The system prompt requires the Agent to use `ask` when it needs an answer before
 it can complete the current task. Later `Ctrl+Enter` prompts remain part

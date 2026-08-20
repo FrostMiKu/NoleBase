@@ -961,8 +961,7 @@
             "input": {
                 "session_id": "terminal-1",
                 "purpose": "Answer the prompt",
-                "text": "yes",
-                "submit": true
+                "text": "yes"
             }
         });
         assert_eq!(

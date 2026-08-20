@@ -104,11 +104,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
             let session = text("session_id")?;
             let input = text("text")
                 .map(|text| {
-                    if input
-                        .get("submit")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
+                    if input.get("submit").and_then(Value::as_bool).unwrap_or(true) {
                         format!("{text} ↵")
                     } else {
                         text

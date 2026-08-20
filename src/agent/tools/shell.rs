@@ -48,6 +48,13 @@ fn required_purpose<'a>(input: &'a Value) -> Result<&'a str> {
     Ok(purpose)
 }
 
+fn should_submit(input: &Value, has_text: bool) -> bool {
+    input
+        .get("submit")
+        .and_then(Value::as_bool)
+        .unwrap_or(has_text)
+}
+
 fn cwd_schema() -> Value {
     json!({
         "type": "string",
@@ -268,9 +275,13 @@ impl Tool for TerminalInput {
                 "purpose": purpose_schema(),
                 "text": {
                     "type": "string",
-                    "description": "Exact UTF-8 text to send. Use submit=true to append Enter."
+                    "description": "Exact UTF-8 text to send. Enter is appended by default; set submit=false to type without submitting."
                 },
-                "submit": { "type": "boolean", "default": false },
+                "submit": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Append Enter after text. Defaults to true for text input; omit it for named keys."
+                },
                 "key": {
                     "type": "string",
                     "enum": ["enter", "tab", "escape", "ctrl-c", "ctrl-d", "backspace", "up", "down", "left", "right", "home", "end", "delete", "page-up", "page-down"]
@@ -294,10 +305,7 @@ impl Tool for TerminalInput {
         let purpose = required_purpose(input)?;
         let text = optional_string(input, "text")?;
         let key = optional_string(input, "key")?;
-        let submit = input
-            .get("submit")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let submit = should_submit(input, text.is_some());
         let bytes = terminal_input_bytes(text, submit, key)?;
         let display = terminal_input_display(text, submit, key)?;
         self.gate
@@ -490,5 +498,15 @@ mod tests {
         assert!(!validator.is_valid(&key));
         text["key"] = json!("enter");
         assert!(!validator.is_valid(&text));
+    }
+
+    #[test]
+    fn terminal_text_submits_by_default_but_named_keys_do_not() {
+        assert!(should_submit(&json!({"text": "yes"}), true));
+        assert!(!should_submit(
+            &json!({"text": "yes", "submit": false}),
+            true
+        ));
+        assert!(!should_submit(&json!({"key": "ctrl-c"}), false));
     }
 }
