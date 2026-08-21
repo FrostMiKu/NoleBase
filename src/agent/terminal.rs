@@ -448,12 +448,18 @@ pub(crate) fn terminal_input_bytes(
 }
 
 fn terminal_key_bytes(key: &str) -> Result<Vec<u8>> {
+    if let Some(letter) = key
+        .strip_prefix("ctrl-")
+        .filter(|letter| letter.len() == 1)
+        .and_then(|letter| letter.bytes().next())
+        .filter(u8::is_ascii_lowercase)
+    {
+        return Ok(vec![letter - b'a' + 1]);
+    }
     let bytes: &[u8] = match key {
         "enter" => b"\r",
         "tab" => b"\t",
         "escape" => b"\x1b",
-        "ctrl-c" => b"\x03",
-        "ctrl-d" => b"\x04",
         "backspace" => b"\x7f",
         "up" => b"\x1b[A",
         "down" => b"\x1b[B",
@@ -509,6 +515,15 @@ mod tests {
             terminal_input_bytes(None, false, Some("ctrl-c")).unwrap(),
             b"\x03"
         );
+        assert_eq!(
+            terminal_input_bytes(None, false, Some("ctrl-l")).unwrap(),
+            b"\x0c"
+        );
+        assert_eq!(
+            terminal_input_bytes(None, false, Some("ctrl-z")).unwrap(),
+            b"\x1a"
+        );
+        assert!(terminal_input_bytes(None, false, Some("ctrl-aa")).is_err());
         assert!(terminal_input_bytes(Some("x"), false, Some("enter")).is_err());
     }
 

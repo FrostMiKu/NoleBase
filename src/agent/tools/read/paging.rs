@@ -1,9 +1,8 @@
 //! Line selectors and bounded text pagination shared by every read parser.
 //!
-//! Parsers hand a raw `path:start-end` selector or a page window here. This
-//! module owns the one-based inclusive selector grammar, the bounded 1 MiB
-//! response budget, and the structured `range`/`returned`/`total`/`has_more`/
-//! `next`/`items` page shape used by the document, attachment, and web parsers.
+//! This module owns the one-based inclusive line-range grammar, the bounded
+//! 1 MiB response budget, and the structured `range`/`returned`/`total`/
+//! `has_more`/`items` page shape used by document, attachment, and web parsers.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read as _};
@@ -21,60 +20,54 @@ use super::{
     MAX_READ_RESPONSE_BYTES, READ_RESPONSE_OVERHEAD,
 };
 
-/// An inclusive one-based line window `start..=end` requested via a
-/// `path:start-end` selector.
+/// An inclusive one-based line window `start..=end` requested through `range`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::agent) struct LineRange {
     offset: usize,
     limit: usize,
 }
 
-/// Splits a `path:start-end` suffix off a read target, leaving targets whose
-/// suffix is not a valid inclusive line selector untouched.
-pub(super) fn split_line_range(requested: &str) -> Result<(&str, Option<LineRange>)> {
-    let Some((path, suffix)) = requested.rsplit_once(':') else {
-        return Ok((requested, None));
+pub(super) fn line_range(input: &Value) -> Result<Option<LineRange>> {
+    let Some(raw) = input.get("range") else {
+        return Ok(None);
     };
-    let Some((start, end)) = suffix.split_once('-') else {
-        return Ok((requested, None));
-    };
-    let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) else {
-        return Ok((requested, None));
-    };
+    let raw = raw
+        .as_str()
+        .context("field range must be a string like `1-200`")?;
+    let (start, end) = raw
+        .split_once('-')
+        .context("range must be an inclusive one-based selector like `1-200`")?;
+    if start.is_empty() || end.is_empty() || end.contains('-') {
+        bail!("range must be an inclusive one-based selector like `1-200`");
+    }
+    let start = start
+        .parse::<usize>()
+        .context("range start must be a positive integer")?;
+    let end = end
+        .parse::<usize>()
+        .context("range end must be a positive integer")?;
     if start == 0 || end < start {
-        bail!("line selector must be an inclusive range with 1 <= start <= end");
+        bail!("range must satisfy 1 <= start <= end");
     }
-    let limit = end - start + 1;
+    let limit = end
+        .checked_sub(start)
+        .and_then(|difference| difference.checked_add(1))
+        .context("range is too large")?;
     if limit > MAX_READ_LINES {
-        bail!("line selector may request at most {MAX_READ_LINES} lines");
+        bail!("range may select at most {MAX_READ_LINES} lines");
     }
-    Ok((
-        path,
-        Some(LineRange {
-            offset: start - 1,
-            limit,
-        }),
-    ))
+    Ok(Some(LineRange {
+        offset: start - 1,
+        limit,
+    }))
 }
 
 /// Resolves a parsed line range into an `(offset, limit)` page window, falling
 /// back to [`DEFAULT_READ_LINES`] lines when no selector was supplied.
-pub(super) fn line_window(range: Option<LineRange>, input: &Value) -> Result<(usize, usize)> {
-    if input.get("range").is_some() {
-        bail!("file and attachment lines must use a `path:start-end` selector");
-    }
-    Ok(range
+pub(super) fn line_window(range: Option<LineRange>) -> (usize, usize) {
+    range
         .map(|range| (range.offset, range.limit))
-        .unwrap_or((0, DEFAULT_READ_LINES)))
-}
-
-/// The `target:start-end` selector that continues a page after `end` lines.
-pub(super) fn continuation_selector(target: &str, end: usize, limit: usize) -> String {
-    format!(
-        "{target}:{}-{}",
-        end.saturating_add(1),
-        end.saturating_add(limit)
-    )
+        .unwrap_or((0, DEFAULT_READ_LINES))
 }
 
 /// One page of selected lines with the pagination bookkeeping needed to render
@@ -246,11 +239,10 @@ pub(super) fn page_extracted_text(
 }
 
 /// Fills a structured payload with the shared `range`/`returned`/`total`/
-/// `has_more`/`next`/`items` page fields.
+/// `has_more`/`items` page fields.
 pub(super) fn add_structured_page(
     payload: &mut Value,
     page: TextPage,
-    target: &str,
     offset: usize,
     limit: usize,
 ) {
@@ -258,9 +250,6 @@ pub(super) fn add_structured_page(
     payload["returned"] = json!(page.end - page.start);
     payload["total"] = json!(page.total_lines);
     payload["has_more"] = json!(page.has_more);
-    if page.has_more {
-        payload["next"] = json!(continuation_selector(target, page.end, limit));
-    }
     payload["items"] = json!(page.lines);
 }
 
@@ -273,25 +262,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn line_selectors_are_one_based_inclusive_and_bounded() {
+    fn line_ranges_are_one_based_inclusive_and_bounded() {
         assert_eq!(
-            split_line_range("data/note.md:50-200").unwrap(),
-            (
-                "data/note.md",
-                Some(LineRange {
-                    offset: 49,
-                    limit: 151,
-                }),
-            )
+            line_range(&json!({"range": "50-200"})).unwrap(),
+            Some(LineRange {
+                offset: 49,
+                limit: 151,
+            })
         );
-        assert_eq!(
-            split_line_range("data/note.md").unwrap(),
-            ("data/note.md", None)
-        );
-        assert!(split_line_range("data/note.md:0-2").is_err());
-        assert!(split_line_range("data/note.md:4-3").is_err());
-        assert!(split_line_range("data/note.md:1-2001").is_err());
-        assert!(line_window(None, &json!({"range": "1-2"})).is_err());
+        assert_eq!(line_range(&json!({})).unwrap(), None);
+        assert!(line_range(&json!({"range": "0-2"})).is_err());
+        assert!(line_range(&json!({"range": "4-3"})).is_err());
+        assert!(line_range(&json!({"range": "1-2001"})).is_err());
     }
 
     #[test]

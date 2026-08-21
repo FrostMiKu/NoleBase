@@ -18,7 +18,7 @@ use crate::agent::images::image_block_from_bytes;
 use crate::image_data::{detect_image_format, MAX_IMAGE_BYTES};
 use crate::provider::ImageSource;
 
-use super::paging::{continuation_selector, line_window, plain_response_len, read_utf8_page};
+use super::paging::{line_window, plain_response_len, read_utf8_page};
 use super::{listed_path, ParseContext, ReadParser, ReadPayload, Target};
 
 /// Number of leading bytes read to detect an image magic before committing to
@@ -41,7 +41,7 @@ impl ReadParser for TextFileParser {
         &self,
         ctx: &ParseContext,
         target: &Target,
-        input: &Value,
+        _input: &Value,
     ) -> Result<ReadPayload> {
         let Target::File { path, range } = target else {
             bail!("text_file parser received non-file target");
@@ -55,7 +55,7 @@ impl ReadParser for TextFileParser {
         let prefix = read_prefix(path, IMAGE_DETECT_PREFIX).await?;
         if detect_image_format(&prefix).is_some() {
             if range.is_some() {
-                bail!("line selectors are not supported for image targets");
+                bail!("range is not supported for image targets");
             }
             if metadata.len() > MAX_IMAGE_BYTES {
                 bail!(
@@ -83,7 +83,7 @@ impl ReadParser for TextFileParser {
             .context("joining image file decode")??;
             return Ok(ReadPayload::Image(block));
         }
-        let (offset, limit) = line_window(*range, input)?;
+        let (offset, limit) = line_window(*range);
         let page_path = path.clone();
         let mut page = tokio::task::spawn_blocking(move || {
             read_utf8_page(&page_path, offset, limit, plain_response_len)
@@ -111,13 +111,6 @@ impl ReadParser for TextFileParser {
                 page.end
             )?,
             None => write!(output, "\n\n[Showing lines {first}-{}", page.end)?,
-        }
-        if page.has_more {
-            write!(
-                output,
-                ". Continue with {}",
-                continuation_selector(&target, page.end, limit)
-            )?;
         }
         output.push(']');
         if let (Some(identity), Some(tag)) = (page.identity, page.tag) {
@@ -175,18 +168,18 @@ mod tests {
         let read = Read::new(directory.path(), tracker.clone(), reqwest::Client::new()).unwrap();
 
         let output = read
-            .execute(&json!({"path": "large.txt:49991-49995"}))
+            .execute(&json!({"path": "large.txt", "range": "49991-49995"}))
             .await
             .unwrap();
         assert!(output.contains("49991:line 49990"));
         assert!(output.contains("[Showing lines 49991-49995"));
-        assert!(output.contains("Continue with large.txt:49996-50000"));
+        assert!(!output.contains("Continue with"));
         assert!(tracker
             .head(&fs::canonicalize(path).unwrap())
             .unwrap()
             .is_some());
         let final_page = read
-            .execute(&json!({"path": "large.txt:49999-50003"}))
+            .execute(&json!({"path": "large.txt", "range": "49999-50003"}))
             .await
             .unwrap();
         assert!(final_page.contains("[Showing lines 49999-50000 of 50000"));

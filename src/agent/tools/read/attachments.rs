@@ -38,7 +38,7 @@ impl ReadParser for AttachmentParser {
         &self,
         ctx: &ParseContext,
         target: &Target,
-        input: &Value,
+        _input: &Value,
     ) -> Result<ReadPayload> {
         let Target::Attachment { uri, range } = target else {
             bail!("attachment parser received non-attachment target");
@@ -50,7 +50,7 @@ impl ReadParser for AttachmentParser {
         let mime = metadata.mime_type.as_deref().unwrap_or("");
         if mime.starts_with("image/") {
             if range.is_some() {
-                bail!("line selectors are not supported for image targets");
+                bail!("range is not supported for image targets");
             }
             let store = ctx.attachments.clone();
             let id = uri.id();
@@ -77,7 +77,7 @@ impl ReadParser for AttachmentParser {
             if metadata.size > MAX_DOCUMENT_BYTES {
                 bail!("document exceeds the {MAX_DOCUMENT_BYTES} byte extraction limit");
             }
-            let (offset, limit) = line_window(*range, input)?;
+            let (offset, limit) = line_window(*range);
             let document_path = ctx
                 .attachments
                 .open(uri.id())
@@ -111,7 +111,7 @@ impl ReadParser for AttachmentParser {
             let page = page_extracted_text(&document.markdown, offset, limit, json_response_len)?;
             let mut payload = attachment_metadata_json(*uri, &metadata);
             payload["format"] = json!(document.format.label());
-            add_structured_page(&mut payload, page, &uri.to_string(), offset, limit);
+            add_structured_page(&mut payload, page, offset, limit);
             return Ok(ReadPayload::Structured(payload));
         }
         if !is_textual_mime(mime) {
@@ -119,7 +119,7 @@ impl ReadParser for AttachmentParser {
                 *uri, &metadata,
             )));
         }
-        let (offset, limit) = line_window(*range, input)?;
+        let (offset, limit) = line_window(*range);
         let page_path = ctx
             .attachments
             .open(uri.id())
@@ -135,7 +135,7 @@ impl ReadParser for AttachmentParser {
             )));
         };
         let mut payload = attachment_metadata_json(*uri, &metadata);
-        add_structured_page(&mut payload, page, &uri.to_string(), offset, limit);
+        add_structured_page(&mut payload, page, offset, limit);
         Ok(ReadPayload::Structured(payload))
     }
 }
@@ -190,7 +190,7 @@ mod tests {
         )
         .unwrap();
         let output = read
-            .execute(&json!({"path": format!("{uri}:1-20")}))
+            .execute(&json!({"path": uri, "range": "1-20"}))
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
@@ -224,7 +224,7 @@ mod tests {
         .unwrap();
 
         let output = read
-            .execute(&json!({ "path": format!("{uri}:3-4") }))
+            .execute(&json!({ "path": uri, "range": "3-4" }))
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(parsed["total"], 5);
         assert_eq!(parsed["has_more"], true);
         assert_eq!(parsed["items"], json!(["line 3", "line 4"]));
-        assert_eq!(parsed["next"], format!("{uri}:5-6"));
+        assert!(parsed.get("next").is_none());
         // Structured read-only content: no hashline `[path#TAG]` snapshot header
         // and no tag field, because attachment reads never gate edit.
         assert!(parsed.get("tag").is_none());
@@ -264,13 +264,13 @@ mod tests {
         .unwrap();
 
         let output = read
-            .execute(&json!({"path": format!("{uri}:49991-49995")}))
+            .execute(&json!({"path": uri, "range": "49991-49995"}))
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["range"], "49991-49995");
         assert_eq!(parsed["returned"], 5);
-        assert_eq!(parsed["next"], format!("{uri}:49996-50000"));
+        assert!(parsed.get("next").is_none());
         assert_eq!(parsed["total"], 50_000);
         assert_eq!(parsed["items"][0], "line 49990 xxxxxxxxxxxxxxxxxxxx");
     }

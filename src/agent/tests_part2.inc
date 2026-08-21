@@ -1318,7 +1318,7 @@
             Arc::new(RegisterBank::default()),
         )
         .unwrap();
-        read.execute(&json!({"path": "data/large.md:11-11"}))
+        read.execute(&json!({"path": "data/large.md", "range": "11-11"}))
             .unwrap();
         edit.execute(&json!({
             "patch": format!(
@@ -1338,7 +1338,7 @@
             Arc::new(RegisterBank::default()),
         )
         .unwrap();
-        read.execute(&json!({"path": "data/large.md:11-11"}))
+        read.execute(&json!({"path": "data/large.md", "range": "11-11"}))
             .unwrap();
         let error = edit
             .execute(&json!({
@@ -1361,7 +1361,7 @@
             Arc::new(RegisterBank::default()),
         )
         .unwrap();
-        read.execute(&json!({"path": "data/large.md:2-2"}))
+        read.execute(&json!({"path": "data/large.md", "range": "2-2"}))
             .unwrap();
         let error = edit
             .execute(&json!({

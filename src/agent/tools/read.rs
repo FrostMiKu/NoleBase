@@ -8,7 +8,7 @@
 //! Attachment reads are read-only: they never register an edit snapshot.
 //!
 //! The registry, target resolution, and shared filesystem helpers live here;
-//! selectors and pagination live in [`paging`], each parser family has its own
+//! ranges and pagination live in [`paging`], each parser family has its own
 //! submodule ([`text`], [`documents`], [`attachments`], [`directory`], [`web`]),
 //! and the note search tools live in [`notes`].
 
@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tokio::fs as async_fs;
 use tokio::io::AsyncReadExt as _;
 
-use super::util::{portable_path, range_schema, required_string};
+use super::util::{portable_path, required_string};
 use crate::agent::{canonical_root, SnapshotStore, Tool, ToolExecutionPolicy, ToolOutput};
 use crate::attachment::{AttachmentStore, AttachmentUri};
 use crate::provider::ImageBlock;
@@ -42,7 +42,7 @@ use self::attachments::AttachmentParser;
 use self::directory::DirectoryParser;
 use self::document::DocumentCache;
 use self::documents::DocumentFileParser;
-use self::paging::{split_line_range, LineRange};
+use self::paging::{line_range, LineRange};
 use self::text::TextFileParser;
 use self::web::WebParser;
 
@@ -182,7 +182,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. Text and extracted documents accept an inclusive `:start-end` line selector; editable text returns tagged source lines, while directories use range, depth, and sort options. To fetch the raw unprocessed response body instead, use `http_request`."
+        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. The inclusive `range` selects lines from text and extracted documents or entries from directories; editable text returns tagged source lines. To fetch the raw unprocessed response body instead, use `http_request`."
     }
 
     fn input_schema(&self) -> Value {
@@ -191,9 +191,13 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Local file or document path, http(s) URL, or attachment URI, optionally suffixed with inclusive lines `:start-end`; or a directory path"
+                    "description": "Local file or document path, http(s) URL, attachment URI, or directory path"
                 },
-                "range": range_schema(MAX_DIRECTORY_RESULTS),
+                "range": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]*-[1-9][0-9]*$",
+                    "description": "Inclusive one-based line or directory-entry range. Defaults to 1-200 for line-based targets and 1-50 for directories; may select at most 2000 positions."
+                },
                 "depth": {
                     "type": "integer", "minimum": 1,
                     "maximum": MAX_DIRECTORY_DEPTH, "default": 1,
@@ -271,17 +275,19 @@ impl Read {
 /// Resolves the `path` argument into a concrete target, rejecting the private
 /// AI configuration and attachment internals before any parser sees them.
 async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
-    let requested_input = required_string(input, "path")?;
-    let (requested, range) = split_line_range(requested_input)?;
+    let requested = required_string(input, "path")?;
     if requested.starts_with("https://") || requested.starts_with("http://") {
         return Ok(Target::Web {
             url: requested.to_string(),
-            range,
+            range: line_range(input)?,
         });
     }
     if AttachmentUri::is_attachment_uri(requested) {
         let uri = AttachmentUri::parse(requested)?;
-        return Ok(Target::Attachment { uri, range });
+        return Ok(Target::Attachment {
+            uri,
+            range: line_range(input)?,
+        });
     }
     let path = if Path::new(requested).is_absolute() {
         PathBuf::from(requested)
@@ -302,11 +308,11 @@ async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
         .await
         .with_context(|| format!("reading {}", path.display()))?;
     if metadata.is_file() {
-        Ok(Target::File { path, range })
+        Ok(Target::File {
+            path,
+            range: line_range(input)?,
+        })
     } else if metadata.is_dir() {
-        if range.is_some() {
-            bail!("line selectors can only be used with files and text attachments");
-        }
         Ok(Target::Directory { path })
     } else {
         bail!(
@@ -491,14 +497,14 @@ mod tests {
             crate::provider::ImageSource::Attachment { .. }
         ));
 
-        // Line selectors are rejected for image targets.
+        // Line ranges are rejected for image targets.
         let error = read
-            .execute_output(&json!({ "path": format!("{uri}:1-2") }))
+            .execute_output(&json!({ "path": uri, "range": "1-2" }))
             .await
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "line selectors are not supported for image targets"
+            "range is not supported for image targets"
         );
 
         // Corrupted image bytes fail explicitly, not as a UTF-8 error.

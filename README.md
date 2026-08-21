@@ -493,8 +493,9 @@ contents of `ai.toml`, `AGENTS.md`, and `MEMORY.md`, rebuilding the Agent only
 when one changed. Versioned file-read snapshots remain valid across prompts;
 successful edits immediately record the new tag while retaining recent versions
 for conservative line-level recovery when unrelated content drifts. Workspace
-file events invalidate only affected paths, a final content comparison catches
-missed events, and clearing the Agent session clears snapshots and registers.
+file events mark only affected paths as dirty; the next edit compares the actual
+identity, preserving delayed events from the Agent's own writes while rejecting
+real external changes. Clearing the Agent session clears snapshots and registers.
 Tool definitions are emitted in fixed registration order instead of hash-map
 iteration order. Messages requests use four explicit prompt-cache breakpoints:
 the final tool, the stable base system block, the skill catalog after project
@@ -547,8 +548,9 @@ retained as scroll state rather than rendered.
 The Agent reads through a single unified `read` tool that dispatches on its
 target. A UTF-8 file returns hashline text: a `[path#TAG]` header, absolute
 one-based `N:text` rows, and a pagination footer. File, extracted document, URL,
-and attachment line windows use an inclusive selector suffix such as
-`data/note.md:50-200`. Office documents, OpenDocument, RTF, EPUB, CSV, and PDF
+and attachment line windows use the independent inclusive `range` argument, for
+example `{"path":"data/note.md","range":"50-200"}`. Office documents,
+OpenDocument, RTF, EPUB, CSV, and PDF
 are converted to Markdown in-process; extracted Markdown is cached by document
 identity so continuation reads do not repeat conversion. A directory returns a
 typed JSON listing, while an http(s) URL returns structured fetched content with
@@ -582,12 +584,12 @@ against both the declared `Content-Length` and the actual streamed bytes; a
 failed or cancelled transfer leaves no partial file. The saved file can be used
 immediately by `read`, `import_attachment`, or any generic workspace tool.
 
-Paginated local list and search tools use an inclusive one-based `range` such as
-`1-50`, not offset/limit. Structured pages consistently return `range`,
-`returned`, `total`, `has_more`, an optional `next`, and `items`; the next page is
-requested by passing the returned selector back as `range`. Tool inputs are
-validated against their advertised JSON Schema before execution, including
-required fields, types, bounds, enums, and unknown-property rejection.
+Paginated reads and local list/search tools use an inclusive one-based `range`
+such as `1-50`, not offset/limit. Structured `read` pages return `range`,
+`returned`, `total`, `has_more`, and `items`; callers choose any later range
+explicitly. Other list and search tools additionally return an optional `next`.
+Tool inputs are validated against their advertised JSON Schema before execution,
+including required fields, types, bounds, enums, and unknown-property rejection.
 
 `read` on a directory lists any directory by absolute path or a path relative to
 the Nole root. `depth=1` returns direct children and values up to 16 include
@@ -677,7 +679,8 @@ exists; the underlying virtual terminal remains 24 rows. In `APPROVE` and
 `AUTO`, every shell command and every Agent PTY input opens an approval dialog
 showing the Agent's purpose and the complete command or input. `YOLO` skips
 these approvals. Text sent through `terminal_input` presses Enter by default;
-`submit=false` types the text without submitting it. An exited PTY keeps its
+`submit=false` types the text without submitting it, and named keys include
+`ctrl-a` through `ctrl-z`. An exited PTY keeps its
 final screen until `terminal_close` removes it. Denying an approval blocks that
 action but preserves an existing PTY; cancelling the Agent or clearing the Agent
 session terminates and removes a live PTY

@@ -107,10 +107,13 @@ impl Edit {
         if inspection.len > MAX_PLANNING_BYTES {
             bail!("file is too large for a hashline edit; use write");
         }
+        if self.reads.reconcile_dirty(&path, inspection.identity)? {
+            bail!("file changed since read; read it again before editing");
+        }
         let snapshot = self
             .reads
             .head(&path)?
-            .context("edit requires read on the same path first")?;
+            .context("edit requires read on the same path in the current Agent session first")?;
         let anchored = if snapshot.tag.eq_ignore_ascii_case(&section.tag) {
             snapshot
         } else if let Some(older) = self.reads.by_tag(&path, &section.tag)? {
@@ -647,9 +650,9 @@ mod tests {
     }
 
     #[test]
-    fn single_section_replace_round_trips_and_supports_an_immediate_second_edit() {
+    fn own_watcher_event_preserves_new_tag_for_a_second_edit() {
         let (directory, root) = workspace();
-        let raw = root.join("workspace/main/note.md");
+        let raw = root.join("data/note.md");
         fs::write(&raw, "line one\nline two\nline three\n").unwrap();
         let path = fs::canonicalize(&raw).unwrap();
         let reads = Arc::new(SnapshotStore::default());
@@ -658,11 +661,11 @@ mod tests {
 
         let result = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": format!("[workspace/main/note.md#{tag}]\nPUT 2.=2:\n+REPLACED\n")
+                "patch": format!("[data/note.md#{tag}]\nPUT 2.=2:\n+REPLACED\n")
             })))
             .unwrap();
-        assert!(result.contains("edited workspace/main/note.md"));
-        assert!(result.contains("[workspace/main/note.md#"));
+        assert!(result.contains("edited data/note.md"));
+        assert!(result.contains("[data/note.md#"));
         assert!(result.contains("2:REPLACED"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -670,20 +673,46 @@ mod tests {
         );
 
         // The published file is re-anchored with the whole file seen, so the
-        // second edit uses the NEW tag from the result without a re-read.
-        let new_tag = extract_tag(&result, "workspace/main/note.md");
+        // delayed watcher event for that write must not discard the NEW tag.
+        let new_tag = extract_tag(&result, "data/note.md");
         assert_ne!(new_tag, tag);
+        reads.mark_dirty(&path).unwrap();
         let second = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": format!("[workspace/main/note.md#{new_tag}]\nPUT 1.=1:\n+first!\n")
+                "patch": format!("[data/note.md#{new_tag}]\nPUT 1.=1:\n+first!\n")
             })))
             .unwrap();
-        assert!(second.contains("edited workspace/main/note.md"));
+        assert!(second.contains("edited data/note.md"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "first!\nREPLACED\nline three\n"
         );
         assert!(directory.path().exists());
+    }
+
+    #[test]
+    fn watcher_event_for_a_different_revision_requires_a_new_read() {
+        let (_directory, root) = workspace();
+        let raw = root.join("data/note.md");
+        fs::write(&raw, "original\n").unwrap();
+        let path = fs::canonicalize(&raw).unwrap();
+        let reads = Arc::new(SnapshotStore::default());
+        let tag = record_full(&reads, &path, "original\n");
+        let edit = edit_tool(&root, reads.clone());
+
+        fs::write(&path, "external revision\n").unwrap();
+        reads.mark_dirty(&path).unwrap();
+        let error = test_runtime()
+            .block_on(edit.execute(&json!({
+                "patch": format!("[data/note.md#{tag}]\nPUT 1.=1:\n+agent revision\n")
+            })))
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "file changed since read; read it again before editing"
+        );
+        assert!(reads.head(&path).unwrap().is_none());
     }
 
     #[test]

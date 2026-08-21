@@ -138,6 +138,9 @@ struct PathHistory {
     versions: Vec<Snapshot>,
     /// Monotonic last-record time driving global LRU eviction.
     recorded_at: u64,
+    /// A watcher observed this path after its latest read or edit anchor. The
+    /// next edit reconciles the current identity before trusting the history.
+    dirty: bool,
 }
 
 #[derive(Default)]
@@ -235,6 +238,7 @@ impl SnapshotStore {
             .entry(path)
             .or_insert_with(PathHistory::default);
         history.recorded_at = now;
+        history.dirty = false;
 
         if let Some(index) = history
             .versions
@@ -332,6 +336,49 @@ impl SnapshotStore {
             .history
             .retain(|tracked, _| !tracked.starts_with(&path));
         Ok(())
+    }
+
+    /// Marks every tracked path at or below `path` as changed by the file
+    /// watcher. Histories remain available until `edit` can compare the actual
+    /// file identity, which distinguishes external changes from delayed events
+    /// caused by the Agent's own published writes.
+    pub(crate) fn mark_dirty(&self, path: &Path) -> Result<()> {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot store lock poisoned"))?;
+        for (tracked, history) in &mut inner.history {
+            if tracked.starts_with(&path) {
+                history.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconciles a dirty watcher observation against the identity scanned by
+    /// `edit`. Returns true and removes the history when the current revision
+    /// differs; an identical revision clears the dirty marker and stays valid.
+    pub(crate) fn reconcile_dirty(&self, path: &Path, identity: [u8; 32]) -> Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot store lock poisoned"))?;
+        let changed = inner.history.get(path).is_some_and(|history| {
+            history.dirty
+                && history
+                    .versions
+                    .first()
+                    .is_none_or(|snapshot| snapshot.identity != identity)
+        });
+        if changed {
+            inner.history.remove(path);
+            return Ok(true);
+        }
+        if let Some(history) = inner.history.get_mut(path) {
+            history.dirty = false;
+        }
+        Ok(false)
     }
 
     /// Empties every tracked path.

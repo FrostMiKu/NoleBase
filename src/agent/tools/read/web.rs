@@ -38,12 +38,12 @@ impl ReadParser for WebParser {
         &self,
         ctx: &ParseContext,
         target: &Target,
-        input: &Value,
+        _input: &Value,
     ) -> Result<ReadPayload> {
         let Target::Web { url, range } = target else {
             bail!("web parser received non-web target");
         };
-        let (offset, limit) = line_window(*range, input)?;
+        let (offset, limit) = line_window(*range);
         let (response, final_url, content_type) = fetch_web_response(&ctx.client, url).await?;
         let is_image_content_type = content_type
             .as_deref()
@@ -63,7 +63,7 @@ impl ReadParser for WebParser {
             // of falling through to document/UTF-8 parsing.
             magic_format.ok_or_else(|| anyhow::anyhow!("web fetch failed during image_decode"))?;
             if range.is_some() {
-                bail!("line selectors are not supported for image targets");
+                bail!("range is not supported for image targets");
             }
             let block = tokio::task::spawn_blocking(move || {
                 image_block_from_bytes(
@@ -104,7 +104,7 @@ impl ReadParser for WebParser {
             "format": format,
             "content_type": content_type,
         });
-        add_structured_page(&mut payload, page, url, offset, limit);
+        add_structured_page(&mut payload, page, offset, limit);
         Ok(ReadPayload::Structured(payload))
     }
 }
@@ -230,7 +230,7 @@ mod tests {
     use crate::provider::ImageSource;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn url_selectors_page_reader_mode_text() {
+    async fn url_ranges_page_reader_mode_text() {
         let (url, server) = serve_once("text/plain", b"first\nsecond\nthird\n".to_vec());
         let read = Read::new(
             tempfile::tempdir().unwrap().path(),
@@ -239,13 +239,13 @@ mod tests {
         )
         .unwrap();
         let output = read
-            .execute(&json!({"path": format!("{url}:2-2")}))
+            .execute(&json!({"path": url, "range": "2-2"}))
             .await
             .unwrap();
         server.join().unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["items"], json!(["second"]));
-        assert_eq!(parsed["next"], format!("{url}:3-3"));
+        assert!(parsed.get("next").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -338,7 +338,7 @@ mod tests {
         )
         .unwrap();
         let output = read
-            .execute(&json!({"path": format!("{url}/report.pdf:1-20")}))
+            .execute(&json!({"path": format!("{url}/report.pdf"), "range": "1-20"}))
             .await
             .unwrap();
         server.join().unwrap();

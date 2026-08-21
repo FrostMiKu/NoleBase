@@ -231,13 +231,11 @@
         .unwrap();
 
         let first = read
-            .execute(&json!({"path": "data/large.md:1-200"}))
+            .execute(&json!({"path": "data/large.md", "range": "1-200"}))
             .unwrap();
         assert!(first.starts_with("[data/large.md#"));
         assert!(first.contains("\n1:line 0\n"));
-        assert!(first.ends_with(
-            "[Showing lines 1-200 of 450. Continue with data/large.md:201-400]"
-        ));
+        assert!(first.ends_with("[Showing lines 1-200 of 450]"));
         assert!(edit
             .execute(&json!({
                 "patch": format!(
@@ -248,7 +246,7 @@
             .returns_err());
 
         let last = read
-            .execute(&json!({"path": "data/large.md:401-450"}))
+            .execute(&json!({"path": "data/large.md", "range": "401-450"}))
             .unwrap();
         assert_eq!(first.lines().next(), last.lines().next());
         assert!(last.ends_with("[Showing lines 401-450 of 450]"));
@@ -285,7 +283,10 @@
         .unwrap();
 
         let page = read
-            .execute(&json!({"path": format!("data/huge.md:{line_count}-{line_count}")}))
+            .execute(&json!({
+                "path": "data/huge.md",
+                "range": format!("{line_count}-{line_count}")
+            }))
             .unwrap();
         assert!(page.contains(&format!("{line_count}:large line {line_count}")));
         edit.execute(&json!({
@@ -329,7 +330,7 @@
     }
 
     #[test]
-    fn file_change_events_invalidate_only_affected_read_snapshots() {
+    fn hard_invalidation_drops_only_affected_read_snapshots() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("data")).unwrap();
         fs::create_dir(directory.path().join("config")).unwrap();
@@ -571,7 +572,7 @@
         assert_eq!(nested["total"], 3);
         assert_eq!(nested["returned"], 1);
         assert_eq!(nested["has_more"], true);
-        assert_eq!(nested["next"], "2-2");
+        assert!(nested.get("next").is_none());
         assert_eq!(nested["items"][0]["path"], "data/Nested/Beta.txt");
         assert_eq!(nested["items"][0]["depth"], 2);
 
@@ -917,15 +918,15 @@
 
         let read = json!({
             "name": "read",
-            "input": {"path": "data/project notes.md:101-300"}
+            "input": {"path": "data/project notes.md", "range": "101-300"}
         });
         assert_eq!(
             tool_start_activity(&read),
-            "Calling Read...\ndata/project notes.md:101-300"
+            "Calling Read...\ndata/project notes.md"
         );
         assert_eq!(
             tool_finish_activity(&read, None),
-            "Completed Read.\ndata/project notes.md:101-300"
+            "Completed Read.\ndata/project notes.md"
         );
         assert_eq!(tool_display_name("add_daily_entry"), "Add Daily Entry");
 
@@ -971,7 +972,7 @@
 
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
-            "Failed Read: file not found\ndata/project notes.md:101-300"
+            "Failed Read: file not found\ndata/project notes.md"
         );
 
         let download = json!({

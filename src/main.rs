@@ -288,7 +288,7 @@ fn process_workspace_events(
             {
                 continue;
             }
-            app.invalidate_agent_reads(&event.paths);
+            app.mark_agent_reads_dirty(&event.paths);
             if event
                 .paths
                 .iter()

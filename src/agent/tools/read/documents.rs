@@ -27,7 +27,7 @@ impl ReadParser for DocumentFileParser {
         &self,
         ctx: &ParseContext,
         target: &Target,
-        input: &Value,
+        _input: &Value,
     ) -> Result<ReadPayload> {
         let Target::File { path, range } = target else {
             bail!("document_file parser received non-file target");
@@ -38,7 +38,7 @@ impl ReadParser for DocumentFileParser {
         if metadata.len() > MAX_DOCUMENT_BYTES {
             bail!("document exceeds the {MAX_DOCUMENT_BYTES} byte extraction limit");
         }
-        let (offset, limit) = line_window(*range, input)?;
+        let (offset, limit) = line_window(*range);
         let key = DocumentSourceKey::Local {
             path: path.clone(),
             len: metadata.len(),
@@ -61,13 +61,7 @@ impl ReadParser for DocumentFileParser {
             .await?;
         let page = page_extracted_text(&document.markdown, offset, limit, json_response_len)?;
         let mut payload = json!({ "format": document.format.label() });
-        add_structured_page(
-            &mut payload,
-            page,
-            &target.display(ctx.root.as_path()),
-            offset,
-            limit,
-        );
+        add_structured_page(&mut payload, page, offset, limit);
         Ok(ReadPayload::Structured(payload))
     }
 }
@@ -98,7 +92,7 @@ mod tests {
         )
         .unwrap();
         let output = read
-            .execute(&json!({"path": "report.pdf:1-20"}))
+            .execute(&json!({"path": "report.pdf", "range": "1-20"}))
             .await
             .unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
@@ -125,14 +119,14 @@ mod tests {
 
         let first: Value = serde_json::from_str(
             &read
-                .execute(&json!({"path": "report.rtf:1-1"}))
+                .execute(&json!({"path": "report.rtf", "range": "1-1"}))
                 .await
                 .unwrap(),
         )
         .unwrap();
         let second: Value = serde_json::from_str(
             &read
-                .execute(&json!({"path": "report.rtf:3-3"}))
+                .execute(&json!({"path": "report.rtf", "range": "3-3"}))
                 .await
                 .unwrap(),
         )
@@ -144,7 +138,7 @@ mod tests {
         fs::write(&path, simple_rtf(&["replacement line", "new tail"])).unwrap();
         let changed: Value = serde_json::from_str(
             &read
-                .execute(&json!({"path": "report.rtf:1-1"}))
+                .execute(&json!({"path": "report.rtf", "range": "1-1"}))
                 .await
                 .unwrap(),
         )

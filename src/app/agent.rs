@@ -441,8 +441,8 @@ impl App {
         }
     }
 
-    pub fn invalidate_agent_reads(&mut self, paths: &[PathBuf]) {
-        if let Err(error) = self.agent_worker.invalidate_reads(paths) {
+    pub fn mark_agent_reads_dirty(&mut self, paths: &[PathBuf]) {
+        if let Err(error) = self.agent_worker.mark_reads_dirty(paths) {
             self.set_error(format!("Agent read-state error: {error:#}"));
         }
     }

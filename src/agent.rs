@@ -580,9 +580,9 @@ impl AgentWorker {
         Ok(())
     }
 
-    pub fn invalidate_reads(&self, paths: &[PathBuf]) -> Result<()> {
+    pub fn mark_reads_dirty(&self, paths: &[PathBuf]) -> Result<()> {
         for path in paths {
-            self.reads.invalidate(path)?;
+            self.reads.mark_dirty(path)?;
         }
         Ok(())
     }

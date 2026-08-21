@@ -284,7 +284,8 @@ impl Tool for TerminalInput {
                 },
                 "key": {
                     "type": "string",
-                    "enum": ["enter", "tab", "escape", "ctrl-c", "ctrl-d", "backspace", "up", "down", "left", "right", "home", "end", "delete", "page-up", "page-down"]
+                    "pattern": "^(enter|tab|escape|backspace|up|down|left|right|home|end|delete|page-up|page-down|ctrl-[a-z])$",
+                    "description": "One named terminal key, including Ctrl+A through Ctrl+Z as ctrl-a through ctrl-z"
                 }
             },
             "required": ["session_id", "purpose"],
@@ -492,6 +493,13 @@ mod tests {
         let mut key = base.clone();
         key["key"] = json!("ctrl-c");
         assert!(validator.is_valid(&key));
+        key["key"] = json!("ctrl-l");
+        assert!(validator.is_valid(&key));
+        key["key"] = json!("ctrl-z");
+        assert!(validator.is_valid(&key));
+        key["key"] = json!("ctrl-aa");
+        assert!(!validator.is_valid(&key));
+        key["key"] = json!("ctrl-c");
         key["submit"] = json!(false);
         assert!(validator.is_valid(&key));
         key["submit"] = json!(true);

@@ -102,7 +102,7 @@ impl ReadParser for DirectoryParser {
                 })
             })
             .collect::<Vec<_>>();
-        let mut payload = json!({
+        let payload = json!({
             "depth": depth,
             "sort_by": sort_by,
             "order": if descending { "desc" } else { "asc" },
@@ -112,9 +112,6 @@ impl ReadParser for DirectoryParser {
             "has_more": page.has_more(),
             "items": items,
         });
-        if let Some(next) = page.next() {
-            payload["next"] = json!(next);
-        }
         Ok(ReadPayload::Structured(payload))
     }
 }
