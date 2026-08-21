@@ -21,6 +21,17 @@ const SETTLE_INTERVAL: Duration = Duration::from_millis(150);
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_SETTLE_WAIT: Duration = Duration::from_secs(2);
 
+struct LimitedOutput {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+}
+
+impl LimitedOutput {
+    fn truncated(&self) -> bool {
+        self.total_bytes > self.bytes.len() as u64
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentTerminalStatus {
     Running,
@@ -102,7 +113,7 @@ impl AgentTerminalHandle {
         }
     }
 
-    pub(crate) fn open(&self, root: &Path, command: &str) -> Result<String> {
+    pub(crate) fn open(&self, root: &Path, nole_root: &Path, command: &str) -> Result<String> {
         if command.contains('\0') {
             bail!("terminal command cannot contain NUL bytes");
         }
@@ -113,7 +124,7 @@ impl AgentTerminalHandle {
         if state.session.is_some() {
             bail!("an Agent terminal session is already active");
         }
-        let helper = shell_helper_command("interactive")?;
+        let helper = shell_helper_command(nole_root)?;
         let mut terminal = EmbeddedTerminal::spawn_command(root, helper)?;
         terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
         let mut bytes = command.as_bytes().to_vec();
@@ -146,6 +157,25 @@ impl AgentTerminalHandle {
             bail!("terminal session has exited");
         }
         session.terminal.write_raw(bytes)
+    }
+
+    /// Validate that `session_id` names the current running Agent PTY without
+    /// reading or returning any terminal screen contents.
+    pub(crate) fn ensure_running_session(&self, session_id: &str) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        let session = state
+            .session
+            .as_mut()
+            .context("no active Agent terminal session")?;
+        ensure_session(session, session_id)?;
+        refresh_status(session)?;
+        if !matches!(session.status, AgentTerminalStatus::Running) {
+            bail!("terminal session has exited");
+        }
+        Ok(())
     }
 
     pub(crate) fn observation(&self, session_id: &str) -> Result<Value> {
@@ -258,7 +288,7 @@ impl AgentTerminalHandle {
     }
 
     #[cfg(all(test, unix))]
-    fn open_process_for_test(&self, root: &Path, script: &str) -> Result<String> {
+    pub(crate) fn open_process_for_test(&self, root: &Path, script: &str) -> Result<String> {
         let mut state = self
             .inner
             .lock()
@@ -392,18 +422,46 @@ pub(crate) fn run_noninteractive_shell(
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    let (stdout, stdout_truncated) = stdout_reader
+    let stdout = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("shell stdout reader panicked"))??;
-    let (stderr, stderr_truncated) = stderr_reader
+    let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("shell stderr reader panicked"))??;
-    Ok(json!({
-        "exit_code": status.code().unwrap_or(1),
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
+    Ok(shell_output_value(
+        status.code().unwrap_or(1),
+        stdout,
+        stderr,
+    ))
+}
+
+fn shell_output_value(exit_code: i32, stdout: LimitedOutput, stderr: LimitedOutput) -> Value {
+    let stdout_truncated = stdout.truncated();
+    let stderr_truncated = stderr.truncated();
+    let mut result = json!({
+        "exit_code": exit_code,
+        "stdout": String::from_utf8_lossy(&stdout.bytes),
+        "stderr": String::from_utf8_lossy(&stderr.bytes),
         "truncated": stdout_truncated || stderr_truncated,
-    }))
+        "output_limit_bytes_per_stream": OUTPUT_LIMIT,
+        "stdout_bytes": stdout.total_bytes,
+        "stdout_returned_bytes": stdout.bytes.len(),
+        "stdout_truncated": stdout_truncated,
+        "stderr_bytes": stderr.total_bytes,
+        "stderr_returned_bytes": stderr.bytes.len(),
+        "stderr_truncated": stderr_truncated,
+    });
+    if stdout_truncated || stderr_truncated {
+        result["warning"] = json!(format!(
+            "Output truncated: stdout returned {} of {} bytes; stderr returned {} of {} bytes (limit: {} bytes per stream).",
+            stdout.bytes.len(),
+            stdout.total_bytes,
+            stderr.bytes.len(),
+            stderr.total_bytes,
+            OUTPUT_LIMIT,
+        ));
+    }
+    result
 }
 
 fn configure_noninteractive_process(command: &mut Command) {
@@ -413,20 +471,23 @@ fn configure_noninteractive_process(command: &mut Command) {
     }
 }
 
-fn read_limited(mut reader: impl Read) -> Result<(Vec<u8>, bool)> {
+fn read_limited(mut reader: impl Read) -> Result<LimitedOutput> {
     let mut output = Vec::new();
-    let mut truncated = false;
+    let mut total_bytes = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }
+        total_bytes = total_bytes.saturating_add(count as u64);
         let remaining = OUTPUT_LIMIT.saturating_sub(output.len());
         output.extend_from_slice(&buffer[..count.min(remaining)]);
-        truncated |= count > remaining;
     }
-    Ok((output, truncated))
+    Ok(LimitedOutput {
+        bytes: output,
+        total_bytes,
+    })
 }
 
 pub(crate) fn terminal_input_bytes(
@@ -500,6 +561,67 @@ pub(crate) fn terminal_input_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limited_output_reports_total_and_retained_bytes() {
+        let input = vec![b'x'; OUTPUT_LIMIT + 37];
+        let output = read_limited(std::io::Cursor::new(input)).unwrap();
+        assert_eq!(output.bytes.len(), OUTPUT_LIMIT);
+        assert_eq!(output.total_bytes, (OUTPUT_LIMIT + 37) as u64);
+        assert!(output.truncated());
+    }
+
+    #[test]
+    fn shell_output_has_per_stream_truncation_metadata_and_warning() {
+        let result = shell_output_value(
+            0,
+            LimitedOutput {
+                bytes: vec![b'x'; OUTPUT_LIMIT],
+                total_bytes: OUTPUT_LIMIT as u64 + 9,
+            },
+            LimitedOutput {
+                bytes: b"warning".to_vec(),
+                total_bytes: 7,
+            },
+        );
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["stdout_bytes"], OUTPUT_LIMIT as u64 + 9);
+        assert_eq!(result["stdout_returned_bytes"], OUTPUT_LIMIT);
+        assert_eq!(result["stdout_truncated"], true);
+        assert_eq!(result["stderr_bytes"], 7);
+        assert_eq!(result["stderr_returned_bytes"], 7);
+        assert_eq!(result["stderr_truncated"], false);
+        assert_eq!(result["output_limit_bytes_per_stream"], OUTPUT_LIMIT);
+        assert!(result["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.starts_with("Output truncated:")));
+    }
+
+    #[test]
+    fn shell_output_omits_warning_when_complete() {
+        let result = shell_output_value(
+            0,
+            LimitedOutput {
+                bytes: b"ok".to_vec(),
+                total_bytes: 2,
+            },
+            LimitedOutput {
+                bytes: Vec::new(),
+                total_bytes: 0,
+            },
+        );
+        assert_eq!(result["truncated"], false);
+        assert!(result.get("warning").is_none());
+    }
+
+    #[test]
+    fn truncated_utf8_is_rendered_lossily_without_panicking() {
+        let mut input = vec![b'x'; OUTPUT_LIMIT - 1];
+        input.extend_from_slice("é".as_bytes());
+        let output = read_limited(std::io::Cursor::new(input)).unwrap();
+        assert!(output.truncated());
+        assert!(String::from_utf8_lossy(&output.bytes).ends_with('\u{fffd}'));
+    }
 
     #[test]
     fn terminal_input_is_exact_and_visible() {

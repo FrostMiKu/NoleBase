@@ -813,6 +813,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -853,6 +854,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -970,6 +972,20 @@
             "Calling Terminal Input...\nterminal-1: yes ↵"
         );
 
+        let private_input = json!({
+            "name": "terminal_request_private_input",
+            "input": {
+                "session_id": "terminal-1",
+                "purpose": "Authenticate the deployment",
+                "prompt": "Enter the SSH passphrase"
+            }
+        });
+        assert_eq!(
+            tool_start_activity(&private_input),
+            "Calling Terminal Request Private Input...\nterminal-1: Authenticate the deployment"
+        );
+        assert!(!tool_start_activity(&private_input).contains("passphrase"));
+
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
             "Failed Read: file not found\ndata/project notes.md"
@@ -1030,6 +1046,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1146,6 +1163,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1310,6 +1328,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1475,6 +1494,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1570,6 +1590,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1676,6 +1697,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1774,6 +1796,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -1998,6 +2021,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -2122,6 +2146,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -2213,6 +2238,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -2352,6 +2378,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 input_buffer.clone(),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -2468,6 +2495,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 input_buffer.clone(),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -2540,6 +2568,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),
@@ -2641,6 +2670,7 @@
                     event_sender,
                     approval_receiver,
                     user_receiver,
+                    private_terminal_input_receiver(),
                     Arc::new(Mutex::new(Vec::new())),
                     Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                     Arc::new(AtomicBool::new(false)),
@@ -2763,6 +2793,7 @@
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver(),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
                 Arc::new(AtomicBool::new(false)),

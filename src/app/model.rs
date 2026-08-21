@@ -370,6 +370,7 @@ pub enum Overlay {
     AiPrompt,
     Approval,
     AskUser,
+    PrivateTerminalInput,
     WikiLinkChoice,
     Terminal,
     /// A caller-provided command dialog. Its mode and purpose live in

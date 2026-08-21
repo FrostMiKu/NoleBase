@@ -133,6 +133,7 @@ pub enum AgentEvent {
     OpenFile(PathBuf),
     Approval(ApprovalRequest),
     AskUser(AskUserRequest),
+    PrivateTerminalInput(PrivateTerminalInputRequest),
     Stopped(AgentStopReason),
     Finished(Result<String, String>),
 }
@@ -233,5 +234,20 @@ pub enum AskUserKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskUserResponse {
     Answer(String),
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateTerminalInputRequest {
+    pub session_id: String,
+    pub purpose: String,
+    pub prompt: String,
+}
+
+/// Internal TUI-to-runtime response. Deliberately has no `Debug`, `Clone`, or
+/// serialization implementation so the private value cannot accidentally be
+/// formatted, copied into activity, or persisted with Agent state.
+pub(crate) enum PrivateTerminalInputDecision {
+    Submit(zeroize::Zeroizing<String>),
     Cancelled,
 }

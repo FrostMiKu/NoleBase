@@ -10,11 +10,12 @@ use anyhow::Context;
 use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::agent::{
     AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision, ApprovalKind,
     ApprovalRequest, AskUserKind, AskUserRequest, AskUserResponse, PermissionMode,
-    AGENT_STREAM_BUFFER,
+    PrivateTerminalInputDecision, PrivateTerminalInputRequest, AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::attachment::{AttachmentId, AttachmentStore};
@@ -360,6 +361,8 @@ pub struct App {
     active_agent: Option<Observable<crate::agent::AgentRunOutput, AgentEvent>>,
     ai_approval_sender: Option<tokio::sync::mpsc::UnboundedSender<ApprovalDecision>>,
     ai_user_sender: Option<tokio::sync::mpsc::UnboundedSender<AskUserResponse>>,
+    ai_private_terminal_input_sender:
+        Option<tokio::sync::mpsc::UnboundedSender<PrivateTerminalInputDecision>>,
     agent_worker: AgentWorker,
     agent_input_buffer: Arc<Mutex<Vec<String>>>,
     pub ai_running: bool,
@@ -389,6 +392,9 @@ pub struct App {
     pub ask_user_input: String,
     pub ask_user_cursor: usize,
     pub ask_user_option: usize,
+    pub private_terminal_input_request: Option<PrivateTerminalInputRequest>,
+    private_terminal_input: Zeroizing<String>,
+    private_terminal_input_cursor: usize,
     pub notifications: NotificationService,
     pub wiki_link_target: Option<String>,
     pub wiki_link_candidates: Vec<WikiLinkCandidate>,
@@ -454,6 +460,8 @@ impl App {
         let (event_sender, _) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
         let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (private_terminal_input_sender, private_terminal_input_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         let agent_worker = AgentWorker::spawn(
             storage.ai_config_path.clone(),
             storage.root.clone(),
@@ -461,6 +469,7 @@ impl App {
                 event_sender,
                 approval_receiver,
                 user_receiver,
+                private_terminal_input_receiver,
                 agent_input_buffer.clone(),
                 permission_mode_atomic.clone(),
                 cancelled.clone(),
@@ -582,6 +591,7 @@ impl App {
             active_agent: None,
             ai_approval_sender: Some(approval_sender),
             ai_user_sender: Some(user_sender),
+            ai_private_terminal_input_sender: Some(private_terminal_input_sender),
             agent_worker,
             agent_input_buffer,
             ai_running: false,
@@ -611,6 +621,9 @@ impl App {
             ask_user_input: String::new(),
             ask_user_cursor: 0,
             ask_user_option: 0,
+            private_terminal_input_request: None,
+            private_terminal_input: Zeroizing::new(String::new()),
+            private_terminal_input_cursor: 0,
             notifications: NotificationService::default(),
             wiki_link_target: None,
             wiki_link_candidates: Vec::new(),

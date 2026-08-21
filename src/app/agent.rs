@@ -293,6 +293,13 @@ impl App {
                     self.ask_user_request = Some(request);
                     self.set_overlay(Overlay::AskUser);
                 }
+                AgentEvent::PrivateTerminalInput(request) => {
+                    self.private_terminal_input.zeroize();
+                    self.private_terminal_input_cursor = 0;
+                    self.private_terminal_input_request = Some(request);
+                    self.set_status("Agent terminal is waiting for private input");
+                    self.set_overlay(Overlay::PrivateTerminalInput);
+                }
                 AgentEvent::Stopped(reason) => {
                     self.active_agent = None;
                     self.deactivate_agent_tools();
@@ -316,6 +323,7 @@ impl App {
                     self.notifications.notify(notification);
                     self.set_status(status);
                     self.clear_ask_user();
+                    self.clear_private_terminal_input();
                     self.reload_workspace();
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
@@ -362,6 +370,7 @@ impl App {
                         }
                     }
                     self.clear_ask_user();
+                    self.clear_private_terminal_input();
                     self.reload_workspace();
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
@@ -388,6 +397,7 @@ impl App {
                 "Agent worker stopped unexpectedly".to_string(),
             )));
             self.clear_ask_user();
+            self.clear_private_terminal_input();
             self.set_error("AI error: worker stopped unexpectedly");
         }
     }
@@ -714,6 +724,7 @@ impl App {
         }
         self.approval_request = None;
         self.clear_ask_user();
+        self.clear_private_terminal_input();
         if self.overlay == Some(Overlay::Approval) {
             self.overlay = None;
         }
@@ -858,6 +869,51 @@ impl App {
             .dialog
             .as_ref()
             .is_some_and(|dialog| dialog.purpose == DialogPurpose::AskUser)
+        {
+            self.dialog = None;
+        }
+    }
+
+    pub(super) fn send_private_terminal_input(&mut self, submit: bool) -> anyhow::Result<()> {
+        let sender = self
+            .ai_private_terminal_input_sender
+            .as_ref()
+            .context("Agent private-input channel is unavailable")?
+            .clone();
+        let decision = if submit {
+            let private_value = std::mem::replace(
+                &mut self.private_terminal_input,
+                Zeroizing::new(String::new()),
+            );
+            PrivateTerminalInputDecision::Submit(private_value)
+        } else {
+            self.private_terminal_input.zeroize();
+            PrivateTerminalInputDecision::Cancelled
+        };
+        if sender.send(decision).is_err() {
+            self.clear_private_terminal_input();
+            anyhow::bail!("sending private input to Agent");
+        }
+        self.set_status(if submit {
+            "Private input submitted to Agent terminal"
+        } else {
+            "Private terminal input cancelled"
+        });
+        self.clear_private_terminal_input();
+        Ok(())
+    }
+
+    pub(super) fn clear_private_terminal_input(&mut self) {
+        self.private_terminal_input.zeroize();
+        self.private_terminal_input_cursor = 0;
+        self.private_terminal_input_request = None;
+        if self.overlay == Some(Overlay::PrivateTerminalInput) {
+            self.overlay = None;
+        }
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.purpose == DialogPurpose::PrivateTerminalInput)
         {
             self.dialog = None;
         }

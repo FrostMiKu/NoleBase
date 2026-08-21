@@ -44,6 +44,7 @@ pub(crate) mod hashline;
 pub(crate) mod images;
 mod prompts;
 mod shell_helper;
+mod shell_policy;
 mod snapshots;
 mod subagent;
 mod terminal;
@@ -58,6 +59,7 @@ pub(crate) use self::context::*;
 pub(crate) use self::hashline::*;
 pub(crate) use self::prompts::*;
 pub(crate) use self::shell_helper::*;
+pub(crate) use self::shell_policy::*;
 pub(crate) use self::snapshots::*;
 pub(crate) use self::terminal::*;
 pub use self::types::*;
@@ -129,6 +131,8 @@ pub struct AgentRuntime {
     events: AgentEventSender,
     decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
     user_responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>>>,
+    private_terminal_input:
+        Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PrivateTerminalInputDecision>>>,
     input_buffer: Arc<Mutex<Vec<String>>>,
     permission_mode: Arc<AtomicU8>,
     cancelled: Arc<AtomicBool>,
@@ -142,6 +146,7 @@ impl AgentRuntime {
         events: AgentEventSender,
         decisions: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
         user_responses: tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>,
+        private_terminal_input: tokio::sync::mpsc::UnboundedReceiver<PrivateTerminalInputDecision>,
         input_buffer: Arc<Mutex<Vec<String>>>,
         permission_mode: Arc<AtomicU8>,
         cancelled: Arc<AtomicBool>,
@@ -150,6 +155,7 @@ impl AgentRuntime {
             events,
             decisions: Arc::new(tokio::sync::Mutex::new(decisions)),
             user_responses: Arc::new(tokio::sync::Mutex::new(user_responses)),
+            private_terminal_input: Arc::new(tokio::sync::Mutex::new(private_terminal_input)),
             input_buffer,
             permission_mode,
             cancelled,
@@ -637,6 +643,7 @@ impl Agent {
             events,
             decisions,
             user_responses,
+            private_terminal_input,
             input_buffer,
             permission_mode,
             cancelled,
@@ -708,6 +715,12 @@ impl Agent {
             cancelled.clone(),
         ));
         agent.register(TerminalRead::new(terminal.clone(), cancelled.clone()));
+        agent.register(TerminalRequestPrivateInput {
+            events: agent.events.clone(),
+            responses: private_terminal_input,
+            terminal: terminal.clone(),
+            cancelled: cancelled.clone(),
+        });
         agent.register(TerminalClose::new(terminal));
         agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
         agent.register(HttpRequest::new(nole_root, client.clone())?);
@@ -1533,6 +1546,12 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    fn private_terminal_input_receiver(
+    ) -> tokio::sync::mpsc::UnboundedReceiver<PrivateTerminalInputDecision> {
+        let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        receiver
+    }
+
     include!("agent/tests_part1.inc");
     include!("agent/tests_part2.inc");
 }

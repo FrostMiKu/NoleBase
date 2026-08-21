@@ -1,10 +1,14 @@
 //! Hidden Brush runner used by Agent shell tools.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use brush_builtins::ShellBuilderExt as _;
 use brush_core::{ProfileLoadBehavior, RcLoadBehavior, ShellVariable};
+use brush_interactive::{InputBackend, InteractivePrompt, ReadResult, ShellError};
+
+use super::shell_policy::validate_shell_command;
 
 const HELPER_FLAG: &str = "--agent-shell-helper";
 pub(crate) const NONINTERACTIVE_ENVIRONMENT: [(&str, &str); 7] = [
@@ -20,7 +24,7 @@ pub(crate) const NONINTERACTIVE_ENVIRONMENT: [(&str, &str); 7] = [
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShellHelperMode {
     Command(String),
-    Interactive,
+    Interactive(PathBuf),
 }
 
 pub(crate) fn shell_helper_mode<I>(mut args: I) -> Option<ShellHelperMode>
@@ -33,17 +37,72 @@ where
     }
     match args.next().as_deref() {
         Some("command") => Some(ShellHelperMode::Command(args.next().unwrap_or_default())),
-        Some("interactive") => Some(ShellHelperMode::Interactive),
+        Some("interactive") => args
+            .next()
+            .map(PathBuf::from)
+            .map(ShellHelperMode::Interactive),
         _ => None,
     }
 }
 
-pub(crate) fn shell_helper_command(mode: &str) -> Result<portable_pty::CommandBuilder> {
+pub(crate) fn shell_helper_command(nole_root: &Path) -> Result<portable_pty::CommandBuilder> {
     let executable = std::env::current_exe().context("locating the Nole executable")?;
     let mut command = portable_pty::CommandBuilder::new(executable);
     command.arg(HELPER_FLAG);
-    command.arg(mode);
+    command.arg("interactive");
+    command.arg(nole_root);
     Ok(command)
+}
+
+struct SafetyInputBackend {
+    inner: brush_interactive::BasicInputBackend,
+    nole_root: PathBuf,
+}
+
+impl SafetyInputBackend {
+    fn new(nole_root: PathBuf) -> Self {
+        Self {
+            inner: brush_interactive::BasicInputBackend,
+            nole_root,
+        }
+    }
+}
+
+impl InputBackend for SafetyInputBackend {
+    fn read_line(
+        &mut self,
+        shell: &brush_interactive::ShellRef<impl brush_core::ShellExtensions>,
+        prompt: InteractivePrompt,
+    ) -> Result<ReadResult, ShellError> {
+        let result = self.inner.read_line(shell, prompt)?;
+        let Some(command) = submitted_command(&result) else {
+            return Ok(result);
+        };
+        let cwd = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { shell.lock().await.working_dir().to_path_buf() })
+        });
+        if let Err(error) = validate_shell_command(command, &cwd, &self.nole_root) {
+            eprintln!("Nole: {error:#}");
+            return Ok(ReadResult::Interrupted);
+        }
+        Ok(result)
+    }
+
+    fn get_read_buffer(&self) -> Option<(String, usize)> {
+        self.inner.get_read_buffer()
+    }
+
+    fn set_read_buffer(&mut self, buffer: String, cursor: usize) {
+        self.inner.set_read_buffer(buffer, cursor);
+    }
+}
+
+fn submitted_command(result: &ReadResult) -> Option<&str> {
+    match result {
+        ReadResult::Input(command) | ReadResult::BoundCommand(command) => Some(command),
+        ReadResult::Eof | ReadResult::Interrupted => None,
+    }
 }
 
 pub(crate) fn run_shell_helper(mode: ShellHelperMode) -> Result<u8> {
@@ -106,9 +165,9 @@ async fn run_shell_helper_async(mode: ShellHelperMode) -> Result<u8> {
                 .context("running shell command")?;
             Ok(u8::from(result.exit_code))
         }
-        ShellHelperMode::Interactive => {
+        ShellHelperMode::Interactive(nole_root) => {
             let shell = Arc::new(tokio::sync::Mutex::new(shell));
-            let mut input = brush_interactive::BasicInputBackend;
+            let mut input = SafetyInputBackend::new(nole_root);
             let options = brush_interactive::InteractiveOptions::default();
             let mut interactive =
                 brush_interactive::InteractiveShell::new(&shell, &mut input, &options)?;
@@ -135,5 +194,30 @@ mod tests {
         );
         let normal = ["nole", "--version"].into_iter().map(str::to_string);
         assert_eq!(shell_helper_mode(normal), None);
+
+        let interactive = ["nole", HELPER_FLAG, "interactive", "/tmp/notes"]
+            .into_iter()
+            .map(str::to_string);
+        assert_eq!(
+            shell_helper_mode(interactive),
+            Some(ShellHelperMode::Interactive(PathBuf::from("/tmp/notes")))
+        );
+    }
+
+    #[test]
+    fn only_submitted_terminal_commands_are_checked() {
+        assert_eq!(
+            submitted_command(&ReadResult::Input("rm -rf /".to_string())),
+            Some("rm -rf /")
+        );
+        assert_eq!(submitted_command(&ReadResult::Interrupted), None);
+        assert_eq!(submitted_command(&ReadResult::Eof), None);
+        let cwd = Path::new("/tmp/notes");
+        assert!(validate_shell_command(
+            submitted_command(&ReadResult::Input("rm -rf /".to_string())).unwrap(),
+            cwd,
+            cwd,
+        )
+        .is_err());
     }
 }

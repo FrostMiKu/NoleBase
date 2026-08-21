@@ -75,6 +75,7 @@ impl App {
             }
             DialogPurpose::SkillBrowser => return self.handle_skill_browser(key),
             DialogPurpose::AskUser => return self.handle_select_or_input_dialog(key),
+            DialogPurpose::PrivateTerminalInput => return self.handle_private_terminal_input(key),
             DialogPurpose::CommandPalette => return self.handle_command_palette(key),
             DialogPurpose::ThemePicker => return self.handle_theme_picker(key),
             DialogPurpose::TagRenameSource => return self.handle_tag_rename_source(key),
@@ -150,9 +151,51 @@ impl App {
             DialogMode::SelectOrInput => return self.handle_custom_select_or_input(key),
             DialogMode::SingleLine | DialogMode::FreeText => return self.handle_text_dialog(key),
             DialogMode::CommandPalette => return self.handle_command_palette(key),
-            DialogMode::Approval | DialogMode::CommandApproval | DialogMode::Informational => {}
+            DialogMode::SecretLine
+            | DialogMode::Approval
+            | DialogMode::CommandApproval
+            | DialogMode::Informational => {}
         }
         None
+    }
+
+    pub(crate) fn handle_private_terminal_input(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Enter => {
+                if self.private_terminal_input.is_empty() {
+                    self.set_status("Enter a private value before submitting");
+                } else if let Err(error) = self.send_private_terminal_input(true) {
+                    self.set_error(error.to_string());
+                }
+            }
+            KeyCode::Esc => {
+                if let Err(error) = self.send_private_terminal_input(false) {
+                    self.set_error(error.to_string());
+                }
+            }
+            _ => {
+                let edit = edit_single_line(
+                    &mut self.private_terminal_input,
+                    &mut self.private_terminal_input_cursor,
+                    key,
+                );
+                if edit.handled() {
+                    self.sync_private_terminal_input_mask();
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn sync_private_terminal_input_mask(&mut self) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        if dialog.purpose != DialogPurpose::PrivateTerminalInput {
+            return;
+        }
+        dialog.input = "•".repeat(self.private_terminal_input.chars().count());
+        dialog.cursor = self.private_terminal_input_cursor;
     }
 
     pub(crate) fn handle_theme_picker(&mut self, key: KeyEvent) -> Option<Command> {

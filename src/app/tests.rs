@@ -1415,6 +1415,82 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
 }
 
 #[test]
+fn private_terminal_input_is_masked_and_sent_only_on_its_private_channel() {
+    let (mut app, _directory) = make_app();
+    let event_sender = install_agent_observable(&mut app);
+    let (response_sender, mut response_receiver) = tokio::sync::mpsc::unbounded_channel();
+    app.ai_private_terminal_input_sender = Some(response_sender);
+    app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
+        text: "Calling Terminal Request Private Input...\nterminal-1: Authenticate".to_string(),
+        active: true,
+        preview: None,
+    }));
+    event_sender
+        .send(AgentEvent::PrivateTerminalInput(
+            PrivateTerminalInputRequest {
+                session_id: "terminal-1".to_string(),
+                purpose: "Authenticate the command".to_string(),
+                prompt: "Enter your password".to_string(),
+            },
+        ))
+        .unwrap();
+    app.poll_agent();
+    assert_eq!(app.overlay, Some(Overlay::PrivateTerminalInput));
+
+    app.handle_key(key(KeyCode::Char('s')));
+    app.handle_paste("3cret\r\nvalue");
+    let secret = "s3cretvalue";
+    assert_eq!(app.private_terminal_input.as_str(), secret);
+    let dialog = app.dialog.as_ref().unwrap();
+    assert_eq!(dialog.input, "•".repeat(secret.chars().count()));
+    assert!(!dialog.input.contains(secret));
+    assert!(!app.status.contains(secret));
+    assert!(!app
+        .agent_panel
+        .iter()
+        .any(|entry| format!("{entry:?}").contains(secret)));
+    app.persist_agent_session().unwrap();
+    let persisted = fs::read_to_string(&app.storage.agent_session_path).unwrap();
+    assert!(!persisted.contains(secret));
+
+    app.handle_key(key(KeyCode::Enter));
+    let submitted = response_receiver.try_recv().unwrap();
+    match submitted {
+        PrivateTerminalInputDecision::Submit(value) => assert_eq!(value.as_str(), secret),
+        PrivateTerminalInputDecision::Cancelled => panic!("expected submitted private input"),
+    }
+    assert!(app.private_terminal_input.is_empty());
+    assert_eq!(app.private_terminal_input_cursor, 0);
+    assert!(app.private_terminal_input_request.is_none());
+    assert!(app.dialog.is_none());
+    assert_eq!(app.overlay, None);
+    assert!(!app.status.contains(secret));
+}
+
+#[test]
+fn private_terminal_input_escape_cancels_without_touching_agent_activity() {
+    let (mut app, _directory) = make_app();
+    let (response_sender, mut response_receiver) = tokio::sync::mpsc::unbounded_channel();
+    app.ai_private_terminal_input_sender = Some(response_sender);
+    app.private_terminal_input_request = Some(PrivateTerminalInputRequest {
+        session_id: "terminal-1".to_string(),
+        purpose: "Authenticate".to_string(),
+        prompt: "Enter a password".to_string(),
+    });
+    app.set_overlay(Overlay::PrivateTerminalInput);
+    app.handle_paste("do-not-record");
+    app.handle_key(key(KeyCode::Esc));
+
+    assert!(matches!(
+        response_receiver.try_recv().unwrap(),
+        PrivateTerminalInputDecision::Cancelled
+    ));
+    assert!(app.private_terminal_input.is_empty());
+    assert!(app.agent_panel.is_empty());
+    assert_eq!(app.status, "Private terminal input cancelled");
+}
+
+#[test]
 fn round_limit_dialog_submits_continue_and_escape_submits_stop() {
     let (mut app, _directory) = make_app();
     let event_sender = install_agent_observable(&mut app);

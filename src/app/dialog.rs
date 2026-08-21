@@ -5,6 +5,7 @@
 pub enum DialogMode {
     Confirm,
     SingleLine,
+    SecretLine,
     SingleSelect,
     MultiSelect,
     SelectOrInput,
@@ -25,6 +26,7 @@ pub enum DialogPurpose {
     AgentApproval,
     AgentDestructiveApproval,
     AskUser,
+    PrivateTerminalInput,
     WikiLinkChoice,
     Help,
     NewFile,

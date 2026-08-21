@@ -421,6 +421,30 @@ impl App {
                 dialog.cursor = self.ask_user_cursor;
                 dialog
             }
+            Overlay::PrivateTerminalInput => {
+                let request = self.private_terminal_input_request.as_ref();
+                let mut dialog = DialogState::new(
+                    request
+                        .map(|request| {
+                            format!("Private terminal input · {}", request.session_id)
+                        })
+                        .unwrap_or_else(|| "Private terminal input".to_string()),
+                    request
+                        .map(|request| {
+                            format!(
+                                "{}\n\n{}\n\nThe value is sent directly to the terminal and is not shared with the Agent.",
+                                request.purpose, request.prompt
+                            )
+                        })
+                        .unwrap_or_default(),
+                    DialogMode::SecretLine,
+                    DialogPurpose::PrivateTerminalInput,
+                    Vec::new(),
+                );
+                dialog.input = "•".repeat(self.private_terminal_input.chars().count());
+                dialog.cursor = self.private_terminal_input_cursor;
+                dialog
+            }
             Overlay::WikiLinkChoice => {
                 let target = self.wiki_link_target.as_deref().unwrap_or("wikilink");
                 let options = self

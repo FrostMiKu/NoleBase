@@ -670,21 +670,41 @@ login profile, interactive rc files, aliases, and shell functions loaded. Its
 stdin is closed, and `PAGER=cat`, `GIT_PAGER=cat`, `SYSTEMD_PAGER=cat`,
 `TERM=dumb`, `GIT_TERMINAL_PROMPT=0`, `CI=true`, and `NO_COLOR=1` are injected
 to prevent routine commands from waiting for interaction. Shell commands have
-full host access and are not sandboxed.
+full host access and are not sandboxed. Before approval, a hard environment
+safety policy parses each command and rejects recursive forced deletion of the
+filesystem root, the command's working directory, the user's home, the Nole
+directory, or a parent that contains one of them. Unresolved deletion targets
+are rejected as well. This policy applies in every permission mode. Shell stdout
+and stderr are each returned up to 1 MiB; results include original and returned
+byte counts plus per-stream truncation flags, and truncated results include an
+explicit warning.
 
 For genuinely interactive work, `terminal_open`, `terminal_input`,
 `terminal_read`, and `terminal_close` manage one persistent Agent PTY. A
-five-row monitor remains at the top of the center panel while the session
+15-row monitor remains at the top of the center panel while the session
 exists; the underlying virtual terminal remains 24 rows. In `APPROVE` and
 `AUTO`, every shell command and every Agent PTY input opens an approval dialog
 showing the Agent's purpose and the complete command or input. `YOLO` skips
-these approvals. Text sent through `terminal_input` presses Enter by default;
+these approvals, but the hard safety check still runs. The initial
+`terminal_open` command is checked before the PTY starts, and the interactive
+Brush input backend checks each complete line assembled through `terminal_input`
+immediately before submission. Text sent through `terminal_input` presses Enter by default;
 `submit=false` types the text without submitting it, and named keys include
 `ctrl-a` through `ctrl-z`. An exited PTY keeps its
 final screen until `terminal_close` removes it. Denying an approval blocks that
 action but preserves an existing PTY; cancelling the Agent or clearing the Agent
 session terminates and removes a live PTY
 immediately.
+
+When a PTY asks for a password, passphrase, or MFA code, the Agent can call
+`terminal_request_private_input`. Nole opens a masked, single-line dialog and
+sends the submitted value plus Enter directly from the TUI to the selected PTY.
+The value is not placed in Agent context, tool arguments or results, activity
+text, or the persisted Agent session; the tool returns only `submitted` or
+`cancelled`. The Agent must call `terminal_read` afterward to observe whether
+authentication succeeded. Nole does not record the entered value, but output
+printed by the child process remains ordinary PTY output; password prompts
+should therefore keep terminal echo disabled as usual.
 
 The system prompt requires the Agent to use `ask` when it needs an answer before
 it can complete the current task. Later `Ctrl+Enter` prompts remain part

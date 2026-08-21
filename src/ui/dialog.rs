@@ -210,6 +210,7 @@ pub(super) fn draw_dialog(
     let desired_height = match dialog.mode {
         DialogMode::Confirm => 5,
         DialogMode::SingleLine => 5,
+        DialogMode::SecretLine => message_rows.min(8).saturating_add(3),
         DialogMode::FreeText => 11,
         DialogMode::SelectOrInput => message_rows
             .min(8)
@@ -268,14 +269,17 @@ pub(super) fn draw_dialog(
         _ if destructive => app.theme.ui_error,
         _ if warning => app.theme.ui_warning,
         DialogMode::Approval | DialogMode::CommandApproval => app.theme.ui_warning,
-        DialogMode::SingleLine | DialogMode::FreeText => app.theme.ui_dialog_input,
+        DialogMode::SingleLine | DialogMode::SecretLine | DialogMode::FreeText => {
+            app.theme.ui_dialog_input
+        }
         DialogMode::SelectOrInput
         | DialogMode::SingleSelect
         | DialogMode::MultiSelect
         | DialogMode::CommandPalette => app.theme.ui_dialog_choice,
         _ => app.theme.text_disabled,
     };
-    let modal_background = if dialog.mode == DialogMode::SingleLine {
+    let modal_background = if matches!(dialog.mode, DialogMode::SingleLine | DialogMode::SecretLine)
+    {
         app.theme.surface_panel
     } else {
         app.theme.surface_overlay
@@ -356,6 +360,42 @@ pub(super) fn draw_dialog(
                 *cursor_position = Some(position);
             }
             draw_dialog_footer(frame, footer, "Enter save · Esc cancel", app.theme);
+        }
+        DialogMode::SecretLine => {
+            let footer_y = inner.y + inner.height.saturating_sub(1);
+            let input_y = footer_y.saturating_sub(1);
+            let message = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                input_y.saturating_sub(inner.y),
+            );
+            if message.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(dialog.message.clone())
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(app.theme.text_secondary)),
+                    message,
+                );
+            }
+            let input = Rect::new(inner.x, input_y, inner.width, 1);
+            // The private-input path stores only bullets in `DialogState` so
+            // cloning it for rendering never clones the value. Mask again at
+            // the mode boundary to keep `SecretLine` safe for future callers.
+            let masked = "•".repeat(dialog.input.chars().count());
+            if let Some(position) = draw_single_line_input(
+                frame,
+                input,
+                "Private input  ",
+                &masked,
+                dialog.cursor,
+                true,
+                app.theme,
+            ) {
+                *cursor_position = Some(position);
+            }
+            let footer = Rect::new(inner.x, footer_y, inner.width, 1);
+            draw_dialog_footer(frame, footer, "Enter submit · Esc cancel", app.theme);
         }
         DialogMode::FreeText => {
             let (input, footer) = split_last_row(inner);

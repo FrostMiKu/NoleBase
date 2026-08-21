@@ -114,6 +114,9 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
             Some(format!("{session}: {input}"))
         }
         "terminal_read" | "terminal_close" => text("session_id"),
+        "terminal_request_private_input" => {
+            Some(format!("{}: {}", text("session_id")?, text("purpose")?))
+        }
         "read" => text("path").map(|path| {
             if is_url(&path) {
                 web_base_url(&path)

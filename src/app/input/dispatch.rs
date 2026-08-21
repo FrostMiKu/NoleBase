@@ -5,6 +5,10 @@ use super::super::*;
 impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         if is_terminal_toggle(key) {
+            if self.overlay == Some(Overlay::PrivateTerminalInput) {
+                self.set_status("Submit or cancel the private input first");
+                return None;
+            }
             self.toggle_terminal();
             return None;
         }
@@ -96,6 +100,7 @@ impl App {
                 Some(
                     DialogPurpose::AgentPrompt
                         | DialogPurpose::AskUser
+                        | DialogPurpose::PrivateTerminalInput
                         | DialogPurpose::NewFile
                         | DialogPurpose::RenameFile
                         | DialogPurpose::ExportDestination
@@ -104,6 +109,16 @@ impl App {
                 )
             ) {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if purpose == Some(DialogPurpose::PrivateTerminalInput) {
+                    let text = text.replace('\n', "");
+                    paste_into(
+                        &mut self.private_terminal_input,
+                        &mut self.private_terminal_input_cursor,
+                        &text,
+                    );
+                    self.sync_private_terminal_input_mask();
+                    return;
+                }
                 if matches!(purpose, Some(DialogPurpose::AskUser)) {
                     self.select_custom_dialog_option();
                 }

@@ -25,6 +25,7 @@ base64 = "0.22"
 brush-builtins = "0.2.0"
 brush-core = "0.5.0"
 brush-interactive = { version = "0.4.0", features = ["basic"] }
+brush-parser = "0.4.0"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 anyhow = "1"
 anydoc = "0.2.0"
@@ -42,6 +43,7 @@ notify = "8"
 open = "5"
 portable-pty = "0.9"
 unicode-width = "0.2.2"
+zeroize = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

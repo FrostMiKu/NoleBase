@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::agent::{
-    run_noninteractive_shell, terminal_input_bytes, terminal_input_display, AgentTerminalHandle,
-    ApprovalGate, ApprovalKind, ApprovalRequest, CommandApproval, Tool,
+    run_noninteractive_shell, terminal_input_bytes, terminal_input_display, validate_shell_command,
+    AgentTerminalHandle, ApprovalGate, ApprovalKind, ApprovalRequest, CommandApproval, Tool,
 };
 
 use super::util::required_string;
@@ -97,7 +97,7 @@ impl Tool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run one non-interactive command in the user's Brush shell. The command has full host access. stdin is closed and common pagers and prompts are disabled."
+        "Run one non-interactive command in the user's Brush shell. The command has full host access. A hard safety policy rejects broad recursive forced deletions in every permission mode. stdin is closed and common pagers and prompts are disabled. stdout and stderr are each capped at 1 MiB with explicit truncation metadata."
     }
 
     fn input_schema(&self) -> Value {
@@ -127,6 +127,7 @@ impl Tool for Shell {
         let purpose = required_purpose(input)?;
         let command = required_string(input, "command")?;
         let cwd = resolve_shell_cwd(&self.root, optional_string(input, "cwd")?)?;
+        validate_shell_command(command, &cwd, &self.root)?;
         let timeout_seconds = input
             .get("timeout_seconds")
             .and_then(Value::as_u64)
@@ -187,7 +188,7 @@ impl Tool for TerminalOpen {
     }
 
     fn description(&self) -> &'static str {
-        "Start one persistent PTY command in the user's interactive Brush shell. Use terminal_input and terminal_read to interact with it. Only one Agent PTY session may be active."
+        "Start one persistent PTY command in the user's interactive Brush shell. A hard safety policy checks the initial command in every permission mode. Use terminal_input and terminal_read to interact with it. Only one Agent PTY session may be active."
     }
 
     fn input_schema(&self) -> Value {
@@ -211,6 +212,7 @@ impl Tool for TerminalOpen {
         let purpose = required_purpose(input)?;
         let command = required_string(input, "command")?;
         let cwd = resolve_shell_cwd(&self.root, optional_string(input, "cwd")?)?;
+        validate_shell_command(command, &cwd, &self.root)?;
         self.gate
             .request_host_action(command_approval(
                 "Open interactive terminal",
@@ -221,10 +223,12 @@ impl Tool for TerminalOpen {
             .await?;
 
         let terminal = self.terminal.clone();
+        let nole_root = self.root.clone();
         let command = command.to_string();
-        let session_id = tokio::task::spawn_blocking(move || terminal.open(&cwd, &command))
-            .await
-            .context("joining terminal startup")??;
+        let session_id =
+            tokio::task::spawn_blocking(move || terminal.open(&cwd, &nole_root, &command))
+                .await
+                .context("joining terminal startup")??;
         let terminal = self.terminal.clone();
         let cancelled = Arc::clone(&self.cancelled);
         let settled_id = session_id.clone();
@@ -445,6 +449,52 @@ mod tests {
             events,
             Arc::new(tokio::sync::Mutex::new(decision_receiver)),
         )
+    }
+
+    fn yolo_gate(root: &Path) -> ApprovalGate {
+        let (events, _) = tokio::sync::broadcast::channel::<AgentEvent>(8);
+        let (_decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
+        ApprovalGate::new(
+            Arc::new(AtomicU8::new(PermissionMode::Yolo.code())),
+            root.to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            events,
+            Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        )
+    }
+
+    #[tokio::test]
+    async fn hard_safety_policy_precedes_approval_for_shell_and_terminal_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let shell = Shell::new(
+            directory.path(),
+            yolo_gate(directory.path()),
+            cancelled.clone(),
+        );
+        let error = shell
+            .execute(&json!({
+                "purpose": "Test the safety policy",
+                "command": "rm -rf /"
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("environment safety policy"));
+
+        let terminal = TerminalOpen::new(
+            directory.path(),
+            yolo_gate(directory.path()),
+            AgentTerminalHandle::default(),
+            cancelled,
+        );
+        let error = terminal
+            .execute(&json!({
+                "purpose": "Test the safety policy",
+                "command": "rm --recursive --force /"
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("environment safety policy"));
     }
 
     #[test]

@@ -153,6 +153,7 @@ fn animated_color(position: usize, tick: u64) -> Color {
 use crate::agent::AskUserKind;
 use crate::agent::{
     AgentTerminalSnapshot, AgentTerminalStatus, ApprovalKind, ApprovalRequest, CommandApproval,
+    PrivateTerminalInputRequest,
 };
 use crate::agent_session::AgentPanelEntry;
 use crate::app::{Document, DocumentKind, DocumentReturn};
@@ -1874,7 +1875,7 @@ fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
             terminal: TerminalSnapshot::from_bytes(
                 24,
                 80,
-                b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive",
+                b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve\r\nthirteen\r\nfourteen\r\nfifteen",
             ),
         });
     app.approval_request = Some(ApprovalRequest {
@@ -1899,7 +1900,10 @@ fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
     assert_eq!(compose.width + 4, chat.width);
     assert!(screen.contains("PTY · ssh build-host · running"));
     assert!(!screen.contains("zero"));
-    for value in ["one", "two", "three", "four", "five"] {
+    for value in [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+        "twelve", "thirteen", "fourteen", "fifteen",
+    ] {
         assert!(screen.contains(value), "missing monitor row {value}");
     }
     assert_eq!(
@@ -1948,7 +1952,7 @@ fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
             .terminal
             .size(),
         (24, 80),
-        "the five-row monitor must not resize the PTY"
+        "the 15-row monitor must not resize the PTY"
     );
     assert!(animations_active(&app, true));
 }
@@ -2539,6 +2543,28 @@ fn ask_user_overlay_renders_choices_and_free_text_input() {
         );
     }
     assert!(app.hitboxes.is_empty());
+}
+
+#[test]
+fn private_terminal_input_renders_only_a_mask() {
+    let (mut app, _directory) = make_app();
+    app.private_terminal_input_request = Some(PrivateTerminalInputRequest {
+        session_id: "terminal-7".to_string(),
+        purpose: "Authenticate the deployment".to_string(),
+        prompt: "Enter the SSH passphrase".to_string(),
+    });
+    app.set_overlay(Overlay::PrivateTerminalInput);
+    app.handle_paste("never-render-this");
+
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Private terminal input"));
+    assert!(screen.contains("Authenticate the deployment"));
+    assert!(screen.contains("Enter the SSH passphrase"));
+    assert!(screen.contains("terminal-7"));
+    assert!(screen.contains(&"•".repeat("never-render-this".chars().count())));
+    assert!(!screen.contains("never-render-this"));
+    assert!(screen.contains("Enter submit · Esc cancel"));
 }
 
 #[test]
