@@ -98,10 +98,22 @@ impl TerminalCell {
         let mut contents = if cell.flags.contains(Flags::HIDDEN) {
             " ".to_string()
         } else {
-            cell.c.to_string()
+            // Alacritty stores a literal tab in the first grid cell traversed by a
+            // horizontal tab. The grid position already represents the tab's visual
+            // width, while terminal renderers require cell contents to be printable.
+            if cell.c.is_control() {
+                " ".to_string()
+            } else {
+                cell.c.to_string()
+            }
         };
         if let Some(zerowidth) = cell.zerowidth() {
-            contents.extend(zerowidth);
+            contents.extend(
+                zerowidth
+                    .iter()
+                    .copied()
+                    .filter(|character| !character.is_control()),
+            );
         }
         Self {
             contents,
@@ -616,6 +628,25 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn terminal_snapshot_cells_are_renderable() {
+        let snapshot = TerminalSnapshot::from_bytes(2, 16, b"1\tcode");
+
+        for row in 0..2 {
+            for col in 0..16 {
+                let contents = snapshot.cell(row, col).unwrap().contents();
+                assert!(
+                    !contents.chars().any(char::is_control),
+                    "control character in snapshot cell ({row}, {col}): {contents:?}"
+                );
+            }
+        }
+        assert_eq!(snapshot.cell(0, 0).unwrap().contents(), "1");
+        assert_eq!(snapshot.cell(0, 1).unwrap().contents(), " ");
+        assert_eq!(snapshot.cell(0, 8).unwrap().contents(), "c");
+        assert_eq!(snapshot.plain_text(), "1       code");
     }
 
     #[test]

@@ -1875,7 +1875,7 @@ fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
             terminal: TerminalSnapshot::from_bytes(
                 24,
                 80,
-                b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve\r\nthirteen\r\nfourteen\r\nfifteen",
+                b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve\r\nthirteen\r\nfourteen\r\n    15\tfifteen",
             ),
         });
     app.approval_request = Some(ApprovalRequest {
