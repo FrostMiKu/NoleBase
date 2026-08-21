@@ -699,9 +699,16 @@ immediately before submission. Text sent through `terminal_input` presses Enter 
 `submit=false` types the text without submitting it, and named keys include
 `ctrl-a` through `ctrl-z`. An exited PTY keeps its
 final screen until `terminal_close` removes it. Denying an approval blocks that
-action but preserves an existing PTY; cancelling the Agent or clearing the Agent
-session terminates and removes a live PTY
-immediately.
+action but preserves an existing PTY. Cancelling the Agent interrupts its model
+request, active tool call, or wait without stopping the PTY process or removing
+the terminal; a later Agent task can read and interact with the same session.
+Clearing the Agent session explicitly terminates and removes a live PTY.
+
+The `wait` tool pauses the current Agent task for a fixed duration from one
+second through 24 hours. It uses an asynchronous timer, so the UI, PTY, and
+external processes remain responsive while the Agent is logically blocked.
+Cancelling the Agent interrupts the wait promptly without affecting those
+external processes.
 
 When a PTY asks for a password, passphrase, or MFA code, the Agent can call
 `terminal_request_private_input`. Nole opens a masked, single-line dialog and

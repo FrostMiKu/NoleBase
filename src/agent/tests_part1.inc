@@ -950,6 +950,13 @@
             "Calling Review...\nCritique the draft migration plan"
         );
 
+        let wait = json!({"name": "wait", "input": {"seconds": 300}});
+        assert_eq!(tool_start_activity(&wait), "Calling Wait...\n300 seconds");
+        assert_eq!(
+            tool_finish_activity(&wait, None),
+            "Completed Wait.\n300 seconds"
+        );
+
         let shell = json!({
             "name": "shell",
             "input": {"purpose": "Check Markdown", "command": "markdownlint data/note.md"}

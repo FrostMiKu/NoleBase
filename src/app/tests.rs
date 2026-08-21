@@ -1735,7 +1735,7 @@ fn thinking_events_build_and_finish_thinking_entries() {
 }
 
 #[test]
-fn cancelling_agent_finishes_streaming_thinking_entry() {
+fn cancelling_agent_finishes_streaming_thinking_and_preserves_terminal() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
@@ -1755,7 +1755,7 @@ fn cancelling_agent_finishes_streaming_thinking_entry() {
     app.cancel_agent();
 
     assert!(!app.ai_running);
-    assert!(!app.agent_terminal.is_active());
+    assert!(app.agent_terminal.is_active());
     assert!(app.agent_panel.iter().all(|entry| !matches!(
         entry.as_ref(),
         AgentPanelEntry::Thinking {
@@ -1767,6 +1767,21 @@ fn cancelling_agent_finishes_streaming_thinking_entry() {
         app.agent_panel.last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Error(text)) if text == "Cancelled"
     ));
+}
+
+#[test]
+fn disconnected_agent_worker_preserves_terminal() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    install_agent_terminal_snapshot(&mut app);
+    drop(sender);
+
+    app.poll_agent();
+
+    assert!(!app.ai_running);
+    assert!(app.agent_terminal.is_active());
+    assert_eq!(app.status, "AI error: worker stopped unexpectedly");
 }
 
 #[test]
@@ -2107,6 +2122,7 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
     ];
     app.agent_conversation = AgentConversation::seeded_for_test();
     app.focus = Focus::Agent;
+    install_agent_terminal_snapshot(&mut app);
 
     app.handle_key(key(KeyCode::Char('C')));
 
@@ -2114,6 +2130,7 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
     assert!(!app.ai_running);
     assert!(!app.agent_conversation.clear());
     assert!(app.agent_panel.is_empty());
+    assert!(!app.agent_terminal.is_active());
     assert_eq!(app.status, "Agent session cleared");
 }
 

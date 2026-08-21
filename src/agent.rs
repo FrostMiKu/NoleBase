@@ -73,10 +73,10 @@ use self::images::{
 };
 
 const MAX_PROVIDER_REQUEST_ATTEMPTS: usize = 3;
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-async fn wait_for_provider_retry(cancelled: &AtomicBool, attempt: usize) -> Result<()> {
-    let delay = Duration::from_millis(500u64.saturating_mul(1u64 << attempt.min(3)));
-    let deadline = tokio::time::Instant::now() + delay;
+pub(crate) async fn wait_while_active(cancelled: &AtomicBool, duration: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + duration;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             bail!("agent task cancelled");
@@ -85,8 +85,13 @@ async fn wait_for_provider_retry(cancelled: &AtomicBool, attempt: usize) -> Resu
         if remaining.is_zero() {
             return Ok(());
         }
-        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        tokio::time::sleep(remaining.min(CANCELLATION_POLL_INTERVAL)).await;
     }
+}
+
+async fn wait_for_provider_retry(cancelled: &AtomicBool, attempt: usize) -> Result<()> {
+    let delay = Duration::from_millis(500u64.saturating_mul(1u64 << attempt.min(3)));
+    wait_while_active(cancelled, delay).await
 }
 
 fn report_provider_metrics(
@@ -704,6 +709,7 @@ impl Agent {
         }
         agent.register(LoadSkill::new(&skills));
         agent.register(Calculate);
+        agent.register(Wait::new(cancelled.clone()));
         agent.register(Shell::new(nole_root, gate.clone(), cancelled.clone()));
         agent.register(TerminalOpen::new(
             nole_root,

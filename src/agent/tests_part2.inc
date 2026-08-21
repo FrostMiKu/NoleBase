@@ -721,6 +721,7 @@
             "explore",
             "review",
             "calculate",
+            "wait",
             "load_skill",
         ] {
             assert!(without_key.tools.contains_key(name), "missing tool {name}");

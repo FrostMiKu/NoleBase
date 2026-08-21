@@ -99,6 +99,10 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
         "explore" => text("task"),
         "review" => text("task"),
         "calculate" => text("expression"),
+        "wait" => input
+            .get("seconds")
+            .and_then(Value::as_u64)
+            .map(|seconds| format!("{seconds} seconds")),
         "shell" | "terminal_open" => text("command"),
         "terminal_input" => {
             let session = text("session_id")?;

@@ -435,7 +435,6 @@ impl App {
             }
         }
         if disconnected && self.ai_running {
-            self.agent_terminal.terminate();
             self.ai_running = false;
             self.ai_cancel = None;
             self.agent_panel.push(Arc::new(AgentPanelEntry::Error(
@@ -763,7 +762,6 @@ impl App {
         }
         self.ai_running = false;
         self.ai_cancelling = true;
-        self.agent_terminal.terminate();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }
