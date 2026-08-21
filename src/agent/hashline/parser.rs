@@ -207,10 +207,10 @@ fn flush_body(open: OpenBody) -> Result<Hunk> {
     if rows.is_empty() {
         let guidance = match locator {
             PutLocator::Span(SpanLocator::Range { start, end }) => {
-                format!("use CUT {start}.={end} to delete")
+                format!("put each replacement row on the following line with a `+` prefix (for example `PUT {start}.={end}:\\n+replacement`); use CUT {start}.={end} only to delete")
             }
-            PutLocator::Span(SpanLocator::Block(start)) => format!("use CUT {start}* to delete"),
-            PutLocator::Gap(_) => "there is nothing to replace or insert".to_string(),
+            PutLocator::Span(SpanLocator::Block(start)) => format!("put each replacement row on the following line with a `+` prefix (for example `PUT {start}*:\\n+replacement`); use CUT {start}* only to delete"),
+            PutLocator::Gap(_) => "put each inserted row on the following line with a `+` prefix (for example `PUT >$:\\n+appended text`)".to_string(),
         };
         return Err(anyhow!("line {header_line}: empty PUT body; {guidance}"));
     }
@@ -311,6 +311,12 @@ fn valid_register(name: &str) -> bool {
 
 /// Parses a `PUT` argument (everything after the keyword).
 fn parse_put(rest: &str) -> Result<ParsedOp, String> {
+    if rest.contains(':') && !rest.trim_end().ends_with(':') {
+        return Err(
+            "a PUT body must start on the next line: end the header at `:`, then prefix every body row with `+`"
+                .to_string(),
+        );
+    }
     let (locator_part, register, had_colon) = split_register_colon(rest)?;
     let locator_part = locator_part.trim();
 
@@ -754,17 +760,23 @@ PUT 2.=2:
     }
 
     #[test]
-    fn empty_put_body_is_rejected_with_cut_guidance() {
+    fn empty_put_body_is_rejected_with_body_format_and_cut_guidance() {
         let err = parse_patch("[f#0000]\nPUT 2.=4:\n[g#0000]").unwrap_err();
         assert!(
-            err.to_string()
-                .contains("line 2: empty PUT body; use CUT 2.=4 to delete"),
+            err.to_string().contains("PUT 2.=4:\\n+replacement"),
             "{err}"
         );
         let err = parse_patch("[f#0000]\nPUT 3*:\n").unwrap_err();
+        assert!(err.to_string().contains("PUT 3*:\\n+replacement"), "{err}");
+    }
+
+    #[test]
+    fn put_body_on_header_line_is_rejected_with_copyable_guidance() {
+        let err = parse_patch("[f#0000]\nPUT >$: appended text").unwrap_err();
         assert!(
-            err.to_string()
-                .contains("line 2: empty PUT body; use CUT 3* to delete"),
+            err.to_string().contains(
+                "a PUT body must start on the next line: end the header at `:`, then prefix every body row with `+`"
+            ),
             "{err}"
         );
     }

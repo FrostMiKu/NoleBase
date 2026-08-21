@@ -44,6 +44,26 @@ pub struct Edit {
     registers: Arc<RegisterBank>,
 }
 
+/// Structured end-of-file insertion for the common append case. It retains
+/// the same read snapshot, approval, drift detection, and atomic publication
+/// semantics as [`Edit`] without exposing hashline body syntax to the model.
+pub struct Append {
+    edit: Edit,
+}
+
+impl Append {
+    pub fn new(
+        root: &Path,
+        gate: ApprovalGate,
+        reads: Arc<SnapshotStore>,
+        registers: Arc<RegisterBank>,
+    ) -> Result<Self> {
+        Ok(Self {
+            edit: Edit::new(root, gate, reads, registers)?,
+        })
+    }
+}
+
 impl Edit {
     pub fn new(
         root: &Path,
@@ -533,13 +553,57 @@ fn append_edit_windows(out: &mut CappedResult, planned: &PlannedFile, lines: &[S
 }
 
 #[async_trait::async_trait]
+impl Tool for Append {
+    fn name(&self) -> &'static str {
+        "append"
+    }
+
+    fn description(&self) -> &'static str {
+        "Append UTF-8 text to the end of one file already read in this Agent session. Pass the exact path and 4-hex tag from the latest [path#TAG] read/edit result. Use this instead of edit with PUT >$ for ordinary end appends."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "minLength": 1 },
+                "tag": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{4}$",
+                    "description": "Exact snapshot tag from the latest [path#TAG] result"
+                },
+                "content": { "type": "string", "minLength": 1 }
+            },
+            "required": ["path", "tag", "content"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: &Value) -> Result<String> {
+        let path = required_string(input, "path")?;
+        let tag = required_string(input, "tag")?;
+        let content = required_string(input, "content")?;
+        if content.is_empty() {
+            bail!("append content must not be empty");
+        }
+        let mut patch = format!("[{path}#{tag}]\nPUT >$:\n");
+        for line in content.lines() {
+            patch.push('+');
+            patch.push_str(line);
+            patch.push('\n');
+        }
+        self.edit.execute(&json!({"patch": patch})).await
+    }
+}
+
+#[async_trait::async_trait]
 impl Tool for Edit {
     fn name(&self) -> &'static str {
         "edit"
     }
 
     fn description(&self) -> &'static str {
-        "Apply a hashline patch to files you have already read: one or more [PATH#TAG] sections. \
+        "Apply a hashline patch to files you have already read. Use append instead for ordinary end-of-file additions. A patch contains one or more [PATH#TAG] sections. \
 PATH is relative to the Nole root or an absolute external path; TAG is the 4-hex snapshot tag \
 from the file's latest read result (the [path#TAG] header); consecutive edits reuse the NEW tag \
 each edit returns. Ops: \
@@ -551,9 +615,8 @@ line N; CUT N.=M or CUT N* deletes a span and captures it, with an optional trai
 required for span replaces). REM deletes the file. MV DEST moves or renames it (DEST is relative \
 to the Nole root or an absolute external path; double-quote DEST only when it contains spaces); \
 line edits in the section apply to the source first. Body \
-rows are +TEXT verbatim with leading spaces preserved; a bare + is a blank line; they appear \
-only under a : header. Line numbers are ORIGINAL file numbers, never shifted by earlier hunks. \
-Example: [data/note.md#3F2A]\nPUT 2.=2:\n+replacement text\n. The result shows each edited \
+rows must start on the line after a `PUT ...:` header. Every body row is +TEXT verbatim with leading spaces preserved; a bare + is a blank line. Never place body text on the PUT header line. Line numbers are ORIGINAL file numbers, never shifted by earlier hunks. \
+Example replacement: [data/note.md#3F2A]\nPUT 2.=2:\n+replacement text\n. Example append: [data/note.md#3F2A]\nPUT >$:\n+new final line\n. The result shows each edited \
 file's NEW [path#TAG], new line count, and numbered windows of the changed regions."
     }
 
@@ -637,6 +700,37 @@ mod tests {
             Arc::new(RegisterBank::default()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn append_uses_structured_content_and_preserves_blank_lines() {
+        let (_directory, root) = workspace();
+        let raw = root.join("data/note.md");
+        fs::write(&raw, "before").unwrap();
+        let path = fs::canonicalize(&raw).unwrap();
+        let reads = Arc::new(SnapshotStore::default());
+        let tag = record_full(&reads, &path, "before");
+        let append = Append::new(
+            &root,
+            bypass_gate(),
+            reads,
+            Arc::new(RegisterBank::default()),
+        )
+        .unwrap();
+
+        let result = test_runtime()
+            .block_on(append.execute(&json!({
+                "path": "data/note.md",
+                "tag": tag,
+                "content": "first appended line\n\nlast appended line"
+            })))
+            .unwrap();
+
+        assert!(result.contains("edited data/note.md"));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "before\nfirst appended line\n\nlast appended line\n"
+        );
     }
 
     /// Extract the `[path#TAG]` tag from an edit result.

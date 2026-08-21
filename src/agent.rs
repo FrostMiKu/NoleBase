@@ -50,6 +50,7 @@ mod subagent;
 mod terminal;
 #[cfg(test)]
 mod test_support;
+mod tool_stream;
 mod tools;
 mod types;
 
@@ -64,6 +65,7 @@ pub(crate) use self::snapshots::*;
 pub(crate) use self::terminal::*;
 pub use self::types::*;
 
+use tool_stream::ToolCallStreamPreview;
 use tools::*;
 
 use self::images::{
@@ -742,6 +744,12 @@ impl Agent {
             gate.clone(),
         )?);
         agent.register(Write::new(nole_root, gate.clone())?);
+        agent.register(Append::new(
+            nole_root,
+            gate.clone(),
+            reads.clone(),
+            registers.clone(),
+        )?);
         agent.register(Copy::new(nole_root, gate.clone())?);
         agent.register(ExportFile::new(nole_root, gate.clone())?);
         agent.register(Mkdir::new(nole_root, gate.clone())?);
@@ -1076,6 +1084,7 @@ impl Agent {
             .config
             .context_window_tokens
             .saturating_sub(u64::from(self.config.max_tokens));
+        let mut tool_previews = HashMap::<usize, ToolCallStreamPreview>::new();
         let mut events_open = true;
         loop {
             tokio::select! {
@@ -1089,6 +1098,29 @@ impl Agent {
                         }
                         Ok(ProviderEvent::ThinkingFinished) => {
                             let _ = self.events.send(AgentEvent::ThinkingFinished);
+                        }
+                        Ok(ProviderEvent::ToolCallDelta { index, name, arguments, .. }) => {
+                            if let Some(message) = tool_previews
+                                .entry(index)
+                                .or_default()
+                                .push(&name, &arguments)
+                            {
+                                let _ = self.events.send(AgentEvent::ToolPreparing {
+                                    index,
+                                    message,
+                                });
+                            }
+                        }
+                        Ok(ProviderEvent::ToolCallFinished { index, id }) => {
+                            if tool_previews
+                                .remove(&index)
+                                .is_some_and(|preview| preview.is_visible())
+                            {
+                                let _ = self.events.send(AgentEvent::ToolPreparationFinished {
+                                    index,
+                                    id: (!id.is_empty()).then_some(id),
+                                });
+                            }
                         }
                         Ok(ProviderEvent::Usage { usage, generation_duration }) => {
                             report_provider_metrics(
@@ -1121,6 +1153,29 @@ impl Agent {
                             ProviderEvent::ThinkingFinished => {
                                 let _ = self.events.send(AgentEvent::ThinkingFinished);
                             }
+                            ProviderEvent::ToolCallDelta { index, name, arguments, .. } => {
+                                if let Some(message) = tool_previews
+                                    .entry(index)
+                                    .or_default()
+                                    .push(&name, &arguments)
+                                {
+                                    let _ = self.events.send(AgentEvent::ToolPreparing {
+                                        index,
+                                        message,
+                                    });
+                                }
+                            }
+                            ProviderEvent::ToolCallFinished { index, id } => {
+                                if tool_previews
+                                    .remove(&index)
+                                    .is_some_and(|preview| preview.is_visible())
+                                {
+                                    let _ = self.events.send(AgentEvent::ToolPreparationFinished {
+                                        index,
+                                        id: (!id.is_empty()).then_some(id),
+                                    });
+                                }
+                            }
                             ProviderEvent::Usage { usage, generation_duration } => {
                                 report_provider_metrics(
                                     &self.events,
@@ -1145,6 +1200,15 @@ impl Agent {
                             answer.generation_duration,
                             context_input_capacity,
                         );
+                    }
+                    for (index, preview) in tool_previews {
+                        if !preview.is_visible() {
+                            continue;
+                        }
+                        let _ = self.events.send(AgentEvent::ToolPreparationFinished {
+                            index,
+                            id: None,
+                        });
                     }
                     return result;
                 }

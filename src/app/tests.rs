@@ -1656,6 +1656,57 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
 }
 
 #[test]
+fn streamed_tool_preparation_updates_one_entry_and_hands_it_to_execution() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Write...\nnotes/design.md · 1 line · 12 B\n…first line".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Write...\nnotes/design.md · 184 lines · 6.2 KB\n…latest line"
+                .to_string(),
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert_eq!(app.status, "Preparing Write...");
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: true, .. }
+            if text == "Preparing Write...\nnotes/design.md · 184 lines · 6.2 KB\n…latest line"
+    ));
+    let preparation_entry = Arc::as_ptr(&app.agent_panel[0]);
+
+    sender
+        .send(AgentEvent::ToolPreparationFinished {
+            index: 0,
+            id: Some("call_write".to_string()),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "call_write".to_string(),
+            message: "Calling Write...\nnotes/design.md".to_string(),
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert_eq!(Arc::as_ptr(&app.agent_panel[0]), preparation_entry);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: true, .. }
+            if text == "Calling Write...\nnotes/design.md"
+    ));
+}
+
+#[test]
 fn thinking_events_build_and_finish_thinking_entries() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);

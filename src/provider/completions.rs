@@ -356,6 +356,27 @@ async fn decode_stream(
                 {
                     partial.arguments.push_str(arguments);
                 }
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let arguments = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !name.is_empty() || !arguments.is_empty() {
+                    let _ = events.send(ProviderEvent::ToolCallDelta {
+                        index,
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    });
+                    // `decode_stream` and its event receiver are driven by the
+                    // same outer `select`. A response chunk can contain many
+                    // already-buffered SSE events, so yield after each tool
+                    // fragment or the receiver may not run until the complete
+                    // call has been assembled.
+                    tokio::task::yield_now().await;
+                }
             }
         }
     }
@@ -377,7 +398,11 @@ async fn decode_stream(
         parts.push(MessagePart::Text { text });
     }
     let mut errors = HashMap::new();
-    for (_, tool) in tools {
+    for (index, tool) in tools {
+        let _ = events.send(ProviderEvent::ToolCallFinished {
+            index,
+            id: tool.id.clone(),
+        });
         let input = parse_tool_input(&tool.id, &tool.arguments, &mut errors);
         parts.push(MessagePart::ToolUse(ToolCall {
             id: tool.id,
@@ -820,8 +845,22 @@ mod tests {
         let provider = CompletionsProvider::new("secret", format!("http://{address}/")).unwrap();
         let observable = provider.call_streaming(request());
         let mut subscriber = observable.subscribe();
-        let mut events = observable.events;
-        let answer = observable.output.await.unwrap();
+        let mut live_events = observable.events;
+        let mut events = live_events.resubscribe();
+        let mut output = observable.output;
+        let first_tool_delta = loop {
+            tokio::select! {
+                biased;
+                result = &mut output => panic!("provider completed before exposing a live tool delta: {result:?}"),
+                event = live_events.recv() => {
+                    if let ProviderEvent::ToolCallDelta { index, arguments, .. } = event.unwrap() {
+                        break (index, arguments);
+                    }
+                }
+            }
+        };
+        assert_eq!(first_tool_delta, (0, r#"{"message":"#.to_string()));
+        let answer = output.await.unwrap();
         let (request_line, headers, body) = server.join().unwrap();
 
         assert!(request_line.starts_with("POST /v1/chat/completions "));
@@ -839,6 +878,26 @@ mod tests {
         assert!(
             matches!(events.try_recv(), Ok(ProviderEvent::TextDelta(text)) if text == "Working ")
         );
+        let assert_tool_deltas =
+            |receiver: &mut tokio::sync::broadcast::Receiver<ProviderEvent>| {
+                let mut arguments = BTreeMap::<usize, String>::new();
+                for expected_index in [0, 1, 0, 1] {
+                    match receiver.try_recv().unwrap() {
+                        ProviderEvent::ToolCallDelta {
+                            index,
+                            arguments: delta,
+                            ..
+                        } => {
+                            assert_eq!(index, expected_index);
+                            arguments.entry(index).or_default().push_str(&delta);
+                        }
+                        other => panic!("expected streamed tool input, got {other:?}"),
+                    }
+                }
+                assert_eq!(arguments[&0], r#"{"message":"A"}"#);
+                assert_eq!(arguments[&1], r#"{"message":"B"}"#);
+            };
+        assert_tool_deltas(&mut events);
         assert!(matches!(
             events.try_recv(),
             Ok(ProviderEvent::Usage { usage, .. })
@@ -849,6 +908,7 @@ mod tests {
         assert!(
             matches!(subscriber.try_recv(), Ok(ProviderEvent::TextDelta(text)) if text == "Working ")
         );
+        assert_tool_deltas(&mut subscriber);
         assert!(matches!(
             subscriber.try_recv(),
             Ok(ProviderEvent::Usage { usage, .. })
@@ -856,6 +916,20 @@ mod tests {
                     && usage.cache_read_input_tokens == 4
                     && usage.output_tokens == 3
         ));
+        let assert_finished = |receiver: &mut tokio::sync::broadcast::Receiver<ProviderEvent>| {
+            let finished = std::iter::from_fn(|| receiver.try_recv().ok())
+                .filter_map(|event| match event {
+                    ProviderEvent::ToolCallFinished { index, id } => Some((index, id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                finished,
+                vec![(0, "call_a".to_string()), (1, "call_b".to_string())]
+            );
+        };
+        assert_finished(&mut events);
+        assert_finished(&mut subscriber);
     }
 
     #[tokio::test(flavor = "current_thread")]

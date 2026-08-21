@@ -388,6 +388,9 @@ Agent to improve that file's Markdown formatting in place without changing its
 meaning or adding facts. The lower two-thirds of the right
 sidebar shows a chronological Agent timeline: user prompts, tool activity,
 intermediate text, and final responses; Todo uses the upper third.
+While a long `write`, `edit`, or `append` input is still streaming, its tool activity row
+shows the target, decoded line/byte progress, and latest non-empty content line;
+the complete JSON is still validated before approval or execution.
 `max_rounds` is the request-round budget for each user prompt and, independently,
 for each `explore` and `review` invocation; it is not a tool-call limit, and one
 response may call several tools. A user follow-up received while the Agent is
@@ -612,7 +615,11 @@ fuzzy filename search used by the Files sidebar.
 files have no 1 MiB tool limit; workspace files remain subject to the 64 MiB
 per-file and 512 MiB total workspace quotas, while Skills retain their separate
 size limit because they enter Agent context. The full candidate content passes
-MBDown or Skill validation before publication. `edit` accepts a hashline patch:
+MBDown or Skill validation before publication. `append` takes a path, the latest
+4-hex snapshot tag, and plain content, and is the preferred tool for ordinary
+end-of-file additions. It uses the same read snapshot, drift detection, approval,
+and atomic publication path as `edit` without requiring hashline body syntax.
+`edit` accepts a hashline patch:
 each section starts with the latest `[path#TAG]` returned by `read`, followed by
 operations against the original one-based line numbers. `PUT N.=M:` replaces an
 inclusive range with `+TEXT` body rows; `PUT <N:`, `PUT >N:`, and `PUT >$:`

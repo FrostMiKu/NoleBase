@@ -166,13 +166,58 @@ impl App {
                         }
                     }
                 }
+                AgentEvent::ToolPreparing { index, message } => {
+                    if let Some(panel_index) = self.preparing_agent_tools.get(&index).copied() {
+                        if let Some(AgentPanelEntry::Tool { text, active, .. }) =
+                            self.agent_panel.get_mut(panel_index).map(Arc::make_mut)
+                        {
+                            *text = message.clone();
+                            *active = true;
+                        }
+                    } else {
+                        let panel_index = self.agent_panel.len();
+                        self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
+                            text: message.clone(),
+                            active: true,
+                            preview: None,
+                        }));
+                        self.preparing_agent_tools.insert(index, panel_index);
+                    }
+                    self.set_status(message.lines().next().unwrap_or("Preparing tool..."));
+                }
+                AgentEvent::ToolPreparationFinished { index, id } => {
+                    if let Some(panel_index) = self.preparing_agent_tools.remove(&index) {
+                        if let Some(id) = id {
+                            self.active_agent_tools.insert(id, panel_index);
+                        } else if let Some(AgentPanelEntry::Tool { active, .. }) =
+                            self.agent_panel.get_mut(panel_index).map(Arc::make_mut)
+                        {
+                            *active = false;
+                        }
+                    }
+                }
                 AgentEvent::ToolStarted { id, message } => {
-                    let index = self.agent_panel.len();
-                    self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
-                        text: message.clone(),
-                        active: true,
-                        preview: None,
-                    }));
+                    let index = if let Some(index) = self.active_agent_tools.get(&id).copied() {
+                        if let Some(AgentPanelEntry::Tool {
+                            text,
+                            active,
+                            preview,
+                        }) = self.agent_panel.get_mut(index).map(Arc::make_mut)
+                        {
+                            *text = message.clone();
+                            *active = true;
+                            *preview = None;
+                        }
+                        index
+                    } else {
+                        let index = self.agent_panel.len();
+                        self.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
+                            text: message.clone(),
+                            active: true,
+                            preview: None,
+                        }));
+                        index
+                    };
                     self.active_agent_tools.insert(id, index);
                     self.set_status(message);
                 }
@@ -743,6 +788,7 @@ impl App {
     }
 
     fn deactivate_agent_tools(&mut self) {
+        self.preparing_agent_tools.clear();
         self.active_agent_tools.clear();
         for entry in &mut self.agent_panel {
             if let AgentPanelEntry::Tool { active, .. } = Arc::make_mut(entry) {
@@ -770,6 +816,7 @@ impl App {
         }
         let had_panel_content = !self.agent_panel.is_empty();
         self.agent_panel.clear();
+        self.preparing_agent_tools.clear();
         self.active_agent_tools.clear();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();

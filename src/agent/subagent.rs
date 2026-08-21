@@ -352,7 +352,9 @@ impl SubagentRunner {
             }
             ProviderEvent::TextDelta(_)
             | ProviderEvent::ThinkingDelta(_)
-            | ProviderEvent::ThinkingFinished => {}
+            | ProviderEvent::ThinkingFinished
+            | ProviderEvent::ToolCallDelta { .. }
+            | ProviderEvent::ToolCallFinished { .. } => {}
         }
     }
 

@@ -1257,6 +1257,34 @@ mod tests {
     }
 
     #[test]
+    fn preparing_write_uses_compact_progress_and_latest_line_tree_rows() {
+        let theme = Theme::default();
+        let padding = " ".repeat(CHAT_BLOCK_PAD);
+        let lines = render_chat_tool(
+            "Preparing Write...\nnotes/design.md · 184 lines · 6.2 KB\n…latest non-empty line",
+            None,
+            120,
+            0,
+            true,
+            theme,
+        );
+
+        assert_eq!(
+            lines[0].to_string(),
+            format!("{padding} \u{28f7} Preparing Write...")
+        );
+        assert_eq!(
+            lines[1].to_string(),
+            format!("{padding}   ├─ notes/design.md · 184 lines · 6.2 KB")
+        );
+        assert_eq!(
+            lines[2].to_string(),
+            format!("{padding}   └─ …latest non-empty line")
+        );
+        assert_eq!(lines[3].to_string(), "");
+    }
+
+    #[test]
     fn chat_thinking_code_blocks_never_emit_terminal_tabs() {
         let source = concat!(
             "```text\n",

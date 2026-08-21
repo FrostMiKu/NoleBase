@@ -98,6 +98,18 @@ pub enum AgentEvent {
     ThinkingDelta(String),
     /// The reasoning text finished streaming.
     ThinkingFinished,
+    /// A model is still generating a `write`, `edit`, or `append` call's JSON
+    /// input.
+    ToolPreparing {
+        index: usize,
+        message: String,
+    },
+    /// The provider response has finished, so a preparation row can be handed
+    /// off to the real tool execution identified by `id`.
+    ToolPreparationFinished {
+        index: usize,
+        id: Option<String>,
+    },
     BufferedInputConsumed(usize),
     ToolStarted {
         id: String,

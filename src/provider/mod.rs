@@ -258,6 +258,21 @@ pub enum ProviderEvent {
     ThinkingDelta(String),
     /// The reasoning block finished streaming.
     ThinkingFinished,
+    /// One streamed fragment of a tool call. Providers retain responsibility
+    /// for assembling and validating the complete JSON input; this event is
+    /// only an early progress signal for the Agent UI.
+    ToolCallDelta {
+        index: usize,
+        name: String,
+        arguments: String,
+    },
+    /// The provider has assembled the complete call identity for a streamed
+    /// tool item. This is the authoritative handoff key for UI preparation;
+    /// consumers must not infer it by concatenating arbitrary delta fields.
+    ToolCallFinished {
+        index: usize,
+        id: String,
+    },
     Usage {
         usage: TokenUsage,
         generation_duration: std::time::Duration,

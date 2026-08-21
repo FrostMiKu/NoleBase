@@ -318,6 +318,20 @@ async fn decode_stream(
                     content.resize(index + 1, Value::Null);
                 }
                 content[index] = value.get("content_block").cloned().unwrap_or(Value::Null);
+                if content[index].get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let _ = events.send(ProviderEvent::ToolCallDelta {
+                        index,
+                        name: content[index]
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: String::new(),
+                    });
+                    // Let the Agent consume the preparation event before this
+                    // decoder drains more already-buffered SSE events.
+                    tokio::task::yield_now().await;
+                }
                 if content[index].get("type").and_then(Value::as_str) == Some("text") {
                     if saw_text {
                         let _ = events.send(ProviderEvent::TextDelta("\n".to_string()));
@@ -357,6 +371,12 @@ async fn decode_stream(
                     Some("input_json_delta") => {
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             partial_inputs.entry(index).or_default().push_str(partial);
+                            let _ = events.send(ProviderEvent::ToolCallDelta {
+                                index,
+                                name: String::new(),
+                                arguments: partial.to_string(),
+                            });
+                            tokio::task::yield_now().await;
                         }
                     }
                     _ => {}
@@ -373,6 +393,19 @@ async fn decode_stream(
                             .to_string();
                         block["input"] = parse_tool_input(&id, &partial, &mut tool_input_errors);
                     }
+                }
+                if let Some(block) = content
+                    .get(index)
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                {
+                    let _ = events.send(ProviderEvent::ToolCallFinished {
+                        index,
+                        id: block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    });
                 }
                 if content
                     .get(index)
@@ -709,6 +742,109 @@ fn retry_delay(attempt: usize, headers: &reqwest::header::HeaderMap) -> Duration
     }
     let base = 500u64.saturating_mul(1u64 << attempt.min(3));
     Duration::from_millis(base.min(5_000))
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    use super::*;
+    use crate::provider::{ProviderRequest, SystemBlock};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_forwards_tool_name_and_input_json_deltas() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; content_length];
+            reader.read_exact(&mut request_body).unwrap();
+            let body = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_write\",\"name\":\"write\",\"input\":{}}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"notes/design.md\\\",\\\"content\\\":\\\"hello\\\"}\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            reader.get_mut().flush().unwrap();
+        });
+
+        let provider = MessagesProvider::new("secret", format!("http://{address}")).unwrap();
+        let observable = provider.call_streaming(ProviderRequest {
+            model: "test-model".to_string(),
+            max_tokens: 128,
+            system: vec![SystemBlock {
+                text: "test".to_string(),
+                cache: false,
+            }],
+            messages: vec![Message::user("write a note")],
+            tools: Vec::new(),
+        });
+        let mut live_events = observable.events;
+        let mut events = live_events.resubscribe();
+        let mut output = observable.output;
+        let live_arguments = loop {
+            tokio::select! {
+                biased;
+                result = &mut output => panic!("provider completed before exposing live tool arguments: {result:?}"),
+                event = live_events.recv() => {
+                    if let ProviderEvent::ToolCallDelta { arguments, .. } = event.unwrap() {
+                        if !arguments.is_empty() {
+                            break arguments;
+                        }
+                    }
+                }
+            }
+        };
+        assert_eq!(
+            live_arguments,
+            r#"{"path":"notes/design.md","content":"hello"}"#
+        );
+        let answer = output.await.unwrap();
+        server.join().unwrap();
+
+        let call = answer.message.tool_calls().next().unwrap();
+        assert_eq!(call.id, "call_write");
+        assert_eq!(
+            call.input,
+            json!({"path": "notes/design.md", "content": "hello"})
+        );
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ProviderEvent::ToolCallDelta { index: 0, name, arguments }
+                if name == "write" && arguments.is_empty()
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ProviderEvent::ToolCallDelta { index: 0, name, arguments }
+                if name.is_empty()
+                    && arguments == r#"{"path":"notes/design.md","content":"hello"}"#
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ProviderEvent::ToolCallFinished { index: 0, id } if id == "call_write"
+        ));
+    }
 }
 
 #[cfg(test)]
