@@ -23,6 +23,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AppCommand {
     InterruptAgent,
+    CopyLastAgentOutput,
     ClearAgentSession,
     OpenTerminal,
     ToggleMouseSupport,
@@ -59,6 +60,12 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Agent: Interrupt task",
         description: "Stop the active Agent task",
         keywords: "agent interrupt cancel stop task",
+    },
+    AppCommandDefinition {
+        id: AppCommand::CopyLastAgentOutput,
+        label: "Agent: Copy last output",
+        description: "Copy the latest Agent response to the clipboard",
+        keywords: "agent copy last latest output response clipboard",
     },
     AppCommandDefinition {
         id: AppCommand::ClearAgentSession,

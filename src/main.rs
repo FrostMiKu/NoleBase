@@ -180,7 +180,7 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
             match clipboard::write_text(&text) {
                 Ok(()) => {
                     app.complete_code_copy(&text, Instant::now());
-                    app.set_status("Code copied");
+                    app.set_status("Copied to clipboard");
                 }
                 Err(error) => {
                     app.cancel_code_copy();

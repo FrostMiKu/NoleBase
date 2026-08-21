@@ -215,6 +215,56 @@ fn command_palette_filters_and_clears_the_agent_session() {
 }
 
 #[test]
+fn copy_last_agent_output_command_uses_latest_visible_assistant_text() {
+    let (mut app, _directory) = make_app();
+    assert!(!app.command_available(AppCommand::CopyLastAgentOutput));
+    assert_eq!(app.copy_last_agent_output(), None);
+    assert_eq!(app.status, "No Agent output to copy");
+
+    app.agent_panel = vec![
+        Arc::new(AgentPanelEntry::Assistant {
+            text: "Earlier completed output".to_string(),
+            streaming: false,
+            final_output: true,
+        }),
+        Arc::new(AgentPanelEntry::Thinking {
+            text: "Internal reasoning".to_string(),
+            streaming: false,
+        }),
+        Arc::new(AgentPanelEntry::Tool {
+            text: "Completed Read.".to_string(),
+            active: false,
+            preview: None,
+        }),
+        Arc::new(AgentPanelEntry::Assistant {
+            text: "Latest partial output".to_string(),
+            streaming: true,
+            final_output: false,
+        }),
+    ];
+
+    assert!(app.command_available(AppCommand::CopyLastAgentOutput));
+    assert_eq!(
+        app.execute_app_command(AppCommand::CopyLastAgentOutput),
+        Some(Command::CopyText("Latest partial output".to_string()))
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    app.handle_paste("copy last output");
+    assert_eq!(
+        app.command_matches.first(),
+        Some(&AppCommand::CopyLastAgentOutput)
+    );
+    assert_eq!(
+        app.dialog
+            .as_ref()
+            .and_then(DialogState::selected_option)
+            .map(|option| option.label.as_str()),
+        Some("Agent: Copy last output")
+    );
+}
+
+#[test]
 fn app_restores_the_single_agent_session() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();

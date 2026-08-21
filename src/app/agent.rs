@@ -7,6 +7,26 @@ use std::sync::Arc;
 use super::*;
 
 impl App {
+    pub(in crate::app) fn last_agent_output(&self) -> Option<&str> {
+        self.agent_panel
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.as_ref() {
+                AgentPanelEntry::Assistant { text, .. } if !text.trim().is_empty() => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+    }
+
+    pub(in crate::app) fn copy_last_agent_output(&mut self) -> Option<Command> {
+        let Some(text) = self.last_agent_output().map(str::to_string) else {
+            self.set_status("No Agent output to copy");
+            return None;
+        };
+        Some(Command::CopyText(text))
+    }
+
     pub(in crate::app) fn scroll_agent_by(&mut self, delta: i32) {
         self.agent_follow_tail = false;
         self.agent_scroll = if delta > 0 {

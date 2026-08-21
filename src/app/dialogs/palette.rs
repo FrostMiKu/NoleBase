@@ -63,6 +63,7 @@ impl App {
     pub(in crate::app) fn execute_app_command(&mut self, command: AppCommand) -> Option<Command> {
         match command {
             AppCommand::InterruptAgent => self.cancel_agent(),
+            AppCommand::CopyLastAgentOutput => return self.copy_last_agent_output(),
             AppCommand::ClearAgentSession => self.clear_agent_session(),
             AppCommand::OpenTerminal => self.toggle_terminal(),
             AppCommand::ToggleMouseSupport => {
@@ -108,8 +109,9 @@ impl App {
 
     pub(in crate::app) fn command_available(&self, command: AppCommand) -> bool {
         match command {
-            AppCommand::InterruptAgent
-            | AppCommand::ClearAgentSession
+            AppCommand::InterruptAgent => true,
+            AppCommand::CopyLastAgentOutput => self.last_agent_output().is_some(),
+            AppCommand::ClearAgentSession
             | AppCommand::OpenTerminal
             | AppCommand::ToggleMouseSupport
             | AppCommand::NewNote

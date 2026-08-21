@@ -472,8 +472,9 @@ settings above adjust these limits. Tool results are returned to the model in
 its original call order even when completion order differs.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
-task, clear its saved session, create or manage notes, or open `template.mb`,
-`ai.toml`, `AGENTS.md`, and `MEMORY.md` with the configured editor.
+task, copy its latest visible output, clear its saved session, create or manage
+notes, or open `template.mb`, `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the
+configured editor.
 `File: Export…` is available when Center is previewing a file, Skill, or Daily
 document. The UI retains its Original/HTML picker; the Agent's `export_file`
 tool exposes HTML rendering only because exact-byte external copies use `copy`.
