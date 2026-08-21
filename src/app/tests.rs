@@ -347,7 +347,7 @@ fn failed_session_delete_keeps_the_in_memory_session() {
     app.clear_agent_session();
 
     assert!(app.agent_conversation.clear());
-    assert!(!app.agent_terminal.is_active());
+    assert!(!app.agent_terminal.is_running());
     assert!(app.status.starts_with("Agent session clear error:"));
     assert!(app.notifications.visible().is_some());
 }
@@ -1396,7 +1396,7 @@ fn approval_overlay_sends_the_user_decision() {
     app.set_overlay(Overlay::Approval);
     app.handle_key(key(KeyCode::Char('n')));
     assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Deny);
-    assert!(app.agent_terminal.is_active());
+    assert!(app.agent_terminal.is_running());
 }
 
 #[test]
@@ -1805,7 +1805,7 @@ fn cancelling_agent_finishes_streaming_thinking_and_preserves_terminal() {
     app.cancel_agent();
 
     assert!(!app.ai_running);
-    assert!(app.agent_terminal.is_active());
+    assert!(app.agent_terminal.is_running());
     assert!(app.agent_panel.iter().all(|entry| !matches!(
         entry.as_ref(),
         AgentPanelEntry::Thinking {
@@ -1830,7 +1830,7 @@ fn disconnected_agent_worker_preserves_terminal() {
     app.poll_agent();
 
     assert!(!app.ai_running);
-    assert!(app.agent_terminal.is_active());
+    assert!(app.agent_terminal.is_running());
     assert_eq!(app.status, "AI error: worker stopped unexpectedly");
 }
 
@@ -1989,7 +1989,7 @@ fn agent_terminal_outcomes_send_distinct_notifications() {
         Some("Agent stopped after tool approval was denied")
     );
     assert_eq!(app.notifications.take_bells(), 1);
-    assert!(app.agent_terminal.is_active());
+    assert!(app.agent_terminal.is_running());
 
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
@@ -2180,7 +2180,7 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
     assert!(!app.ai_running);
     assert!(!app.agent_conversation.clear());
     assert!(app.agent_panel.is_empty());
-    assert!(!app.agent_terminal.is_active());
+    assert!(!app.agent_terminal.is_running());
     assert_eq!(app.status, "Agent session cleared");
 }
 

@@ -188,7 +188,7 @@ impl Tool for TerminalOpen {
     }
 
     fn description(&self) -> &'static str {
-        "Start one persistent PTY command in the user's interactive Brush shell. A hard safety policy checks the initial command in every permission mode. Use terminal_input and terminal_read to interact with it. Only one Agent PTY session may be active."
+        "Start one persistent PTY command in the user's interactive Brush shell. A hard safety policy checks the initial command in every permission mode. Use terminal_input and terminal_read to interact with it. Only one Agent PTY process may run at a time; opening a new one replaces any exited session."
     }
 
     fn input_schema(&self) -> Value {
@@ -356,7 +356,7 @@ impl Tool for TerminalRead {
     }
 
     fn description(&self) -> &'static str {
-        "Read the active Agent PTY screen, optionally waiting for it to change. This does not send input."
+        "Read the Agent PTY screen or its retained final screen after exit, optionally waiting for it to change. This does not send input."
     }
 
     fn input_schema(&self) -> Value {
@@ -411,7 +411,7 @@ impl Tool for TerminalClose {
     }
 
     fn description(&self) -> &'static str {
-        "Remove an Agent PTY session after its process has exited. Send an approved exit, Ctrl-C, or Ctrl-D first when it is still running."
+        "Discard a retained Agent PTY session after its process has exited. Send an approved exit, Ctrl-C, or Ctrl-D first when it is still running."
     }
 
     fn input_schema(&self) -> Value {

@@ -65,6 +65,7 @@ struct AgentTerminalSession {
 struct AgentTerminalState {
     next_id: u64,
     session: Option<AgentTerminalSession>,
+    monitor_changed: bool,
     #[cfg(test)]
     monitor_override: Option<AgentTerminalSnapshot>,
 }
@@ -75,29 +76,11 @@ pub(crate) struct AgentTerminalHandle {
 }
 
 impl AgentTerminalHandle {
-    pub(crate) fn is_active(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         let Ok(state) = self.inner.lock() else {
             return false;
         };
-        if state.session.is_some() {
-            return true;
-        }
-        #[cfg(test)]
-        {
-            state.monitor_override.is_some()
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
-    }
-
-    pub(crate) fn is_running(&self) -> bool {
-        let Ok(mut state) = self.inner.lock() else {
-            return false;
-        };
-        if let Some(session) = state.session.as_mut() {
-            let _ = refresh_status(session);
+        if let Some(session) = state.session.as_ref() {
             return matches!(session.status, AgentTerminalStatus::Running);
         }
         #[cfg(test)]
@@ -113,6 +96,18 @@ impl AgentTerminalHandle {
         }
     }
 
+    pub(crate) fn poll_monitor_change(&self) -> bool {
+        let Ok(mut state) = self.inner.lock() else {
+            return false;
+        };
+        let status_changed = state
+            .session
+            .as_mut()
+            .is_some_and(|session| refresh_status(session).unwrap_or(false));
+        state.monitor_changed |= status_changed;
+        std::mem::take(&mut state.monitor_changed)
+    }
+
     pub(crate) fn open(&self, root: &Path, nole_root: &Path, command: &str) -> Result<String> {
         if command.contains('\0') {
             bail!("terminal command cannot contain NUL bytes");
@@ -121,9 +116,7 @@ impl AgentTerminalHandle {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
-        if state.session.is_some() {
-            bail!("an Agent terminal session is already active");
-        }
+        ensure_open_slot(&mut state)?;
         let helper = shell_helper_command(nole_root)?;
         let mut terminal = EmbeddedTerminal::spawn_command(root, helper)?;
         terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
@@ -139,6 +132,7 @@ impl AgentTerminalHandle {
             terminal,
             status: AgentTerminalStatus::Running,
         });
+        state.monitor_changed = true;
         Ok(id)
     }
 
@@ -147,12 +141,16 @@ impl AgentTerminalHandle {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
-        let session = state
-            .session
-            .as_mut()
-            .context("no active Agent terminal session")?;
-        ensure_session(session, session_id)?;
-        refresh_status(session)?;
+        let status_changed = {
+            let session = state
+                .session
+                .as_mut()
+                .context("no active Agent terminal session")?;
+            ensure_session(session, session_id)?;
+            refresh_status(session)?
+        };
+        state.monitor_changed |= status_changed;
+        let session = state.session.as_mut().expect("session was validated");
         if !matches!(session.status, AgentTerminalStatus::Running) {
             bail!("terminal session has exited");
         }
@@ -166,12 +164,16 @@ impl AgentTerminalHandle {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
-        let session = state
-            .session
-            .as_mut()
-            .context("no active Agent terminal session")?;
-        ensure_session(session, session_id)?;
-        refresh_status(session)?;
+        let status_changed = {
+            let session = state
+                .session
+                .as_mut()
+                .context("no active Agent terminal session")?;
+            ensure_session(session, session_id)?;
+            refresh_status(session)?
+        };
+        state.monitor_changed |= status_changed;
+        let session = state.session.as_ref().expect("session was validated");
         if !matches!(session.status, AgentTerminalStatus::Running) {
             bail!("terminal session has exited");
         }
@@ -183,13 +185,17 @@ impl AgentTerminalHandle {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
-        let session = state
-            .session
-            .as_mut()
-            .context("no active Agent terminal session")?;
-        ensure_session(session, session_id)?;
-        refresh_status(session)?;
-        Ok(observation_value(session))
+        let (status_changed, observation) = {
+            let session = state
+                .session
+                .as_mut()
+                .context("no active Agent terminal session")?;
+            ensure_session(session, session_id)?;
+            let status_changed = refresh_status(session)?;
+            (status_changed, observation_value(session))
+        };
+        state.monitor_changed |= status_changed;
+        Ok(observation)
     }
 
     pub(crate) fn wait_until_settled(
@@ -241,22 +247,34 @@ impl AgentTerminalHandle {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
-        let session = state
-            .session
-            .as_mut()
-            .context("no active Agent terminal session")?;
-        ensure_session(session, session_id)?;
-        refresh_status(session)?;
-        if matches!(session.status, AgentTerminalStatus::Running) {
+        let status_changed = {
+            let session = state
+                .session
+                .as_mut()
+                .context("no active Agent terminal session")?;
+            ensure_session(session, session_id)?;
+            refresh_status(session)?
+        };
+        state.monitor_changed |= status_changed;
+        if matches!(
+            state
+                .session
+                .as_ref()
+                .expect("session was validated")
+                .status,
+            AgentTerminalStatus::Running
+        ) {
             bail!("terminal session is still running");
         }
         state.session = None;
+        state.monitor_changed = true;
         Ok(())
     }
 
     pub(crate) fn terminate(&self) {
         if let Ok(mut state) = self.inner.lock() {
             state.session = None;
+            state.monitor_changed = true;
             #[cfg(test)]
             {
                 state.monitor_override = None;
@@ -268,11 +286,14 @@ impl AgentTerminalHandle {
         let mut state = self.inner.lock().ok()?;
         #[cfg(test)]
         if let Some(snapshot) = &state.monitor_override {
-            return Some(snapshot.clone());
+            return matches!(snapshot.status, AgentTerminalStatus::Running)
+                .then(|| snapshot.clone());
         }
         let session = state.session.as_mut()?;
+        if !matches!(session.status, AgentTerminalStatus::Running) {
+            return None;
+        }
         let _ = session.terminal.resize(TERMINAL_ROWS, cols.max(1));
-        let _ = refresh_status(session);
         Some(AgentTerminalSnapshot {
             title: session.title.clone(),
             status: session.status.clone(),
@@ -284,6 +305,7 @@ impl AgentTerminalHandle {
     pub(crate) fn set_monitor_snapshot_for_test(&self, snapshot: AgentTerminalSnapshot) {
         if let Ok(mut state) = self.inner.lock() {
             state.monitor_override = Some(snapshot);
+            state.monitor_changed = true;
         }
     }
 
@@ -293,9 +315,7 @@ impl AgentTerminalHandle {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
-        if state.session.is_some() {
-            bail!("an Agent terminal session is already active");
-        }
+        ensure_open_slot(&mut state)?;
         let mut command = portable_pty::CommandBuilder::new("/bin/sh");
         command.arg("-c");
         command.arg(script);
@@ -309,8 +329,20 @@ impl AgentTerminalHandle {
             terminal,
             status: AgentTerminalStatus::Running,
         });
+        state.monitor_changed = true;
         Ok(id)
     }
+}
+
+fn ensure_open_slot(state: &mut AgentTerminalState) -> Result<()> {
+    let Some(session) = state.session.as_mut() else {
+        return Ok(());
+    };
+    state.monitor_changed |= refresh_status(session)?;
+    if matches!(session.status, AgentTerminalStatus::Running) {
+        bail!("an Agent terminal session is already running");
+    }
+    Ok(())
 }
 
 fn ensure_session(session: &AgentTerminalSession, session_id: &str) -> Result<()> {
@@ -321,13 +353,14 @@ fn ensure_session(session: &AgentTerminalSession, session_id: &str) -> Result<()
     }
 }
 
-fn refresh_status(session: &mut AgentTerminalSession) -> Result<()> {
+fn refresh_status(session: &mut AgentTerminalSession) -> Result<bool> {
     if matches!(session.status, AgentTerminalStatus::Running) {
         if let Some(status) = session.terminal.try_wait()? {
             session.status = AgentTerminalStatus::Exited(status.exit_code());
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn observation_value(session: &AgentTerminalSession) -> Value {
@@ -675,7 +708,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn terminal_handle_allows_one_session_and_closes_only_after_exit() {
+    fn terminal_handle_allows_one_running_session_and_replaces_an_exited_session() {
         let directory = tempfile::tempdir().unwrap();
         let terminal = AgentTerminalHandle::default();
         let running = terminal
@@ -686,11 +719,14 @@ mod tests {
             .is_err());
         assert!(terminal.close_exited(&running).is_err());
         terminal.terminate();
-        assert!(!terminal.is_active());
+        assert!(terminal.observation(&running).is_err());
 
         let exited = terminal
             .open_process_for_test(directory.path(), "exit 7")
             .unwrap();
+        assert!(terminal.is_running());
+        assert!(terminal.monitor_snapshot(INITIAL_COLS).is_some());
+        assert!(terminal.poll_monitor_change());
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let observation = terminal.observation(&exited).unwrap();
@@ -703,7 +739,32 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        terminal.close_exited(&exited).unwrap();
-        assert!(!terminal.is_active());
+        assert_eq!(
+            terminal.observation(&exited).unwrap()["status"],
+            "exited 7",
+            "final screen must remain readable"
+        );
+        assert!(!terminal.is_running());
+        assert!(terminal.monitor_snapshot(INITIAL_COLS).is_none());
+        assert!(terminal.poll_monitor_change());
+        assert!(!terminal.poll_monitor_change());
+        let replacement = terminal
+            .open_process_for_test(directory.path(), "exit 0")
+            .unwrap();
+        assert_ne!(replacement, exited);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observation = terminal.observation(&replacement).unwrap();
+            if observation["status"] == "exited 0" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement terminal did not exit: {observation}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        terminal.close_exited(&replacement).unwrap();
+        assert!(terminal.observation(&replacement).is_err());
     }
 }

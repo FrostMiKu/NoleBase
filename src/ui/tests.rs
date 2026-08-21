@@ -1958,6 +1958,30 @@ fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
 }
 
 #[test]
+fn exited_agent_terminal_retains_its_screen_without_reserving_monitor_rows() {
+    let (mut baseline, _baseline_directory) = make_app();
+    baseline.center_view = CenterView::Chat;
+    let _ = render(&mut baseline, 120, 30);
+    let baseline_compose = baseline.layout.compose;
+
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Chat;
+    app.agent_terminal
+        .set_monitor_snapshot_for_test(AgentTerminalSnapshot {
+            title: "ssh build-host".to_string(),
+            status: AgentTerminalStatus::Exited(0),
+            terminal: TerminalSnapshot::from_bytes(24, 80, b"final output"),
+        });
+
+    let terminal = render(&mut app, 120, 30);
+
+    assert!(!app.agent_terminal.is_running());
+    assert!(app.agent_terminal.monitor_snapshot(80).is_none());
+    assert_eq!(app.layout.compose, baseline_compose);
+    assert!(!buffer_string(&terminal).contains("PTY · ssh build-host"));
+}
+
+#[test]
 fn command_approval_wraps_long_commands_with_spaced_sections() {
     let (mut app, _directory) = make_app();
     let long_argument = "x".repeat(120);

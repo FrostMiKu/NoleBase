@@ -286,7 +286,7 @@ fn draw_center(
     cursor_position: &mut Option<Position>,
 ) {
     let monitor_axis = inset_horizontal(center_content_axis(area), 2);
-    let area = if app.agent_terminal.is_active()
+    let area = if app.agent_terminal.is_running()
         && area.height >= AGENT_TERMINAL_RESERVED_ROWS
         && monitor_axis.width > 0
     {
@@ -330,7 +330,7 @@ fn draw_overlay(
     cursor_position: &mut Option<Position>,
 ) -> Rect {
     let root = if overlay == Overlay::Approval
-        && app.agent_terminal.is_active()
+        && app.agent_terminal.is_running()
         && app.layout.center.is_some()
         && root.height > AGENT_TERMINAL_RESERVED_ROWS
     {
