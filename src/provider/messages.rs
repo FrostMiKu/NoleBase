@@ -83,12 +83,18 @@ impl MessagesProvider {
         cancel: &CancellationToken,
     ) -> Result<Response> {
         for attempt in 0..MAX_HTTP_ATTEMPTS {
-            let request = self
+            let mut request = self
                 .client
                 .post(url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .json(body);
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            // Anthropic accepts both credential headers; vLLM-style gateways
+            // only authenticate `Authorization: Bearer`, so send both.
+            if !self.api_key.trim().is_empty() {
+                request = request
+                    .header("x-api-key", &self.api_key)
+                    .bearer_auth(&self.api_key);
+            }
+            let request = request.json(body);
             let sent = tokio::select! {
                 _ = cancel.cancelled() => bail!("Messages request cancelled"),
                 result = request.send() => result,
@@ -796,6 +802,62 @@ mod streaming_tests {
             events.try_recv().unwrap(),
             ProviderEvent::ToolCallFinished { index: 0, id } if id == "call_write"
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_carry_both_credential_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut headers = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            let mut request_body = vec![0; content_length];
+            reader.read_exact(&mut request_body).unwrap();
+            let body = r#"{"content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            reader.get_mut().flush().unwrap();
+            (headers, serde_json::from_slice::<Value>(&request_body).unwrap())
+        });
+
+        let provider = MessagesProvider::new("secret", format!("http://{address}")).unwrap();
+        let observable = provider.call_streaming(ProviderRequest {
+            model: "test-model".to_string(),
+            max_tokens: 128,
+            system: vec![SystemBlock {
+                text: "test".to_string(),
+                cache: false,
+            }],
+            messages: vec![Message::user("write a note")],
+            tools: Vec::new(),
+        });
+        let answer = observable.output.await.unwrap();
+        let (headers, _body) = server.join().unwrap();
+
+        assert_eq!(answer.text(), "hello");
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains("x-api-key: secret"));
+        // vLLM-style gateways authenticate only via the Bearer header.
+        assert!(headers.contains("authorization: bearer secret"));
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
     }
 }
 

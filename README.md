@@ -378,7 +378,9 @@ max_concurrent_subagents = 4
 Set `api_format` to `messages` for the Anthropic Messages protocol, or to
 `completions` for the OpenAI-compatible Chat Completions protocol. Set the
 provider credential in `api_key`; `completions` also permits an empty key for
-local endpoints. `base_url` uses the host prefix; Nole appends
+local endpoints. `messages` requests send the key as both `x-api-key` and
+`Authorization: Bearer`, so vLLM-style deployments that only check the Bearer
+header authenticate too. `base_url` uses the host prefix; Nole appends
 `/v1/messages`, `/v1/messages/count_tokens`, or `/v1/chat/completions` itself.
 
 The card's `AI` button runs the configured provider in the background. It first opens a prompt dialog; an
