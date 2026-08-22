@@ -2,10 +2,9 @@
 //!
 //! The index parses each managed Markdown/MBDown file (daily/, data/,
 //! archives/) with the same MBDown parser the renderer uses and records the
-//! `[[...]]` targets that appear as wiki-link events. Targets inside fenced or
-//! inline code, HTML comments, escaped text, and `![[...]]` embed bodies never
-//! produce those events and are therefore not references: the renderer itself
-//! does not render them as wiki links.
+//! `[[...]]` targets that appear as wiki-link events. Fenced or inline code,
+//! HTML comments, escaped text, and `![[...]]` embed bodies remain content
+//! because the renderer classifies those regions separately from wiki links.
 //!
 //! Per target the index preserves the total occurrence count and the distinct
 //! set of referencing managed notes. The shared document indexer rebuilds at
@@ -16,27 +15,16 @@
 //! every managed file containing a wiki target that matches `path` by file
 //! name or stem, exactly as the renderer resolves a clicked `[[target]]`.
 
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use mbdown::{Event, Node};
 
-use crate::document_index::DocumentIndex;
+use crate::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
 #[cfg(test)]
 use crate::storage::Storage;
-
-/// Aggregate reference data for one wiki-link target.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ReferenceEntry {
-    /// Total occurrences across all managed files.
-    count: usize,
-    /// Distinct managed files that reference the target, sorted by path.
-    locations: Vec<PathBuf>,
-}
 
 /// Derived wiki-link index: wiki target -> referencing notes.
 #[derive(Clone, Debug, Default)]
@@ -53,39 +41,14 @@ impl WikiLinkIndex {
             .iter()
             .map(|(path, document)| (path.clone(), document.wiki_links.clone()))
             .collect();
-        let mut index = Self {
-            files,
-            references: HashMap::new(),
-        };
-        index.rebuild_references();
-        index
+        let references = aggregate_references(&files);
+        Self { files, references }
     }
 
-    /// Scan every managed Markdown/MBDown file and index its wiki targets.
+    /// Build from the production document snapshot path.
     #[cfg(test)]
     pub fn build(storage: &Storage) -> Self {
         Self::from_documents(&DocumentIndex::build(storage))
-    }
-
-    /// Re-index the given paths (created, modified, or removed). Paths that are
-    /// not managed Markdown files are ignored, so watcher events for the
-    /// attachments and workspace directories never disturb the index.
-    #[cfg(test)]
-    pub fn refresh_paths(&mut self, storage: &Storage, paths: &[PathBuf]) {
-        let mut unique = paths.iter().cloned().collect::<HashSet<_>>();
-        let mut changed = false;
-        for path in unique.drain() {
-            if self.files.remove(&path).is_some() {
-                changed = true;
-            }
-            if let Some(document) = crate::document_index::index_file(storage, &path) {
-                self.files.insert(path, document.wiki_links);
-                changed = true;
-            }
-        }
-        if changed {
-            self.rebuild_references();
-        }
     }
 
     #[cfg(test)]
@@ -109,14 +72,15 @@ impl WikiLinkIndex {
     /// Distinct managed files referencing any case-insensitive spelling of the
     /// wiki target, sorted by path. The index keys on the exact target text as
     /// written, so rename discovery must match case-insensitively like
-    /// [`matching_wiki_link_spans`] or `[[old]]` would never be found when the
-    /// requested target is `Old`.
+    /// [`matching_wiki_link_spans`] so `[[old]]` is found when the requested
+    /// target is `Old`.
     pub fn locations_ignoring_case(&self, target: &str) -> Vec<PathBuf> {
         let mut locations = Vec::new();
+        let mut seen = HashSet::new();
         for (key, entry) in &self.references {
             if key.eq_ignore_ascii_case(target) {
                 for path in &entry.locations {
-                    if !locations.contains(path) {
+                    if seen.insert(path) {
                         locations.push(path.clone());
                     }
                 }
@@ -164,22 +128,6 @@ impl WikiLinkIndex {
         backlinks.sort();
         backlinks
     }
-
-    fn rebuild_references(&mut self) {
-        self.references.clear();
-        for (path, targets) in &self.files {
-            for target in targets {
-                let entry = self.references.entry(target.clone()).or_default();
-                entry.count += 1;
-                if !entry.locations.contains(path) {
-                    entry.locations.push(path.clone());
-                }
-            }
-        }
-        for entry in self.references.values_mut() {
-            entry.locations.sort();
-        }
-    }
 }
 
 /// Whether `path`'s file name or stem matches `requested`, case-insensitively —
@@ -215,8 +163,8 @@ impl WikiLinkIndexHandle {
 
 /// Source spans of every `[[target]]` whose target equals `from`
 /// (case-insensitive), in source order. Only real wiki-link events count:
-/// targets inside code, HTML comments, escaped text, or embeds never produce
-/// those events and are left untouched.
+/// targets inside code, HTML comments, escaped text, or embeds remain outside
+/// the event stream and retain their source text.
 pub fn matching_wiki_link_spans(source: &str, from: &str) -> Vec<Range<usize>> {
     let Ok(document) = mbdown::parse(source) else {
         return Vec::new();
@@ -264,8 +212,8 @@ pub fn replace_wiki_link_spans(source: &str, spans: &[Range<usize>], to: &str) -
 
 /// Every wiki-link target in `text` that the MBDown renderer would render as
 /// a wiki link, in source order, including duplicates. Targets inside code,
-/// HTML comments, escaped text, or `![[...]]` embed bodies never produce those
-/// events and are therefore not references.
+/// HTML comments, escaped text, or `![[...]]` embed bodies remain ordinary
+/// content because MBDown emits events for rendered wiki links.
 #[cfg(test)]
 pub fn find_wiki_links(text: &str) -> Vec<String> {
     let Ok(document) = mbdown::parse(text) else {
@@ -344,7 +292,7 @@ mod tests {
         .unwrap();
         fs::write(storage.archives_dir.join("Old.md"), "[[Project]] again\n").unwrap();
 
-        let index = WikiLinkIndex::build(&storage);
+        let index = WikiLinkIndex::from_documents(&DocumentIndex::build(&storage));
         assert_eq!(index.reference_count("Project"), 3);
         assert_eq!(index.locations("Project").len(), 3);
         assert_eq!(index.reference_count("Other"), 1);
@@ -364,11 +312,11 @@ mod tests {
         .unwrap();
         fs::write(storage.daily_dir.join("2026-07-28.md"), "[[Project]]\n").unwrap();
 
-        let index = WikiLinkIndex::build(&storage);
+        let index = WikiLinkIndex::from_documents(&DocumentIndex::build(&storage));
         assert_eq!(
             index.reference_count("Project"),
             3,
-            "occurrences, not notes"
+            "total occurrence count"
         );
         assert_eq!(index.locations("Project").len(), 2, "distinct notes");
     }
@@ -396,7 +344,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = WikiLinkIndex::build(&storage);
+        let index = WikiLinkIndex::from_documents(&DocumentIndex::build(&storage));
         assert_eq!(
             index.backlinks(&note),
             vec![
@@ -409,24 +357,5 @@ mod tests {
         assert!(index
             .backlinks(&storage.data_dir.join("Missing.md"))
             .is_empty());
-    }
-
-    #[test]
-    fn refresh_paths_reindexes_created_modified_and_removed_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = storage_with(&directory);
-        let note = storage.data_dir.join("Note.md");
-        fs::write(&note, "[[Target]]\n").unwrap();
-        let mut index = WikiLinkIndex::build(&storage);
-        assert_eq!(index.reference_count("Target"), 1);
-
-        fs::write(&note, "[[Changed]]\n").unwrap();
-        index.refresh_paths(&storage, std::slice::from_ref(&note));
-        assert_eq!(index.reference_count("Target"), 0);
-        assert_eq!(index.reference_count("Changed"), 1);
-
-        fs::remove_file(&note).unwrap();
-        index.refresh_paths(&storage, &[note]);
-        assert!(!index.is_referenced("Changed"));
     }
 }

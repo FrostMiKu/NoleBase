@@ -70,7 +70,7 @@ pub(super) fn draw_filter_header(
     )
 }
 
-/// Clear a widget's rectangle without leaving a wide-character continuation
+/// Clear a widget's rectangle while removing any wide-character continuation
 /// cell from the content underneath it. Ratatui's diff buffer can otherwise
 /// miss the cell next to a one-column border when a CJK glyph straddles that
 /// boundary.
@@ -187,6 +187,98 @@ pub(super) fn shared_selection_area(container: Rect, item_y: u16, item_height: u
     )
 }
 
+/// Geometry for one row in a selectable list.
+///
+/// Selectable lists share a one-row breathing space before their first item.
+/// The selected area starts in that space and extends through the item, while
+/// adjacent rows share their boundary row. Keeping this geometry in one place
+/// prevents individual list renderers from drifting apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SelectionRow {
+    pub(super) index: usize,
+    pub(super) item_area: Rect,
+    pub(super) selection_area: Option<Rect>,
+}
+
+pub(super) fn selection_rows(
+    container: Rect,
+    item_height: u16,
+    start: usize,
+    visible: usize,
+    total: usize,
+    selected: usize,
+) -> Vec<SelectionRow> {
+    let item_height = item_height.max(1);
+    let end = container.y.saturating_add(container.height);
+    let selected = selected.min(total.saturating_sub(1));
+    (start.min(total)..total)
+        .take(visible)
+        .enumerate()
+        .filter_map(|(row, index)| {
+            let y = selection_item_y(container, row, item_height);
+            if y >= end {
+                return None;
+            }
+            let height = item_height.min(end.saturating_sub(y));
+            let item_area = Rect::new(container.x, y, container.width, height);
+            let selection_area =
+                (index == selected).then(|| shared_selection_area(container, y, height));
+            Some(SelectionRow {
+                index,
+                item_area,
+                selection_area,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn render_selection_background(frame: &mut Frame, row: SelectionRow, style: Style) {
+    let Some(area) = row.selection_area else {
+        return;
+    };
+    frame.render_widget(Block::default().style(style), area);
+}
+
+pub(super) fn selection_styles(selected: bool, theme: Theme) -> (Style, Style) {
+    if selected {
+        let style = Style::default()
+            .fg(theme.selection_foreground)
+            .bg(theme.selection_background);
+        (style, style.add_modifier(Modifier::DIM))
+    } else {
+        (Style::default(), Style::default().fg(theme.text_muted))
+    }
+}
+
+pub(super) fn render_label_metadata_row(
+    frame: &mut Frame,
+    area: Rect,
+    label: String,
+    metadata: String,
+    label_style: Style,
+    metadata_style: Style,
+) {
+    let metadata_width = UnicodeWidthStr::width(metadata.as_str()).min(area.width as usize);
+    let label_width = (area.width as usize).saturating_sub(metadata_width.saturating_add(1));
+    if label_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(label, label_style)),
+            Rect::new(area.x, area.y, label_width as u16, 1),
+        );
+    }
+    if metadata_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(metadata, metadata_style)).alignment(Alignment::Right),
+            Rect::new(
+                area.x + area.width.saturating_sub(metadata_width as u16),
+                area.y,
+                metadata_width as u16,
+                1,
+            ),
+        );
+    }
+}
+
 pub(super) fn draw_selection_indicator(frame: &mut Frame, area: Rect, theme: Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -213,7 +305,8 @@ pub(super) fn selection_list_height(item_count: u16, item_height: u16) -> u16 {
 }
 
 pub(super) fn visible_selection_items(list_height: u16, item_height: u16) -> usize {
-    (list_height.saturating_sub(1) as usize).div_ceil(item_height as usize)
+    let item_height = usize::from(item_height.max(1));
+    (list_height.saturating_sub(1) as usize).div_ceil(item_height)
 }
 
 pub(super) fn selection_viewport_start(

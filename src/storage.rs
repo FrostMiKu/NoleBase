@@ -20,7 +20,10 @@ use crate::export::{ExportDiagnostic, ExportFormat};
 use crate::model::{DailyNote, NoteFile, TodoItem};
 use crate::theme::Theme;
 
+mod atomic;
 mod theme;
+
+pub(crate) use atomic::replace_file_atomically;
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
@@ -731,12 +734,14 @@ impl Storage {
         }
         fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("creating {}", self.config_dir.display()))?;
-        let temporary_path = self
-            .config_dir
-            .join(format!(".{AGENT_SESSION_FILE}.{}.tmp", std::process::id()));
+        let temporary_path = self.config_dir.join(format!(
+            ".{AGENT_SESSION_FILE}.{}-{:016x}.tmp",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
         let result = (|| -> Result<()> {
             let mut options = OpenOptions::new();
-            options.write(true).create(true).truncate(true);
+            options.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -750,13 +755,15 @@ impl Storage {
             file.write_all(b"\n")?;
             file.sync_all()
                 .with_context(|| format!("syncing {}", temporary_path.display()))?;
-            fs::rename(&temporary_path, &self.agent_session_path).with_context(|| {
-                format!(
-                    "replacing {} using {}",
-                    self.agent_session_path.display(),
-                    temporary_path.display()
-                )
-            })?;
+            replace_file_atomically(&temporary_path, &self.agent_session_path).with_context(
+                || {
+                    format!(
+                        "replacing {} using {}",
+                        self.agent_session_path.display(),
+                        temporary_path.display()
+                    )
+                },
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -963,7 +970,8 @@ impl Storage {
     /// Remove the first occurrence of `needle` from `path`. Returns `true` if
     /// found and removed. Used by undo to clean up a filed copy.
     pub fn remove_first_occurrence(&self, path: &Path, needle: &str) -> Result<bool> {
-        let text = fs::read_to_string(path).unwrap_or_default();
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("reading {} for undo", path.display()))?;
         if let Some(idx) = text.find(needle) {
             let mut out = String::with_capacity(text.len() - needle.len());
             out.push_str(&text[..idx]);
@@ -1574,7 +1582,12 @@ fn expand_leading_home(input: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-fn normalize_lexical(path: PathBuf) -> Result<PathBuf> {
+/// Normalize `.` and `..` components without touching the filesystem.
+///
+/// Callers use this before canonicalization when they need to validate a
+/// path's lexical boundary. Parent components that leave the path base are
+/// rejected immediately.
+pub(crate) fn normalize_lexical(path: PathBuf) -> Result<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1671,7 +1684,8 @@ fn date_from_path(path: &Path) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()
 }
 
-fn is_note_path(path: &Path) -> bool {
+/// Whether a path names a Markdown or MBDown note by extension.
+pub(crate) fn is_note_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -1802,9 +1816,19 @@ fn append_text(path: &Path, content: &str) -> Result<()> {
 
 fn append_text_tracked(path: &Path, content: &str) -> Result<AppendReceipt> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).ok();
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory {}", parent.display()))?;
     }
-    let created = !path.exists();
+    let created = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to append through symlink {}", path.display());
+            }
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+    };
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1871,6 +1895,22 @@ mod tests {
         let notes = st.load_daily_notes().unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].body, "first\n\nsecond\n\nthird");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daily_append_rejects_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let (_dir, storage) = fresh();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.md");
+        fs::write(&target, "protected\n").unwrap();
+        let daily = storage.daily_dir.join("2026-07-26.md");
+        symlink(&target, &daily).unwrap();
+
+        assert!(storage.append_daily("2026-07-26", "injected").is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "protected\n");
     }
 
     #[test]

@@ -326,12 +326,23 @@ pub(super) fn measure_visible_daily_cards(
     }
 }
 
-pub(super) fn render_daily_note(
-    note: &crate::model::DailyNote,
-    date_label: String,
+pub(super) struct NoteCardRender {
+    pub(super) body_start: usize,
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) links: Vec<crate::markdown::RenderedLink>,
+    pub(super) tags: Vec<crate::markdown::RenderedTag>,
+    pub(super) images: Vec<mbtui::ImagePlacement>,
+}
+
+/// Render the common heading and Markdown body used by Daily and tag cards.
+/// The callers add their page-specific footer while sharing all layout and
+/// hitbox offsets.
+pub(super) fn render_note_card_content(
+    label: &str,
+    body: &str,
     width: usize,
     theme: Theme,
-) -> crate::app::DailyCardRenderCache {
+) -> NoteCardRender {
     let card_style = Style::default().bg(theme.surface_panel);
     let horizontal_padding = DAILY_PADDING_X.min(width.saturating_sub(1) / 2);
     let body_start = horizontal_padding + DAILY_DATE_LABEL_WIDTH + 2;
@@ -343,7 +354,7 @@ pub(super) fn render_daily_note(
             vec![
                 Span::raw(" ".repeat(body_start)),
                 Span::styled(
-                    date_label.clone(),
+                    label.to_string(),
                     Style::default()
                         .fg(theme.text_subtle)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -354,7 +365,7 @@ pub(super) fn render_daily_note(
         ),
         line_with_background(Vec::new(), width, card_style),
     ];
-    let markdown = crate::markdown::render_at_width(&note.body, body_width, theme);
+    let markdown = crate::markdown::render_at_width(body, body_width, theme);
     let body_line_start = lines.len();
     let links = markdown
         .links
@@ -391,24 +402,49 @@ pub(super) fn render_daily_note(
             lines.push(line_with_background(spans, width, card_style));
         }
     }
-    lines.push(line_with_background(Vec::new(), width, card_style));
+    NoteCardRender {
+        body_start,
+        lines,
+        links,
+        tags,
+        images,
+    }
+}
+
+pub(super) fn render_daily_note(
+    note: &crate::model::DailyNote,
+    date_label: String,
+    width: usize,
+    theme: Theme,
+) -> crate::app::DailyCardRenderCache {
+    let mut content = render_note_card_content(&date_label, &note.body, width, theme);
+    let card_style = Style::default().bg(theme.surface_panel);
+    content
+        .lines
+        .push(line_with_background(Vec::new(), width, card_style));
     let button_start = width
-        .saturating_sub(body_start)
+        .saturating_sub(content.body_start)
         .saturating_sub(action_buttons_width());
-    let button_line = lines.len();
-    lines.push(daily_button_line(width, button_start, false, theme));
-    lines.push(line_with_background(Vec::new(), width, card_style));
-    lines.push(line_with_background(Vec::new(), width, card_style));
-    lines.push(Line::default());
+    let button_line = content.lines.len();
+    content
+        .lines
+        .push(daily_button_line(width, button_start, false, theme));
+    content
+        .lines
+        .push(line_with_background(Vec::new(), width, card_style));
+    content
+        .lines
+        .push(line_with_background(Vec::new(), width, card_style));
+    content.lines.push(Line::default());
     crate::app::DailyCardRenderCache {
         width,
         date: note.date,
         date_label,
         body: note.body.clone(),
-        lines,
-        links,
-        tags,
-        images,
+        lines: content.lines,
+        links: content.links,
+        tags: content.tags,
+        images: content.images,
         button_line,
         button_start,
     }

@@ -19,6 +19,7 @@ use super::{
     DEFAULT_READ_LINES, MAX_EXTRACTED_TEXT_BYTES, MAX_READ_LINES, MAX_READ_LINE_BYTES,
     MAX_READ_RESPONSE_BYTES, READ_RESPONSE_OVERHEAD,
 };
+use crate::agent::tools::util::parse_inclusive_range;
 
 /// An inclusive one-based line window `start..=end` requested through `range`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,25 +35,7 @@ pub(super) fn line_range(input: &Value) -> Result<Option<LineRange>> {
     let raw = raw
         .as_str()
         .context("field range must be a string like `1-200`")?;
-    let (start, end) = raw
-        .split_once('-')
-        .context("range must be an inclusive one-based selector like `1-200`")?;
-    if start.is_empty() || end.is_empty() || end.contains('-') {
-        bail!("range must be an inclusive one-based selector like `1-200`");
-    }
-    let start = start
-        .parse::<usize>()
-        .context("range start must be a positive integer")?;
-    let end = end
-        .parse::<usize>()
-        .context("range end must be a positive integer")?;
-    if start == 0 || end < start {
-        bail!("range must satisfy 1 <= start <= end");
-    }
-    let limit = end
-        .checked_sub(start)
-        .and_then(|difference| difference.checked_add(1))
-        .context("range is too large")?;
+    let (start, _end, limit) = parse_inclusive_range(raw, "1-200")?;
     if limit > MAX_READ_LINES {
         bail!("range may select at most {MAX_READ_LINES} lines");
     }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -84,7 +84,8 @@ pub(crate) fn resolve_image(
         if target.is_absolute() {
             bail!("absolute image paths are not exportable");
         }
-        let candidate = normalize(note.parent().unwrap_or(root).join(target))?;
+        let candidate =
+            crate::storage::normalize_lexical(note.parent().unwrap_or(root).join(target))?;
         reject_symlink_components(root, &candidate)?;
         let canonical_root = fs::canonicalize(root).context("canonicalizing Nole root")?;
         let canonical = fs::canonicalize(&candidate)
@@ -145,24 +146,6 @@ pub(crate) fn reject_symlink_components(root: &Path, target: &Path) -> Result<()
     Ok(())
 }
 
-pub(crate) fn normalize(path: PathBuf) -> Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    bail!("path escapes its base");
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -182,19 +165,6 @@ mod tests {
         image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
             .save(path)
             .unwrap();
-    }
-
-    #[test]
-    fn normalize_collapses_dot_segments_and_rejects_escapes() {
-        assert_eq!(
-            normalize(PathBuf::from("/a/./b/../c")).unwrap(),
-            PathBuf::from("/a/c")
-        );
-        assert!(normalize(PathBuf::from("/a/../..")).is_err());
-        assert_eq!(
-            normalize(PathBuf::from("a/./b")).unwrap(),
-            PathBuf::from("a/b")
-        );
     }
 
     #[test]

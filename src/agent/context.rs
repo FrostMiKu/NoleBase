@@ -48,10 +48,15 @@ pub(crate) fn estimate_request_tokens(
         .saturating_add(CONTEXT_ESTIMATE_OVERHEAD)
 }
 
-pub(crate) fn context_compaction_cut(messages: &[Message], target_tokens: u64) -> Option<usize> {
+pub(crate) fn context_compaction_cut_for_request(
+    system: &[SystemBlock],
+    messages: &[Message],
+    definitions: &[ToolSpec],
+    target_tokens: u64,
+) -> Option<usize> {
     (1..messages.len()).find(|&cut| {
         is_safe_compaction_boundary(messages, cut)
-            && estimate_request_tokens(&[], &messages[cut..], &[]) <= target_tokens
+            && estimate_request_tokens(system, &messages[cut..], definitions) <= target_tokens
     })
 }
 
@@ -104,5 +109,33 @@ mod tests {
         assert_eq!(with_small, with_large);
         let baseline = estimate_request_tokens(&[], &[Message::user("x")], &[]);
         assert!(with_small > baseline);
+    }
+
+    #[test]
+    fn compaction_boundary_accounts_for_system_and_tool_tokens() {
+        let system = vec![SystemBlock {
+            text: "system context ".repeat(100),
+            cache: false,
+        }];
+        let definitions = vec![ToolSpec {
+            name: "read".to_string(),
+            description: "read ".repeat(100),
+            input_schema: serde_json::json!({"type": "object"}),
+            cache: false,
+        }];
+        let messages = vec![Message::user("old"), Message::user("latest")];
+        let full_tail = estimate_request_tokens(&system, &messages[1..], &definitions);
+
+        assert!(
+            context_compaction_cut_for_request(&system, &messages, &definitions, full_tail)
+                .is_some()
+        );
+        assert!(context_compaction_cut_for_request(
+            &system,
+            &messages,
+            &definitions,
+            full_tail.saturating_sub(1)
+        )
+        .is_none());
     }
 }

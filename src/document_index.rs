@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::attachment_index::{collect_attachment_uris, AttachmentReferenceIndex};
 use crate::storage::Storage;
@@ -24,8 +25,8 @@ use crate::wiki_link_index::{collect_wiki_links, WikiLinkIndex};
 use crate::workspace_index::{collect_document_tags, WorkspaceIndex};
 
 const CACHE_DIR: &str = "cache";
-const CACHE_FILE: &str = "document-index-v2.json";
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FILE: &str = "document-index.json";
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DocumentGroup {
@@ -47,10 +48,11 @@ struct FileStamp {
     modified_secs: u64,
     modified_nanos: u32,
     size: u64,
+    content_sha256: [u8; 32],
 }
 
 impl FileStamp {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn from_metadata(metadata: &fs::Metadata, content: &[u8]) -> Self {
         let modified = metadata
             .modified()
             .unwrap_or(UNIX_EPOCH)
@@ -59,7 +61,8 @@ impl FileStamp {
         Self {
             modified_secs: modified.as_secs(),
             modified_nanos: modified.subsec_nanos(),
-            size: metadata.len(),
+            size: content.len() as u64,
+            content_sha256: Sha256::digest(content).into(),
         }
     }
 
@@ -86,6 +89,41 @@ impl IndexedDocument {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DocumentIndex {
     files: HashMap<PathBuf, IndexedDocument>,
+}
+
+/// Aggregated occurrences of one parsed reference target.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReferenceEntry {
+    pub(crate) count: usize,
+    pub(crate) locations: Vec<PathBuf>,
+}
+
+/// Build occurrence counts and sorted distinct locations for parsed targets.
+pub(crate) fn aggregate_references(
+    files: &HashMap<PathBuf, Vec<String>>,
+) -> HashMap<String, ReferenceEntry> {
+    let mut references: HashMap<String, ReferenceEntry> = HashMap::new();
+    let mut locations: HashMap<String, HashSet<PathBuf>> = HashMap::new();
+    for (path, targets) in files {
+        for target in targets {
+            let entry = references.entry(target.clone()).or_default();
+            entry.count += 1;
+            locations
+                .entry(target.clone())
+                .or_default()
+                .insert(path.clone());
+        }
+    }
+    for (target, entry) in references.iter_mut() {
+        let mut paths: Vec<PathBuf> = locations
+            .remove(target)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        paths.sort();
+        entry.locations = paths;
+    }
+    references
 }
 
 #[derive(Deserialize)]
@@ -174,7 +212,10 @@ impl DocumentIndex {
                 if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
                     continue;
                 }
-                let stamp = FileStamp::from_metadata(&metadata);
+                let Ok(content) = fs::read(&path) else {
+                    continue;
+                };
+                let stamp = FileStamp::from_metadata(&metadata, &content);
                 let relative = path.strip_prefix(&storage.root).unwrap_or(&path);
                 let document = match cached.remove(relative) {
                     Some(document) if document.group == group && document.stamp == stamp => {
@@ -182,9 +223,10 @@ impl DocumentIndex {
                         document
                     }
                     _ => {
-                        let Some(document) = parse_file(&path, group, stamp) else {
+                        let Ok(source) = String::from_utf8(content) else {
                             continue;
                         };
+                        let document = parse_source(&source, group, stamp);
                         stats.parsed += 1;
                         document
                     }
@@ -235,13 +277,15 @@ impl DocumentIndex {
             file.sync_all()
                 .with_context(|| format!("syncing index cache {}", temporary.display()))?;
             drop(file);
-            replace_cache_file(&temporary, &destination).with_context(|| {
-                format!(
-                    "publishing index cache {} to {}",
-                    temporary.display(),
-                    destination.display()
-                )
-            })?;
+            crate::storage::replace_file_atomically(&temporary, &destination).with_context(
+                || {
+                    format!(
+                        "publishing index cache {} to {}",
+                        temporary.display(),
+                        destination.display()
+                    )
+                },
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -382,47 +426,6 @@ fn publish_snapshot(
         .is_ok()
 }
 
-fn replace_cache_file(staged: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        fs::rename(staged, destination)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
-
-        if !destination.exists() {
-            return fs::rename(staged, destination);
-        }
-        let destination_wide: Vec<u16> = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let staged_wide: Vec<u16> = staged
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let replaced = unsafe {
-            ReplaceFileW(
-                destination_wide.as_ptr(),
-                staged_wide.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if replaced == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-}
-
 fn read_cache(storage: &Storage) -> Result<HashMap<PathBuf, IndexedDocument>> {
     let path = storage.root.join(CACHE_DIR).join(CACHE_FILE);
     let file =
@@ -445,16 +448,18 @@ pub(crate) fn index_file(storage: &Storage, path: &Path) -> Option<IndexedDocume
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return None;
     }
-    parse_file(path, group, FileStamp::from_metadata(&metadata))
+    let content = fs::read(path).ok()?;
+    let stamp = FileStamp::from_metadata(&metadata, &content);
+    let source = String::from_utf8(content).ok()?;
+    Some(parse_source(&source, group, stamp))
 }
 
-fn parse_file(path: &Path, group: DocumentGroup, stamp: FileStamp) -> Option<IndexedDocument> {
-    let source = fs::read_to_string(path).ok()?;
+fn parse_source(source: &str, group: DocumentGroup, stamp: FileStamp) -> IndexedDocument {
     let mut tags_by_line: HashMap<usize, Vec<String>> = HashMap::new();
     let mut attachment_uris = Vec::new();
     let mut wiki_links = Vec::new();
-    if let Ok(document) = mbdown::parse(&source) {
-        collect_document_tags(document.nodes(), &source, &mut tags_by_line);
+    if let Ok(document) = mbdown::parse(source) {
+        collect_document_tags(document.nodes(), source, &mut tags_by_line);
         attachment_uris = collect_attachment_uris(document.nodes());
         wiki_links = collect_wiki_links(document.nodes());
     }
@@ -471,13 +476,13 @@ fn parse_file(path: &Path, group: DocumentGroup, stamp: FileStamp) -> Option<Ind
             })
         })
         .collect();
-    Some(IndexedDocument {
+    IndexedDocument {
         group,
         stamp,
         lines,
         attachment_uris,
         wiki_links,
-    })
+    }
 }
 
 pub(crate) fn document_group(storage: &Storage, path: &Path) -> Option<DocumentGroup> {
@@ -611,6 +616,32 @@ mod tests {
     }
 
     #[test]
+    fn same_size_and_timestamp_content_changes_rebuild_the_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let note = storage.data_dir.join("Stable.md");
+        fs::write(&note, "a\n").unwrap();
+        let initial_modified = fs::metadata(&note).unwrap().modified().unwrap();
+        let (_, initial_stats) = DocumentIndex::load_or_build(&storage);
+        assert_eq!(initial_stats.parsed, 1);
+
+        fs::write(&note, "b\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&note)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(initial_modified))
+            .unwrap();
+
+        let (rebuilt, stats) = DocumentIndex::load_or_build(&storage);
+        assert_eq!(stats.reused, 0);
+        assert_eq!(stats.parsed, 1);
+        let workspace = WorkspaceIndex::from_documents(&rebuilt);
+        assert!(workspace.search("a").is_empty());
+        assert_eq!(workspace.search("b").len(), 1);
+    }
+
+    #[test]
     fn shared_worker_publishes_workspace_and_attachment_updates_together() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
@@ -633,7 +664,7 @@ mod tests {
         assert_eq!(
             initial.wiki_links.backlinks(&note),
             Vec::<std::path::PathBuf>::new(),
-            "a note is not its own backlink"
+            "self backlinks are excluded"
         );
 
         fs::write(&note, "second value #two\n").unwrap();

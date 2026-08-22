@@ -4,8 +4,8 @@
 //! joined with the shared usage snapshot (how many distinct managed notes
 //! reference each attachment), ordered by `imported_at` descending through the
 //! store's list API. Opening an attachment opens the real application-managed
-//! content file in place — no copy is ever materialized into the workspace.
-//! Deletion is confirmed, refuses while the usage index is not ready or stale,
+//! content file in place; the workspace and cache remain unchanged.
+//! Deletion is confirmed after the usage index reaches a current ready state,
 //! and always ends in the shared authoritative reference scan before the
 //! atomic store trash.
 
@@ -122,9 +122,9 @@ impl App {
         }
     }
 
-    /// Begin the confirmed trash flow for the selected attachment. Refused
-    /// before the usage index is ready, and refused up front when managed
-    /// notes still reference the attachment, reporting the distinct locations.
+    /// Begin the confirmed trash flow for the selected attachment after the
+    /// usage index is ready. Managed references keep the attachment in place;
+    /// the status reports each distinct location.
     pub(in crate::app) fn request_delete_attachment(&mut self) {
         let Some(entry) = self.attachment_entries.get(self.attachment_index).cloned() else {
             self.set_status("No attachment selected");
@@ -147,7 +147,7 @@ impl App {
             return;
         }
         // Remember which usage snapshot the "unreferenced" decision came from;
-        // the confirm handler refuses if it rotated in the meantime.
+        // the confirm handler validates that revision before publishing.
         self.pending_attachment = Some((entry.id, snapshot.revision));
         self.open_dialog(DialogState::new(
             "Move attachment to trash",
@@ -188,7 +188,7 @@ fn locations_label(locations: &[PathBuf]) -> String {
 }
 
 /// The display name of an attachment: the application-managed display name
-/// stored in metadata (never derived from the store path).
+/// stored in metadata and independent of the store path.
 pub(in crate::app) fn attachment_display_name(metadata: &AttachmentMetadata) -> String {
     metadata.display_name.clone()
 }

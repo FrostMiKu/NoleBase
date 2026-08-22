@@ -205,14 +205,12 @@ impl App {
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    if self
-                        .storage
-                        .remove_first_occurrence(&target, &appended)
-                        .unwrap_or(false)
-                    {
-                        format!("Undid move to {name}")
-                    } else {
-                        format!("Undid move (couldn't tidy {name})")
+                    match self.storage.remove_first_occurrence(&target, &appended) {
+                        Ok(true) => format!("Undid move to {name}"),
+                        Ok(false) => format!("Undid move; cleanup skipped for {name}"),
+                        Err(error) => {
+                            format!("Undo error: restored the daily note; cleaning {name}: {error}")
+                        }
                     }
                 }
                 Err(error) => format!("Undo error: {error}"),

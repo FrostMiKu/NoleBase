@@ -85,8 +85,8 @@ pub(crate) fn completed_tool_results(execution: ToolBatchExecution) -> Vec<Messa
 
 pub(crate) const TEST_MESSAGES_CONFIG: &str = "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'https://api.anthropic.com'\n";
 
-/// A gate in YOLO mode: every request passes without asking (the root is never
-/// consulted and can stay empty).
+/// A YOLO gate approves every request immediately; its root is unused and may
+/// remain empty in tests.
 pub(crate) fn bypass_gate() -> ApprovalGate {
     let (event_sender, _event_receiver) = event_channel();
     let (_decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();

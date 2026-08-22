@@ -18,6 +18,7 @@ pub(crate) mod read;
 mod review;
 mod shell;
 mod skills;
+mod subagent_tools;
 mod util;
 mod wait;
 pub(crate) mod web;

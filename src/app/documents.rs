@@ -1,7 +1,7 @@
 //! Document browsing, todo/search/tag views, and note actions.
 //!
-//! Submodules group the `App` methods by feature so no single file carries the
-//! whole workspace behavior.
+//! Submodules group the `App` methods by feature so each file carries a focused
+//! slice of workspace behavior.
 
 mod actions;
 mod attachments;

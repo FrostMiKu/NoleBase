@@ -5,7 +5,7 @@
 //! headers carry a mandatory 4-hex snapshot tag, hunks are `PUT` / `CUT` /
 //! `REM` / `MV`, and body rows are verbatim `+TEXT` lines under a `:` header.
 //! Parsing is strict: every malformed construct is a hard error prefixed with
-//! the 1-based patch line it occurred on, and no compatibility shims are kept.
+//! the 1-based patch line it occurred on, using the current upstream grammar.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -39,7 +39,7 @@ struct SectionBuilder {
     tag: String,
     line_num: usize,
     hunks: Vec<Hunk>,
-    /// Which file-level op was emitted, if any; nothing may follow it.
+    /// The terminal file-level op emitted for this section, when present.
     file_op: Option<&'static str>,
 }
 
@@ -63,7 +63,7 @@ struct OpenBody {
 
 /// The result of parsing one hunk-header line.
 enum ParsedOp {
-    /// A complete op with no body rows to follow.
+    /// A complete op whose payload is inline.
     Bodyless(Op),
     /// A `PUT <locator>:` header whose body rows are still to come.
     Body(PutLocator),
@@ -80,8 +80,8 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
         let line_num = index + 1;
         let line = physical.strip_suffix('\r').unwrap_or(physical);
 
-        // A line that is not a `+` row terminates any open body first, then is
-        // itself processed as a blank line, section header, or hunk header.
+        // A header, blank line, or other structural line closes an open body;
+        // the same line then continues through the structural parser.
         if let Some(open) = body.take() {
             if let Some(rest) = line.strip_prefix('+') {
                 let mut rows = open.rows;
@@ -105,14 +105,14 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
             continue;
         }
 
-        // Trailing whitespace is trimmed from header lines only, never from
-        // body rows.
+        // Header lines trim trailing whitespace; body rows preserve their
+        // original bytes.
         let header = line.trim_end();
 
         if header == BEGIN_PATCH_MARKER || header == END_PATCH_MARKER {
             return Err(anyhow!(
-                "line {line_num}: {header} is a patch envelope marker; pass the \
-                 [PATH#TAG] sections only, not the surrounding envelope"
+                "line {line_num}: {header} is a patch envelope marker; pass [PATH#TAG] \
+                 sections and omit the surrounding envelope"
             ));
         }
 
@@ -152,7 +152,7 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch> {
 
         if line.starts_with('+') {
             return Err(anyhow!(
-                "line {line_num}: body row without a PUT ...: header"
+                "line {line_num}: body rows require a PUT ...: header"
             ));
         }
 
@@ -240,9 +240,9 @@ fn push_hunk(section: &mut SectionBuilder, hunk: Hunk) -> Result<()> {
     Ok(())
 }
 
-/// Parses one hunk-header line into a parsed op, or `Ok(None)` when the line
-/// is not a hunk header at all. Errors carry a message without the leading
-/// `line {n}:` prefix, which the caller adds.
+/// Parses one hunk-header line into a parsed op. `Ok(None)` marks text outside
+/// hunk-header syntax. Errors carry the message body; the caller adds the
+/// leading `line {n}:` prefix.
 fn parse_hunk_body(trimmed: &str) -> Result<Option<ParsedOp>, String> {
     if trimmed == "REM" {
         return Ok(Some(ParsedOp::Bodyless(Op::Rem)));
@@ -373,7 +373,7 @@ fn parse_cut(rest: &str) -> Result<ParsedOp, String> {
     Ok(ParsedOp::Bodyless(Op::Cut { locator, register }))
 }
 
-/// Parses a positive 1-based line number: `[1-9][0-9]*` with no leading zeros.
+/// Parses a positive 1-based line number: `[1-9][0-9]*` with leading-zero-free form.
 fn parse_positive(text: &str) -> Option<usize> {
     let text = text.trim();
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) || text.starts_with('0') {
@@ -382,8 +382,8 @@ fn parse_positive(text: &str) -> Option<usize> {
     text.parse().ok()
 }
 
-/// Parses a span locator (`N.=M` or `N*`). `Ok(None)` means the text is not a
-/// span locator at all; `Err` is a semantic locator error (start > end).
+/// Parses a span locator (`N.=M` or `N*`). `Ok(None)` marks text outside span
+/// syntax; `Err` reports a semantic locator error (end before start).
 fn parse_span_locator(loc: &str) -> Result<Option<SpanLocator>, String> {
     let loc = loc.trim();
     if let Some(digits) = loc.strip_suffix('*') {
@@ -396,7 +396,7 @@ fn parse_span_locator(loc: &str) -> Result<Option<SpanLocator>, String> {
         return Ok(None);
     };
     if start > end {
-        return Err("range start must not exceed end".into());
+        return Err("range end must be at least the start line".into());
     }
     Ok(Some(SpanLocator::Range { start, end }))
 }
@@ -721,17 +721,17 @@ PUT 2.=2:
     }
 
     #[test]
-    fn range_start_must_not_exceed_end() {
+    fn range_end_must_follow_start() {
         let err = parse_patch("[f#0000]\nPUT 5.=3:").unwrap_err();
         assert!(
             err.to_string()
-                .contains("line 2: range start must not exceed end"),
+                .contains("line 2: range end must be at least the start line"),
             "{err}"
         );
         let err = parse_patch("[f#0000]\nCUT 5.=3").unwrap_err();
         assert!(
             err.to_string()
-                .contains("line 2: range start must not exceed end"),
+                .contains("line 2: range end must be at least the start line"),
             "{err}"
         );
     }
@@ -754,7 +754,7 @@ PUT 2.=2:
         let err = parse_patch("[f#0000]\n+orphan").unwrap_err();
         assert!(
             err.to_string()
-                .contains("line 2: body row without a PUT ...: header"),
+                .contains("line 2: body rows require a PUT ...: header"),
             "{err}"
         );
     }

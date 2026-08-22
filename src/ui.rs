@@ -77,7 +77,7 @@ pub(in crate::ui) const WORKSPACE_VIEW_SPACED_HEIGHT: u16 = 3;
 pub(in crate::ui) const WORKSPACE_VIEW_COMPACT_HEIGHT: u16 = 2;
 
 /// Render one frame, rebuild mouse geometry, and return the requested cursor
-/// position without changing the terminal's hardware cursor.
+/// position while leaving the terminal's hardware cursor under caller control.
 pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
     app.layout = LayoutSnapshot::default();
     clear_hitboxes(app);
@@ -113,7 +113,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
 
     if let Some(overlay) = app.overlay {
         // Background widgets may still be visible, but an overlay owns all input.
-        // Keeping no base hitboxes makes that ownership explicit to mouse code.
+        // Clearing base hitboxes makes that ownership explicit to mouse code.
         clear_hitboxes(app);
         let area = draw_overlay(frame, app, root, overlay, &mut cursor_position);
         app.layout.overlay = non_empty(area);

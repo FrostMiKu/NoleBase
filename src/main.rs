@@ -84,7 +84,7 @@ fn enter_tui() -> Result<()> {
         EnableBracketedPaste,
     )?;
     // Crossterm's Windows event backend always uses the legacy Windows API,
-    // where kitty keyboard progressive enhancement is unsupported. Windows
+    // where kitty keyboard progressive enhancement is unavailable. Windows
     // still receives normal key events; only modified-key disambiguation is
     // unavailable there.
     #[cfg(not(windows))]
@@ -217,10 +217,9 @@ fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
 
 /// Register the file watcher for application-managed content only.
 ///
-/// The whole Nole root is deliberately never watched: the agent workspace
-/// (`workspace/`) churns constantly while a task runs, and its events must
-/// not enter the notify queue at all. Only locations whose changes require
-/// refresh are registered, each individually:
+/// The watcher covers only locations whose changes require application
+/// refresh. The agent workspace (`workspace/`) churns constantly while a task
+/// runs, so its events stay outside the notify queue. Registered locations are:
 ///
 /// - `daily/`, `data/`, `archives/` — managed notes (workspace reload and
 ///   the note/attachment reference indexes);
@@ -233,9 +232,9 @@ fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
 ///   `<uuid>/metadata.json`); events refresh mutable externally edited
 ///   attachment metadata in the browser.
 ///
-/// Missing optional directories simply have nothing to watch, matching the
-/// previous root-recursive watcher, which silently produced no events for
-/// directories it had never seen.
+/// Optional directories contribute watches when present; an absent directory
+/// contributes no watch, matching the previous root-recursive behavior for
+/// directories that had not appeared yet.
 fn watch_workspace(storage: &storage::Storage) -> Result<(RecommendedWatcher, WatchEvents)> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -268,10 +267,9 @@ fn process_workspace_events(
     app: &mut App,
 ) -> (Vec<std::path::PathBuf>, bool) {
     // The agent workspace sandbox (workspace/main) churns constantly while an
-    // Agent task runs. It is never registered with the watcher, so its events
-    // never enter this queue; the check below is defense in depth. Workspace
-    // events must never reload the workspace UI or feed the note/attachment
-    // indexes; session file handling is the workspace policy's job.
+    // Agent task runs. It stays outside the watcher, and the check below adds
+    // defense in depth. Workspace events leave workspace UI and note/attachment
+    // indexes unchanged; session file handling is the workspace policy's job.
     let workspace_dir = app.storage.workspace_dir.clone();
     let attachments_dir = app.storage.attachments_dir.clone();
     let mut changed = false;
@@ -340,10 +338,10 @@ fn process_workspace_events(
     }
     let mut ui_changed = false;
     if !attachment_paths.is_empty() {
-        // Attachment events refresh the browser only: mutable metadata (e.g.
-        // display_name) can be edited externally. They never reload the
-        // workspace UI or feed the note/attachment reference indexes, which
-        // track managed Markdown files only.
+        // Attachment events refresh the browser: mutable metadata (e.g.
+        // display_name) can be edited externally. They leave the workspace UI
+        // and note/attachment reference indexes unchanged; those indexes track
+        // managed Markdown files only.
         app.attachment_paths_changed(&attachment_paths);
         ui_changed = true;
     }
@@ -362,8 +360,8 @@ fn event_wait_duration(app: &App, focused: bool) -> Duration {
     if ui::animations_active(app, focused) {
         ANIMATION_FRAME_INTERVAL
     } else {
-        // Static screens do not need redraws. Keep a bounded wait so external
-        // file/indexer updates are noticed even though crossterm cannot wait
+        // Static screens remain quiet between redraws. Keep a bounded wait so
+        // external file/indexer updates are noticed while crossterm handles
         // on both terminal input and the watcher channel simultaneously.
         Duration::from_secs(1)
     }
@@ -507,16 +505,16 @@ fn flush_wheel(pending: &mut Option<(u16, u16, i32)>, app: &mut App) -> bool {
 
 fn resolve_storage() -> Result<storage::Storage> {
     // NOLE_DIR overrides the default ~/.nole location - handy for testing or
-    // keeping multiple notebooks without ever touching the real data dir.
+    // keeping multiple notebooks while preserving the real data directory.
     match std::env::var("NOLE_DIR") {
         Ok(dir) if !dir.trim().is_empty() => storage::Storage::new(dir.trim()),
         _ => storage::Storage::default_root(),
     }
 }
 
-/// True when the first CLI argument is a version request. `nole --version` must
-/// print the version and exit without touching the workspace or terminal, so
-/// this runs before any storage or TUI setup.
+/// True when the first CLI argument is a version request. `nole --version`
+/// prints the version before workspace or terminal setup, keeping this path
+/// side-effect free.
 fn wants_version<I>(mut args: I) -> bool
 where
     I: Iterator<Item = String>,
@@ -791,8 +789,8 @@ mod tests {
 
         let (_watcher, events) = watch_workspace(&storage).unwrap();
 
-        // Agent workspace churn must never enter the notify queue: the
-        // workspace is not registered, so even a settle window yields nothing.
+        // Agent workspace churn stays outside the notify queue because the
+        // workspace is unregistered; a settle window therefore remains empty.
         let workspace = storage.agent_workspace_dir();
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("session.json"), "{}").unwrap();

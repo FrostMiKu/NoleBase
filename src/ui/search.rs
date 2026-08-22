@@ -54,26 +54,19 @@ pub(super) fn draw_search(
         app.search_results.len(),
     );
     app.search_list_start = start;
-    for (row, (index, hit)) in app
-        .search_results
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible)
-        .enumerate()
-    {
-        let y = selection_item_y(results, row, SELECT_OPTION_HEIGHT);
-        let item_height =
-            SELECT_OPTION_HEIGHT.min(results.y.saturating_add(results.height).saturating_sub(y));
-        let item_area = Rect::new(results.x, y, results.width, item_height);
-        let is_selected = index == selected;
-        let metadata_style = if is_selected {
-            Style::default()
-                .fg(app.theme.selection_foreground)
-                .add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(app.theme.text_muted)
-        };
+    for row in selection_rows(
+        results,
+        SELECT_OPTION_HEIGHT,
+        start,
+        visible,
+        app.search_results.len(),
+        selected,
+    ) {
+        let index = row.index;
+        let hit = &app.search_results[index];
+        let item_area = row.item_area;
+        let is_selected = row.selection_area.is_some();
+        let (style, metadata_style) = selection_styles(is_selected, app.theme);
         let spans = match hit {
             SearchHit::FileLine {
                 path,
@@ -95,22 +88,12 @@ pub(super) fn draw_search(
                 Span::raw(text.clone()),
             ],
         };
-        let style = if is_selected {
-            Style::default()
-                .fg(app.theme.selection_foreground)
-                .bg(app.theme.selection_background)
-        } else {
-            Style::default()
-        };
-        let selection_area = is_selected.then(|| shared_selection_area(results, y, item_height));
-        if let Some(selection_area) = selection_area {
-            frame.render_widget(Block::default().style(style), selection_area);
-        }
+        render_selection_background(frame, row, style);
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(style),
             inset_horizontal(Rect::new(item_area.x, item_area.y, item_area.width, 1), 2),
         );
-        if let Some(selection_area) = selection_area {
+        if let Some(selection_area) = row.selection_area {
             draw_selection_indicator(frame, selection_area, app.theme);
         }
         if interactive {

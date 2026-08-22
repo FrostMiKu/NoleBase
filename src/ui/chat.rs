@@ -72,16 +72,15 @@ fn draw_chat_messages(
     let view_height = visible_area.height.min(area.height) as usize;
     sync_chat_vlist(app, width);
     let tail_pinned = app.agent_follow_tail || app.agent_scroll == u16::MAX;
-    let maximum = app.agent_vlist.geometry.max_scroll(view_height);
-    let mut scroll = if tail_pinned {
-        maximum
-    } else {
-        (app.agent_scroll as usize).min(maximum)
-    };
+    let mut scroll = app.agent_vlist.geometry.scroll_offset(
+        app.agent_scroll,
+        app.agent_follow_tail,
+        view_height,
+    );
     scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
     evict_agent_caches(app, scroll, view_height);
     app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
-    if scroll >= app.agent_vlist.geometry.max_scroll(view_height) {
+    if app.agent_vlist.geometry.is_at_end(scroll, view_height) {
         app.agent_follow_tail = true;
     }
     let (visible, rendered_links, rendered_images) =
@@ -139,7 +138,7 @@ pub(super) fn render_chat_entry_with_thinking_mode(
         crate::agent_session::AgentPanelEntry::Assistant { text, .. } if text.trim().is_empty() => {
             (vec![Line::default()], Vec::new(), Vec::new())
         }
-        // Ordinary agent text renders directly without a card.
+        // Ordinary agent text renders directly on the page surface.
         crate::agent_session::AgentPanelEntry::Assistant { text, .. } => {
             render_chat_plain_text(text, width, theme)
         }
@@ -271,8 +270,8 @@ fn render_chat_prompt_bar(
     (lines, links, images)
 }
 
-/// Ordinary agent text renders directly, no card background and no loading
-/// marker — streaming simply grows the text in place.
+/// Ordinary agent text renders directly on the page surface with streaming
+/// text growing in place.
 pub(super) fn render_chat_plain_text(
     text: &str,
     width: usize,
@@ -480,7 +479,8 @@ mod tests {
                 active: false,
                 preview: None,
             }),
-            // A streaming reply renders as plain text, no spinner, no card.
+            // A streaming reply uses plain text styling and remains free of
+            // spinner or card chrome.
             Arc::new(AgentPanelEntry::Assistant {
                 text: "hello agent".to_string(),
                 streaming: true,
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(buffer[(user_x, user_y)].bg, app.theme.selection_background);
         let (prefix_x, _) = find_text(&terminal, "> hello user");
         assert_eq!(prefix_x, user_x - 2);
-        // Tool rows and plain agent text keep no card background.
+        // Tool rows and plain agent text keep the page surface background.
         assert_ne!(buffer[(tool_x, _tool_y)].bg, app.theme.selection_background);
         assert_ne!(
             buffer[(tool_x, _tool_y)].bg,
@@ -732,7 +732,8 @@ mod tests {
             format!("{padding} • Completed Read.")
         );
         // The detail row and the result preview share the activity-tree glyphs:
-        // `├─` for the path, then the final `└─` for the preview, no chat-only ↳.
+        // `├─` for the path, then the final `└─` for the preview; the tree stays
+        // consistent with the panel renderer.
         assert_eq!(
             with_preview[1].to_string(),
             format!("{padding}   ├─ data/Note.md")
@@ -833,7 +834,7 @@ mod tests {
         )
         .0;
 
-        // Final reply: direct plain text, no card background.
+        // Final reply: direct plain text on the page surface.
         assert!(plain
             .iter()
             .any(|line| line.to_string().contains("The finished answer")));
@@ -1071,7 +1072,7 @@ mod tests {
             app.theme.surface_message_agent,
             "pad row below the thinking body must be visible"
         );
-        // …and the outer blank row sits below it without a background.
+        // …and the outer blank row sits below it with the page background.
         assert_ne!(
             buffer[(40, body_y + 2)].bg,
             app.theme.surface_message_agent,
@@ -1083,8 +1084,8 @@ mod tests {
     fn chat_remeasures_completed_tool_after_streaming_finishes() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
-        // The running tool is volatile: measured at the active height, never
-        // cached, so no `Arc` reference keeps its allocation alive.
+        // The running tool is volatile: measured at the active height and
+        // held outside the cache, so its allocation follows the active entry.
         app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
             text: "Calling Read File...\ndata/Note.md".to_string(),
             active: true,
@@ -1096,7 +1097,7 @@ mod tests {
         assert!(app.agent_vlist.caches[0].is_none());
 
         // Completing the tool mutates the entry in place (`Arc::make_mut` keeps
-        // the pointer because the volatile entry has no cached Arc reference).
+        // the pointer because the volatile entry has an uncached Arc reference).
         let before = Arc::as_ptr(&app.agent_panel[0]);
         let entry = &mut app.agent_panel[0];
         if let AgentPanelEntry::Tool {

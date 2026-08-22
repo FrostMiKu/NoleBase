@@ -61,62 +61,35 @@ fn draw_tag_picker(
     let start =
         selection_viewport_start(app.tag_list_start, selected, visible, app.tag_results.len());
     app.tag_list_start = start;
-    for (row, (index, tag)) in app
-        .tag_results
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible)
-        .enumerate()
-    {
-        let y = selection_item_y(results, row, SELECT_OPTION_HEIGHT);
-        let item_height =
-            SELECT_OPTION_HEIGHT.min(results.y.saturating_add(results.height).saturating_sub(y));
-        let item_area = Rect::new(results.x, y, results.width, item_height);
-        let is_selected = index == selected;
-        let style = if is_selected {
-            Style::default()
-                .fg(app.theme.selection_foreground)
-                .bg(app.theme.selection_background)
-        } else {
-            Style::default()
-        };
-        let metadata_style = if is_selected {
-            style.add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(app.theme.text_muted)
-        };
-        let selection_area = is_selected.then(|| shared_selection_area(results, y, item_height));
-        if let Some(selection_area) = selection_area {
-            frame.render_widget(Block::default().style(style), selection_area);
-        }
-
+    for row in selection_rows(
+        results,
+        SELECT_OPTION_HEIGHT,
+        start,
+        visible,
+        app.tag_results.len(),
+        selected,
+    ) {
+        let index = row.index;
+        let tag = &app.tag_results[index];
+        let item_area = row.item_area;
+        let is_selected = row.selection_area.is_some();
+        let (style, metadata_style) = selection_styles(is_selected, app.theme);
+        render_selection_background(frame, row, style);
         let row_area = inset_horizontal(Rect::new(item_area.x, item_area.y, item_area.width, 1), 2);
         let metadata = if row_area.width >= 32 {
             format!("{} documents · {} mentions", tag.documents, tag.mentions)
         } else {
             format!("{}d · {}x", tag.documents, tag.mentions)
         };
-        let metadata_width = UnicodeWidthStr::width(metadata.as_str()).min(row_area.width as usize);
-        let name_width = (row_area.width as usize).saturating_sub(metadata_width.saturating_add(1));
-        if name_width > 0 {
-            frame.render_widget(
-                Paragraph::new(Span::styled(format!("#{}", tag.name), style)),
-                Rect::new(row_area.x, row_area.y, name_width as u16, 1),
-            );
-        }
-        if metadata_width > 0 {
-            frame.render_widget(
-                Paragraph::new(Span::styled(metadata, metadata_style)).alignment(Alignment::Right),
-                Rect::new(
-                    row_area.x + row_area.width.saturating_sub(metadata_width as u16),
-                    row_area.y,
-                    metadata_width as u16,
-                    1,
-                ),
-            );
-        }
-        if let Some(selection_area) = selection_area {
+        render_label_metadata_row(
+            frame,
+            row_area,
+            format!("#{}", tag.name),
+            metadata,
+            style,
+            metadata_style,
+        );
+        if let Some(selection_area) = row.selection_area {
             draw_selection_indicator(frame, selection_area, app.theme);
         }
         if interactive {
@@ -399,79 +372,22 @@ pub(super) fn render_tag_note_card(
     width: usize,
     theme: Theme,
 ) -> crate::app::TagNoteCardRenderCache {
+    let mut content = render_note_card_content(&note.title, &note.body, width, theme);
     let card_style = Style::default().bg(theme.surface_panel);
-    let horizontal_padding = DAILY_PADDING_X.min(width.saturating_sub(1) / 2);
-    let body_start = horizontal_padding + DAILY_DATE_LABEL_WIDTH + 2;
-    let (body_start, body_width) = centered_daily_body_axis(width, body_start);
-    let mut lines = vec![
-        line_with_background(Vec::new(), width, card_style),
-        line_with_background(Vec::new(), width, card_style),
-        line_with_background(
-            vec![
-                Span::raw(" ".repeat(body_start)),
-                Span::styled(
-                    note.title.clone(),
-                    Style::default()
-                        .fg(theme.text_subtle)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ),
-            ],
-            width,
-            card_style,
-        ),
-        line_with_background(Vec::new(), width, card_style),
-    ];
-
-    let markdown = crate::markdown::render_at_width(&note.body, body_width, theme);
-    let body_line_start = lines.len();
-    let links = markdown
-        .links
-        .into_iter()
-        .map(|mut link| {
-            link.row += body_line_start;
-            link.column += body_start;
-            link
-        })
-        .collect();
-    let tags = markdown
-        .tags
-        .into_iter()
-        .map(|mut tag| {
-            tag.row += body_line_start;
-            tag.column += body_start;
-            tag
-        })
-        .collect();
-    let images = markdown
-        .images
-        .into_iter()
-        .map(|mut image| {
-            image.row += body_line_start;
-            image.column += body_start;
-            image
-        })
-        .collect();
-    for markdown_line in markdown.lines {
-        for body in wrap_spans_to_width(&markdown_line.spans, body_width) {
-            let mut spans = Vec::with_capacity(body.len() + 1);
-            spans.push(Span::raw(" ".repeat(body_start)));
-            spans.extend(body);
-            lines.push(line_with_background(spans, width, card_style));
-        }
+    for _ in 0..4 {
+        content
+            .lines
+            .push(line_with_background(Vec::new(), width, card_style));
     }
-    lines.push(line_with_background(Vec::new(), width, card_style));
-    lines.push(line_with_background(Vec::new(), width, card_style));
-    lines.push(line_with_background(Vec::new(), width, card_style));
-    lines.push(line_with_background(Vec::new(), width, card_style));
-    lines.push(Line::default());
+    content.lines.push(Line::default());
     crate::app::TagNoteCardRenderCache {
         width,
         path: note.path.clone(),
         title: note.title.clone(),
         body: note.body.clone(),
-        lines,
-        links,
-        tags,
-        images,
+        lines: content.lines,
+        links: content.links,
+        tags: content.tags,
+        images: content.images,
     }
 }

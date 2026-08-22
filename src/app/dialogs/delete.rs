@@ -60,10 +60,10 @@ impl App {
     }
 
     /// Move an attachment to trash after confirmation, through the shared
-    /// usage service. The service refuses when the usage index rotated past
-    /// the snapshot the dialog was based on, and always performs a final
-    /// authoritative reference scan before the atomic store trash, so a stale
-    /// async index can never authorize deleting a referenced attachment.
+    /// usage service. The service validates that the usage index revision still
+    /// matches the dialog snapshot and always performs a final authoritative
+    /// reference scan before the atomic store trash, so only an unreferenced
+    /// attachment reaches deletion.
     fn trash_attachment(&mut self, id: AttachmentId, expected_revision: u64) {
         let name = self
             .attachment_store

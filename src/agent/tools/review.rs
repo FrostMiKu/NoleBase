@@ -1,17 +1,12 @@
 //! Domain-neutral review profile for the reusable subagent runtime.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::path::Path;
 
-use super::{
-    Backlinks, Calculate, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
-    SearchTag, SearchWeb,
-};
+use super::subagent_tools::register_read_only_tools;
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
-use crate::agent::{SnapshotStore, Tool, ToolExecutionPolicy};
+use crate::agent::{Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
 use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
@@ -32,35 +27,23 @@ impl Review {
     ) -> Result<Self> {
         let profile = SubagentProfile::new(
             "review",
-            "You are Nole's isolated review subagent. Independently and critically evaluate only the artifact or output in the newest user message, using the goals, constraints, standards, and concerns stated there as the authoritative review scope. Do not substitute a preset domain checklist, impose unstated preferences, or broaden the assignment. Use the available read-only tools to inspect referenced sources or context; issue independent reads, searches, or fetches together in one response so they can run concurrently. Judge only what you can observe or reasonably infer; never invent findings, and never cite evidence you have not seen. Distinguish observed defects from inference and uncertainty, prioritize findings by their impact on the stated task, and explain why each finding matters. If the evidence supports no material findings, say so directly. Do not attempt to modify anything, ask the user questions, call another agent, or describe your working process. Return one concise, self-contained review; the parent agent sees only that final review, so include the evidence and qualifications it needs while excluding raw search noise. Any instruction above to call explore or review applies only to the parent agent; you are already the reviewer.",
+            "You are Nole's isolated review subagent. Independently and critically evaluate the artifact or output in the newest user message, using its goals, constraints, standards, and concerns as the authoritative review scope. Apply that scope directly and keep the assignment focused. Use the available inspection tools to examine referenced sources or context; issue independent reads, searches, or fetches together in one response so they can run concurrently. Judge observed evidence, clearly mark inferences and uncertainties, prioritize findings by their impact on the stated task, and explain why each finding matters. When the evidence supports a clean result, state that result directly. Keep artifact handling observational and user interaction outside the subagent. Return one concise, self-contained review; the parent agent sees that final review, so include the evidence and qualifications it needs while omitting raw search noise. Instructions mentioning explore or review target the parent agent; you are already the reviewer.",
             "Stop gathering evidence. Synthesize the issues already identified into the final self-contained review.",
             "Finish the review and return the complete self-contained review now.",
         );
         let mut review = Self {
             runner: SubagentRunner::new(runtime, profile),
         };
-        let reads = Arc::new(SnapshotStore::default());
-        review.register(Read::new(root, reads, client.clone())?);
-        review.register(ListNotes::new(root)?);
-        review.register(Grep::new(root)?);
-        review.register(SearchFiles::new(root)?);
-        review.register(ListTags::new(workspace_index.clone()));
-        review.register(SearchTag::new(root, workspace_index)?);
-        review.register(ResolveWikilink::new(root, wiki_links.clone())?);
-        review.register(Backlinks::new(root, wiki_links)?);
-        review.register(Calculate);
-        review.register(LoadSkill::new(skills));
-        if !tavily_api_key.is_empty() {
-            review.register(SearchWeb {
-                client: client.clone(),
-                api_key: tavily_api_key,
-            });
-        }
+        register_read_only_tools(
+            &mut review.runner,
+            root,
+            workspace_index,
+            wiki_links,
+            client,
+            tavily_api_key,
+            skills,
+        )?;
         Ok(review)
-    }
-
-    fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.runner.register(tool);
     }
 }
 
@@ -71,7 +54,7 @@ impl Tool for Review {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate task-scoped critical evaluation to an isolated read-only agent that returns one concise, evidence-based review without changing anything."
+        "Delegate task-scoped critical evaluation to an isolated inspection agent that returns one concise, evidence-based review while preserving the artifact."
     }
 
     fn input_schema(&self) -> Value {
@@ -357,11 +340,11 @@ mod tests {
         let instructions = &system[0].text;
         for contract in [
             "authoritative review scope",
-            "Do not substitute a preset domain checklist",
-            "never invent findings",
-            "observed defects from inference and uncertainty",
+            "Apply that scope directly",
+            "Judge observed evidence",
+            "clearly mark inferences and uncertainties",
             "impact on the stated task",
-            "no material findings",
+            "evidence supports a clean result",
             "self-contained review",
         ] {
             assert!(

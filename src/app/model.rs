@@ -118,7 +118,7 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
     AppCommandDefinition {
         id: AppCommand::RenameCurrentNote,
         label: "Note: Rename",
-        description: "Rename the current note without changing its format",
+        description: "Rename the current note while preserving its format",
         keywords: "note rename name current article",
     },
     AppCommandDefinition {
@@ -252,10 +252,10 @@ pub(super) enum UndoOp {
 pub struct AttachmentEntry {
     pub id: AttachmentId,
     pub name: String,
-    /// Short display type: media type or file extension when unrecognized.
+    /// Short display type: media type or file extension for an unrecognized value.
     pub kind: String,
     pub size: u64,
-    /// Distinct managed notes referencing the attachment (not occurrences).
+    /// Distinct managed-note locations referencing the attachment.
     pub locations: usize,
 }
 
@@ -309,7 +309,7 @@ impl CenterView {
 ///
 /// Adding a page starts here: register it in [`WorkspaceView::ALL`], then add
 /// its center renderer and input handler. The sidebar reads this registry and
-/// never owns its own list of pages.
+/// keeps its page registry in [`WorkspaceView::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceView {
     pub center_view: CenterView,
@@ -381,8 +381,8 @@ pub enum Overlay {
     WikiLinkChoice,
     Terminal,
     /// A caller-provided command dialog. Its mode and purpose live in
-    /// [`DialogState`], allowing new command-style interactions without
-    /// adding another overlay variant.
+    /// [`DialogState`], allowing new command-style interactions through this
+    /// shared overlay variant.
     Dialog,
 }
 

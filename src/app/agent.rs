@@ -339,8 +339,8 @@ impl App {
                 }
                 AgentEvent::Approval(request) => {
                     // The gate is the single decision source: whatever lands
-                    // here already needs an explicit user decision. The UI must
-                    // not re-decide based on its permission mode.
+                    // here already needs an explicit user decision. The UI
+                    // presents that decision consistently across permission modes.
                     self.set_status(format!("Approval required: {}", request.title));
                     self.approval_request = Some(request);
                     self.approval_scroll = 0;
@@ -496,7 +496,7 @@ impl App {
 
     /// Recompute [`App::document_backlinks`] from the published wiki-link index
     /// for the currently open managed note (daily, data, or archives). Skills
-    /// and previews have no managed backing note, so they never get backlinks.
+    /// and previews use local content, leaving the managed backlink list empty.
     pub(in crate::app) fn recompute_document_backlinks(&mut self) {
         self.document_backlinks.clear();
         let Some(document) = self.document.as_ref() else {
@@ -1016,8 +1016,8 @@ impl App {
         self.permission_mode_atomic
             .store(self.permission_mode.code(), Ordering::Relaxed);
         // Entering YOLO approves whatever approval is currently waiting.
-        // Entering AUTO or APPROVE never blindly approves a pending request —
-        // the gate decides whether it still needs a user decision.
+        // AUTO and APPROVE leave a pending request at the gate for its user
+        // decision; YOLO approves the request currently shown by the overlay.
         if self.permission_mode == PermissionMode::Yolo && self.overlay == Some(Overlay::Approval) {
             let _ = self.send_approval(ApprovalDecision::Approve);
         }

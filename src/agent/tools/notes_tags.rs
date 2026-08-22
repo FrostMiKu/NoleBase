@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 use super::util::{
     display_path, fuzzy_match, limited_diff, range_schema, required_string, truncate_chars,
-    RangeSelector, MAX_DIFF_BYTES, MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
+    truncate_with_marker, RangeSelector, MAX_DIFF_BYTES, MAX_SEARCH_RESULTS,
+    MAX_SEARCH_SNIPPET_CHARS,
 };
 use super::write_policy::{mbdown_warning, REPAIR_REQUIRED_MARKER};
 use crate::agent::{
@@ -276,12 +277,7 @@ impl Tool for RenameTag {
             diff.push_str(&limited_diff(before, after, &label, &label));
             diff.push('\n');
             if diff.len() > MAX_DIFF_BYTES {
-                let mut end = MAX_DIFF_BYTES;
-                while !diff.is_char_boundary(end) {
-                    end -= 1;
-                }
-                diff.truncate(end);
-                diff.push_str("\n... diff truncated ...\n");
+                diff = truncate_with_marker(&diff, MAX_DIFF_BYTES);
                 break;
             }
         }

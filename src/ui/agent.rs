@@ -171,16 +171,15 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     let view_height = inner.height as usize;
     sync_agent_vlist(app, width);
     let tail_pinned = app.agent_follow_tail || app.agent_scroll == u16::MAX;
-    let maximum = app.agent_vlist.geometry.max_scroll(view_height);
-    let mut scroll = if tail_pinned {
-        maximum
-    } else {
-        (app.agent_scroll as usize).min(maximum)
-    };
+    let mut scroll = app.agent_vlist.geometry.scroll_offset(
+        app.agent_scroll,
+        app.agent_follow_tail,
+        view_height,
+    );
     scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
     evict_agent_caches(app, scroll, view_height);
     app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
-    if scroll >= app.agent_vlist.geometry.max_scroll(view_height) {
+    if app.agent_vlist.geometry.is_at_end(scroll, view_height) {
         app.agent_follow_tail = true;
     }
     let (visible, rendered_links, rendered_images) = visible_agent_lines(app, scroll, view_height);
@@ -243,11 +242,11 @@ fn sync_agent_vlist_with_style(
         // A stable entry must always carry a render cache: its measured height
         // is only trustworthy while the cached render it was measured from is
         // still the current entry. Entries that streamed in place (a running
-        // tool that completed, streamed text that finished) were volatile —
-        // never cached — so `Arc::make_mut` mutates them in place without
-        // changing the pointer, leaving the stale measured height from the
-        // volatile phase behind unless we invalidate it here. Evicted entries
-        // are already unmeasured, so invalidating again is a no-op.
+        // tool that completed, streamed text that finished) were volatile and
+        // have no cache. `Arc::make_mut` mutates them in place while preserving
+        // the pointer, so invalidation refreshes the measured height from the
+        // volatile phase. Evicted entries already carry an unmeasured geometry,
+        // making repeated invalidation harmless.
         if volatile
             || cache.is_none()
             || cache
@@ -339,7 +338,7 @@ pub(super) fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
     }
     let entry = Arc::clone(&app.agent_panel[index]);
     // Measure with the same renderer the display pass uses so volatile entry
-    // heights cannot clip content or shift scroll anchors between frames.
+    // heights preserve content and scroll anchors between frames.
     let (lines, links, images) = render_agent_entry_current(app, index);
     let height = lines.len();
     if !is_volatile_agent_entry(&entry) {
@@ -412,8 +411,8 @@ pub(super) fn measure_visible_agent_entries(
 }
 
 /// Drop render caches (and their measurements) for entries far outside the viewport
-/// window so long agent sessions do not accumulate rendered text for the whole panel.
-/// The margin keeps a small scroll-back buffer so quick wheel bursts do not thrash.
+/// window so long agent sessions retain only a bounded rendered window.
+/// The margin keeps a small scroll-back buffer so quick wheel bursts remain smooth.
 const CACHE_KEEP_MARGIN: usize = 50;
 
 pub(super) fn evict_agent_caches(app: &mut App, scroll: usize, view_height: usize) {
@@ -539,8 +538,8 @@ pub(super) fn render_agent_entry(
             lines.push(Line::default());
         }
         crate::agent_session::AgentPanelEntry::Thinking { streaming, .. } => {
-            // The panel shows only a status row, not the reasoning detail: a
-            // braille spinner while streaming, a check mark once done.
+            // The panel shows a status row with a braille spinner while
+            // streaming and a check mark once done.
             let marker = if *streaming {
                 animated_activity_marker(width, tick, theme)
             } else {
@@ -640,10 +639,10 @@ pub(super) fn visible_agent_lines(
             let (rendered_lines, rendered_links, rendered_images) =
                 render_agent_entry_current(app, index);
             // The geometry height may still be an estimate when the measure
-            // budget left this entry unmeasured this frame; never clip the fresh
-            // render to that estimate or the block's trailing rows (body padding,
-            // the shared outer blank) vanish while streaming. Slice to the real
-            // rendered length instead so live rows match a fresh full render.
+            // budget left this entry unmeasured this frame; use the fresh render
+            // length so the block's trailing rows (body padding, the shared outer
+            // blank) remain visible while streaming. Slice to that real length
+            // so live rows match a fresh full render.
             let content_to = rendered_lines.len().min(end.saturating_sub(item_top));
             visible.extend(
                 rendered_lines[content_from.min(content_to)..content_to]

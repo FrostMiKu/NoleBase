@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::util::{display_path, limited_diff, required_string, MAX_DIFF_BYTES};
+use super::util::{
+    display_path, limited_diff, required_string, truncate_with_marker, MAX_DIFF_BYTES,
+};
 use crate::agent::{ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy};
 use crate::storage::Storage;
 use crate::wiki_link_index::{
@@ -276,12 +278,7 @@ impl Tool for RenameWikilink {
             diff.push_str(&limited_diff(&change.before, &change.after, &label, &label));
             diff.push('\n');
             if diff.len() > MAX_DIFF_BYTES {
-                let mut end = MAX_DIFF_BYTES;
-                while !diff.is_char_boundary(end) {
-                    end -= 1;
-                }
-                diff.truncate(end);
-                diff.push_str("\n... diff truncated ...\n");
+                diff = truncate_with_marker(&diff, MAX_DIFF_BYTES);
                 break;
             }
         }

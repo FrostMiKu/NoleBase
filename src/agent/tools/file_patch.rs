@@ -2,11 +2,11 @@
 //!
 //! One tool call takes a single `patch` string made of zero or more
 //! `[PATH#TAG]` sections. Every section is preflighted (path safety, snapshot
-//! anchor, planning, drift rebase, read coverage, staged candidate) before any
-//! file is mutated, so a multi-section patch either lands completely or leaves
-//! every target untouched. After publication each surviving file is re-scanned
-//! and re-anchored in the [`crate::agent::SnapshotStore`] with the whole file
-//! marked seen, so consecutive edits keep working without an intervening read.
+//! anchor, planning, drift rebase, read coverage, staged candidate) before
+//! publication, so a multi-section patch commits as one complete operation.
+//! After publication each surviving file is re-scanned and re-anchored in the
+//! [`crate::agent::SnapshotStore`] with the whole file marked seen; consecutive
+//! edits therefore reuse the latest read state.
 
 use std::collections::HashSet;
 use std::fs;
@@ -46,7 +46,7 @@ pub struct Edit {
 
 /// Structured end-of-file insertion for the common append case. It retains
 /// the same read snapshot, approval, drift detection, and atomic publication
-/// semantics as [`Edit`] without exposing hashline body syntax to the model.
+/// semantics as [`Edit`] while presenting structured append input to the model.
 pub struct Append {
     edit: Edit,
 }
@@ -79,9 +79,9 @@ impl Edit {
         })
     }
 
-    /// Resolve an existing edit target: canonical parent, no symlinks, and
-    /// never inside `config/` or `attachments/`. The target may be a Nole-
-    /// relative path or an external absolute path.
+    /// Resolve an existing edit target through its canonical parent and a real
+    /// file path in an editable zone. The target may be a Nole-relative path or
+    /// an external absolute path.
     fn resolve_path(&self, input: &str) -> Result<PathBuf> {
         let unresolved = resolve_mutation_path(&self.root, input)?;
         let metadata = fs::symlink_metadata(&unresolved)
@@ -101,9 +101,9 @@ impl Edit {
         Ok(path)
     }
 
-    /// Resolve the destination of an `MV` op: canonical parent, no existing
-    /// file, and never inside `config/` or `attachments/`. The destination may
-    /// be a Nole-relative path or an external absolute path.
+    /// Resolve the destination of an `MV` op: canonical parent, fresh leaf, and
+    /// an editable zone. The destination may be a Nole-relative path or an
+    /// external absolute path.
     fn resolve_destination(&self, dest_text: &str) -> Result<PathBuf> {
         let destination = resolve_mutation_path(&self.root, dest_text)?;
         match path_zone(&self.root, &destination) {
@@ -121,7 +121,8 @@ impl Edit {
     }
 
     /// Preflight one section: anchor the snapshot, plan, recover drift, gate
-    /// read coverage, and stage the prepared candidate (never for `REM`).
+    /// read coverage, and stage the prepared candidate; `REM` follows its
+    /// removal path.
     fn preflight(&self, section: &Section, relative: &str, path: PathBuf) -> Result<SectionPlan> {
         let inspection = inspect_text_file(&path)?;
         if inspection.len > MAX_PLANNING_BYTES {
@@ -211,7 +212,8 @@ impl Edit {
 
     /// Request approval for the whole patch, covering every touched path and
     /// every move destination. The gate decides by path: APPROVE always asks,
-    /// AUTO asks only when a path leaves the Nole root, YOLO never asks.
+    /// APPROVE asks for every path, AUTO asks for paths leaving the Nole root,
+    /// and YOLO approves immediately.
     async fn approve(&self, plans: &[SectionPlan]) -> Result<()> {
         let mut paths = Vec::with_capacity(plans.len() * 2);
         for plan in plans {
@@ -258,8 +260,8 @@ impl Edit {
     /// preflight, validate preconditions and workspace staging, write the
     /// staged candidates, then apply file operations (`REM` then `MV`).
     fn publish(&self, plans: &mut [SectionPlan]) -> Result<()> {
-        // Everything that can fail before the first write happens first, so a
-        // multi-section patch never lands halfway.
+        // Every pre-publication check completes before the first write, so a
+        // multi-section patch publishes as one complete operation.
         // A patch whose body reproduces the original bytes is a no-op: drop the
         // staged candidate so publication neither churns the mtime nor wakes the
         // file watcher. Identity is normalized, so a whitespace-only rewrite is
@@ -327,9 +329,10 @@ impl Edit {
         Ok(())
     }
 
-    /// Re-anchor every surviving file so consecutive edits require no re-read.
+    /// Re-anchor every surviving file so consecutive edits use the current
+    /// snapshot.
     /// The stored identity is the raw-byte identity (matching
-    /// [`inspect_text_file`]) so an unchanged file never triggers drift.
+    /// [`inspect_text_file`]), so matching content preserves the anchor.
     fn anchor(&self, plans: &mut [SectionPlan]) -> Result<()> {
         for plan in plans.iter_mut() {
             let Some((location, display)) = plan.surviving_location() else {
@@ -367,7 +370,7 @@ impl Edit {
                 continue;
             }
             let Some(tag) = &plan.post_tag else {
-                // `REM` sections have no content block of their own.
+                // `REM` sections carry their removal operation directly.
                 continue;
             };
             let total = plan.post_total.unwrap_or(0);
@@ -446,9 +449,9 @@ struct ScannedFile {
 /// Scan a published file for re-anchoring. The tag, identity, and retained
 /// text all use the store's per-line normalization (trailing spaces, tabs,
 /// and CR stripped, then a single `\n` per line), exactly matching both
-/// `inspect_text_file` and the read pipeline — so an unchanged file never
-/// triggers drift, and CRLF/LF or trailing-whitespace differences never
-/// invalidate the anchor.
+/// `inspect_text_file` and the read pipeline — matching content preserves the
+/// anchor, and CRLF/LF or trailing-whitespace normalization shares that anchor
+/// identity.
 fn scan_published_file(path: &Path) -> Result<ScannedFile> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("reading {} after edit", path.display()))?;
@@ -467,8 +470,8 @@ fn scan_published_file(path: &Path) -> Result<ScannedFile> {
 
 /// Normalize file text exactly as the snapshot store does: each line's body
 /// (with any trailing `\r`) stripped of trailing spaces, tabs, and CR, then
-/// newline-terminated. A missing final newline still yields a trailing `\n`,
-/// so line-ending style never distinguishes two snapshots.
+/// newline-terminated. Final-newline normalization yields a trailing `\n`,
+/// giving equivalent line-ending styles one snapshot identity.
 fn normalize_text(content: &str) -> String {
     let mut normalized = String::with_capacity(content.len());
     for segment in content.split_inclusive('\n') {
@@ -615,7 +618,7 @@ line N; CUT N.=M or CUT N* deletes a span and captures it, with an optional trai
 required for span replaces). REM deletes the file. MV DEST moves or renames it (DEST is relative \
 to the Nole root or an absolute external path; double-quote DEST only when it contains spaces); \
 line edits in the section apply to the source first. Body \
-rows must start on the line after a `PUT ...:` header. Every body row is +TEXT verbatim with leading spaces preserved; a bare + is a blank line. Never place body text on the PUT header line. Line numbers are ORIGINAL file numbers, never shifted by earlier hunks. \
+rows start on the line after a `PUT ...:` header. Every body row is +TEXT verbatim with leading spaces preserved; a bare + is a blank line. Keep body text on the following row rather than the PUT header line. Line numbers remain ORIGINAL file numbers throughout the section. \
 Example replacement: [data/note.md#3F2A]\nPUT 2.=2:\n+replacement text\n. Example append: [data/note.md#3F2A]\nPUT >$:\n+new final line\n. The result shows each edited \
 file's NEW [path#TAG], new line count, and numbered windows of the changed regions."
     }

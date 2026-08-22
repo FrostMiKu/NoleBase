@@ -15,6 +15,7 @@ use super::super::util::{
 };
 use super::count_file_lines;
 use crate::agent::{canonical_root, Tool, ToolExecutionPolicy};
+use crate::storage::is_note_path;
 
 const MAX_NOTE_RESULTS: usize = 2_000;
 
@@ -260,14 +261,6 @@ async fn list_note_files_in(directory: &Path) -> Result<Vec<ListedNote>> {
             .then_with(|| left.path.file_name().cmp(&right.path.file_name()))
     });
     Ok(files)
-}
-
-fn is_note_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
-        })
 }
 
 fn search_schema(query_description: &str) -> Value {

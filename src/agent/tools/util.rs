@@ -14,6 +14,29 @@ pub(super) const MAX_SEARCH_SNIPPET_CHARS: usize = 500;
 
 pub(super) const DEFAULT_PAGE_SIZE: usize = 50;
 
+pub(super) fn parse_inclusive_range(raw: &str, example: &str) -> Result<(usize, usize, usize)> {
+    let (start, end) = raw.split_once('-').with_context(|| {
+        format!("range must be an inclusive one-based selector like `{example}`")
+    })?;
+    if start.is_empty() || end.is_empty() || end.contains('-') {
+        bail!("range must be an inclusive one-based selector like `{example}`");
+    }
+    let start = start
+        .parse::<usize>()
+        .context("range start must be a positive integer")?;
+    let end = end
+        .parse::<usize>()
+        .context("range end must be a positive integer")?;
+    if start == 0 || end < start {
+        bail!("range must satisfy 1 <= start <= end");
+    }
+    let span = end
+        .checked_sub(start)
+        .and_then(|difference| difference.checked_add(1))
+        .context("range is too large")?;
+    Ok((start, end, span))
+}
+
 /// One-based inclusive selector shared by model-facing list and search tools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RangeSelector {
@@ -34,25 +57,7 @@ impl RangeSelector {
     }
 
     pub fn parse(raw: &str, max_span: usize) -> Result<Self> {
-        let (start, end) = raw
-            .split_once('-')
-            .context("range must be an inclusive one-based selector like `1-50`")?;
-        if start.is_empty() || end.is_empty() || end.contains('-') {
-            bail!("range must be an inclusive one-based selector like `1-50`");
-        }
-        let start = start
-            .parse::<usize>()
-            .context("range start must be a positive integer")?;
-        let end = end
-            .parse::<usize>()
-            .context("range end must be a positive integer")?;
-        if start == 0 || end < start {
-            bail!("range must satisfy 1 <= start <= end");
-        }
-        let span = end
-            .checked_sub(start)
-            .and_then(|difference| difference.checked_add(1))
-            .context("range is too large")?;
+        let (start, end, span) = parse_inclusive_range(raw, "1-50")?;
         if span > max_span {
             bail!("range may select at most {max_span} items");
         }
@@ -193,14 +198,27 @@ pub(super) fn limited_diff(old: &str, new: &str, old_label: &str, new_label: &st
         .context_radius(3)
         .header(old_label, new_label)
         .to_string();
-    if diff.len() <= MAX_DIFF_BYTES {
-        return diff;
+    truncate_with_marker(&diff, MAX_DIFF_BYTES)
+}
+
+pub(super) fn truncate_with_marker(text: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n... diff truncated ...\n";
+    if text.len() <= max_bytes {
+        return text.to_string();
     }
-    let mut end = MAX_DIFF_BYTES;
-    while !diff.is_char_boundary(end) {
+    if max_bytes < MARKER.len() {
+        let mut end = max_bytes.min(MARKER.len());
+        while !MARKER.is_char_boundary(end) {
+            end -= 1;
+        }
+        return MARKER[..end].to_string();
+    }
+    let prefix_limit = max_bytes.saturating_sub(MARKER.len());
+    let mut end = prefix_limit.min(text.len());
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n... diff truncated ...\n", &diff[..end])
+    format!("{}{MARKER}", &text[..end])
 }
 
 #[cfg(test)]
@@ -235,5 +253,14 @@ mod tests {
         assert_eq!(last.returned(), 1);
         assert!(!last.has_more());
         assert_eq!(last.next(), None);
+    }
+
+    #[test]
+    fn diff_truncation_preserves_utf8_and_byte_budget() {
+        let text = "界".repeat(64);
+        let truncated = truncate_with_marker(&text, 32);
+        assert!(truncated.len() <= 32);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        assert!(truncated.ends_with("\n... diff truncated ...\n"));
     }
 }

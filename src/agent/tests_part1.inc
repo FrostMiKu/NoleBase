@@ -107,7 +107,9 @@
         assert!(!is_safe_compaction_boundary(&messages, 2));
         assert!(!is_safe_compaction_boundary(&messages, 3));
         assert!(is_safe_compaction_boundary(&messages, 4));
-        let cut = context_compaction_cut(&messages, CONTEXT_ESTIMATE_OVERHEAD + 100).unwrap();
+        let cut =
+            context_compaction_cut_for_request(&[], &messages, &[], CONTEXT_ESTIMATE_OVERHEAD + 100)
+                .unwrap();
         assert_eq!(cut, 4);
         assert_eq!(messages.last().unwrap().text(), "latest request");
     }

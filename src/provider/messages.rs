@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Response};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -14,7 +14,8 @@ use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
 
 use super::{
-    build_agent_http_client, parse_tool_input, transient_provider_error, AssistantMessage,
+    build_agent_http_client, emit_usage, error_message, image_bytes, normalize_provider_base_url,
+    parse_tool_input, retry_delay, retryable, transient_provider_error, AssistantMessage,
     ImageBlock, Message, MessagePart, MessageRole, Provider, ProviderEvent, ProviderRequest,
     StopReason, ToolCall, DEFAULT_STREAM_BUFFER,
 };
@@ -31,10 +32,7 @@ pub struct MessagesProvider {
 
 impl MessagesProvider {
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_string();
-        if base_url.ends_with("/v1") {
-            bail!("base_url must not include /v1");
-        }
+        let base_url = normalize_provider_base_url(base_url)?;
         Ok(Self {
             api_key: api_key.into(),
             base_url,
@@ -527,18 +525,13 @@ fn content_to_parts(content: &[Value]) -> Result<Vec<MessagePart>> {
 /// Encode a single image block as an Anthropic base64 content block. The
 /// pixels must already be resolved; a missing cache is a local mapping error.
 fn image_block_wire(block: &ImageBlock) -> Result<Value> {
-    let bytes = block.bytes.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "image {:?} is missing its bytes; re-resolve the source before sending",
-            block.source
-        )
-    })?;
+    let bytes = image_bytes(block)?;
     Ok(json!({
         "type": "image",
         "source": {
             "type": "base64",
             "media_type": block.media_type.mime(),
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()),
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
         }
     }))
 }
@@ -693,19 +686,6 @@ fn update_usage_snapshot(usage: &mut TokenUsage, value: Option<&Value>) {
     }
 }
 
-fn emit_usage(
-    events: &broadcast::Sender<ProviderEvent>,
-    usage: TokenUsage,
-    first_event: Option<Instant>,
-) {
-    if !usage.is_empty() {
-        let _ = events.send(ProviderEvent::Usage {
-            usage,
-            generation_duration: first_event.map_or(Duration::ZERO, |start| start.elapsed()),
-        });
-    }
-}
-
 fn parse_stop_reason(reason: &str) -> StopReason {
     match reason {
         "end_turn" | "stop_sequence" => StopReason::End,
@@ -714,34 +694,6 @@ fn parse_stop_reason(reason: &str) -> StopReason {
         "refusal" => StopReason::Refusal,
         other => StopReason::Unknown(other.to_string()),
     }
-}
-
-fn error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")?
-                .as_str()
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.to_string())
-}
-
-fn retryable(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
-}
-
-fn retry_delay(attempt: usize, headers: &reqwest::header::HeaderMap) -> Duration {
-    if let Some(seconds) = headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        return Duration::from_secs(seconds.min(5));
-    }
-    let base = 500u64.saturating_mul(1u64 << attempt.min(3));
-    Duration::from_millis(base.min(5_000))
 }
 
 #[cfg(test)]

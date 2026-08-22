@@ -1,8 +1,8 @@
 //! Safe, offline publication formats shared by the UI and Agent.
 //!
 //! Renderers return a [`RenderedExport`] carrying the artifact bytes plus
-//! explicit diagnostics, so degraded resources (missing/broken images) are
-//! surfaced instead of being silently swallowed.
+//! explicit diagnostics, so degraded resources (unavailable images) are
+//! surfaced as warnings.
 
 mod assets;
 mod highlight;
@@ -18,8 +18,8 @@ use anyhow::{bail, Context, Result};
 use crate::attachment::AttachmentStore;
 
 /// Upper bound for the UTF-8 source of a rendered export. Rendered formats
-/// hold the whole source in memory, so pathological files are rejected at
-/// prepare time instead of blowing up during rendering.
+/// hold the whole source in memory, so pathological files receive a size error
+/// during preparation and rendering remains bounded.
 pub(crate) const MAX_RENDER_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Upper bound for the produced artifact (HTML) of a single export.

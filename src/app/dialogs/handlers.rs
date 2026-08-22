@@ -264,10 +264,9 @@ impl App {
             .as_ref()
             .map(|dialog| dialog.input.clone())
             .unwrap_or_default();
-        // An existing destination never fails or overwrites silently: when it
-        // is a plain file, ask for explicit confirmation first. Directories,
-        // symlinks, and special files are not offered and fall through to the
-        // normal preparation error.
+        // An existing destination receives explicit confirmation before
+        // replacement. Directories, symlinks, and special files enter the
+        // normal preparation error path.
         if self
             .storage
             .export_destination_is_overwritable(Path::new(&destination))
@@ -356,9 +355,8 @@ impl App {
             Ok(prepared) => self.start_export_worker(prepared, destination, format),
             Err(error) => {
                 // The destination changed since the confirmation was offered
-                // (gone, replaced by a directory or symlink, ...). Return to
-                // the destination input so the user can retry without losing
-                // their path.
+                // (removed, replaced by a directory or symlink, ...). Return
+                // to the destination input so the user can retry with its path.
                 self.set_error(error.to_string());
                 self.open_export_destination_dialog_with_input(Some(&destination));
             }

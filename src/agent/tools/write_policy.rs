@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::storage::is_note_path;
 use anyhow::{bail, Context, Result};
 
 #[derive(Clone, Copy)]
@@ -59,7 +60,7 @@ pub(super) fn post_write_result(summary: String, display_path: &str, path: &Path
 }
 
 pub(super) fn mbdown_warning(display_path: &str, path: &Path) -> Option<String> {
-    if !is_mbdown_path(path) {
+    if !is_note_path(path) {
         return None;
     }
     let diagnostic = match fs::read_to_string(path) {
@@ -118,14 +119,6 @@ impl<'a> WriteSource<'a> {
             }
         }
     }
-}
-
-fn is_mbdown_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
-        })
 }
 
 #[cfg(test)]

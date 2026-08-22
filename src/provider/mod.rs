@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
+use anyhow::{bail, Result};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::broadcast;
 
 use crate::agent_session::TokenUsage;
 use crate::observable::{BoxFuture, Observable};
@@ -16,6 +18,14 @@ pub mod messages;
 pub const DEFAULT_STREAM_BUFFER: usize = 1_024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(crate) fn normalize_provider_base_url(base_url: impl Into<String>) -> Result<String> {
+    let base_url = base_url.into().trim_end_matches('/').to_string();
+    if base_url.ends_with("/v1") {
+        bail!("base_url must not include /v1");
+    }
+    Ok(base_url)
+}
 
 pub(crate) fn build_agent_http_client() -> reqwest::Result<Client> {
     build_agent_http_client_with_timeouts(HTTP_CONNECT_TIMEOUT, HTTP_READ_IDLE_TIMEOUT)
@@ -174,6 +184,15 @@ pub enum ImageSource {
     Url { url: String },
 }
 
+pub(crate) fn image_bytes(block: &ImageBlock) -> Result<&[u8]> {
+    block.bytes.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "image {:?} is missing its bytes; re-resolve the source before sending",
+            block.source
+        )
+    })
+}
+
 /// A pixel-carrying image content block for user messages and tool output.
 /// `bytes` is skipped by serde so sessions never persist base64 or pixels, and
 /// clones share the underlying pixels through `Arc` without copying.
@@ -278,6 +297,49 @@ pub enum ProviderEvent {
         generation_duration: std::time::Duration,
     },
     Retry,
+}
+
+/// Publish a cumulative usage snapshot to a streaming provider subscriber.
+/// Both wire protocols expose the same runtime event, so the emission policy
+/// belongs to the provider boundary rather than either protocol adapter.
+pub(crate) fn emit_usage(
+    events: &broadcast::Sender<ProviderEvent>,
+    usage: TokenUsage,
+    first_event: Option<std::time::Instant>,
+) {
+    if !usage.is_empty() {
+        let _ = events.send(ProviderEvent::Usage {
+            usage,
+            generation_duration: first_event.map_or(Duration::ZERO, |start| start.elapsed()),
+        });
+    }
+}
+
+pub(crate) fn error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
+pub(crate) fn retryable(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error()
+}
+
+pub(crate) fn retry_delay(attempt: usize, headers: &reqwest::header::HeaderMap) -> Duration {
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.min(5));
+    }
+    Duration::from_millis(500u64.saturating_mul(1u64 << attempt.min(3)).min(5_000))
 }
 
 pub trait Provider: Send + Sync {

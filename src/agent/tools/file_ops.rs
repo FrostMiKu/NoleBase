@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 
 use super::util::{display_path, required_string};
 use super::workspace_quota::{
-    check_workspace_write, check_workspace_writes, copy_with_workspace_limits, workspace_dir,
+    check_workspace_write, check_workspace_writes, copy_new_file, copy_with_workspace_limits,
+    workspace_dir,
 };
 use super::write_policy::{
     mbdown_warning, post_write_result, validate_write_preconditions, WriteSource,
@@ -121,24 +122,6 @@ pub fn ensure_not_special(root: &Path, path: &Path) -> Result<()> {
     }
 }
 
-fn copy_to_new_file(source: &Path, destination: &Path) -> Result<u64> {
-    let mut input =
-        fs::File::open(source).with_context(|| format!("opening source {}", source.display()))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .with_context(|| format!("creating destination {}", destination.display()))?;
-    match std::io::copy(&mut input, &mut output) {
-        Ok(bytes) => Ok(bytes),
-        Err(error) => {
-            drop(output);
-            let _ = fs::remove_file(destination);
-            Err(error).with_context(|| format!("copying to {}", destination.display()))
-        }
-    }
-}
-
 /// Identity of a move source captured before approval and re-verified after,
 /// so a file that changes while the user is deciding is never moved.
 struct SourceIdentity {
@@ -208,7 +191,7 @@ pub(super) fn move_to_new_file(source: &Path, destination: &Path) -> Result<u64>
 /// file and its parent directory, then remove the source. A failure before
 /// the source is removed rolls back the destination copy.
 fn move_across_devices(source: &Path, destination: &Path) -> Result<u64> {
-    let bytes = copy_to_new_file(source, destination)?;
+    let bytes = copy_new_file(source, destination)?;
     if let Err(error) = OpenOptions::new()
         .write(true)
         .open(destination)

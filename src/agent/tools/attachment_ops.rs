@@ -6,14 +6,13 @@
 //! canonical URI `nole://attachment/<uuid>`; importing the same bytes twice
 //! produces two distinct attachments. Attachment internals are private to the
 //! store: every tool here exchanges ids, canonical URIs, metadata, bounded
-//! reads, and deterministic content tokens only, and tool results never print
-//! physical object paths. Editing an existing attachment is checkout
+//! reads, and deterministic content tokens only; tool results expose metadata
+//! rather than physical object paths. Editing an existing attachment is checkout
 //! (materialize a separate workspace copy plus its `sha256:<hex>` content
 //! token) followed by update (publish the edited copy back to the same
-//! identity after approval, refusing stale content). Deletion funnels through
-//! the shared usage-checked service in [`crate::attachment_usage`], never raw
-//! store removal, so an attachment still referenced by a managed note can
-//! never be deleted.
+//! identity after approval, with a current-content match). Deletion funnels
+//! through the shared usage-checked service in [`crate::attachment_usage`],
+//! which protects managed-note references before moving content to trash.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -75,7 +74,8 @@ fn resolve_import_source(root: &Path, unresolved: &Path) -> Result<PathBuf> {
     Ok(source)
 }
 
-/// Metadata shaped for Agent output. Never contains physical object paths.
+/// Metadata shaped for Agent output. It contains stable identifiers and
+/// presentation metadata while keeping storage locations private.
 fn attachment_metadata_json(metadata: &AttachmentMetadata) -> Value {
     json!({
         "id": metadata.id.to_string(),
@@ -89,10 +89,10 @@ fn attachment_metadata_json(metadata: &AttachmentMetadata) -> Value {
 }
 
 /// Resolve an update source under `workspace/main`: an existing regular file
-/// whose path never follows a symlink and never escapes the sandbox. Every
-/// component must exist and be a real directory (the final one a regular
-/// file); each step is canonicalized and re-checked against the workspace
-/// root so a symlinked parent can never redirect the read outside it.
+/// whose path follows real filesystem entries and remains inside the sandbox.
+/// Every component exists and is a real directory (the final one a regular
+/// file); each step is canonicalized and checked against the workspace root so
+/// the resolved read stays inside the sandbox.
 fn workspace_source(root: &Path, input: &str) -> Result<PathBuf> {
     let workspace_main = Storage::new(root)?.agent_workspace_dir();
     match fs::symlink_metadata(&workspace_main) {
@@ -316,7 +316,7 @@ impl Tool for AttachmentInfo {
     }
 
     fn description(&self) -> &'static str {
-        "Show metadata for one attachment without exposing its storage path."
+        "Show metadata for one attachment using stable identifiers and presentation fields."
     }
 
     fn input_schema(&self) -> Value {
@@ -459,7 +459,7 @@ impl Tool for UpdateAttachment {
                 },
                 "expected_content_token": {
                     "type": "string",
-                    "description": "The sha256:<hex> content token returned by checkout_attachment; the update is refused when the attachment's current content no longer matches it"
+                "description": "The sha256:<hex> content token returned by checkout_attachment; the current attachment content must match this token"
                 }
             },
             "required": ["uri", "source", "expected_content_token"], "additionalProperties": false
@@ -567,7 +567,7 @@ impl Tool for DeleteAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Move an attachment to trash, refusing while any managed note still references it."
+        "Move an attachment to trash after confirming that managed notes have released it."
     }
 
     fn input_schema(&self) -> Value {

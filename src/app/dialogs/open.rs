@@ -84,9 +84,8 @@ impl App {
     /// Default destination input for the current export: the configured
     /// `export_directory` setting joined with the document name and the
     /// selected format's extension (the source extension for Original). When
-    /// the setting is missing, blank, or unreadable, the dialog still opens
-    /// with the bare file name and the configuration error is surfaced through
-    /// the existing error state.
+    /// the setting is unavailable, the dialog opens with the bare file name
+    /// and surfaces the configuration error through the existing error state.
     fn default_export_destination(&mut self) -> Option<String> {
         let source = self.pending_export_source.as_ref()?;
         let format = self.pending_export_format?;

@@ -36,7 +36,7 @@ use crate::workspace_index::{
     TagDocument, TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle,
 };
 
-pub(in crate::app) const FORMAT_DAILY_NOTE_PROMPT: &str = "Read this daily note, then edit it in place to improve its Markdown formatting and readability. Preserve every fact, idea, task, link, and the author's meaning. Only improve structure and presentation, such as headings, paragraphs, lists, spacing, and emphasis. Do not add new factual content, and do not merely describe the changes.";
+pub(in crate::app) const FORMAT_DAILY_NOTE_PROMPT: &str = "Read this daily note, then edit it in place to improve its Markdown formatting and readability. Preserve every fact, idea, task, link, and the author's meaning. Limit changes to structure and presentation, such as headings, paragraphs, lists, spacing, and emphasis. Apply the improvements directly in the file and keep its factual content unchanged.";
 
 mod agent;
 mod dialog;
@@ -831,7 +831,7 @@ impl App {
         }
     }
 
-    /// Collect background Agent events without blocking the TUI.
+    /// Collect background Agent events while keeping the TUI responsive.
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
     }

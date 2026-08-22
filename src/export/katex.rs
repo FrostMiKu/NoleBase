@@ -4,9 +4,9 @@
 //! the binary and is inlined into exports that contain math: the stylesheet
 //! with every referenced font embedded as a `data:font/woff2` URI, the
 //! engine, and a bootstrap that renders each `.math[data-math]` element.
-//! Formulas render fully offline (no CDN) with `throwOnError:false`,
-//! `strict:"warn"`, and `trust:false`, so invalid or hostile TeX never throws
-//! and cannot forge links or markup, and the raw escaped source stays visible
+//! Formulas render fully offline with `throwOnError:false`, `strict:"warn"`,
+//! and `trust:false`, so invalid or hostile TeX returns safely and keeps links
+//! and markup inert while the raw escaped source stays visible
 //! whenever scripting is unavailable.
 
 use std::sync::LazyLock;

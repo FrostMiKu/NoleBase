@@ -17,8 +17,8 @@ fn approval_diff_lines(message: &str, content_width: u16, theme: Theme) -> Vec<L
 }
 
 /// Body lines for an approval dialog. An empty diff (for example when the
-/// agent deletes an empty file) must still render content so the panel never
-/// degrades to a bare frame with no body or footer.
+/// agent deletes an empty file) receives a content placeholder so the panel
+/// keeps its body and footer structure.
 fn approval_content_lines(message: &str, content_width: u16, theme: Theme) -> Vec<Line<'static>> {
     let lines = approval_diff_lines(message, content_width, theme);
     if !lines.is_empty() {
@@ -380,7 +380,7 @@ pub(super) fn draw_dialog(
             }
             let input = Rect::new(inner.x, input_y, inner.width, 1);
             // The private-input path stores only bullets in `DialogState` so
-            // cloning it for rendering never clones the value. Mask again at
+            // cloning it for rendering clones only the bullets. Mask again at
             // the mode boundary to keep `SecretLine` safe for future callers.
             let masked = "•".repeat(dialog.input.chars().count());
             if let Some(position) = draw_single_line_input(

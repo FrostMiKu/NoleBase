@@ -235,7 +235,7 @@ pub(crate) fn copy_with_workspace_limits(
 ) -> Result<u64> {
     let workspace = workspace_dir(root);
     if !destination.starts_with(&workspace) {
-        return copy_bounded(source, destination, u64::MAX);
+        return copy_new_file(source, destination);
     }
     let used = workspace_used_bytes(&workspace)?;
     let source_len = fs::metadata(source)
@@ -246,6 +246,12 @@ pub(crate) fn copy_with_workspace_limits(
     // and never grow the workspace past its total cap.
     let budget = MAX_WORKSPACE_FILE_BYTES.min(MAX_WORKSPACE_TOTAL_BYTES.saturating_sub(used));
     copy_bounded(source, destination, budget)
+}
+
+/// Copy a regular file into a destination that the caller has already
+/// validated as new. Partial output is removed whenever the transfer fails.
+pub(crate) fn copy_new_file(source: &Path, destination: &Path) -> Result<u64> {
+    copy_bounded(source, destination, u64::MAX)
 }
 
 fn copy_bounded(source: &Path, destination: &Path, budget: u64) -> Result<u64> {

@@ -1,6 +1,7 @@
 //! Attachment parser for the unified `read` tool.
 //!
-//! Attachment reads are read-only: they never register an edit snapshot.
+//! Attachment reads inspect content and return structured results; edit
+//! snapshots belong to the text-file editing pipeline.
 //! Physical object paths stay private; the URI is the only address exposed to
 //! the model. Images return native validated pixels, documents extract Markdown,
 //! textual content pages like a file, and everything else returns metadata.
@@ -239,8 +240,8 @@ mod tests {
         assert_eq!(parsed["has_more"], true);
         assert_eq!(parsed["items"], json!(["line 3", "line 4"]));
         assert!(parsed.get("next").is_none());
-        // Structured read-only content: no hashline `[path#TAG]` snapshot header
-        // and no tag field, because attachment reads never gate edit.
+        // Structured attachment content uses metadata pagination. Hashline
+        // snapshots and edit-gating tags belong to editable text files.
         assert!(parsed.get("tag").is_none());
         assert!(!output.contains("[notes.txt#"));
     }

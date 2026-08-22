@@ -4,7 +4,7 @@
 //! The UI and the agent must observe the same limits and the same decoding
 //! behavior; keeping the implementation here (instead of a second copy) makes
 //! that a module-level invariant. Format detection is always by content magic
-//! bytes, never by extension or MIME header.
+//! bytes; extensions and MIME headers remain display hints only.
 
 use std::io::Cursor;
 
@@ -43,8 +43,8 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<(image::DynamicImage, image::
     Ok((image, format))
 }
 
-/// Detect an image format from the short magic-byte prefix only, without
-/// reading or allocating the full file. Used to decide whether a target should
+/// Detect an image format from the short magic-byte prefix while keeping file
+/// reads bounded. Used to decide whether a target should
 /// be treated as an image before a bounded full read.
 pub(crate) fn detect_image_format(prefix: &[u8]) -> Option<image::ImageFormat> {
     image::guess_format(prefix).ok()

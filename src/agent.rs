@@ -1251,7 +1251,13 @@ impl Agent {
             }
 
             let target = input_budget.saturating_mul(CONTEXT_COMPACTION_TARGET_PERCENT) / 100;
-            let cut = context_compaction_cut(messages, target).with_context(|| {
+            let cut = context_compaction_cut_for_request(
+                &self.system,
+                messages,
+                definitions,
+                target,
+            )
+            .with_context(|| {
                 format!(
                     "context needs {input_tokens} input tokens but the configured budget is {input_budget}; the current turn cannot be compacted safely"
                 )

@@ -538,45 +538,14 @@ impl DiffPreview {
     }
 }
 
-#[cfg(not(windows))]
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination).with_context(|| {
+    crate::storage::replace_file_atomically(source, destination).with_context(|| {
         format!(
             "publishing edited file {} -> {}",
             source.display(),
             destination.display()
         )
     })
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error()).context("publishing edited file");
-    }
-    Ok(())
 }
 
 fn sync_parent(path: &Path) -> Result<()> {

@@ -4,24 +4,23 @@
 //! reference-index snapshots as they arrive from the background indexer (each
 //! carrying a monotonic revision), and every destructive delete — from the UI
 //! browser or the Agent's `delete_attachment` tool — funnels through
-//! [`AttachmentUsageHandle::trash`], never through `AttachmentStore::remove`
-//! directly.
+//! [`AttachmentUsageHandle::trash`], the single deletion boundary around
+//! `AttachmentStore::remove`.
 //!
 //! `trash` enforces the review's deletion rules:
 //!
-//! - refuses while the index has not published its initial snapshot
+//! - requires the index's initial authoritative snapshot
 //!   ([`TrashError::NotReady`]);
-//! - refuses when the caller's `expected_revision` no longer matches the
-//!   published snapshot revision, i.e. notes changed after the state the
-//!   user/agent acted on ([`TrashError::Stale`]);
+//! - requires the caller's `expected_revision` to match the published
+//!   snapshot revision, so the decision reflects the state the user or agent
+//!   reviewed ([`TrashError::Stale`]);
 //! - performs a final, synchronous, authoritative scan of the managed notes
-//!   (daily/, data/, archives/) immediately before the store trash, refusing
-//!   with the distinct referencing note paths ([`TrashError::Referenced`]);
-//! - only then calls the store's atomic one-directory trash (`remove`).
+//!   (daily/, data/, archives/) immediately before trashing, reporting the
+//!   distinct referencing note paths ([`TrashError::Referenced`]);
+//! - then calls the store's atomic one-directory trash (`remove`).
 //!
-//! The synchronous scan is the correctness backstop for the window between a
-//! file event and its index refresh: even a stale snapshot can never authorize
-//! trashing an attachment that a managed note still references.
+//! The synchronous scan closes the window between a file event and its index
+//! refresh: a managed note reference always blocks trashing that attachment.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -45,7 +44,7 @@ pub struct AttachmentUsageSnapshot {
 /// Why a trash request was refused before touching the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrashError {
-    /// The shared usage index has not completed its initial build yet.
+    /// The shared usage index is still building its initial snapshot.
     NotReady,
     /// The caller acted on an outdated snapshot (`expected_revision` no longer
     /// matches the current one); re-read the snapshot and retry.
@@ -64,7 +63,10 @@ impl fmt::Display for TrashError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TrashError::NotReady => {
-                write!(formatter, "attachment usage index is not ready yet")
+                write!(
+                    formatter,
+                    "attachment usage index is building its initial snapshot"
+                )
             }
             TrashError::Stale { current_revision } => write!(
                 formatter,
@@ -114,17 +116,20 @@ struct UsageInner {
 }
 
 impl AttachmentUsageHandle {
-    /// A fresh handle with no published snapshot (not ready).
+    /// A fresh handle awaiting its initial snapshot.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Publish a reference-index snapshot produced by the background indexer.
     /// The first publish marks the handle ready; later publishes advance the
-    /// revision. Monotonicity is the publisher's responsibility (the indexer
-    /// already guarantees it).
+    /// revision. Older snapshots are discarded so consumers always observe
+    /// monotonic state even when publishers race.
     pub fn publish_snapshot(&self, revision: u64, references: AttachmentReferenceIndex) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.ready && revision <= inner.revision {
+            return;
+        }
         inner.ready = true;
         inner.revision = revision;
         inner.references = references;
@@ -147,8 +152,8 @@ impl AttachmentUsageHandle {
 
     /// Trash `id` after enforcing the deletion rules, using the store's atomic
     /// one-directory trash. This is the single entry point for both the UI and
-    /// the Agent tools; callers must not call `AttachmentStore::remove`
-    /// directly.
+    /// the Agent tools; callers use this operation as the deletion boundary
+    /// instead of calling `AttachmentStore::remove` directly.
     ///
     /// `expected_revision` is the snapshot revision the caller showed the user
     /// (UI) or based its decision on (Agent) — typically captured when the
@@ -173,8 +178,8 @@ impl AttachmentUsageHandle {
         }
 
         // Final authoritative check: synchronously re-derive references from
-        // the managed notes on disk, so a stale or still-refreshing async
-        // index can never authorize deleting a referenced attachment.
+        // the managed notes on disk, so deletion proceeds only when the scan
+        // finds zero managed-note references.
         let uri = AttachmentUri::from_id(id).to_string();
         let authoritative = AttachmentReferenceIndex::build(storage);
         let locations = authoritative.locations(&uri);
@@ -246,6 +251,26 @@ mod tests {
             })
         );
         assert!(store.lookup(metadata.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn ignores_snapshots_that_arrive_out_of_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let uri = "nole://attachment/00000001-0000-4000-8000-000000000000";
+        let note = storage.data_dir.join("Reference.md");
+        fs::write(&note, format!("[attachment]({uri})\n")).unwrap();
+        let handle = AttachmentUsageHandle::new();
+        let references = AttachmentReferenceIndex::build(&storage);
+        assert_eq!(references.locations(uri), vec![note]);
+        handle.publish_snapshot(2, references);
+        handle.publish_snapshot(1, AttachmentReferenceIndex::default());
+        handle.publish_snapshot(2, AttachmentReferenceIndex::default());
+
+        let snapshot = handle.snapshot();
+        assert!(snapshot.ready);
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.references.locations(uri).len(), 1);
     }
 
     #[test]

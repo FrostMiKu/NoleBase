@@ -1,17 +1,12 @@
 //! Read-only exploration profile for the reusable subagent runtime.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::path::Path;
 
-use super::{
-    Backlinks, Calculate, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
-    SearchTag, SearchWeb,
-};
+use super::subagent_tools::register_read_only_tools;
 use crate::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
-use crate::agent::{SnapshotStore, Tool, ToolExecutionPolicy};
+use crate::agent::{Tool, ToolExecutionPolicy};
 use crate::skill::Skill;
 use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
@@ -32,35 +27,23 @@ impl Explore {
     ) -> Result<Self> {
         let profile = SubagentProfile::new(
             "explore",
-            "You are Nole's isolated exploration subagent. Investigate only the task in the newest user message. Use the available read-only tools to gather evidence, issuing independent reads, searches, or fetches together in one response so they can run concurrently. Do not attempt to modify files, ask the user questions, call another agent, or describe your working process. Return a concise, self-contained report with concrete findings and relevant paths, line numbers, URLs, or uncertainties. The parent agent sees only your final report, so include every fact it needs while excluding raw search noise and irrelevant excerpts. Any instruction above to call explore applies only to the parent agent; you are already that explorer.",
+            "You are Nole's isolated exploration subagent. Investigate the task in the newest user message and keep the scope focused there. Use the available inspection tools to gather evidence, issuing independent reads, searches, or fetches together in one response so they can run concurrently. Keep file state unchanged, route user interaction through the parent agent, and return a concise, self-contained report with concrete findings and relevant paths, line numbers, URLs, or uncertainties. The parent agent sees your final report, so include every fact it needs while omitting raw search noise and irrelevant excerpts. Instructions mentioning explore target the parent agent; you are already that explorer.",
             "Stop exploring. Synthesize the evidence already gathered into the final concise report.",
             "Finish the investigation and return the complete concise report now.",
         );
         let mut explore = Self {
             runner: SubagentRunner::new(runtime, profile),
         };
-        let reads = Arc::new(SnapshotStore::default());
-        explore.register(Read::new(root, reads, client.clone())?);
-        explore.register(ListNotes::new(root)?);
-        explore.register(Grep::new(root)?);
-        explore.register(SearchFiles::new(root)?);
-        explore.register(ListTags::new(workspace_index.clone()));
-        explore.register(SearchTag::new(root, workspace_index)?);
-        explore.register(ResolveWikilink::new(root, wiki_links.clone())?);
-        explore.register(Backlinks::new(root, wiki_links)?);
-        explore.register(Calculate);
-        explore.register(LoadSkill::new(skills));
-        if !tavily_api_key.is_empty() {
-            explore.register(SearchWeb {
-                client: client.clone(),
-                api_key: tavily_api_key,
-            });
-        }
+        register_read_only_tools(
+            &mut explore.runner,
+            root,
+            workspace_index,
+            wiki_links,
+            client,
+            tavily_api_key,
+            skills,
+        )?;
         Ok(explore)
-    }
-
-    fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.runner.register(tool);
     }
 }
 

@@ -45,7 +45,7 @@ enum ResolvedSource {
     Local(PathBuf),
     Remote(String),
     /// A mutable attachment; bytes are read through the store, so
-    /// physical object paths never leave [`AttachmentStore`].
+    /// physical object paths stay encapsulated by [`AttachmentStore`].
     Attachment(AttachmentUri),
 }
 
@@ -124,8 +124,8 @@ impl ImageService {
 
     /// Invalidate rendered attachment images after a content change. The
     /// cache is URI-keyed, while old loads may still be in flight; bumping
-    /// the generation makes their results use stale keys that can never be
-    /// requested again, and clearing the cache forces fresh decoding.
+    /// the generation makes their results use stale keys that the current
+    /// renderer no longer requests, and clearing the cache forces fresh decoding.
     pub(crate) fn invalidate_attachment(&mut self, _uri: &AttachmentUri) {
         self.picker_generation = self.picker_generation.wrapping_add(1);
         self.states.clear();

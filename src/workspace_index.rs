@@ -389,7 +389,7 @@ impl TagRenamePlan {
             });
         }
         if changes.is_empty() {
-            bail!("tag #{from} was not found");
+            bail!("no managed note contains tag #{from}");
         }
         changes.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(Self { from, to, changes })
@@ -508,7 +508,7 @@ pub(crate) fn collect_document_tags(
 fn valid_tag_name(value: &str) -> Result<String> {
     let name = value.trim().strip_prefix('#').unwrap_or(value.trim());
     if name.is_empty() {
-        bail!("tag name must not be empty");
+        bail!("tag name is empty");
     }
     let source = format!("#{name}");
     let document = mbdown::parse(&source).context("validating tag name")?;
@@ -734,7 +734,7 @@ mod tests {
         let documents = index.tag_documents("#rust");
         // The daily note (two mentions, one document) and archive share the
         // oldest mtime; the lexical path tie-breaker puts archives first.
-        // Note.md is newest; Other.md only carries #rustlang and must not match.
+        // Note.md is newest; Other.md carries only #rustlang.
         assert_eq!(
             documents,
             vec![

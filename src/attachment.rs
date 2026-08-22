@@ -40,7 +40,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -398,10 +398,8 @@ impl AttachmentStore {
         let display_name = validate_display_name(display_name)?;
         self.ensure_layout()?;
         let id = AttachmentId::new();
-        let staged = self.root.join(staging_name());
+        let staged = create_staging_dir(&self.root)?;
         let publish = (|| {
-            fs::create_dir(&staged)
-                .with_context(|| format!("creating staging directory {}", staged.display()))?;
             // Stream the content into the staging directory, capping size.
             let mut content = OpenOptions::new()
                 .write(true)
@@ -618,14 +616,10 @@ impl AttachmentStore {
         let metadata = self.metadata(id)?;
         let content_path = self.content_path(&metadata);
         let dir = self.attachment_dir(id);
-        let staged = dir.join(staging_name());
+        let (staged, staged_file) = create_staging_file(&dir)?;
         let publish = (|| {
             let mut hasher = Sha256::new();
-            let mut content = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staged)
-                .with_context(|| format!("creating staging content {}", staged.display()))?;
+            let mut content = staged_file;
             let mut buffer = [0u8; STREAM_BUFFER];
             let mut size = 0u64;
             let limit = limit.min(MAX_ATTACHMENT_SIZE);
@@ -656,7 +650,7 @@ impl AttachmentStore {
                     "attachment content changed since checkout: expected {expected_content_token}, found {current_token}"
                 );
             }
-            atomic_replace(&staged, &content_path).with_context(|| {
+            crate::storage::replace_file_atomically(&staged, &content_path).with_context(|| {
                 format!(
                     "publishing content {} for attachment {id}",
                     content_path.display()
@@ -929,6 +923,44 @@ fn staging_name() -> String {
     format!(".tmp-{}-{:016x}", std::process::id(), fastrand::u64(..))
 }
 
+/// Reserve a staging directory under `root`; retries keep concurrent imports
+/// independent even when random names collide.
+fn create_staging_dir(root: &Path) -> Result<PathBuf> {
+    for _ in 0..32 {
+        let staged = root.join(staging_name());
+        match fs::create_dir(&staged) {
+            Ok(()) => return Ok(staged),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating staging directory {}", staged.display()))
+            }
+        }
+    }
+    bail!("could not allocate a unique attachment staging directory")
+}
+
+/// Reserve a staging file under an attachment directory. The returned open
+/// handle proves ownership of the path and makes cleanup safe after failures.
+fn create_staging_file(directory: &Path) -> Result<(PathBuf, File)> {
+    for _ in 0..32 {
+        let staged = directory.join(staging_name());
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+        {
+            Ok(file) => return Ok((staged, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating staging content {}", staged.display()))
+            }
+        }
+    }
+    bail!("could not allocate a unique attachment staging file")
+}
+
 /// Lowercase hex encoding used by content tokens.
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -940,46 +972,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// Replace an existing file with a same-directory staged file. Unix rename
-/// atomically replaces the destination; Windows uses ReplaceFileW, the OS
-/// primitive specifically intended to replace an existing file atomically.
-fn atomic_replace(staged: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        fs::rename(staged, destination)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
-
-        let replacement = staged
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let replaced = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let replaced = unsafe {
-            ReplaceFileW(
-                replaced.as_ptr(),
-                replacement.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        if replaced == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-}
 /// Stream `reader` through SHA-256, refusing once more than `limit` bytes
 /// would be read. Returns the byte count and the content token of those
 /// bytes.
@@ -1004,9 +996,9 @@ fn hash_stream(reader: &mut impl Read, limit: u64) -> Result<(u64, String)> {
     ))
 }
 
-/// Validate a display name: it must be a non-empty bare file name with no
-/// path separators, no control characters (including newlines and NUL), not
-/// `.` or `..`, and at most [`MAX_DISPLAY_NAME_BYTES`] bytes.
+/// Validate a display name as a non-empty bare file name with path separators
+/// and control characters (including newlines and NUL) excluded. Dot entries
+/// are reserved, and the name fits within [`MAX_DISPLAY_NAME_BYTES`] bytes.
 pub fn validate_display_name(name: &str) -> Result<String> {
     if name.is_empty() {
         bail!("display name must not be empty");

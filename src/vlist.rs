@@ -91,6 +91,27 @@ impl VList {
         self.total_height().saturating_sub(viewport_height)
     }
 
+    /// Resolve a persisted scroll request against the current geometry.
+    /// `follow_tail` and the `u16::MAX` sentinel both pin the view to the end;
+    /// every other request is clamped to the available content range.
+    pub fn scroll_offset(
+        &mut self,
+        requested: u16,
+        follow_tail: bool,
+        viewport_height: usize,
+    ) -> usize {
+        let maximum = self.max_scroll(viewport_height);
+        if follow_tail || requested == u16::MAX {
+            maximum
+        } else {
+            usize::from(requested).min(maximum)
+        }
+    }
+
+    pub fn is_at_end(&mut self, scroll: usize, viewport_height: usize) -> bool {
+        scroll >= self.max_scroll(viewport_height)
+    }
+
     pub fn visible_range(&mut self, scroll: usize, viewport_height: usize) -> Range<usize> {
         self.rebuild_prefix();
         if self.measured.is_empty() || viewport_height == 0 {
@@ -155,5 +176,16 @@ mod tests {
         assert_eq!(list.total_height(), 48);
         list.invalidate(0);
         assert_eq!(list.total_height(), 16);
+    }
+
+    #[test]
+    fn scroll_offset_resolves_tail_and_clamps_persisted_position() {
+        let mut list = VList::new(10);
+        list.resize(10);
+        assert_eq!(list.scroll_offset(3, false, 20), 3);
+        assert_eq!(list.scroll_offset(u16::MAX, false, 20), 80);
+        assert_eq!(list.scroll_offset(3, true, 20), 80);
+        assert!(list.is_at_end(80, 20));
+        assert!(!list.is_at_end(79, 20));
     }
 }

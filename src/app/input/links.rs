@@ -19,8 +19,8 @@ impl App {
                     }
                 };
                 // Open the store's real application-managed content file in
-                // place; external saves update the attachment itself. No copy
-                // is written to the workspace or the cache.
+                // place; external saves update the attachment itself. The
+                // workspace and cache remain unchanged.
                 match self.attachment_store.open(uri.id()) {
                     Ok(path) => Some(Command::OpenPath(path)),
                     Err(error) => {

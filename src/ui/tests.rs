@@ -1179,7 +1179,27 @@ fn narrow_center_renders_each_center_view_in_place() {
     assert!(screen.contains("#rust"));
     assert!(screen.contains("2 documents · 3 mentions"));
     assert_eq!(app.tag_hitboxes.len(), 2);
-    assert_eq!(app.tag_hitboxes[0].area.height, SELECT_OPTION_HEIGHT);
+    let first = app.tag_hitboxes[0].area;
+    assert_eq!(first.height, SELECT_OPTION_HEIGHT);
+    assert!(
+        first.y > 0,
+        "the first tag starts below its shared blank row"
+    );
+    let buffer = terminal.backend().buffer();
+    for y in first.y - 1..first.y + first.height {
+        assert_eq!(
+            buffer[(first.x + first.width - 1, y)].bg,
+            app.theme.selection_background,
+            "tag selection spans the complete shared area"
+        );
+        assert_eq!(buffer[(first.x, y)].symbol(), "▌");
+        assert_eq!(buffer[(first.x, y)].fg, app.theme.selection_indicator);
+    }
+    assert!(
+        (first.x..first.x + first.width)
+            .any(|x| buffer[(x, first.y)].modifier.contains(Modifier::DIM)),
+        "selected tag metadata keeps its dim modifier"
+    );
 }
 
 #[test]

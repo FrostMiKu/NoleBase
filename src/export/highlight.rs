@@ -4,32 +4,32 @@
 //! in the binary and is inlined into exports that contain plain fenced code
 //! blocks: the theme stylesheet in the head, the engine, and a bootstrap that
 //! highlights every `pre code[class^="language-"]` element whose language the
-//! pinned build knows. Highlighting is fully offline (no CDN); blocks with an
-//! unknown or missing language keep their plain escaped source, and any
+//! pinned build knows. Highlighting is fully offline; blocks with a language
+//! outside the pinned catalog keep their plain escaped source, and any
 //! bootstrap failure leaves the source untouched.
 
 /// Minified highlight.js "common" browser build (v11.11.1, git 08cb242e7d) —
 /// defines `window.hljs` and registers ~40 common languages (rust, python,
 /// javascript, typescript, c/c++/c#, go, …) including the aliases the
 /// exporter's language allowlist admits (`c++`, `c#`, `objective-c`,
-/// `python-repl`). Verified to contain no `</script` sequence, so it can be
+/// `python-repl`). Verified to contain a safe script payload, so it can be
 /// inlined verbatim between script tags.
 pub(crate) const HIGHLIGHT_JS: &str = include_str!("../../assets/highlight/highlight.min.js");
 pub(crate) const HIGHLIGHT_LICENSE: &str = include_str!("../../assets/highlight/LICENSE");
 
 /// GitHub light theme. The base `.hljs` rule is inert here because the
-/// bootstrap never adds the `hljs` class; only the standalone token selectors
+/// bootstrap adds the `hljs` class only for standalone token selectors
 /// (`.hljs-keyword`, …) apply, so highlighted and plain blocks keep the
 /// export's own `pre`/`pre code` layout.
 pub(crate) const HIGHLIGHT_THEME_CSS: &str = include_str!("../../assets/highlight/github.min.css");
 
 /// Runs after the engine, highlighting every fenced code block that carries a
 /// `language-*` class the exporter emitted. Only languages the pinned build
-/// knows are touched: unknown or missing languages keep their plain escaped
-/// source, and a missing engine aborts without touching anything. The raw
+/// knows are touched: languages outside the catalog keep their plain escaped
+/// source, and an unavailable engine returns the source unchanged. The raw
 /// source is read back from the DOM (the server-side escaping is already
 /// decoded there) and the engine re-escapes it before emitting token spans,
-/// so hostile code can never execute; any failure leaves the source
+/// so hostile code remains inert; any failure leaves the source
 /// untouched.
 pub(crate) const HIGHLIGHT_INIT_JS: &str = r#"(function(){try{if(typeof hljs==='undefined')return;var nodes=document.querySelectorAll('pre code[class^="language-"]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var match=/^language-([A-Za-z0-9_+#-]+)$/.exec(el.className);if(!match)continue;var name=match[1];if(!hljs.getLanguage(name))continue;el.innerHTML=hljs.highlight(name,el.textContent,true).value;}}catch(error){}})();"#;
 

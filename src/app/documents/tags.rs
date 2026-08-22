@@ -9,7 +9,7 @@ impl App {
     }
 
     /// Recompute the state the Tags view needs right now: the filtered tag
-    /// picker while no stream is open, or the active tag's card stream.
+    /// picker while the stream is closed, or the active tag's card stream.
     pub(in crate::app) fn recompute_tags(&mut self) {
         if self.active_tag.is_some() {
             self.reload_tag_notes();
