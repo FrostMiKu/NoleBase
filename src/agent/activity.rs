@@ -73,6 +73,18 @@ pub(crate) fn tool_start_activity(call: &Value) -> String {
     }
 }
 
+pub(crate) fn tool_wait_progress_activity(remaining_seconds: u64) -> String {
+    format!("Calling Wait...\n{}", wait_seconds_text(remaining_seconds))
+}
+
+fn wait_seconds_text(seconds: u64) -> String {
+    if seconds == 1 {
+        "1 second".to_string()
+    } else {
+        format!("{seconds} seconds")
+    }
+}
+
 pub(crate) fn tool_finish_activity(call: &Value, error: Option<&str>) -> String {
     let name = tool_display_name(call.get("name").and_then(Value::as_str).unwrap_or(""));
     let target = tool_activity_target(call)
@@ -102,7 +114,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
         "wait" => input
             .get("seconds")
             .and_then(Value::as_u64)
-            .map(|seconds| format!("{seconds} seconds")),
+            .map(wait_seconds_text),
         "shell" | "terminal_open" => text("command"),
         "terminal_input" => {
             let session = text("session_id")?;

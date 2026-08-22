@@ -1706,6 +1706,56 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
 }
 
 #[test]
+fn wait_tool_countdown_updates_its_live_activity_entry() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "wait-1".to_string(),
+            message: "Calling Wait...\n300 seconds".to_string(),
+        })
+        .unwrap();
+    app.poll_agent();
+    assert_eq!(app.status, "Calling Wait...\n300 seconds");
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: true, .. }
+            if text == "Calling Wait...\n300 seconds"
+    ));
+
+    sender
+        .send(AgentEvent::ToolUpdated {
+            id: "wait-1".to_string(),
+            message: "Calling Wait...\n299 seconds".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolUpdated {
+            id: "wait-1".to_string(),
+            message: "Calling Wait...\n298 seconds".to_string(),
+        })
+        .unwrap();
+    app.poll_agent();
+    assert_eq!(app.status, "Calling Wait...\n298 seconds");
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: true, .. }
+            if text == "Calling Wait...\n298 seconds"
+    ));
+
+    // Updates for an unknown tool id are ignored and leave the countdown intact.
+    sender
+        .send(AgentEvent::ToolUpdated {
+            id: "other".to_string(),
+            message: "Calling Wait...\n297 seconds".to_string(),
+        })
+        .unwrap();
+    app.poll_agent();
+    assert_eq!(app.status, "Calling Wait...\n298 seconds");
+}
+
+#[test]
 fn streamed_tool_preparation_updates_one_entry_and_hands_it_to_execution() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);

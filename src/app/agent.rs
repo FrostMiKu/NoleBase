@@ -278,6 +278,17 @@ impl App {
                     }
                     self.set_status(message);
                 }
+                AgentEvent::ToolUpdated { id, message } => {
+                    if let Some(index) = self.active_agent_tools.get(&id).copied() {
+                        if let Some(AgentPanelEntry::Tool { text, active, .. }) =
+                            self.agent_panel.get_mut(index).map(Arc::make_mut)
+                        {
+                            *text = message.clone();
+                            *active = true;
+                        }
+                        self.set_status(message);
+                    }
+                }
                 AgentEvent::Usage(usage) => self.agent_usage.add(usage),
                 AgentEvent::ContextWindow { tokens, capacity } => {
                     self.agent_context_window = tokens;

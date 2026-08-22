@@ -958,6 +958,14 @@
             tool_finish_activity(&wait, None),
             "Completed Wait.\n300 seconds"
         );
+        assert_eq!(
+            tool_wait_progress_activity(299),
+            "Calling Wait...\n299 seconds"
+        );
+        assert_eq!(
+            tool_wait_progress_activity(1),
+            "Calling Wait...\n1 second"
+        );
 
         let shell = json!({
             "name": "shell",

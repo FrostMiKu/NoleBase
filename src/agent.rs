@@ -1544,7 +1544,7 @@ impl Agent {
             Some(error) => {
                 ToolCallExecution::Completed(ToolCallOutput::text(failed_tool_result(call, error)))
             }
-            None => self.execute_tool_call(call).await,
+            None => self.execute_tool_call_with_wait_progress(call).await,
         };
         let output = match &execution {
             ToolCallExecution::Completed(output) | ToolCallExecution::Denied(output) => output,
@@ -1561,6 +1561,39 @@ impl Agent {
             message: tool_finish_activity(&tool_call_value(call), error),
             preview,
         });
+        execution
+    }
+
+    async fn execute_tool_call_with_wait_progress(&self, call: &ToolCall) -> ToolCallExecution {
+        // `Wait` has no output to stream while it runs, so the activity row
+        // instead shows a live per-second countdown via AgentEvent::ToolUpdated.
+        if call.name != "wait" {
+            return self.execute_tool_call(call).await;
+        }
+        let Some(seconds) = call.input.get("seconds").and_then(Value::as_u64) else {
+            return self.execute_tool_call(call).await;
+        };
+        if seconds == 0 {
+            return self.execute_tool_call(call).await;
+        }
+        let id = call.id.clone();
+        let events = self.events.clone();
+        let ticking = tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let remaining = seconds.saturating_sub(started.elapsed().as_secs());
+                if remaining == 0 {
+                    break;
+                }
+                let _ = events.send(AgentEvent::ToolUpdated {
+                    id: id.clone(),
+                    message: tool_wait_progress_activity(remaining),
+                });
+            }
+        });
+        let execution = self.execute_tool_call(call).await;
+        ticking.abort();
         execution
     }
 

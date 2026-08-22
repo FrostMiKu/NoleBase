@@ -115,6 +115,12 @@ pub enum AgentEvent {
         id: String,
         message: String,
     },
+    /// A running tool updated its live activity text (for example, the
+    /// per-second countdown shown while `wait` is active).
+    ToolUpdated {
+        id: String,
+        message: String,
+    },
     ToolFinished {
         id: String,
         message: String,
