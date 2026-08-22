@@ -1158,30 +1158,33 @@
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let valid = "---\ndescription: Original workflow\n---\n\n# Steps\n";
+        let valid =
+            "---\nname: existing\ndescription: Original workflow\n---\n\n# Steps\n";
         let invalid = "# Missing front matter\n";
 
         let write = Write::new(directory.path(), bypass_gate()).unwrap();
+        fs::create_dir(storage.skills_dir.join("broken")).unwrap();
         let create_error = write
             .execute(&json!({
-                "path": "skills/broken.md",
+                "path": "skills/broken/SKILL.md",
                 "content": invalid
             }))
             .unwrap_err()
             .to_string();
         assert!(create_error.contains("front matter"));
-        assert!(!storage.skills_dir.join("broken.md").exists());
+        assert!(!storage.skills_dir.join("broken/SKILL.md").exists());
 
+        fs::create_dir(storage.skills_dir.join("existing")).unwrap();
         write
             .execute(&json!({
-                "path": "skills/existing.md",
+                "path": "skills/existing/SKILL.md",
                 "content": valid
             }))
             .unwrap();
-        let existing = storage.skills_dir.join("existing.md");
+        let existing = storage.skills_dir.join("existing/SKILL.md");
         let overwrite_error = write
             .execute(&json!({
-                "path": "skills/existing.md",
+                "path": "skills/existing/SKILL.md",
                 "content": invalid,
                 "overwrite": true
             }))
@@ -1192,7 +1195,7 @@
         let reads = Arc::new(SnapshotStore::default());
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
             .unwrap()
-            .execute(&json!({"path": "skills/existing.md"}))
+            .execute(&json!({"path": "skills/existing/SKILL.md"}))
             .unwrap();
         let edit = Edit::new(
             directory.path(),
@@ -1204,7 +1207,7 @@
         let edit_error = edit
             .execute(&json!({
                 "patch": format!(
-                    "[skills/existing.md#{}]\nPUT 2.=2:\n+desc: Wrong field\n",
+                    "[skills/existing/SKILL.md#{}]\nPUT 3.=3:\n+desc: Wrong field\n",
                     file_snapshot_tag(&existing)
                 )
             }))
@@ -1218,26 +1221,28 @@
         let move_source = outside.path().join("moved.md");
         fs::write(&copy_source, invalid).unwrap();
         fs::write(&move_source, invalid).unwrap();
+        fs::create_dir(storage.skills_dir.join("copied")).unwrap();
         assert!(Copy::new(directory.path(), bypass_gate())
             .unwrap()
             .execute(&json!({
                 "source": copy_source,
-                "destination": "skills/copied.md"
+                "destination": "skills/copied/SKILL.md"
             }))
             .returns_err());
         assert!(copy_source.exists());
-        assert!(!storage.skills_dir.join("copied.md").exists());
+        assert!(!storage.skills_dir.join("copied/SKILL.md").exists());
 
+        fs::create_dir(storage.skills_dir.join("moved")).unwrap();
         let (event_sender, _) = event_channel();
         assert!(Move::new(directory.path(), event_sender.clone(), bypass_gate())
             .unwrap()
             .execute(&json!({
                 "source": move_source,
-                "destination": "skills/moved.md"
+                "destination": "skills/moved/SKILL.md"
             }))
             .returns_err());
         assert!(move_source.exists());
-        assert!(!storage.skills_dir.join("moved.md").exists());
+        assert!(!storage.skills_dir.join("moved/SKILL.md").exists());
 
         let batch_valid = outside.path().join("batch-valid.md");
         let batch_invalid = outside.path().join("batch-invalid.md");
@@ -1259,7 +1264,7 @@
         assert!(Rename::new(directory.path(), event_sender, bypass_gate())
             .unwrap()
             .execute(&json!({
-                "path": "skills/existing.md",
+                "path": "skills/existing/SKILL.md",
                 "new_name": "Invalid.md"
             }))
             .returns_err());

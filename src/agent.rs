@@ -29,7 +29,7 @@ use crate::provider::{
     MessagePart, Provider, ProviderEvent, ProviderRequest, StopReason, SystemBlock, ToolCall,
     ToolResult, ToolSpec,
 };
-use crate::skill::{load_skill_catalog, SkillCatalog};
+use crate::skill::{load_default_skill_catalog, SkillCatalog};
 #[cfg(test)]
 use crate::storage::Storage;
 use crate::storage::ATTACHMENTS_DIR;
@@ -612,7 +612,7 @@ impl AgentSource {
             agents_instructions: fs::read_to_string(nole_root.join("config/AGENTS.md"))
                 .context("reading config/AGENTS.md")?,
             memory: fs::read_to_string(nole_root.join("MEMORY.md")).context("reading MEMORY.md")?,
-            skill_catalog: load_skill_catalog(&nole_root.join("skills"))?,
+            skill_catalog: load_default_skill_catalog(&nole_root.join("skills")),
         })
     }
 }

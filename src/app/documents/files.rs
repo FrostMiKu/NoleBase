@@ -95,11 +95,20 @@ impl App {
             self.set_status("No note is open");
             return;
         };
-        self.rename_input = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .to_string();
+        self.rename_input = if self.document.as_ref().is_some_and(
+            |document| matches!(&document.kind, DocumentKind::Skill(open) if open == &path),
+        ) {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string()
+        };
         self.rename_cursor = self.rename_input.chars().count();
         self.pending_file = Some(path);
         self.files_context = FilesContext::Rename;

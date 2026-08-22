@@ -814,7 +814,7 @@ impl App {
             Some(DocumentKind::Skill(path)) => match self.storage.read_skill(&path) {
                 Ok(updated) => {
                     if let Some(document) = self.document.as_mut() {
-                        document.title = updated.id;
+                        document.title = updated.name;
                         document.replace_source(updated.body);
                     }
                 }

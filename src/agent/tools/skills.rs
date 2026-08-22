@@ -17,7 +17,13 @@ impl LoadSkill {
         Self {
             skills: skills
                 .iter()
-                .map(|skill| (skill.id.clone(), skill.body.clone()))
+                .map(|skill| {
+                    let directory = skill.path.parent().unwrap_or(&skill.path);
+                    (
+                        skill.path.to_string_lossy().into_owned(),
+                        format!("Skill directory: {}\n\n{}", directory.display(), skill.body),
+                    )
+                })
                 .collect(),
         }
     }
@@ -33,32 +39,32 @@ impl Tool for LoadSkill {
     }
 
     fn description(&self) -> &'static str {
-        "Load the complete instructions for one available Agent skill by its exact id. Load a relevant skill before following its workflow."
+        "Load the complete instructions for one available Agent skill by its exact catalog path. Load a relevant skill before following its workflow."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "id": {
+                "path": {
                     "type": "string",
-                    "description": "Exact id from the available skills catalog"
+                    "description": "Exact SKILL.md path from the available skills catalog"
                 }
             },
-            "required": ["id"],
+            "required": ["path"],
             "additionalProperties": false
         })
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
-        let id = input
-            .get("id")
+        let path = input
+            .get("path")
             .and_then(Value::as_str)
-            .context("field id must be a string")?;
+            .context("field path must be a string")?;
         self.skills
-            .get(id)
+            .get(path)
             .cloned()
-            .with_context(|| format!("unknown or unavailable skill: {id}"))
+            .with_context(|| format!("unknown or unavailable skill path: {path}"))
     }
 }
 
@@ -72,28 +78,28 @@ mod tests {
     fn loader_returns_only_the_requested_skill_body() {
         let loader = LoadSkill::new(&[
             Skill {
-                id: "alpha".to_string(),
+                name: "alpha".to_string(),
                 description: "Alpha".to_string(),
                 body: "Alpha body".to_string(),
-                path: PathBuf::from("skills/alpha.md"),
+                path: PathBuf::from("skills/alpha/SKILL.md"),
             },
             Skill {
-                id: "beta".to_string(),
+                name: "beta".to_string(),
                 description: "Beta".to_string(),
                 body: "Beta body".to_string(),
-                path: PathBuf::from("skills/beta.md"),
+                path: PathBuf::from("skills/beta/SKILL.md"),
             },
         ]);
         let runtime = crate::agent::test_support::test_runtime();
 
         assert_eq!(
             runtime
-                .block_on(loader.execute(&json!({"id": "beta"})))
+                .block_on(loader.execute(&json!({"path": "skills/beta/SKILL.md"})))
                 .unwrap(),
-            "Beta body"
+            "Skill directory: skills/beta\n\nBeta body"
         );
         assert!(runtime
-            .block_on(loader.execute(&json!({"id": "missing"})))
+            .block_on(loader.execute(&json!({"path": "skills/missing/SKILL.md"})))
             .unwrap_err()
             .to_string()
             .contains("unknown or unavailable skill"));

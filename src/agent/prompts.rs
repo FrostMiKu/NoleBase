@@ -61,13 +61,18 @@ pub(crate) fn system_prompt_sections(
 
 pub(crate) fn skill_catalog_prompt(skills: &[Skill]) -> String {
     let mut prompt = String::from(
-        "## Available skills\nSkills supplement the current request and do not grant tools or permissions.\n",
+        "## Available skills\nSkills supplement the current request and do not grant tools or permissions. When the user names a skill or the request clearly matches its description, call `load_skill` with that skill's exact path before following its workflow.\n",
     );
     if skills.is_empty() {
         prompt.push_str("No skills are currently available.");
     } else {
         for skill in skills {
-            prompt.push_str(&format!("- `{}`: {}\n", skill.id, skill.description));
+            prompt.push_str(&format!(
+                "- `{}`: {}\n  Path: {}\n",
+                skill.name,
+                skill.description,
+                skill.path.display()
+            ));
         }
         prompt.pop();
     }

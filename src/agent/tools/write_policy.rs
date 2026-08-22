@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+#[derive(Clone, Copy)]
 pub(super) enum WriteSource<'a> {
     Text(&'a str),
     File(&'a Path),
@@ -23,13 +24,19 @@ pub(super) fn validate_write_preconditions(
 ) -> Result<()> {
     let skills = root.join("skills");
     if destination.starts_with(&skills) {
-        validate_skill_destination(&skills, destination)?;
-        let content = source.read_skill_text()?;
-        if let Err(error) = crate::skill::validate_skill_source(content.as_ref()) {
-            bail!(
-                "invalid Skill document for {}: {error:#}",
-                destination.display()
-            );
+        if let Some(name) = skill_document_name(&skills, destination)? {
+            let content = source.read_skill_text()?;
+            if let Err(error) =
+                crate::skill::validate_skill_source_for_name(content.as_ref(), &name)
+            {
+                bail!(
+                    "invalid Skill document for {}: {error:#}",
+                    destination.display()
+                );
+            }
+        } else if matches!(source, WriteSource::File(path) if path.file_name().and_then(|name| name.to_str()) == Some(crate::skill::SKILL_FILE_NAME))
+        {
+            bail!("SKILL.md cannot be renamed or moved away from its standard path");
         }
         return Ok(());
     }
@@ -67,22 +74,27 @@ pub(super) fn mbdown_warning(display_path: &str, path: &Path) -> Option<String> 
         .map(|diagnostic| format!("MBDown validation warning for {display_path}: {diagnostic}"))
 }
 
-fn validate_skill_destination(skills: &Path, destination: &Path) -> Result<()> {
-    if destination.parent() != Some(skills) {
-        bail!("Skills must be direct files under skills/");
+fn skill_document_name(skills: &Path, destination: &Path) -> Result<Option<String>> {
+    let relative = destination
+        .strip_prefix(skills)
+        .context("Skill path is outside the skills root")?;
+    let mut components = relative.components();
+    let name = match components.next() {
+        Some(std::path::Component::Normal(name)) => name
+            .to_str()
+            .context("Skill directory name must be valid UTF-8")?,
+        _ => bail!("Skill files must be stored below a named skill directory"),
+    };
+    let Some(second) = components.next() else {
+        bail!("Skills must use <name>/SKILL.md instead of flat files under skills/");
+    };
+    crate::skill::validate_skill_name(name)?;
+    let is_skill_document = second.as_os_str() == crate::skill::SKILL_FILE_NAME;
+    if is_skill_document && components.next().is_none() {
+        Ok(Some(name.to_string()))
+    } else {
+        Ok(None)
     }
-    if destination
-        .extension()
-        .and_then(|extension| extension.to_str())
-        != Some("md")
-    {
-        bail!("Skill files must use the .md extension");
-    }
-    let id = destination
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .context("Skill file name must be valid UTF-8")?;
-    crate::skill::validate_skill_id(id)
 }
 
 impl<'a> WriteSource<'a> {
@@ -120,23 +132,24 @@ fn is_mbdown_path(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    const VALID_SKILL: &str = "---\ndescription: A useful workflow\n---\n\n# Steps\n";
+    const VALID_SKILL: &str =
+        "---\nname: valid-skill\ndescription: A useful workflow\n---\n\n# Steps\n";
 
     #[test]
-    fn skill_writes_require_valid_front_matter_and_flat_paths() {
+    fn skill_writes_require_standard_layout_and_matching_front_matter() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         fs::create_dir(root.join("skills")).unwrap();
 
         validate_write_preconditions(
             root,
-            &root.join("skills/valid-skill.md"),
+            &root.join("skills/valid-skill/SKILL.md"),
             WriteSource::Text(VALID_SKILL),
         )
         .unwrap();
         assert!(validate_write_preconditions(
             root,
-            &root.join("skills/broken.md"),
+            &root.join("skills/broken/SKILL.md"),
             WriteSource::Text("# Missing front matter"),
         )
         .unwrap_err()
@@ -144,12 +157,19 @@ mod tests {
         .contains("front matter"));
         assert!(validate_write_preconditions(
             root,
-            &root.join("skills/nested/valid-skill.md"),
+            &root.join("skills/valid-skill.md"),
             WriteSource::Text(VALID_SKILL),
         )
         .unwrap_err()
         .to_string()
-        .contains("direct files"));
+        .contains("instead of flat files"));
+
+        validate_write_preconditions(
+            root,
+            &root.join("skills/valid-skill/scripts/run.sh"),
+            WriteSource::Text("#!/bin/sh"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -161,7 +181,7 @@ mod tests {
 
         let error = validate_write_preconditions(
             root,
-            &root.join("skills/oversized.md"),
+            &root.join("skills/valid-skill/SKILL.md"),
             WriteSource::Text(&oversized),
         )
         .unwrap_err();
@@ -180,13 +200,13 @@ mod tests {
 
         validate_write_preconditions(
             root,
-            &root.join("skills/transferred.md"),
+            &root.join("skills/valid-skill/SKILL.md"),
             WriteSource::File(&valid),
         )
         .unwrap();
         assert!(validate_write_preconditions(
             root,
-            &root.join("skills/transferred.md"),
+            &root.join("skills/valid-skill/SKILL.md"),
             WriteSource::File(&invalid),
         )
         .is_err());

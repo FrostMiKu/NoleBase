@@ -186,10 +186,10 @@ impl App {
     }
 
     pub(in crate::app) fn reopen_skill_browser(&mut self) {
-        let selected_id = self
+        let selected_path = self
             .skill_entries
             .get(self.skill_index)
-            .map(|skill| skill.id.clone());
+            .map(|skill| skill.path.clone());
         let catalog = match self.storage.load_skills() {
             Ok(catalog) => catalog,
             Err(error) => {
@@ -201,9 +201,13 @@ impl App {
             self.set_status(format!("Skill warning: {warning}"));
         }
         self.skill_entries = catalog.skills;
-        self.skill_index = selected_id
+        self.skill_index = selected_path
             .as_deref()
-            .and_then(|id| self.skill_entries.iter().position(|skill| skill.id == id))
+            .and_then(|path| {
+                self.skill_entries
+                    .iter()
+                    .position(|skill| skill.path == path)
+            })
             .unwrap_or_else(|| {
                 self.skill_index
                     .min(self.skill_entries.len().saturating_sub(1))
@@ -211,7 +215,7 @@ impl App {
         let options = self
             .skill_entries
             .iter()
-            .map(|skill| DialogOption::with_hint(&skill.id, &skill.description))
+            .map(|skill| DialogOption::with_hint(&skill.name, &skill.description))
             .collect();
         let mut dialog = DialogState::new(
             "Skills · Enter preview",

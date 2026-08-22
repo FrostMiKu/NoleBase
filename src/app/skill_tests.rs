@@ -16,10 +16,12 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 fn write_skill(app: &App, id: &str, description: &str, body: &str) -> PathBuf {
-    let path = app.storage.skills_dir.join(format!("{id}.md"));
+    let directory = app.storage.skills_dir.join(id);
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(crate::skill::SKILL_FILE_NAME);
     fs::write(
         &path,
-        format!("---\ndescription: {description}\n---\n\n{body}\n"),
+        format!("---\nname: {id}\ndescription: {description}\n---\n\n{body}\n"),
     )
     .unwrap();
     path
@@ -87,7 +89,11 @@ fn skill_document_supports_append_edit_rename_delete_and_returns_to_browser() {
         dialog.cursor = dialog.input.chars().count();
     }
     app.handle_key(key(KeyCode::Enter));
-    let renamed = app.storage.skills_dir.join("renamed-skill.md");
+    let renamed = app
+        .storage
+        .skills_dir
+        .join("renamed-skill")
+        .join(crate::skill::SKILL_FILE_NAME);
     assert!(!original.exists());
     assert!(renamed.exists());
     assert_eq!(
@@ -116,7 +122,7 @@ fn escape_from_skill_preview_restores_the_browser_selection() {
     app.execute_app_command(AppCommand::BrowseSkills);
     app.handle_key(key(KeyCode::Down));
     let selected = app.dialog_selected();
-    let selected_id = app.skill_entries[selected].id.clone();
+    let selected_name = app.skill_entries[selected].name.clone();
     app.handle_key(key(KeyCode::Enter));
 
     app.handle_document(key(KeyCode::Esc));
@@ -126,5 +132,5 @@ fn escape_from_skill_preview_restores_the_browser_selection() {
         Some(DialogPurpose::SkillBrowser)
     );
     assert_eq!(app.dialog_selected(), selected);
-    assert_eq!(app.skill_entries[selected].id, selected_id);
+    assert_eq!(app.skill_entries[selected].name, selected_name);
 }

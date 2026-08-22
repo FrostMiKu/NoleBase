@@ -47,7 +47,7 @@ impl App {
                         self.close_dialog();
                         self.show_document(
                             DocumentKind::Skill(skill.path),
-                            skill.id,
+                            skill.name,
                             skill.body,
                             DocumentReturn::Skills,
                         );

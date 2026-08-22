@@ -146,7 +146,14 @@ impl App {
                             self.document_render_lru.remove(&kind);
                             self.set_status(format!(
                                 "Deleted {}",
-                                path.file_name().unwrap_or_default().to_string_lossy()
+                                if skill {
+                                    path.parent()
+                                        .and_then(Path::file_name)
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                } else {
+                                    path.file_name().unwrap_or_default().to_string_lossy()
+                                }
                             ));
                             if skill {
                                 self.document = None;
