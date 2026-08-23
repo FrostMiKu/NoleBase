@@ -607,7 +607,7 @@
     #[test]
     fn system_prompt_stays_compact() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.len() < 1_750, "system prompt grew to {} bytes", prompt.len());
+        assert!(prompt.len() < 2_100, "system prompt grew to {} bytes", prompt.len());
     }
 
     #[test]
@@ -636,7 +636,17 @@
     fn system_prompt_prefers_built_in_tools_before_shells() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
         assert!(prompt.contains(
-            "Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."
+            "Prefer purpose-built tools because they provide structured inputs, path protections, and change previews."
+        ));
+        assert!(prompt.contains("Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."));
+        assert!(prompt.contains(
+            "Change files only with `edit`, `append`, or `write`; shell edits (`sed -i`, redirections) desync read snapshots and are rejected."
+        ));
+        assert!(prompt.contains(
+            "Search and inspect with `grep`/`read`, never shell search tools like `rg` or `cat`."
+        ));
+        assert!(prompt.contains(
+            "If an edit or write fails validation, fix the cause—never bypass it via `shell`."
         ));
         assert!(!prompt.contains("every shell command"));
         assert!(!prompt.contains("terminal input"));

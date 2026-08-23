@@ -100,7 +100,7 @@ Root: {root}
 - `MEMORY.md` at the Nole root is persistent Agent memory. Read it when useful and update it with focused edits when durable user preferences, project facts, or workflow decisions should survive future tasks. Do not store secrets or transient task details there.
 - Never read or expose `config/ai.toml`, and access attachments only through attachment tools.
 
-Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."#,
+Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Change files only with `edit`, `append`, or `write`; shell edits (`sed -i`, redirections) desync read snapshots and are rejected. Search and inspect with `grep`/`read`, never shell search tools like `rg` or `cat`. If an edit or write fails validation, fix the cause—never bypass it via `shell`. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."#,
         root = root.display(),
     )
 }
