@@ -13,8 +13,8 @@ use ratatui::layout::Rect;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::agent::{
-    AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision, ApprovalKind,
-    ApprovalRequest, AskUserKind, AskUserRequest, AskUserResponse, PermissionMode,
+    AgentConfig, AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision,
+    ApprovalKind, ApprovalRequest, AskUserKind, AskUserRequest, AskUserResponse, PermissionMode,
     PrivateTerminalInputDecision, PrivateTerminalInputRequest, AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
@@ -383,6 +383,9 @@ pub struct App {
     pub agent_retry_count: u64,
     pub agent_round: u32,
     pub agent_round_limit: u32,
+    /// Reasoning-effort tier label from the active AI config, published by the
+    /// worker at run start; `None` until the first run announces it.
+    pub agent_effort: Option<String>,
     agent_conversation: AgentConversation,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
@@ -481,6 +484,12 @@ impl App {
             attachment_usage.clone(),
         );
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
+        let mut agent_effort = None;
+        if let Ok(effort) = AgentConfig::load_effort(&storage.ai_config_path) {
+            agent_effort = Some(
+                effort.map_or_else(|| "default".to_string(), |tier| tier.as_str().to_string()),
+            );
+        }
         Ok(Self {
             storage,
             theme: loaded_theme.theme,
@@ -613,6 +622,7 @@ impl App {
             agent_retry_count: 0,
             agent_round: 0,
             agent_round_limit: 0,
+            agent_effort,
             agent_conversation,
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,
@@ -691,8 +701,18 @@ impl App {
         }
     }
 
+    /// Refresh the effort label from the AI config file. Kept on parse or read
+    /// failure so a broken config does not blank a previously known tier.
+    pub(super) fn reload_agent_effort(&mut self) {
+        if let Ok(effort) = AgentConfig::load_effort(&self.storage.ai_config_path) {
+            self.agent_effort = Some(
+                effort.map_or_else(|| "default".to_string(), |tier| tier.as_str().to_string()),
+            );
+        }
+    }
     pub fn reload(&mut self) {
         self.reload_thinking_display_config();
+        self.reload_agent_effort();
         let selected_date = self.selected_date();
         match self.storage.load_daily_notes() {
             Ok(daily_notes) => {

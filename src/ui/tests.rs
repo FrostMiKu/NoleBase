@@ -262,6 +262,27 @@ fn agent_header_shows_rounds_usage_stream_speed_and_cache_reads() {
 }
 
 #[test]
+fn agent_statistics_panel_shows_current_effort() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Chat;
+
+    // ensure_files pins effort = "high" in the default AI config, so the
+    // panel shows the configured tier before any run.
+    let terminal = render(&mut app, 170, 24);
+    assert!(buffer_string(&terminal).contains("Effort  high"));
+
+    app.agent_effort = None;
+    let terminal = render(&mut app, 170, 24);
+    assert!(buffer_string(&terminal).contains("Effort  --"));
+
+    app.agent_effort = Some("xhigh".to_string());
+    let terminal = render(&mut app, 170, 24);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Effort"));
+    assert!(screen.contains("xhigh"));
+}
+
+#[test]
 fn agent_header_shows_retries_without_confirmed_usage() {
     let (mut app, _directory) = make_app();
     app.agent_retry_count = 2;

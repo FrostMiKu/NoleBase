@@ -411,6 +411,12 @@ conversation and tool history, so a later prompt can continue it.
 exhausted, uses provider token counting when available and replaces a safe prefix
 of older completed turns with a dense summary. The system prompt, current turn,
 recent history, and complete `tool_use`/`tool_result` pairs are retained.
+Tool results entering the conversation are capped by the same input budget —
+one quarter per result and one half per tool batch, with an explicit
+truncation marker telling the model how to fetch the remainder. If a stored
+result still blocks compaction (cuts only land on user-message boundaries,
+which current-turn results follow), it is cut to a small emergency snippet so
+the conversation keeps running instead of failing the turn.
 The three `max_concurrent_*` settings bound local read/search calls, web
 search/fetch calls, and isolated subagents across the complete Agent tree.
 Endpoints lacking token counting use a conservative local estimate.

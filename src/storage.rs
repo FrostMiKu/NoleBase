@@ -593,7 +593,9 @@ impl Storage {
             "api_key = \"\"\n",
             "tavily_api_key = \"\"\n",
             "model = \"claude-sonnet-4-5\"\n",
-            "base_url = \"https://api.anthropic.com\"\n",
+            "# Reasoning effort: \"low\", \"medium\", \"high\", \"xhigh\", or \"max\".\n",
+            "# Omit or leave empty to keep the provider default (\"high\" for Anthropic).\n",
+            "effort = \"high\"\n",
             "max_tokens = 8192\n",
             "context_window_tokens = 200000\n",
             "max_rounds = 25\n",
@@ -2360,6 +2362,7 @@ mod tests {
         assert!(config.contains("api_key = \"\""));
         assert!(config.contains("tavily_api_key = \"\""));
         assert!(config.contains("max_tokens = 8192"));
+        assert!(config.contains("effort = \"high\""));
         assert!(config.contains("context_window_tokens = 200000"));
         assert!(config.contains("max_rounds = 25"));
         assert!(config.contains("max_concurrent_local_reads = 8"));

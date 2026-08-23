@@ -49,7 +49,7 @@ impl MessagesProvider {
     }
 
     fn body(request: &ProviderRequest, stream: bool) -> Result<Value> {
-        Ok(json!({
+        let mut body = json!({
             "model": request.model,
             "max_tokens": request.max_tokens,
             "system": request.system.iter().map(|block| {
@@ -72,7 +72,11 @@ impl MessagesProvider {
                 value
             }).collect::<Vec<_>>(),
             "stream": stream,
-        }))
+        });
+        if let Some(effort) = request.effort {
+            body["output_config"] = json!({"effort": effort});
+        }
+        Ok(body)
     }
 
     async fn send(
@@ -751,6 +755,7 @@ mod streaming_tests {
         let observable = provider.call_streaming(ProviderRequest {
             model: "test-model".to_string(),
             max_tokens: 128,
+            effort: None,
             system: vec![SystemBlock {
                 text: "test".to_string(),
                 cache: false,
@@ -835,13 +840,17 @@ mod streaming_tests {
             )
             .unwrap();
             reader.get_mut().flush().unwrap();
-            (headers, serde_json::from_slice::<Value>(&request_body).unwrap())
+            (
+                headers,
+                serde_json::from_slice::<Value>(&request_body).unwrap(),
+            )
         });
 
         let provider = MessagesProvider::new("secret", format!("http://{address}")).unwrap();
         let observable = provider.call_streaming(ProviderRequest {
             model: "test-model".to_string(),
             max_tokens: 128,
+            effort: None,
             system: vec![SystemBlock {
                 text: "test".to_string(),
                 cache: false,
@@ -887,6 +896,7 @@ mod cache_tests {
         let request = ProviderRequest {
             model: "test-model".to_string(),
             max_tokens: 512,
+            effort: None,
             system: vec![
                 SystemBlock {
                     text: "base".to_string(),
@@ -921,6 +931,24 @@ mod cache_tests {
         assert_eq!(content.len(), 2);
         assert!(content[0].get("cache_control").is_none());
         assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn body_encodes_effort_as_output_config_and_omits_it_when_unset() {
+        let mut request = ProviderRequest {
+            model: "test-model".to_string(),
+            max_tokens: 512,
+            effort: Some(crate::provider::ReasoningEffort::Xhigh),
+            system: Vec::new(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+        };
+        let body = MessagesProvider::body(&request, false).unwrap();
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+
+        request.effort = None;
+        let body = MessagesProvider::body(&request, false).unwrap();
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]

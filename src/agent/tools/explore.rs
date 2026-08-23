@@ -161,6 +161,7 @@ mod tests {
             model: "test".to_string(),
             base_url: "https://example.com".to_string(),
             max_tokens: 1_024,
+            effort: None,
             context_window_tokens: 8_192,
             max_rounds,
             max_concurrent_local_reads: 8,

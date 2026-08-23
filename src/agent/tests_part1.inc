@@ -18,6 +18,24 @@
         assert_eq!(config.max_concurrent_network_tools, 8);
         assert_eq!(config.max_concurrent_subagents, 4);
 
+
+        assert_eq!(config.effort, None);
+        fs::write(&path, format!("{TEST_MESSAGES_CONFIG}effort = 'max'\n")).unwrap();
+        assert_eq!(
+            AgentConfig::load(&path).unwrap().effort,
+            Some(ReasoningEffort::Max)
+        );
+        fs::write(&path, format!("{TEST_MESSAGES_CONFIG}effort = 'turbo'\n")).unwrap();
+        assert!(format!(
+            "{:#}",
+            AgentConfig::load(&path).unwrap_err()
+        )
+        .contains("unknown variant"));
+        fs::write(&path, "effort = 'high'\n").unwrap();
+        assert_eq!(
+            AgentConfig::load_effort(&path).unwrap(),
+            Some(ReasoningEffort::High)
+        );
         fs::write(
             &path,
             format!(
@@ -112,6 +130,125 @@
                 .unwrap();
         assert_eq!(cut, 4);
         assert_eq!(messages.last().unwrap().text(), "latest request");
+    }
+
+    fn small_budget_agent() -> Agent {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            "api_format = 'completions'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'https://example.com'\nmax_tokens = 1024\ncontext_window_tokens = 8192\n",
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                private_terminal_input_receiver(),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn stored_tool_result(message: &Message) -> &str {
+        match message.parts.first() {
+            Some(MessagePart::ToolResult(result)) => result.content.as_str(),
+            _ => panic!("expected a tool result message"),
+        }
+    }
+
+    #[test]
+    fn tool_results_are_capped_before_entering_the_conversation() {
+        let agent = small_budget_agent();
+        let calls = [
+            ToolCall {
+                id: "one".to_string(),
+                name: "http_request".to_string(),
+                input: json!({"url": "https://example.com/blob"}),
+            },
+            ToolCall {
+                id: "two".to_string(),
+                name: "shell".to_string(),
+                input: json!({"command": "ls"}),
+            },
+        ];
+        let outputs = vec![
+            (
+                0,
+                ToolCallOutput::text(ToolResult {
+                    tool_use_id: "one".to_string(),
+                    content: "x".repeat(40_000),
+                    is_error: false,
+                }),
+            ),
+            (
+                1,
+                ToolCallOutput::text(ToolResult {
+                    tool_use_id: "two".to_string(),
+                    content: "small".to_string(),
+                    is_error: false,
+                }),
+            ),
+        ];
+        let messages = agent
+            .finalize_tool_messages(&calls, outputs, Vec::new())
+            .unwrap();
+        let oversized = stored_tool_result(&messages[0]);
+        assert!(oversized.contains("agent truncated this tool result"));
+        assert!(estimate_text_tokens(oversized) <= agent.tool_result_token_cap());
+        assert_eq!(stored_tool_result(&messages[1]), "small");
+    }
+
+    #[test]
+    fn compaction_heals_oversized_tool_results_instead_of_failing() {
+        let agent = small_budget_agent();
+        let mut messages = vec![
+            Message::user("fetch the report"),
+            Message::assistant(vec![MessagePart::ToolUse(ToolCall {
+                id: "one".to_string(),
+                name: "http_request".to_string(),
+                input: json!({"url": "https://example.com/big"}),
+            })]),
+            Message::tool(ToolResult {
+                tool_use_id: "one".to_string(),
+                content: "y".repeat(40_000),
+                is_error: false,
+            }),
+        ];
+        let compacted = agent
+            .compact_context_if_needed(&mut messages, &[])
+            .unwrap();
+        assert!(compacted);
+        let healed = stored_tool_result(&messages[2]);
+        assert!(healed.contains("agent truncated this tool result"));
+        assert!(estimate_text_tokens(healed) <= TOOL_RESULT_EMERGENCY_TOKENS);
+    }
+
+    #[test]
+    fn compaction_still_fails_when_nothing_can_be_truncated() {
+        let agent = small_budget_agent();
+        let mut messages = vec![
+            Message::user("go"),
+            Message::assistant(vec![MessagePart::Text {
+                text: "z".repeat(40_000),
+            }]),
+        ];
+        let error = agent
+            .compact_context_if_needed(&mut messages, &[])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("the current turn cannot be compacted safely"));
     }
 
     #[test]

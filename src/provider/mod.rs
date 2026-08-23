@@ -68,6 +68,33 @@ pub enum ApiFormat {
     Completions,
 }
 
+/// Reasoning-effort tier requested from the model. Serialized at the wire
+/// boundary per protocol: `reasoning_effort` for Chat Completions,
+/// `output_config.effort` for Anthropic Messages. `None` omits the parameter
+/// so the provider default applies.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Lowercase wire label, shared by both protocols and the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub role: MessageRole,
@@ -243,6 +270,8 @@ pub struct ProviderRequest {
     pub system: Vec<SystemBlock>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// Requested reasoning-effort tier; `None` keeps the provider default.
+    pub effort: Option<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

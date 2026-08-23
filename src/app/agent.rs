@@ -734,6 +734,7 @@ impl App {
             return false;
         }
         self.reload_thinking_display_config();
+        self.reload_agent_effort();
         if let Ok(mut buffer) = self.agent_input_buffer.lock() {
             buffer.clear();
         }

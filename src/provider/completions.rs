@@ -62,6 +62,9 @@ impl CompletionsProvider {
         if stream {
             body.insert("stream_options".to_string(), json!({"include_usage": true}));
         }
+        if let Some(effort) = request.effort {
+            body.insert("reasoning_effort".to_string(), json!(effort));
+        }
         if !request.tools.is_empty() {
             body.insert(
                 "tools".to_string(),
@@ -606,12 +609,13 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     use super::*;
-    use crate::provider::{SystemBlock, ToolResult, ToolSpec};
+    use crate::provider::{ReasoningEffort, SystemBlock, ToolResult, ToolSpec};
 
     fn request() -> ProviderRequest {
         ProviderRequest {
             model: "test-model".to_string(),
             max_tokens: 321,
+            effort: Some(ReasoningEffort::Max),
             system: vec![SystemBlock {
                 text: "System rules".to_string(),
                 cache: true,
@@ -648,6 +652,15 @@ mod tests {
         assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call-1");
         assert_eq!(body["messages"][3]["tool_call_id"], "call-1");
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn body_omits_reasoning_effort_when_unset() {
+        let mut request = request();
+        request.effort = None;
+        let body = CompletionsProvider::body(&request, true).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

@@ -16,13 +16,14 @@ use super::{
 use crate::agent_session::TokenUsage;
 use crate::provider::{
     is_transient_provider_error, Message, MessagePart, Provider, ProviderEvent, ProviderRequest,
-    StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
+    ReasoningEffort, StopReason, SystemBlock, ToolCall, ToolResult, ToolSpec,
 };
 
 #[derive(Clone)]
 pub(crate) struct SubagentRuntime {
     model: String,
     max_tokens: u32,
+    effort: Option<ReasoningEffort>,
     max_rounds: u32,
     supports_images: bool,
     provider: Arc<dyn Provider>,
@@ -46,6 +47,7 @@ impl SubagentRuntime {
             max_tokens: config.max_tokens,
             max_rounds: config.max_rounds,
             supports_images: config.supports_images,
+            effort: config.effort,
             provider,
             system,
             events,
@@ -176,6 +178,7 @@ impl SubagentRunner {
         let provider_request = ProviderRequest {
             model: self.runtime.model.clone(),
             max_tokens: self.runtime.max_tokens,
+            effort: self.runtime.effort,
             system: self.system.clone(),
             messages: messages.to_vec(),
             tools: if final_round { Vec::new() } else { definitions },
@@ -489,6 +492,7 @@ mod tests {
             model: "test-model".to_string(),
             base_url: "https://example.com".to_string(),
             max_tokens: 1_024,
+            effort: None,
             context_window_tokens: 8_192,
             max_rounds,
             max_concurrent_local_reads: 8,
@@ -531,6 +535,7 @@ mod tests {
             model: "test-model".to_string(),
             base_url: "https://example.com".to_string(),
             max_tokens: 1_024,
+            effort: None,
             context_window_tokens: 8_192,
             max_rounds,
             max_concurrent_local_reads: 8,

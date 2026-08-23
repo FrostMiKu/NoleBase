@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::agent::types::ToolExecutionPolicy;
-use crate::provider::ApiFormat;
+use crate::provider::{ApiFormat, ReasoningEffort};
 
 pub(crate) const DEFAULT_MAX_ROUNDS: u32 = 25;
 pub(crate) const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
@@ -67,6 +67,10 @@ pub struct AgentConfig {
     pub tavily_api_key: String,
     pub model: String,
     pub base_url: String,
+    /// Requested reasoning-effort tier sent to the provider on every request.
+    /// Absent (`effort` key omitted or empty) keeps the provider default.
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_context_window_tokens")]
@@ -148,5 +152,22 @@ impl AgentConfig {
             bail!("max_concurrent_subagents must be greater than zero");
         }
         Ok(config)
+    }
+
+    /// Read only the `effort` tier from an AI config, tolerating an incomplete
+    /// file: a fresh template carries an empty api_key that the full
+    /// [`AgentConfig::load`] validation rejects, but the effort label is still
+    /// meaningful for the statistics panel.
+    pub fn load_effort(path: &Path) -> Result<Option<ReasoningEffort>> {
+        #[derive(Deserialize)]
+        struct EffortConfig {
+            #[serde(default)]
+            effort: Option<ReasoningEffort>,
+        }
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("reading AI config {}", path.display()))?;
+        toml::from_str::<EffortConfig>(&text)
+            .map(|config| config.effort)
+            .with_context(|| format!("parsing AI config {}", path.display()))
     }
 }

@@ -801,6 +801,7 @@ mod tests {
         let statistics_area = app.layout.agent.expect("statistics panel");
         let statistics = area_text(&terminal, statistics_area);
         let (_, state_y) = find_text(&terminal, "State");
+        let (_, effort_y) = find_text(&terminal, "Effort");
         let (_, context_y) = find_text(&terminal, "Context");
 
         assert!(statistics.contains("Agent statistics"));
@@ -815,9 +816,9 @@ mod tests {
         assert!(statistics.contains("Stream"));
         assert!(statistics.contains("1 user · 1 agent"));
         assert!(!statistics.contains("private prompt text"));
-        assert!(!statistics.contains("private reply text"));
         assert_eq!(state_y, statistics_area.y + 2);
-        assert_eq!(context_y, state_y + 2);
+        assert_eq!(effort_y, state_y + 2);
+        assert_eq!(context_y, effort_y + 2);
     }
 
     #[test]

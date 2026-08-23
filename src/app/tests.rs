@@ -1835,6 +1835,29 @@ fn thinking_events_build_and_finish_thinking_entries() {
 }
 
 #[test]
+fn agent_effort_label_follows_the_ai_config_file() {
+    let (mut app, _directory) = make_app();
+    // ensure_files writes the default template, which pins effort = "high".
+    assert_eq!(app.agent_effort.as_deref(), Some("high"));
+
+    fs::write(
+        &app.storage.ai_config_path,
+        "api_format = 'messages'\napi_key = ''\nmodel = ''\nbase_url = ''\neffort = 'max'\n",
+    )
+    .unwrap();
+    app.reload_agent_effort();
+    assert_eq!(app.agent_effort.as_deref(), Some("max"));
+
+    fs::write(
+        &app.storage.ai_config_path,
+        "api_format = 'messages'\napi_key = 'k'\nmodel = 'm'\nbase_url = 'https://example.com'\n",
+    )
+    .unwrap();
+    app.reload_agent_effort();
+    assert_eq!(app.agent_effort.as_deref(), Some("default"));
+}
+
+#[test]
 fn cancelling_agent_finishes_streaming_thinking_and_preserves_terminal() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);

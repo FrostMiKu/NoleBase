@@ -80,6 +80,10 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     let state = if app.ai_running { "Working" } else { "Idle" };
     let rows = [
         ("State", state.to_string()),
+        (
+            "Effort",
+            app.agent_effort.clone().unwrap_or_else(|| "--".to_string()),
+        ),
         ("Context", context),
         ("Input", human_token_count(app.agent_usage.total_input())),
         ("Output", human_token_count(app.agent_usage.output_tokens)),
