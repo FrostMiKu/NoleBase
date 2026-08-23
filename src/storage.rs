@@ -1108,20 +1108,27 @@ impl Storage {
     }
 
     pub fn load_skills(&self) -> Result<crate::skill::SkillCatalog> {
-        crate::skill::load_skill_catalog(&self.skills_dir)
+        Ok(crate::skill::load_default_skill_catalog(&self.skills_dir))
     }
 
     pub fn read_skill(&self, path: &Path) -> Result<crate::skill::Skill> {
-        let path = crate::skill::validate_skill_path(&self.skills_dir, path)?;
+        let (_, path) = self.locate_skill(path)?;
         crate::skill::load_skill(&path)
     }
 
     pub fn rename_skill(&self, from: &Path, new_id: &str) -> Result<PathBuf> {
-        crate::skill::rename_skill(&self.skills_dir, from, new_id)
+        let (root, _) = self.locate_skill(from)?;
+        crate::skill::rename_skill(&root, from, new_id)
     }
 
     pub fn delete_skill(&self, path: &Path) -> Result<()> {
-        crate::skill::delete_skill(&self.skills_dir, path)
+        let (root, _) = self.locate_skill(path)?;
+        crate::skill::delete_skill(&root, path)
+    }
+
+    fn locate_skill(&self, path: &Path) -> Result<(PathBuf, PathBuf)> {
+        let roots = crate::skill::default_skill_roots(&self.skills_dir);
+        crate::skill::locate_managed_skill(&roots, path)
     }
 
     /// Read a managed note after applying the same path checks used by

@@ -147,13 +147,19 @@ pub fn user_skills_directory() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".agents").join("skills"))
 }
 
+/// Every managed skill root for a workspace: workspace first, then per-user.
+pub fn default_skill_roots(workspace_directory: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![workspace_directory.to_path_buf()];
+    if let Some(user_directory) = user_skills_directory() {
+        roots.push(user_directory);
+    }
+    roots
+}
+
 /// Load workspace skills plus the standard per-user skill root.
 pub fn load_default_skill_catalog(workspace_directory: &Path) -> SkillCatalog {
-    let user_directory = user_skills_directory();
-    let mut directories = vec![workspace_directory];
-    if let Some(user_directory) = user_directory.as_deref() {
-        directories.push(user_directory);
-    }
+    let roots = default_skill_roots(workspace_directory);
+    let directories: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
     load_skill_catalogs(directories)
 }
 
@@ -268,6 +274,23 @@ pub fn delete_skill(directory: &Path, path: &Path) -> Result<()> {
     let skill_directory = path.parent().context("skill has no parent directory")?;
     fs::remove_dir_all(skill_directory)
         .with_context(|| format!("deleting skill directory {}", skill_directory.display()))
+}
+
+/// Locate the managed root that owns `path` and its validated canonical file.
+///
+/// Roots are tried in order, so the workspace root wins ties.
+pub fn locate_managed_skill(roots: &[PathBuf], path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let mut last_error = None;
+    for root in roots {
+        match validate_skill_path(root, path) {
+            Ok(validated) => return Ok((root.clone(), validated)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => bail!("no managed skill roots are configured"),
+    }
 }
 
 pub fn validate_skill_name(name: &str) -> Result<()> {
@@ -466,6 +489,36 @@ mod tests {
             .skills
             .iter()
             .all(|skill| skill.name == "shared-name"));
+    }
+
+    #[test]
+    fn managed_skill_lookup_resolves_the_owning_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace").join("skills");
+        let user = directory.path().join("home").join(".agents").join("skills");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        write_skill(&workspace, "workspace-skill", "Workspace");
+        let user_path = write_skill(&user, "user-skill", "User");
+        let roots = vec![workspace.clone(), user.clone()];
+
+        let (root, validated) = locate_managed_skill(&roots, &user_path).unwrap();
+        assert_eq!(
+            validated.parent().unwrap().parent().unwrap(),
+            fs::canonicalize(&user).unwrap()
+        );
+        assert_eq!(validated, load_skill(&user_path).unwrap().path);
+
+        let workspace_path = write_skill(&workspace, "another", "Another workspace skill");
+        assert_eq!(
+            fs::canonicalize(locate_managed_skill(&roots, &workspace_path).unwrap().0).unwrap(),
+            fs::canonicalize(&workspace).unwrap()
+        );
+
+        let stray_directory = directory.path().join("stray");
+        fs::create_dir(&stray_directory).unwrap();
+        let stray = write_skill(&stray_directory, "stray", "Stray");
+        assert!(locate_managed_skill(&roots, &stray).is_err());
     }
 
     #[test]
