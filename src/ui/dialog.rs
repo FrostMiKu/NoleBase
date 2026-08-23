@@ -207,8 +207,9 @@ pub(super) fn draw_dialog(
     } else {
         SELECT_OPTION_HEIGHT
     };
-    let option_heights = (dialog.purpose == DialogPurpose::AskUser)
-        .then(|| ask_user_option_heights(&dialog, text_width));
+    let option_heights = dialog
+        .wrap_options
+        .then(|| wrapped_option_heights(&dialog, text_width));
     let desired_height = match dialog.mode {
         DialogMode::Confirm => 5,
         DialogMode::SingleLine => 5,
@@ -741,8 +742,9 @@ pub(super) fn draw_select_dialog(
         );
     }
     let text_width = options.width.saturating_sub(2) as usize;
-    let option_heights = (dialog.purpose == DialogPurpose::AskUser)
-        .then(|| ask_user_option_heights(dialog, text_width));
+    let option_heights = dialog
+        .wrap_options
+        .then(|| wrapped_option_heights(dialog, text_width));
     let item_offsets: Vec<u16> = match &option_heights {
         Some(heights) => {
             let mut offsets = Vec::with_capacity(heights.len() + 1);
@@ -835,19 +837,26 @@ pub(super) fn draw_select_dialog(
                 selection_area,
             );
         }
-        let text_height = if dialog.purpose == DialogPurpose::AskUser {
-            item_height
-        } else {
-            1
-        };
+        let text_height = if dialog.wrap_options { item_height } else { 1 };
         let text_area = Rect::new(
             item_area.x.saturating_add(2),
             item_area.y,
             item_area.width.saturating_sub(2),
             text_height,
         );
-        if dialog.purpose == DialogPurpose::AskUser {
-            let rows = wrap_spans_to_width(&[Span::styled(label, style)], text_area.width as usize);
+        if dialog.wrap_options {
+            let mut spans = vec![Span::styled(label, style)];
+            if let Some(hint) = &option.hint {
+                spans.push(Span::styled(
+                    format!("  {hint}"),
+                    if selected {
+                        style.add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(app.theme.text_muted)
+                    },
+                ));
+            }
+            let rows = wrap_spans_to_width(&spans, text_area.width as usize);
             let lines = rows.into_iter().map(Line::from).collect::<Vec<_>>();
             frame.render_widget(Paragraph::new(lines), text_area);
         } else if dialog.purpose == DialogPurpose::SkillBrowser {
@@ -973,14 +982,17 @@ pub(super) fn draw_select_dialog(
     };
     draw_dialog_footer(frame, footer, footer_text, app.theme);
 }
-/// Per-option rows for Ask-User dialogs: wrapped label rows plus one
-/// separator row so long answers wrap instead of clipping.
-fn ask_user_option_heights(dialog: &DialogState, text_width: usize) -> Vec<u16> {
+/// Per-option rows for wrapping option lists: wrapped label (and hint) rows
+/// plus one separator row so long answers wrap instead of clipping.
+fn wrapped_option_heights(dialog: &DialogState, text_width: usize) -> Vec<u16> {
     dialog
         .options
         .iter()
         .map(|option| {
-            let spans = [Span::raw(option.label.clone())];
+            let mut spans = vec![Span::raw(option.label.clone())];
+            if let Some(hint) = &option.hint {
+                spans.push(Span::raw(format!("  {hint}")));
+            }
             let rows = wrap_spans_to_width(&spans, text_width).len().max(1) as u16;
             rows.saturating_add(1)
         })

@@ -418,7 +418,8 @@ impl App {
                                 .collect()
                         })
                         .unwrap_or_default(),
-                );
+                )
+                .with_wrapped_options();
                 dialog.selected = self.ask_user_option;
                 dialog.input = self.ask_user_input.clone();
                 dialog.cursor = self.ask_user_cursor;

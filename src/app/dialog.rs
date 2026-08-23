@@ -91,6 +91,8 @@ pub struct DialogState {
     pub input: String,
     pub cursor: usize,
     pub scroll: u16,
+    /// Options wrap to their content width instead of clipping long labels.
+    pub wrap_options: bool,
     pub command: Option<DialogCommand>,
 }
 
@@ -114,8 +116,15 @@ impl DialogState {
             input: String::new(),
             cursor: 0,
             scroll: 0,
+            wrap_options: false,
             command: None,
         }
+    }
+    /// Opt this dialog's option list into content-aware wrapping: options
+    /// grow to fit their wrapped label rows instead of clipping.
+    pub fn with_wrapped_options(mut self) -> Self {
+        self.wrap_options = true;
+        self
     }
 
     pub fn selected_option(&self) -> Option<&DialogOption> {
