@@ -3,6 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -17,7 +18,7 @@ use super::workspace_quota::{
     check_workspace_write, workspace_destination, workspace_dir, workspace_used_bytes,
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_TOTAL_BYTES,
 };
-use crate::agent::{canonical_root, Tool, ToolExecutionPolicy};
+use crate::agent::{canonical_root, AgentJobsHandle, JobKind, Tool, ToolExecutionPolicy};
 
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_WEB_SEARCH_RESULTS: usize = 10;
@@ -121,15 +122,17 @@ impl Tool for SearchWeb {
 pub struct HttpRequest {
     root: PathBuf,
     client: Client,
-    workspace_write_lock: tokio::sync::Mutex<()>,
+    workspace_write_lock: Arc<tokio::sync::Mutex<()>>,
+    jobs: AgentJobsHandle,
 }
 
 impl HttpRequest {
-    pub fn new(root: &Path, client: Client) -> Result<Self> {
+    pub fn new(root: &Path, client: Client, jobs: AgentJobsHandle) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
             client,
-            workspace_write_lock: tokio::sync::Mutex::new(()),
+            workspace_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            jobs,
         })
     }
 
@@ -178,14 +181,15 @@ impl HttpRequest {
     }
 
     async fn save_response(
-        &self,
+        root: PathBuf,
+        workspace_write_lock: Arc<tokio::sync::Mutex<()>>,
         response: reqwest::Response,
         destination: PathBuf,
-        destination_text: &str,
+        destination_text: String,
     ) -> Result<String> {
         // Network downloads may execute concurrently, but quota accounting and
         // no-overwrite publication must observe one workspace state at a time.
-        let _workspace_write_guard = self.workspace_write_lock.lock().await;
+        let _workspace_write_guard = workspace_write_lock.lock().await;
         let status = response.status();
         if !status.is_success() {
             bail!("download failed: HTTP {status}");
@@ -202,9 +206,9 @@ impl HttpRequest {
             .map(str::to_owned);
 
         if let Some(length) = content_length {
-            check_workspace_write(&self.root, &destination, length)?;
+            check_workspace_write(&root, &destination, length)?;
         }
-        let workspace = workspace_dir(&self.root);
+        let workspace = workspace_dir(&root);
         let used = workspace_used_bytes(&workspace)?;
         let budget = MAX_WORKSPACE_FILE_BYTES.min(MAX_WORKSPACE_TOTAL_BYTES.saturating_sub(used));
         let staged = staged_path(&destination);
@@ -262,7 +266,7 @@ impl HttpRequest {
 
         let token = format!("sha256:{}", hex_lower(&hasher.finalize()));
         let mut result = json!({
-            "path": display_path(&self.root, &destination),
+            "path": display_path(&root, &destination),
             "bytes": written,
             "url": final_url,
             "sha256": token,
@@ -335,6 +339,11 @@ impl Tool for HttpRequest {
                     "type": "string",
                     "minLength": 1,
                     "description": "New file path relative to workspace/main; streams the response body to disk instead of returning it inline and reports path, byte count, sha256, media type, and final URL"
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "With save_to: run the download as a background job and return immediately. The result is delivered automatically when the download finishes; the job keeps running when the Agent is interrupted and can be stopped with the jobs tool."
                 }
             },
             "required": ["url"],
@@ -377,8 +386,15 @@ impl Tool for HttpRequest {
             Some(text) => Some(workspace_destination(&self.root, text)?),
             None => None,
         };
+        let background = input
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if background && destination.is_none() {
+            bail!("field background requires field save_to");
+        }
 
-        let mut request = self.client.request(method, url);
+        let mut request = self.client.request(method, url.clone());
         request = apply_headers(request, input.get("headers"))?;
         if let Some(range) = input.get("range") {
             request = request.header(reqwest::header::RANGE, range_header(range)?);
@@ -391,14 +407,63 @@ impl Tool for HttpRequest {
             );
         }
 
-        let response = request.send().await.context("sending HTTP request")?;
-        if let (Some(destination), Some(destination_text)) = (destination, save_to.as_deref()) {
-            return self
-                .save_response(response, destination, destination_text)
-                .await;
+        if let (Some(destination), Some(destination_text)) = (destination, save_to.clone()) {
+            if background {
+                let label = download_label(&url, &destination_text);
+                let started = self.jobs.start_background(JobKind::Download, &label)?;
+                let jobs = self.jobs.clone();
+                let id = started.id.clone();
+                let root = self.root.clone();
+                let write_lock = Arc::clone(&self.workspace_write_lock);
+                tokio::spawn(async move {
+                    let outcome = async {
+                        let response = request.send().await.context("sending HTTP request")?;
+                        Self::save_response(
+                            root,
+                            write_lock,
+                            response,
+                            destination,
+                            destination_text,
+                        )
+                        .await
+                    }
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                    jobs.settle(&id, outcome);
+                });
+                return Ok(serde_json::to_string_pretty(&json!({
+                    "backgrounded": true,
+                    "job": started.id,
+                    "note": "The download keeps running in the background; its result will be delivered automatically as a [background job] frame."
+                }))?);
+            }
+            let response = request.send().await.context("sending HTTP request")?;
+            return Self::save_response(
+                self.root.clone(),
+                Arc::clone(&self.workspace_write_lock),
+                response,
+                destination,
+                destination_text,
+            )
+            .await;
         }
+        let response = request.send().await.context("sending HTTP request")?;
         self.render_response(response).await
     }
+}
+
+/// Compact job label for a background download: file name plus host.
+fn download_label(url: &reqwest::Url, destination_text: &str) -> String {
+    let url_text = url.as_str();
+    let file = destination_text
+        .rsplit('/')
+        .next()
+        .unwrap_or(destination_text);
+    let host = reqwest::Url::parse(url_text)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    format!("{file} <- {host}")
 }
 
 fn apply_headers(
@@ -699,6 +764,7 @@ pub fn web_fetch_content(content_type: Option<&str>, bytes: Vec<u8>) -> Result<S
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::JobStatus;
     use std::fs;
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::TcpListener;
@@ -792,7 +858,8 @@ mod tests {
     }
 
     fn http_request(root: &Path) -> HttpRequest {
-        HttpRequest::new(root, reqwest::Client::new()).unwrap()
+        let (events, _receiver) = crate::agent::test_support::event_channel();
+        HttpRequest::new(root, reqwest::Client::new(), AgentJobsHandle::new(events)).unwrap()
     }
 
     fn workspace(root: &Path) -> PathBuf {
@@ -1009,6 +1076,66 @@ mod tests {
             vec!["binaries"],
             "no staging file may remain after a successful download"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_download_returns_immediately_and_delivers_result() {
+        let (_directory, root) = fresh_root();
+        let body = b"background payload".to_vec();
+        let (url, handle) = server(vec![ok_response(body.clone(), None)]);
+        let (events, _receiver) = crate::agent::test_support::event_channel();
+        let jobs = AgentJobsHandle::new(events);
+        let tool = HttpRequest::new(&root, reqwest::Client::new(), jobs.clone()).unwrap();
+        let started = std::time::Instant::now();
+        let output = tool
+            .execute(&json!({
+                "url": url,
+                "save_to": "binaries/async.bin",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["backgrounded"], json!(true));
+        let job = value["job"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !jobs
+                .rows()
+                .iter()
+                .any(|row| row.id == job && row.status == JobStatus::Running)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "download never settled"
+            );
+        }
+        handle.join().unwrap();
+        let deliveries = jobs.take_deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].status, JobStatus::Done);
+        let result: Value = serde_json::from_str(&deliveries[0].result).unwrap();
+        assert_eq!(result["bytes"], body.len() as u64);
+        assert_eq!(
+            fs::read(workspace(&root).join("binaries/async.bin")).unwrap(),
+            body
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_requires_save_to() {
+        let (_directory, root) = fresh_root();
+        let (url, handle) = server(vec![ok_response(b"x".to_vec(), None)]);
+        let error = http_request(&root)
+            .execute(&json!({"url": url, "background": true}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires field save_to"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -32,12 +32,6 @@ impl LimitedOutput {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AgentTerminalStatus {
-    Running,
-    Exited(u32),
-}
-
 impl AgentTerminalStatus {
     pub(crate) fn label(&self) -> String {
         match self {
@@ -52,6 +46,21 @@ pub(crate) struct AgentTerminalSnapshot {
     pub(crate) title: String,
     pub(crate) status: AgentTerminalStatus,
     pub(crate) terminal: TerminalSnapshot,
+}
+
+/// One watcher sample from a live Agent PTY session.
+pub(crate) struct TerminalWatchSample {
+    pub(crate) offset: u64,
+    pub(crate) data: Vec<u8>,
+    pub(crate) exit_code: Option<u32>,
+    pub(crate) exited: bool,
+    pub(crate) screen: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentTerminalStatus {
+    Running,
+    Exited(u32),
 }
 
 struct AgentTerminalSession {
@@ -196,6 +205,33 @@ impl AgentTerminalHandle {
         };
         state.monitor_changed |= status_changed;
         Ok(observation)
+    }
+
+    /// One watcher sample: new raw-stream bytes since `from`, the exit state,
+    /// and the current screen. `None` when the session is unknown.
+    pub(crate) fn sample_watch(&self, session_id: &str, from: u64) -> Option<TerminalWatchSample> {
+        let mut state = self.inner.lock().ok()?;
+        let session = state.session.as_mut()?;
+        if session.id != session_id {
+            return None;
+        }
+        let _ = refresh_status(session);
+        let (exit_code, exited) = match &session.status {
+            AgentTerminalStatus::Exited(code) => (Some(*code), true),
+            _ => (None, false),
+        };
+        let data = session.terminal.raw_tap();
+        let tap = data.lock().ok()?;
+        let (offset, bytes) = tap.read_since(from);
+        drop(tap);
+        let screen = session.terminal.snapshot().plain_text();
+        Some(TerminalWatchSample {
+            offset,
+            data: bytes,
+            exit_code,
+            exited,
+            screen,
+        })
     }
 
     pub(crate) fn wait_until_settled(
@@ -418,12 +454,23 @@ pub(crate) fn run_noninteractive_shell(
     if command.contains('\0') {
         bail!("shell command cannot contain NUL bytes");
     }
-    let executable = std::env::current_exe().context("locating the Nole executable")?;
-    let mut process = Command::new(executable);
+    // The helper re-invokes this executable; under `cargo test` the current
+    // exe is the test harness, which rejects the flag. Test builds spawn the
+    // shell directly so background-job tests exercise the real pipeline.
+    let mut process = if cfg!(test) {
+        let mut process = Command::new("/bin/sh");
+        process.arg("-c").arg(command);
+        process
+    } else {
+        let executable = std::env::current_exe().context("locating the Nole executable")?;
+        let mut process = Command::new(executable);
+        process
+            .arg("--agent-shell-helper")
+            .arg("command")
+            .arg(command);
+        process
+    };
     process
-        .arg("--agent-shell-helper")
-        .arg("command")
-        .arg(command)
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

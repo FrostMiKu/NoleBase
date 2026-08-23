@@ -3526,3 +3526,28 @@ fn agent_vlist_only_renders_visible_entries_and_keeps_animation_out_of_cache() {
     assert!(app.agent_vlist.caches[0].is_none());
     assert!(!app.agent_vlist.geometry.is_measured(0));
 }
+
+#[test]
+fn agent_sidebar_lists_running_background_jobs() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Daily;
+    let started = app
+        .agent_jobs
+        .start_background(crate::agent::JobKind::Shell, "cargo build --release")
+        .unwrap();
+    assert_eq!(started.id, "job-1");
+    assert!(crate::ui::animations_active(&app, true));
+
+    let terminal = render(&mut app, 220, 32);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("Jobs"), "jobs section missing: {screen}");
+    assert!(screen.contains("job-1"));
+    assert!(screen.contains("cargo build"));
+
+    // Once settled and drained, the section disappears.
+    app.agent_jobs.settle("job-1", Ok("done".to_string()));
+    let _ = app.agent_jobs.take_deliveries();
+    let terminal = render(&mut app, 220, 32);
+    let screen = buffer_string(&terminal);
+    assert!(!screen.contains("cargo build"));
+}

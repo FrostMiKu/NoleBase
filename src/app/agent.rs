@@ -289,6 +289,51 @@ impl App {
                         self.set_status(message);
                     }
                 }
+                AgentEvent::JobStarted { id, label, .. } => {
+                    self.set_status(format!("Background job {id} started: {label}"));
+                }
+                AgentEvent::JobSettled { id, failed } => {
+                    // While a run is active, the Agent loop drains deliveries
+                    // at the next round boundary and injects them as a framed
+                    // user message. Idle: start a delivery run now.
+                    let label = self
+                        .agent_jobs
+                        .rows()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.label)
+                        .unwrap_or_default();
+                    self.notifications.notify(if failed {
+                        format!("Background job {id} failed: {label}")
+                    } else {
+                        format!("Background job {id} finished: {label}")
+                    });
+                    if !self.ai_running && !self.ai_cancelling {
+                        let deliveries = self.agent_jobs.take_deliveries();
+                        if !deliveries.is_empty() {
+                            let prompt = crate::agent::format_job_deliveries(&deliveries);
+                            self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
+                                text: format!(
+                                    "{} {}",
+                                    if failed {
+                                        "Job failed"
+                                    } else {
+                                        "Job completed"
+                                    },
+                                    deliveries[0].label
+                                ),
+                                muted: true,
+                            }));
+                            self.start_agent_worker(prompt);
+                        }
+                    }
+                }
+                AgentEvent::JobDelivered(ids) => {
+                    self.set_status(format!(
+                        "Background job result delivered: {}",
+                        ids.join(", ")
+                    ));
+                }
                 AgentEvent::Usage(usage) => self.agent_usage.add(usage),
                 AgentEvent::ContextWindow { tokens, capacity } => {
                     self.agent_context_window = tokens;
@@ -460,6 +505,18 @@ impl App {
                         if !pending.is_empty() {
                             self.mark_buffered_prompts_consumed(pending.len());
                             self.start_agent_worker(pending.join("\n\n"));
+                        }
+                    } else if self.agent_jobs.has_pending_deliveries() {
+                        // A job settled between the run's last drain and this
+                        // Finished event; deliver it now.
+                        let deliveries = self.agent_jobs.take_deliveries();
+                        if !deliveries.is_empty() {
+                            let prompt = crate::agent::format_job_deliveries(&deliveries);
+                            self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
+                                text: format!("Job settled: {}", deliveries[0].label),
+                                muted: true,
+                            }));
+                            self.start_agent_worker(prompt);
                         }
                     }
                 }
@@ -833,6 +890,8 @@ impl App {
             self.cancel_agent();
         }
         self.agent_terminal.terminate();
+        // Cancel jobs before the workspace reset removes their spill files.
+        self.agent_jobs.terminate();
         let had_saved_session = match self.storage.clear_agent_session() {
             Ok(had_saved_session) => had_saved_session,
             Err(error) => {

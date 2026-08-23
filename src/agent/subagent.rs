@@ -498,6 +498,9 @@ mod tests {
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,
+            auto_background: false,
+            auto_background_threshold_seconds: 60,
+            max_background_jobs: 15,
             supports_images: false,
         };
         let (events, _receiver) = tokio::sync::broadcast::channel(16);
@@ -541,6 +544,9 @@ mod tests {
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,
+            auto_background: false,
+            auto_background_threshold_seconds: 60,
+            max_background_jobs: 15,
             supports_images: true,
         };
         let (events, _receiver) = tokio::sync::broadcast::channel(16);

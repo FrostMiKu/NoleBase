@@ -280,12 +280,44 @@ impl TerminalSnapshot {
     }
 }
 
+/// A capped ring of the raw PTY output byte stream. Terminal watchers grep
+/// this original stream (ANSI escapes included) rather than the rendered grid.
+#[derive(Default)]
+pub struct RawTap {
+    bytes: std::collections::VecDeque<u8>,
+    base_offset: u64,
+}
+
+impl RawTap {
+    const CAPACITY: usize = 256 * 1024;
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend(chunk.iter().copied());
+        let overflow = self.bytes.len().saturating_sub(Self::CAPACITY);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+            self.base_offset += overflow as u64;
+        }
+    }
+
+    /// Bytes appended after `offset` (clamped to the retained window) and the
+    /// offset to resume from next time.
+    pub fn read_since(&self, offset: u64) -> (u64, Vec<u8>) {
+        let skip = offset
+            .saturating_sub(self.base_offset)
+            .min(self.bytes.len() as u64) as usize;
+        let data = self.bytes.iter().skip(skip).copied().collect();
+        (self.base_offset + self.bytes.len() as u64, data)
+    }
+}
+
 pub struct EmbeddedTerminal {
     master: Box<dyn MasterPty + Send>,
     writer: PtyWriter,
     child: Box<dyn Child + Send + Sync>,
     exited: bool,
     terminal: Arc<Mutex<TerminalCore>>,
+    raw_tap: Arc<Mutex<RawTap>>,
     size: PtySize,
 }
 
@@ -348,11 +380,13 @@ impl EmbeddedTerminal {
         let event_listener = PtyEventListener {
             writer: Arc::clone(&writer),
         };
+        let raw_tap = Arc::new(Mutex::new(RawTap::default()));
         let terminal = Arc::new(Mutex::new(Term::new(
             config,
             &terminal_size,
             event_listener,
         )));
+        let reader_tap = Arc::clone(&raw_tap);
         let reader_terminal = Arc::clone(&terminal);
         thread::spawn(move || {
             let mut buffer = [0_u8; 16 * 1024];
@@ -364,6 +398,12 @@ impl EmbeddedTerminal {
                         let mut terminal = reader_terminal
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        {
+                            let mut tap = reader_tap
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            tap.push(&buffer[..count]);
+                        }
                         parser.advance(&mut *terminal, &buffer[..count]);
                     }
                 }
@@ -376,6 +416,7 @@ impl EmbeddedTerminal {
             child,
             exited: false,
             terminal,
+            raw_tap,
             size,
         })
     }
@@ -403,6 +444,11 @@ impl EmbeddedTerminal {
         }
         self.size = size;
         Ok(())
+    }
+
+    /// The raw output stream tap for terminal watchers.
+    pub fn raw_tap(&self) -> Arc<Mutex<RawTap>> {
+        Arc::clone(&self.raw_tap)
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {

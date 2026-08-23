@@ -13,6 +13,7 @@ mod file_ops;
 mod file_patch;
 mod grep;
 mod interactive;
+mod jobs;
 mod notes_tags;
 pub(crate) mod read;
 mod review;
@@ -28,7 +29,7 @@ mod write_policy;
 
 pub use self::{
     attachment_ops::*, calculator::*, explore::*, file_ops::*, file_patch::*, grep::*,
-    interactive::*, notes_tags::*, read::*, review::*, shell::*, skills::*, wait::*, web::*,
-    wiki_links::*,
+    interactive::*, jobs::*, notes_tags::*, read::*, review::*, shell::*, skills::*, wait::*,
+    web::*, wiki_links::*,
 };
 pub(crate) use write_policy::REPAIR_REQUIRED_MARKER;

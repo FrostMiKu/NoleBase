@@ -110,7 +110,22 @@ pub enum AgentEvent {
         index: usize,
         id: Option<String>,
     },
+    /// A background job was registered and is now running.
+    JobStarted {
+        id: String,
+        label: String,
+    },
+    /// A background job settled (completed or failed) and its delivery frame
+    /// is queued for the conversation. Suppressed jobs (foreground race
+    /// acknowledgment, `job_wait`) never emit this.
+    JobSettled {
+        id: String,
+        failed: bool,
+    },
     BufferedInputConsumed(usize),
+    /// Job delivery frames were appended to the conversation at a round
+    /// boundary, while a run was active.
+    JobDelivered(Vec<String>),
     ToolStarted {
         id: String,
         message: String,

@@ -357,7 +357,7 @@ pub struct App {
     terminal_return_overlay: Option<Overlay>,
     terminal_return_dialog: Option<DialogState>,
     pub(crate) agent_terminal: crate::agent::AgentTerminalHandle,
-
+    pub(crate) agent_jobs: crate::agent::AgentJobsHandle,
     active_agent: Option<Observable<crate::agent::AgentRunOutput, AgentEvent>>,
     ai_approval_sender: Option<tokio::sync::mpsc::UnboundedSender<ApprovalDecision>>,
     ai_user_sender: Option<tokio::sync::mpsc::UnboundedSender<AskUserResponse>>,
@@ -462,6 +462,7 @@ impl App {
         let cancelled = Arc::new(AtomicBool::new(false));
         let agent_terminal = crate::agent::AgentTerminalHandle::default();
         let (event_sender, _) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
+        let agent_jobs = crate::agent::AgentJobsHandle::new(event_sender.clone());
         let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (private_terminal_input_sender, private_terminal_input_receiver) =
@@ -479,6 +480,7 @@ impl App {
                 cancelled.clone(),
             )
             .with_terminal(agent_terminal.clone())
+            .with_jobs(agent_jobs.clone())
             .with_workspace_index(workspace_index.clone())
             .with_wiki_link_index(wiki_links.clone()),
             attachment_usage.clone(),
@@ -598,6 +600,7 @@ impl App {
             terminal_return_overlay: None,
             terminal_return_dialog: None,
             agent_terminal,
+            agent_jobs,
             active_agent: None,
             ai_approval_sender: Some(approval_sender),
             ai_user_sender: Some(user_sender),

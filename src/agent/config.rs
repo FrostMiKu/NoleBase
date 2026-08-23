@@ -15,7 +15,8 @@ pub(crate) const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 pub(crate) const DEFAULT_MAX_CONCURRENT_LOCAL_READS: usize = 8;
 pub(crate) const DEFAULT_MAX_CONCURRENT_NETWORK_TOOLS: usize = 8;
 pub(crate) const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
-
+pub(crate) const DEFAULT_MAX_BACKGROUND_JOBS: usize = 15;
+pub(crate) const DEFAULT_AUTO_BACKGROUND_THRESHOLD_SECONDS: u64 = 60;
 #[derive(Clone)]
 pub(crate) struct ToolConcurrencyLimits {
     pub(crate) local_reads: Arc<tokio::sync::Semaphore>,
@@ -83,6 +84,18 @@ pub struct AgentConfig {
     pub max_concurrent_network_tools: usize,
     #[serde(default = "default_max_concurrent_subagents")]
     pub max_concurrent_subagents: usize,
+    /// Automatically convert long-running foreground `shell` commands into
+    /// background jobs once the foreground wait is exceeded. Mirrors omp's
+    /// `bash.autoBackground.enabled`.
+    #[serde(default = "default_auto_background")]
+    pub auto_background: bool,
+    /// How long an automatically backgrounded `shell` command is foreground-
+    /// waited before it converts into a background job.
+    #[serde(default = "default_auto_background_threshold_seconds")]
+    pub auto_background_threshold_seconds: u64,
+    /// Maximum concurrently running background jobs.
+    #[serde(default = "default_max_background_jobs")]
+    pub max_background_jobs: usize,
     /// Whether the configured model accepts native image input. Defaults to
     /// false; vision capability is never guessed from the model name or
     /// protocol, so the user must enable it explicitly for a vision-capable
@@ -113,6 +126,18 @@ const fn default_max_concurrent_network_tools() -> usize {
 
 const fn default_max_concurrent_subagents() -> usize {
     DEFAULT_MAX_CONCURRENT_SUBAGENTS
+}
+
+const fn default_auto_background() -> bool {
+    true
+}
+
+const fn default_auto_background_threshold_seconds() -> u64 {
+    DEFAULT_AUTO_BACKGROUND_THRESHOLD_SECONDS
+}
+
+const fn default_max_background_jobs() -> usize {
+    DEFAULT_MAX_BACKGROUND_JOBS
 }
 
 impl AgentConfig {
@@ -150,6 +175,12 @@ impl AgentConfig {
         }
         if config.max_concurrent_subagents == 0 {
             bail!("max_concurrent_subagents must be greater than zero");
+        }
+        if config.auto_background_threshold_seconds == 0 {
+            bail!("auto_background_threshold_seconds must be greater than zero");
+        }
+        if config.max_background_jobs == 0 {
+            bail!("max_background_jobs must be greater than zero");
         }
         Ok(config)
     }

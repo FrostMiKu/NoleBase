@@ -42,6 +42,7 @@ mod config;
 mod context;
 pub(crate) mod hashline;
 pub(crate) mod images;
+pub(crate) mod jobs;
 mod prompts;
 mod shell_helper;
 mod shell_policy;
@@ -58,6 +59,7 @@ pub(crate) use self::activity::*;
 pub(crate) use self::config::*;
 pub(crate) use self::context::*;
 pub(crate) use self::hashline::*;
+pub(crate) use self::jobs::*;
 pub(crate) use self::prompts::*;
 pub(crate) use self::shell_helper::*;
 pub(crate) use self::shell_policy::*;
@@ -144,6 +146,7 @@ pub struct AgentRuntime {
     permission_mode: Arc<AtomicU8>,
     cancelled: Arc<AtomicBool>,
     terminal: AgentTerminalHandle,
+    jobs: AgentJobsHandle,
     workspace_index: WorkspaceIndexHandle,
     wiki_links: crate::wiki_link_index::WikiLinkIndexHandle,
 }
@@ -159,13 +162,14 @@ impl AgentRuntime {
         cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            jobs: AgentJobsHandle::new(events.clone()),
             events,
             decisions: Arc::new(tokio::sync::Mutex::new(decisions)),
             user_responses: Arc::new(tokio::sync::Mutex::new(user_responses)),
             private_terminal_input: Arc::new(tokio::sync::Mutex::new(private_terminal_input)),
             input_buffer,
-            permission_mode,
             cancelled,
+            permission_mode,
             terminal: AgentTerminalHandle::default(),
             workspace_index: WorkspaceIndexHandle::default(),
             wiki_links: crate::wiki_link_index::WikiLinkIndexHandle::default(),
@@ -174,6 +178,11 @@ impl AgentRuntime {
 
     pub fn with_terminal(mut self, terminal: AgentTerminalHandle) -> Self {
         self.terminal = terminal;
+        self
+    }
+
+    pub fn with_jobs(mut self, jobs: AgentJobsHandle) -> Self {
+        self.jobs = jobs;
         self
     }
 
@@ -398,6 +407,7 @@ pub struct Agent {
     /// HTTP client shared with the read tools; used to resolve URL image
     /// sources with the exact same network policy as the read tool.
     client: Client,
+    jobs: AgentJobsHandle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -471,13 +481,27 @@ impl AgentWorker {
             let mut loaded_source: Option<AgentSource> = None;
             let mut agent: Option<Agent> = None;
 
-            while let Ok(AgentTask {
-                prompt,
-                conversation,
-                output,
-                cancel,
-            }) = receiver.recv()
-            {
+            loop {
+                // Sync task channel; while idle, wake at a coarse interval so
+                // short `block_on` cycles keep background job futures on the
+                // worker runtime advancing (downloads, settle notifications).
+                // Job completion itself is broadcast as an AgentEvent the App
+                // reacts to by starting a delivery run.
+                let task = match receiver.recv_timeout(Duration::from_millis(250)) {
+                    Ok(task) => task,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        async_runtime
+                            .block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let AgentTask {
+                    prompt,
+                    conversation,
+                    output,
+                    cancel,
+                } = task;
                 let mut conversation = conversation;
                 let result = (|| {
                     let source = AgentSource::load(&config_path, &nole_root)?;
@@ -655,6 +679,7 @@ impl Agent {
             permission_mode,
             cancelled,
             terminal,
+            jobs: jobs_handle,
             workspace_index,
             wiki_links,
         } = runtime;
@@ -691,6 +716,7 @@ impl Agent {
             user_responses: user_responses.clone(),
             input_buffer,
             cancelled: cancelled.clone(),
+            jobs: jobs_handle.clone(),
             concurrency,
             attachments,
             client: agent_client,
@@ -710,7 +736,26 @@ impl Agent {
         agent.register(LoadSkill::new(&skills));
         agent.register(Calculate);
         agent.register(Wait::new(cancelled.clone()));
-        agent.register(Shell::new(nole_root, gate.clone(), cancelled.clone()));
+        agent.register(Shell::new(
+            nole_root,
+            gate.clone(),
+            cancelled.clone(),
+            jobs_handle.clone().with_workspace(
+                crate::storage::Storage::new(nole_root)
+                    .map(|storage| storage.agent_workspace_dir())
+                    .unwrap_or_else(|_| nole_root.to_path_buf()),
+            ),
+            agent.input_buffer.clone(),
+            agent.config.auto_background,
+            agent.config.auto_background_threshold_seconds,
+        ));
+        agent.jobs.set_max_running(agent.config.max_background_jobs);
+        agent.register(Jobs::new(agent.jobs.clone()));
+        agent.register(JobWait::new(
+            agent.jobs.clone(),
+            cancelled.clone(),
+            agent.input_buffer.clone(),
+        ));
         agent.register(TerminalOpen::new(
             nole_root,
             gate.clone(),
@@ -722,7 +767,12 @@ impl Agent {
             terminal.clone(),
             cancelled.clone(),
         ));
-        agent.register(TerminalRead::new(terminal.clone(), cancelled.clone()));
+        agent.register(TerminalRead::new(
+            terminal.clone(),
+            cancelled.clone(),
+            agent.jobs.clone(),
+            agent.input_buffer.clone(),
+        ));
         agent.register(TerminalRequestPrivateInput {
             events: agent.events.clone(),
             responses: private_terminal_input,
@@ -731,7 +781,11 @@ impl Agent {
         });
         agent.register(TerminalClose::new(terminal));
         agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
-        agent.register(HttpRequest::new(nole_root, client.clone())?);
+        agent.register(HttpRequest::new(
+            nole_root,
+            client.clone(),
+            agent.jobs.clone(),
+        )?);
         agent.register(ListNotes::new(nole_root)?);
         agent.register(Grep::new(nole_root)?);
         agent.register(SearchFiles::new(nole_root)?);
@@ -865,13 +919,21 @@ impl Agent {
 
         loop {
             let buffered = self.take_buffered_prompts()?;
-            if !buffered.is_empty() {
+            let delivered = self.jobs.take_deliveries();
+            if !buffered.is_empty() || !delivered.is_empty() {
                 for raw_prompt in buffered {
                     let dated = prompt_with_datetime(&raw_prompt, Local::now());
                     let parsed =
                         parse_user_message(dated, &self.attachments, self.config.supports_images)
                             .await?;
                     append_user_parts(&mut conversation.messages, parsed.parts);
+                }
+                if !delivered.is_empty() {
+                    let frame = format_job_deliveries(&delivered);
+                    append_user_parts(&mut conversation.messages, Message::user(frame).parts);
+                    let _ = self.events.send(AgentEvent::JobDelivered(
+                        delivered.iter().map(|job| job.id.clone()).collect(),
+                    ));
                 }
                 self.checkpoint_conversation(conversation);
                 round = 0;

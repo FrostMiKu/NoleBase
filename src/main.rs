@@ -404,6 +404,7 @@ fn run(
         app.poll_export();
         needs_draw |= was_ai_running != app.ai_running || was_overlay != app.overlay;
         needs_draw |= app.agent_terminal.poll_monitor_change();
+        needs_draw |= app.agent_jobs.poll_change();
         let pending_bells = app.notifications.take_bells();
         if pending_bells > 0 {
             let mut output = io::stdout();

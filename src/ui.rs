@@ -14,6 +14,7 @@ mod document;
 mod files;
 mod footer;
 mod input;
+mod jobs;
 mod notification;
 mod search;
 #[cfg(test)]
@@ -30,8 +31,8 @@ use std::time::Instant;
 
 use self::{
     agent::*, attachments::*, chat::*, compose::*, daily::*, dialog::*, diff::*, document::*,
-    files::*, footer::*, input::*, notification::*, search::*, tags::*, terminal::*, todo::*,
-    util::*, views::*,
+    files::*, footer::*, input::*, jobs::*, notification::*, search::*, tags::*, terminal::*,
+    todo::*, util::*, views::*,
 };
 
 use chrono::{DateTime, Local, NaiveDate};
@@ -134,7 +135,7 @@ pub(crate) fn animations_active(app: &App, focused: bool) -> bool {
             || app.export_in_progress
             || app.overlay == Some(Overlay::Terminal)
             || app.agent_terminal.is_running()
-            || app.permission_mode == PermissionMode::Yolo
+            || app.agent_jobs.has_running()
             || app.focus == Focus::Compose
             || matches!(app.center_view, CenterView::Daily | CenterView::Tags))
 }
