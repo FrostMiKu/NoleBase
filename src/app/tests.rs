@@ -3481,6 +3481,42 @@ fn wheel_routes_by_layout_coordinates_not_focus() {
 }
 
 #[test]
+fn wheel_outside_an_open_overlay_scrolls_the_background() {
+    let (mut app, _directory) = make_app();
+    app.layout.center = Some(Rect::new(20, 0, 60, 20));
+    app.center_view = CenterView::Daily;
+    app.scroll = 4;
+    app.open_dialog(DialogState::new(
+        "Dialog",
+        "Pick one",
+        DialogMode::SingleSelect,
+        DialogPurpose::ThemePicker,
+        vec![DialogOption::new("one")],
+    ));
+    // The overlay occupies the top-left corner; the wheel lands outside it
+    // over the center pane.
+    app.layout.overlay = Some(Rect::new(0, 0, 10, 6));
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 30,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.scroll, 3);
+    assert!(app.overlay.is_some());
+
+    // Wheeling over the overlay itself still scrolls the dialog.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 5,
+        row: 3,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.dialog.as_ref().unwrap().scroll, 1);
+}
+
+#[test]
 fn todo_navigation_follows_grouped_display_order() {
     let (mut app, _directory) = make_app();
     app.todo_items = vec![

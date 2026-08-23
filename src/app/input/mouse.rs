@@ -5,6 +5,9 @@ use super::super::*;
 impl App {
     pub(in crate::app) fn route_wheel(&mut self, column: u16, row: u16, delta: i32) {
         if self.overlay.is_some() {
+            // Over the floating window itself: scroll the dialog. Outside
+            // it: fall through so the dimmed background panes stay
+            // scrollable while a dialog is open.
             if self.layout.overlay.is_none() || in_area(column, row, self.layout.overlay) {
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.scroll = if delta > 0 {
@@ -20,8 +23,8 @@ impl App {
                         _ => {}
                     }
                 }
+                return;
             }
-            return;
         }
         if matches!(
             self.files_context,
