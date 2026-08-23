@@ -2611,6 +2611,80 @@ fn ask_user_overlay_renders_choices_and_free_text_input() {
 }
 
 #[test]
+fn ask_user_long_options_wrap_instead_of_clipping() {
+    let (mut app, _directory) = make_app();
+    let long_option = "Refactor the storage layer to stream attachments instead of buffering whole files in memory";
+    app.ask_user_request = Some(crate::agent::AskUserRequest {
+        kind: AskUserKind::Tool,
+        question: "How should we fix the attachment pipeline?".to_string(),
+        options: vec![long_option.to_string(), "Ship as-is".to_string()],
+    });
+    app.ask_user_option = 0;
+    app.set_overlay(Overlay::AskUser);
+    let terminal = render(&mut app, 80, 24);
+    let screen = buffer_string(&terminal);
+
+    // Both the head and the tail of the wrapped answer are visible.
+    assert!(screen.contains("Refactor the storage"), "{screen}");
+    assert!(screen.contains("files in memory"), "{screen}");
+
+    let long = app
+        .dialog_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == 0)
+        .expect("long option hitbox");
+    let short = app
+        .dialog_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == 1)
+        .expect("short option hitbox");
+    let other = app
+        .dialog_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.index == 2)
+        .expect("other answer hitbox");
+    // A single-line option keeps the standard height; the wrapped one grows
+    // by its extra content rows, and later rows shift down accordingly.
+    assert_eq!(short.area.height, SELECT_OPTION_HEIGHT);
+    assert!(long.area.height > SELECT_OPTION_HEIGHT);
+    assert_eq!(
+        short.area.y,
+        long.area.y + long.area.height,
+        "items must stack without overlap"
+    );
+    assert_eq!(other.area.y, short.area.y + short.area.height);
+
+    // The shared selection indicator spans every row of the wrapped item.
+    let buffer = terminal.backend().buffer();
+    for y in long.area.y.saturating_sub(1)..long.area.y + long.area.height {
+        assert_eq!(buffer[(long.area.x, y)].symbol(), "▌");
+        assert_eq!(
+            buffer[(long.area.x + long.area.width - 1, y)].bg,
+            app.theme.selection_background
+        );
+    }
+}
+
+#[test]
+fn ask_user_wrapped_options_stay_selectable_by_keyboard() {
+    let (mut app, _directory) = make_app();
+    app.ask_user_request = Some(crate::agent::AskUserRequest {
+        kind: AskUserKind::Tool,
+        question: "Pick one".to_string(),
+        options: vec![
+            "A very long first option that will need to wrap across several rows in a narrow terminal window".to_string(),
+            "Second".to_string(),
+        ],
+    });
+    app.set_overlay(Overlay::AskUser);
+    render(&mut app, 60, 24);
+
+    assert_eq!(app.dialog.as_ref().unwrap().selected, 0);
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.dialog.as_ref().unwrap().selected, 1);
+}
+
+#[test]
 fn private_terminal_input_renders_only_a_mask() {
     let (mut app, _directory) = make_app();
     app.private_terminal_input_request = Some(PrivateTerminalInputRequest {

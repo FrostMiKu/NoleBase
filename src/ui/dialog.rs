@@ -207,6 +207,8 @@ pub(super) fn draw_dialog(
     } else {
         SELECT_OPTION_HEIGHT
     };
+    let option_heights = (dialog.purpose == DialogPurpose::AskUser)
+        .then(|| ask_user_option_heights(&dialog, text_width));
     let desired_height = match dialog.mode {
         DialogMode::Confirm => 5,
         DialogMode::SingleLine => 5,
@@ -214,16 +216,29 @@ pub(super) fn draw_dialog(
         DialogMode::FreeText => 11,
         DialogMode::SelectOrInput => message_rows
             .min(8)
-            .saturating_add(selection_list_height(
-                option_count.saturating_add(1),
-                SELECT_OPTION_HEIGHT,
-            ))
+            .saturating_add(match &option_heights {
+                Some(heights) => 1_u16
+                    .saturating_add(
+                        heights
+                            .iter()
+                            .fold(0_u16, |total, height| total.saturating_add(*height)),
+                    )
+                    .saturating_add(SELECT_OPTION_HEIGHT),
+                None => selection_list_height(option_count.saturating_add(1), SELECT_OPTION_HEIGHT),
+            })
             .saturating_add(4)
             .saturating_add(1)
             .saturating_add(2),
         DialogMode::SingleSelect | DialogMode::MultiSelect => message_rows
             .min(8)
-            .saturating_add(selection_list_height(option_count, select_option_height))
+            .saturating_add(match &option_heights {
+                Some(heights) => 1_u16.saturating_add(
+                    heights
+                        .iter()
+                        .fold(0_u16, |total, height| total.saturating_add(*height)),
+                ),
+                None => selection_list_height(option_count, select_option_height),
+            })
             .saturating_add(1)
             .saturating_add(2),
         DialogMode::Approval => approval_rows
@@ -725,30 +740,71 @@ pub(super) fn draw_select_dialog(
             message,
         );
     }
+    let text_width = options.width.saturating_sub(2) as usize;
+    let option_heights = (dialog.purpose == DialogPurpose::AskUser)
+        .then(|| ask_user_option_heights(dialog, text_width));
+    let item_offsets: Vec<u16> = match &option_heights {
+        Some(heights) => {
+            let mut offsets = Vec::with_capacity(heights.len() + 1);
+            let mut offset = 0_u16;
+            for height in heights {
+                offsets.push(offset);
+                offset = offset.saturating_add(*height);
+            }
+            offsets.push(offset);
+            offsets
+        }
+        None => Vec::new(),
+    };
     let visible_items = visible_selection_items(options.height, option_item_height);
-    let list_start = selection_viewport_start(
-        dialog.scroll as usize,
-        dialog.selected,
-        visible_items,
-        option_items,
-    );
+    let list_start = match &option_heights {
+        Some(heights) => {
+            let heights: Vec<usize> = heights.iter().map(|height| *height as usize).collect();
+            variable_selection_viewport_start(
+                dialog.scroll as usize,
+                dialog.selected,
+                &heights,
+                options.height.saturating_sub(1) as usize,
+            )
+        }
+        None => selection_viewport_start(
+            dialog.scroll as usize,
+            dialog.selected,
+            visible_items,
+            option_items,
+        ),
+    };
     if let Some(state) = app.dialog.as_mut() {
         state.scroll = u16::try_from(list_start).unwrap_or(u16::MAX);
     }
+    let base_y = options.y.saturating_add(1);
+    // Row offset of an item from the first list row; uniform lists multiply
+    // by the fixed item height, Ask-User lists use per-item wrapped heights.
+    let offset_of = |index: usize| -> u16 {
+        if !item_offsets.is_empty() {
+            return item_offsets
+                .get(index.saturating_sub(list_start))
+                .copied()
+                .unwrap_or_default();
+        }
+        u16::try_from(index.saturating_sub(list_start))
+            .unwrap_or(u16::MAX)
+            .saturating_mul(option_item_height)
+    };
     let options_end = options.y.saturating_add(options.height);
-    for (index, option) in dialog
-        .options
-        .iter()
-        .enumerate()
-        .skip(list_start)
-        .take(visible_items)
-    {
-        let row = index - list_start;
-        let y = selection_item_y(options, row, option_item_height);
+    for (index, option) in dialog.options.iter().enumerate() {
+        if index < list_start {
+            continue;
+        }
+        let y = base_y.saturating_add(offset_of(index));
         if y >= options_end {
             break;
         }
-        let item_height = option_item_height.min(options_end.saturating_sub(y));
+        let natural_height = option_heights
+            .as_ref()
+            .and_then(|heights| heights.get(index).copied())
+            .unwrap_or(option_item_height);
+        let item_height = natural_height.min(options_end.saturating_sub(y));
         let item_area = Rect::new(options.x, y, options.width, item_height);
         let selected = dialog.selected == index;
         let style = if selected {
@@ -779,13 +835,22 @@ pub(super) fn draw_select_dialog(
                 selection_area,
             );
         }
+        let text_height = if dialog.purpose == DialogPurpose::AskUser {
+            item_height
+        } else {
+            1
+        };
         let text_area = Rect::new(
             item_area.x.saturating_add(2),
             item_area.y,
             item_area.width.saturating_sub(2),
-            1,
+            text_height,
         );
-        if dialog.purpose == DialogPurpose::SkillBrowser {
+        if dialog.purpose == DialogPurpose::AskUser {
+            let rows = wrap_spans_to_width(&[Span::styled(label, style)], text_area.width as usize);
+            let lines = rows.into_iter().map(Line::from).collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), text_area);
+        } else if dialog.purpose == DialogPurpose::SkillBrowser {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(label, style))),
                 text_area,
@@ -831,6 +896,7 @@ pub(super) fn draw_select_dialog(
             });
         }
     }
+
     if has_input && input.height > 0 {
         let custom_selected = dialog.selected >= dialog.options.len();
         let input_block = Block::default()
@@ -851,9 +917,8 @@ pub(super) fn draw_select_dialog(
             *cursor_position = Some(position);
         }
         let other_index = dialog.options.len();
-        if other_index >= list_start && other_index < list_start + visible_items {
-            let row = other_index - list_start;
-            let y = selection_item_y(options, row, SELECT_OPTION_HEIGHT);
+        let y = base_y.saturating_add(offset_of(other_index));
+        if other_index >= list_start && y < options_end {
             let item_height = SELECT_OPTION_HEIGHT.min(options_end.saturating_sub(y));
             let item_area = Rect::new(options.x, y, options.width, item_height);
             let selection_area =
@@ -907,6 +972,19 @@ pub(super) fn draw_select_dialog(
         _ => "↑↓ choose · Enter open · Esc cancel",
     };
     draw_dialog_footer(frame, footer, footer_text, app.theme);
+}
+/// Per-option rows for Ask-User dialogs: wrapped label rows plus one
+/// separator row so long answers wrap instead of clipping.
+fn ask_user_option_heights(dialog: &DialogState, text_width: usize) -> Vec<u16> {
+    dialog
+        .options
+        .iter()
+        .map(|option| {
+            let spans = [Span::raw(option.label.clone())];
+            let rows = wrap_spans_to_width(&spans, text_width).len().max(1) as u16;
+            rows.saturating_add(1)
+        })
+        .collect()
 }
 
 pub(super) fn help_lines(theme: Theme) -> Vec<Line<'static>> {
