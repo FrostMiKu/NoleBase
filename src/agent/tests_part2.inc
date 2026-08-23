@@ -629,7 +629,9 @@
         assert!(prompt.contains("MEMORY.md"));
         assert!(prompt.contains("persistent Agent memory"));
         assert!(prompt.contains("durable user preferences"));
-        assert!(prompt.contains("Do not store secrets"));
+        assert!(prompt.contains(
+            "Its full contents are already provided in your Memory section, so never read it back"
+        ));
     }
 
     #[test]
