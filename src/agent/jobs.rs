@@ -325,9 +325,10 @@ impl AgentJobsHandle {
         };
         if let Some(delivery) = delivery {
             self.enqueue(delivery);
-        } else {
-            self.notify_settled(id, false);
         }
+        // A settlement without a delivery was suppressed: the foreground
+        // race or an active `job_wait` already owns the outcome, so it must
+        // stay silent instead of emitting JobSettled.
     }
 
     /// Lift a suppression. A job that settled while suppressed has its
@@ -654,6 +655,24 @@ mod tests {
         assert!(!jobs.has_pending_deliveries());
         jobs.resume(&started.id);
         assert!(!jobs.has_pending_deliveries());
+    }
+
+    #[test]
+    fn suppressed_settlement_stays_silent() {
+        let (events, mut receiver) = event_channel();
+        let jobs = AgentJobsHandle::new(events);
+        let started = jobs.start_raced(JobKind::Shell, "build").unwrap();
+        // The foreground race consumed the outcome inline and never resumes
+        // the job, so settling while suppressed must neither deliver a frame
+        // nor emit JobSettled.
+        jobs.settle(&started.id, Ok("inline".to_string()));
+        assert!(!jobs.has_pending_deliveries());
+        while let Ok(event) = receiver.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::JobSettled { .. }),
+                "suppressed settlement emitted JobSettled"
+            );
+        }
     }
 
     #[test]
