@@ -217,7 +217,12 @@ impl App {
                     }
                 }
                 AgentEvent::ToolStarted { id, message } => {
-                    let index = if let Some(index) = self.active_agent_tools.get(&id).copied() {
+                    let index = if let Some(index) = self
+                        .active_agent_tools
+                        .get(&id)
+                        .copied()
+                        .or_else(|| self.stranded_preparation_index())
+                    {
                         if let Some(AgentPanelEntry::Tool {
                             text,
                             active,
@@ -246,11 +251,15 @@ impl App {
                     message,
                     preview,
                 } => {
-                    let index = self.active_agent_tools.remove(&id).or_else(|| {
-                        self.agent_panel.iter().rposition(|entry| {
-                            matches!(entry.as_ref(), AgentPanelEntry::Tool { active: true, .. })
-                        })
-                    });
+                    let index = self
+                        .active_agent_tools
+                        .remove(&id)
+                        .or_else(|| self.stranded_preparation_index())
+                        .or_else(|| {
+                            self.agent_panel.iter().rposition(|entry| {
+                                matches!(entry.as_ref(), AgentPanelEntry::Tool { active: true, .. })
+                            })
+                        });
                     let entry = index.and_then(|index| self.agent_panel.get_mut(index));
                     if let Some(entry) = entry {
                         if let AgentPanelEntry::Tool {
@@ -872,6 +881,22 @@ impl App {
             .push(Arc::new(AgentPanelEntry::Error("Cancelled".to_string())));
         self.notifications.notify("Agent task cancelled");
         self.set_status("Agent task cancelled");
+    }
+
+    /// Panel index of an unclaimed preparation row: a streamed tool call
+    /// whose id was lost between the streaming preview and execution, so no
+    /// `ToolStarted`/`ToolFinished` event can address it through the maps.
+    fn stranded_preparation_index(&self) -> Option<usize> {
+        self.agent_panel.iter().rposition(|entry| {
+            matches!(
+                entry.as_ref(),
+                AgentPanelEntry::Tool {
+                    active: false,
+                    text,
+                    ..
+                } if text.starts_with("Preparing")
+            )
+        })
     }
 
     fn deactivate_agent_tools(&mut self) {

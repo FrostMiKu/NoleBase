@@ -1807,6 +1807,79 @@ fn streamed_tool_preparation_updates_one_entry_and_hands_it_to_execution() {
 }
 
 #[test]
+fn tool_started_adopts_a_stranded_preparation_entry_when_the_id_chain_breaks() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md · 3 lines · 38 B\n…+revised".to_string(),
+        })
+        .unwrap();
+    // The streamed tool call carried no id, so the preparation row is
+    // deactivated without ever being registered under a tool-use id.
+    sender
+        .send(AgentEvent::ToolPreparationFinished { index: 0, id: None })
+        .unwrap();
+    app.poll_agent();
+    let preparation_entry = Arc::as_ptr(&app.agent_panel[0]);
+
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "call_edit".to_string(),
+            message: "Calling Edit...\ndata/Note.md".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "call_edit".to_string(),
+            message: "Completed Edit.\ndata/Note.md".to_string(),
+            preview: None,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert_eq!(Arc::as_ptr(&app.agent_panel[0]), preparation_entry);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: false, .. }
+            if text == "Completed Edit.\ndata/Note.md"
+    ));
+}
+
+#[test]
+fn tool_finished_adopts_a_stranded_preparation_entry_without_a_started_event() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparationFinished { index: 0, id: None })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "call_edit".to_string(),
+            message: "Denied Edit.".to_string(),
+            preview: None,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: false, .. } if text == "Denied Edit."
+    ));
+}
+
+#[test]
 fn thinking_events_build_and_finish_thinking_entries() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
