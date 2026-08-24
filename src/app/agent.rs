@@ -362,6 +362,11 @@ impl App {
                 }
                 AgentEvent::Retry => {
                     self.agent_retry_count = self.agent_retry_count.saturating_add(1);
+                    // The retried attempt re-streams its tool calls with
+                    // fresh ids and reuses stream indexes, so preparation
+                    // rows left by the failed attempt can never be claimed
+                    // again. The retain also shifts panel indices, which
+                    // would leave both index maps pointing at wrong rows.
                     self.agent_panel.retain(|entry| {
                         !matches!(
                             entry.as_ref(),
@@ -372,8 +377,10 @@ impl App {
                                 streaming: true,
                                 ..
                             }
-                        )
+                        ) && !Self::is_unclaimed_preparation(entry)
                     });
+                    self.preparing_agent_tools.clear();
+                    self.active_agent_tools.clear();
                 }
                 AgentEvent::Round { current, limit } => {
                     self.agent_round = current;
@@ -474,6 +481,11 @@ impl App {
                 AgentEvent::Finished(result) => {
                     self.active_agent = None;
                     self.deactivate_agent_tools();
+                    // A finished run executes none of the tool calls it was
+                    // still streaming, so unclaimed preparation rows are
+                    // dropped instead of lingering above the outcome row.
+                    self.agent_panel
+                        .retain(|entry| !Self::is_unclaimed_preparation(entry));
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
                         self.ai_cancel = None;
@@ -901,6 +913,16 @@ impl App {
                 } if text.starts_with("Preparing")
             )
         })
+    }
+
+    /// A preparation row whose request attempt was abandoned: the retry
+    /// re-issues tool ids and a finished run executes nothing, so no later
+    /// event can ever claim this row.
+    fn is_unclaimed_preparation(entry: &AgentPanelEntry) -> bool {
+        matches!(
+            entry,
+            AgentPanelEntry::Tool { text, .. } if text.starts_with("Preparing")
+        )
     }
 
     fn deactivate_agent_tools(&mut self) {

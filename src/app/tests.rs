@@ -1880,6 +1880,156 @@ fn tool_finished_adopts_a_stranded_preparation_entry_without_a_started_event() {
 }
 
 #[test]
+fn retry_reclaims_preparation_rows_for_the_retried_attempt() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    // The failed attempt streams an edit preparation; the thinking row
+    // above it is pruned by the retry, shifting panel indices.
+    sender
+        .send(AgentEvent::ThinkingDelta("partial thought".to_string()))
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md · 25 lines · 1.3 KB".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparationFinished {
+            index: 0,
+            id: Some("call_edit_first".to_string()),
+        })
+        .unwrap();
+    sender.send(AgentEvent::Retry).unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_retry_count, 1);
+    assert!(app.agent_panel.is_empty());
+    assert!(app.preparing_agent_tools.is_empty());
+    assert!(app.active_agent_tools.is_empty());
+
+    // The retried attempt re-streams the same call under a fresh id and
+    // must render it as the same single entry through execution.
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md · 25 lines · 1.3 KB".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparationFinished {
+            index: 0,
+            id: Some("call_edit_retry".to_string()),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "call_edit_retry".to_string(),
+            message: "Calling Edit...\ndata/Note.md".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "call_edit_retry".to_string(),
+            message: "Failed Edit: old_string did not match any file content".to_string(),
+            preview: None,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: false, .. }
+            if text == "Failed Edit: old_string did not match any file content"
+    ));
+}
+
+#[test]
+fn retry_drops_a_preparation_row_whose_stream_died_before_an_id_arrived() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md · 25 lines · 1.3 KB".to_string(),
+        })
+        .unwrap();
+    sender.send(AgentEvent::Retry).unwrap();
+    app.poll_agent();
+
+    assert!(app.agent_panel.is_empty());
+    assert!(app.preparing_agent_tools.is_empty());
+
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md · 25 lines · 1.3 KB".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparationFinished {
+            index: 0,
+            id: Some("call_edit_retry".to_string()),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolStarted {
+            id: "call_edit_retry".to_string(),
+            message: "Calling Edit...\ndata/Note.md".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "call_edit_retry".to_string(),
+            message: "Completed Edit.".to_string(),
+            preview: None,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: false, .. } if text == "Completed Edit."
+    ));
+}
+
+#[test]
+fn failed_run_drops_unclaimed_preparation_rows() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparationFinished {
+            index: 0,
+            id: Some("call_edit".to_string()),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::Finished(Err("network unavailable".to_string())))
+        .unwrap();
+    app.poll_agent();
+
+    assert!(app
+        .agent_panel
+        .iter()
+        .all(|entry| !matches!(entry.as_ref(), AgentPanelEntry::Tool { .. })));
+    assert!(app
+        .agent_panel
+        .iter()
+        .any(|entry| matches!(entry.as_ref(), AgentPanelEntry::Error(message) if message.contains("network unavailable"))));
+}
+
+#[test]
 fn thinking_events_build_and_finish_thinking_entries() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
