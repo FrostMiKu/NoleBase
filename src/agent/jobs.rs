@@ -539,10 +539,14 @@ fn truncate_result(state: &mut JobState, id: &str, text: &str) -> (String, Optio
         .workspace
         .as_ref()
         .and_then(|workspace| write_spill(workspace, id, text));
+    let mut limit = INLINE_RESULT_LIMIT;
+    while !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
     let inline = format!(
         "{}\n\n[Output truncated; showing the first {} characters.{}]",
-        &text[..INLINE_RESULT_LIMIT],
-        INLINE_RESULT_LIMIT,
+        &text[..limit],
+        limit,
         spill
             .as_ref()
             .map(|path| format!(" Full output: {}", path.display()))
@@ -722,6 +726,19 @@ mod tests {
         let deliveries = jobs.take_deliveries();
         assert!(deliveries[0].result.contains("Output truncated"));
         assert!(deliveries[0].result.contains("jobs"));
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let jobs = handle();
+        let started = jobs.start_background(JobKind::Shell, "utf8").unwrap();
+        let big = "意".repeat(INLINE_RESULT_LIMIT / 3 + 10);
+        assert!(big.len() > INLINE_RESULT_LIMIT);
+        jobs.settle(&started.id, Ok(big));
+        let deliveries = jobs.take_deliveries();
+        let result = &deliveries[0].result;
+        assert!(result.contains("Output truncated"));
+        assert!(result.is_char_boundary(result.find("[Output truncated").unwrap()));
     }
 
     #[test]
