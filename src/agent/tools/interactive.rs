@@ -373,9 +373,21 @@ mod tests {
         assert!(!result.contains("length"));
 
         let cancelled = AtomicBool::new(false);
-        let observation = terminal
-            .wait_for_change(&session_id, Duration::from_secs(2), &cancelled)
-            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // A single change can be an intermediate redraw, so keep polling
+        // until the final status actually renders or the deadline passes.
+        let observation = loop {
+            let observation = terminal
+                .wait_for_change(&session_id, Duration::from_millis(100), &cancelled)
+                .unwrap();
+            if observation["screen"]
+                .as_str()
+                .is_some_and(|screen| screen.contains("authenticated"))
+                || std::time::Instant::now() >= deadline
+            {
+                break observation;
+            }
+        };
         assert!(observation["screen"]
             .as_str()
             .is_some_and(|screen| screen.contains("authenticated")));
