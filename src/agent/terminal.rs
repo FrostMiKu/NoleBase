@@ -775,11 +775,13 @@ mod tests {
         assert!(terminal.monitor_snapshot(INITIAL_COLS).is_some());
         assert!(terminal.poll_monitor_change());
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_running = false;
         loop {
             let observation = terminal.observation(&exited).unwrap();
             if observation["status"] == "exited 7" {
                 break;
             }
+            saw_running = true;
             assert!(
                 Instant::now() < deadline,
                 "terminal did not exit: {observation}"
@@ -793,7 +795,19 @@ mod tests {
         );
         assert!(!terminal.is_running());
         assert!(terminal.monitor_snapshot(INITIAL_COLS).is_none());
-        assert!(terminal.poll_monitor_change());
+        // The exit surfaces as exactly one monitor change, but which call
+        // observes it is racy: the poll above may fold in the transition when
+        // the process dies fast enough, so require a pending change only when
+        // the exit was first seen through an observation, and always require
+        // polling to be quiet afterward.
+        if saw_running {
+            assert!(
+                terminal.poll_monitor_change(),
+                "the exit must surface as a monitor change"
+            );
+        } else {
+            terminal.poll_monitor_change();
+        }
         assert!(!terminal.poll_monitor_change());
         let replacement = terminal
             .open_process_for_test(directory.path(), "exit 0")
