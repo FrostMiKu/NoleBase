@@ -1317,10 +1317,13 @@ impl Agent {
         }
 
         let mut compacted_any = false;
+        // Token counts can drift below what the real request is charged,
+        // so only trust counts that clear the budget with slack to spare.
+        let safety_margin = input_budget.saturating_mul(CONTEXT_COUNT_SAFETY_MARGIN_PERCENT) / 100;
         for _ in 0..MAX_CONTEXT_COMPACTIONS_PER_ROUND {
             self.ensure_active()?;
             let input_tokens = self.count_input_tokens(messages, definitions).await?;
-            if input_tokens < input_budget {
+            if input_tokens.saturating_add(safety_margin) < input_budget {
                 return Ok(compacted_any);
             }
 

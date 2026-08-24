@@ -251,6 +251,64 @@
             .contains("the current turn cannot be compacted safely"));
     }
 
+    /// Builds `[user "go", assistant filler]` whose estimated request size
+    /// lands at `target` tokens, for driving conversations into specific
+    /// bands of the input budget.
+    fn conversation_estimating(agent: &Agent, target: u64) -> Vec<Message> {
+        let base = estimate_request_tokens(&agent.system, &[Message::user("go")], &[]);
+        let filler = "z".repeat(usize::try_from(3 * target.saturating_sub(base)).unwrap());
+        vec![
+            Message::user("go"),
+            Message::assistant(vec![MessagePart::Text { text: filler }]),
+        ]
+    }
+
+    #[test]
+    fn compaction_starts_inside_the_safety_margin_below_budget() {
+        let agent = small_budget_agent();
+        let budget = agent.input_token_budget();
+        let margin = budget * CONTEXT_COUNT_SAFETY_MARGIN_PERCENT / 100;
+        let mut messages = conversation_estimating(&agent, budget - margin / 2);
+
+        let estimate = estimate_request_tokens(&agent.system, &messages, &[]);
+        assert!(estimate < budget, "estimate {estimate} should stay in budget");
+        assert!(
+            estimate + margin >= budget,
+            "estimate {estimate} should sit inside the safety margin"
+        );
+
+        // Below budget but inside the margin, compaction must engage; with
+        // no safe cut and nothing truncatable it reports the failure instead
+        // of silently sending an over-budget request.
+        let error = agent
+            .compact_context_if_needed(&mut messages, &[])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("the current turn cannot be compacted safely"));
+    }
+
+    #[test]
+    fn compaction_skips_conversations_clearing_the_margin() {
+        let agent = small_budget_agent();
+        let budget = agent.input_token_budget();
+        let margin = budget * CONTEXT_COUNT_SAFETY_MARGIN_PERCENT / 100;
+        let gate = budget * CONTEXT_COUNT_THRESHOLD_PERCENT / 100;
+        let mut messages = conversation_estimating(&agent, gate + (budget - margin - gate) / 2);
+
+        let estimate = estimate_request_tokens(&agent.system, &messages, &[]);
+        assert!(estimate >= gate, "estimate {estimate} should pass the gate");
+        assert!(
+            estimate + margin < budget,
+            "estimate {estimate} should clear the safety margin"
+        );
+
+        assert!(!agent
+            .compact_context_if_needed(&mut messages, &[])
+            .unwrap());
+        assert_eq!(messages.len(), 2);
+    }
+
     #[test]
     fn agent_conversation_is_clearable() {
         let mut conversation = AgentConversation::default();
