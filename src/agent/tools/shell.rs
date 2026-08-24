@@ -1114,6 +1114,7 @@ mod terminal_watch_tests {
         assert!(sample_payload("never", b"other").is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminal_read_wait_for_converts_to_background_job() {
         use crate::agent::{AgentTerminalHandle, JobStatus};
