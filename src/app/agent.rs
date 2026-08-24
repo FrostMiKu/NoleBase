@@ -73,25 +73,27 @@ impl App {
                     if delta.is_empty() {
                         continue;
                     }
-                    match self.agent_panel.last_mut() {
-                        Some(entry)
-                            if matches!(
-                                entry.as_ref(),
-                                AgentPanelEntry::Assistant {
-                                    streaming: true,
-                                    ..
-                                }
-                            ) =>
-                        {
-                            if let AgentPanelEntry::Assistant { text, .. } = Arc::make_mut(entry) {
-                                text.push_str(&delta);
+                    // Buffered prompts push a Prompt entry on top of the
+                    // panel mid-run, so stream events must address their
+                    // block by its streaming flag, not by the panel tail.
+                    if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
+                        matches!(
+                            entry.as_ref(),
+                            AgentPanelEntry::Assistant {
+                                streaming: true,
+                                ..
                             }
+                        )
+                    }) {
+                        if let AgentPanelEntry::Assistant { text, .. } = Arc::make_mut(entry) {
+                            text.push_str(&delta);
                         }
-                        _ => self.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
+                    } else {
+                        self.agent_panel.push(Arc::new(AgentPanelEntry::Assistant {
                             text: delta,
                             streaming: true,
                             final_output: false,
-                        })),
+                        }));
                     }
                 }
                 AgentEvent::AssistantMessageFinished { text, final_output } => {
@@ -136,24 +138,25 @@ impl App {
                     if delta.is_empty() {
                         continue;
                     }
-                    match self.agent_panel.last_mut() {
-                        Some(entry)
-                            if matches!(
-                                entry.as_ref(),
-                                AgentPanelEntry::Thinking {
-                                    streaming: true,
-                                    ..
-                                }
-                            ) =>
-                        {
-                            if let AgentPanelEntry::Thinking { text, .. } = Arc::make_mut(entry) {
-                                text.push_str(&delta);
+                    // See the AssistantDelta handler: a buffered Prompt
+                    // entry may sit above the still-streaming block.
+                    if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
+                        matches!(
+                            entry.as_ref(),
+                            AgentPanelEntry::Thinking {
+                                streaming: true,
+                                ..
                             }
+                        )
+                    }) {
+                        if let AgentPanelEntry::Thinking { text, .. } = Arc::make_mut(entry) {
+                            text.push_str(&delta);
                         }
-                        _ => self.agent_panel.push(Arc::new(AgentPanelEntry::Thinking {
+                    } else {
+                        self.agent_panel.push(Arc::new(AgentPanelEntry::Thinking {
                             text: delta,
                             streaming: true,
-                        })),
+                        }));
                     }
                 }
                 AgentEvent::ThinkingFinished => {
@@ -486,7 +489,8 @@ impl App {
                         }
                         Err(error) => {
                             for entry in &mut self.agent_panel {
-                                if let AgentPanelEntry::Assistant { streaming, .. } =
+                                if let AgentPanelEntry::Assistant { streaming, .. }
+                                | AgentPanelEntry::Thinking { streaming, .. } =
                                     Arc::make_mut(entry)
                                 {
                                     *streaming = false;

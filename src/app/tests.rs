@@ -1908,6 +1908,71 @@ fn thinking_events_build_and_finish_thinking_entries() {
 }
 
 #[test]
+fn buffered_prompt_keeps_thinking_stream_in_its_original_block() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ThinkingDelta("First thought".to_string()))
+        .unwrap();
+    app.poll_agent();
+
+    app.buffer_agent_prompt("guidance".to_string(), "guidance".to_string());
+    sender
+        .send(AgentEvent::ThinkingDelta(", continued".to_string()))
+        .unwrap();
+    sender.send(AgentEvent::ThinkingFinished).unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 2);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Thinking { text, streaming: false }
+            if text == "First thought, continued"
+    ));
+    assert!(matches!(
+        app.agent_panel[1].as_ref(),
+        AgentPanelEntry::Prompt {
+            text,
+            muted: true,
+        } if text == "guidance"
+    ));
+}
+
+#[test]
+fn buffered_prompt_keeps_assistant_stream_in_its_original_block() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::AssistantDelta("Partial reply".to_string()))
+        .unwrap();
+    app.poll_agent();
+
+    app.buffer_agent_prompt("guidance".to_string(), "guidance".to_string());
+    sender
+        .send(AgentEvent::AssistantDelta(" finished".to_string()))
+        .unwrap();
+    sender
+        .send(AgentEvent::AssistantMessageFinished {
+            text: "Partial reply finished".to_string(),
+            final_output: true,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 2);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Assistant {
+            text,
+            streaming: false,
+            final_output: true,
+        } if text == "Partial reply finished"
+    ));
+}
+
+#[test]
 fn agent_effort_label_follows_the_ai_config_file() {
     let (mut app, _directory) = make_app();
     // ensure_files writes the default template, which pins effort = "high".
