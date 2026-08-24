@@ -929,54 +929,55 @@ impl Tool for Write {
 /// the ancestor chain is followed.
 fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
     let path = Path::new(input);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("path must not contain `..`");
+    }
     let absolute = path.is_absolute();
-    let mut existing = if absolute {
-        PathBuf::from(Component::RootDir.as_os_str())
+    // Walk the real path so Windows drive/UNC prefixes resolve against the
+    // target location instead of the process working directory.
+    let full = if absolute {
+        path.to_path_buf()
     } else {
-        root.to_path_buf()
+        root.join(path)
     };
-    let mut missing = Vec::new();
-    let mut missing_started = false;
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::Prefix(_) | Component::CurDir => continue,
-            Component::ParentDir => bail!("path must not contain `..`"),
-            Component::Normal(_) => {}
-        }
-        if missing_started {
-            missing.push(component.as_os_str().to_os_string());
-            continue;
-        }
-        let candidate = existing.join(component.as_os_str());
-        match fs::symlink_metadata(&candidate) {
+    let mut deepest_existing = None;
+    let mut ancestors: Vec<&Path> = full.ancestors().collect();
+    ancestors.reverse();
+    for ancestor in &ancestors {
+        match fs::symlink_metadata(ancestor) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
                     bail!("refusing to create a directory through a symlink");
                 }
-                existing = candidate;
+                deepest_existing = Some(ancestor);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing_started = true;
-                missing.push(component.as_os_str().to_os_string());
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(error) => {
-                return Err(error).with_context(|| format!("checking {}", candidate.display()));
+                return Err(error).with_context(|| format!("checking {}", ancestor.display()));
             }
         }
     }
-    if missing.is_empty() {
+    let existing =
+        deepest_existing.with_context(|| format!("checking {}", full.display()))?;
+    if *existing == full {
         bail!("destination already exists: {input}");
     }
-    let canonical = fs::canonicalize(&existing)
+    let canonical = fs::canonicalize(existing)
         .with_context(|| format!("resolving parent directory {}", existing.display()))?;
     if !absolute && !canonical.starts_with(root) {
         bail!("path escapes the Nole root");
     }
-    let mut path = canonical;
-    for part in missing {
-        path.push(part);
+    let mut resolved = canonical;
+    for component in full.strip_prefix(existing)?.components() {
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        resolved.push(component.as_os_str());
     }
-    Ok(path)
+    Ok(resolved)
 }
 
 pub struct Mkdir {

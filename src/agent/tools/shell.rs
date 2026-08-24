@@ -983,6 +983,7 @@ mod tests {
         let _ = receiver.try_recv();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn race_returns_inline_when_command_finishes_fast() {
         let directory = tempfile::tempdir().unwrap();
@@ -1011,6 +1012,7 @@ mod tests {
         assert!(!jobs.has_pending_deliveries());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn race_backgrounds_when_threshold_expires() {
         let directory = tempfile::tempdir().unwrap();
@@ -1041,6 +1043,7 @@ mod tests {
         assert!(jobs.cancel(job));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn race_backgrounds_early_on_buffered_prompt() {
         let directory = tempfile::tempdir().unwrap();
