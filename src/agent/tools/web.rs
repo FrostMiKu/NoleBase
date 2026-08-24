@@ -1130,7 +1130,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn background_requires_save_to() {
         let (_directory, root) = fresh_root();
-        let (url, handle) = server(vec![ok_response(b"x".to_vec(), None)]);
+        let (url, _handle) = server(vec![ok_response(b"x".to_vec(), None)]);
         let error = http_request(&root)
             .execute(&json!({"url": url, "background": true}))
             .await

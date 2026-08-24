@@ -502,7 +502,7 @@ mod tests {
         let user_path = write_skill(&user, "user-skill", "User");
         let roots = vec![workspace.clone(), user.clone()];
 
-        let (root, validated) = locate_managed_skill(&roots, &user_path).unwrap();
+        let (_root, validated) = locate_managed_skill(&roots, &user_path).unwrap();
         assert_eq!(
             validated.parent().unwrap().parent().unwrap(),
             fs::canonicalize(&user).unwrap()
