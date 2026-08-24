@@ -373,6 +373,9 @@ pub struct App {
     active_agent_tools: HashMap<String, usize>,
     pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
+    /// Scroll offset of the Agent statistics panel's job list, clamped by the
+    /// renderer against the panel's content height.
+    pub agent_stats_scroll: usize,
     pub(crate) agent_follow_tail: bool,
     pub(crate) show_full_thinking: bool,
     pub agent_usage: TokenUsage,
@@ -615,6 +618,7 @@ impl App {
             active_agent_tools: HashMap::new(),
             agent_vlist: AgentVirtualList::default(),
             agent_scroll,
+            agent_stats_scroll: 0,
             agent_follow_tail,
             show_full_thinking,
             agent_usage,

@@ -2510,6 +2510,39 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
 }
 
 #[test]
+fn agent_statistics_panel_keys_scroll_the_job_list() {
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Chat;
+    app.focus = Focus::Agent;
+    app.agent_stats_scroll = 3;
+
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.agent_stats_scroll, 4);
+    app.handle_key(key(KeyCode::PageDown));
+    assert_eq!(app.agent_stats_scroll, 12);
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.agent_stats_scroll, 11);
+    app.handle_key(key(KeyCode::PageUp));
+    assert_eq!(app.agent_stats_scroll, 3);
+    app.handle_key(key(KeyCode::Up));
+    app.handle_key(key(KeyCode::Up));
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.agent_stats_scroll, 0);
+    // One more Up at the top hands focus back to the center, mirroring the
+    // output panel's escape hatch.
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.focus, Focus::Center);
+
+    // Outside the chat view the same keys keep scrolling the output panel.
+    app.focus = Focus::Agent;
+    app.center_view = CenterView::Daily;
+    app.agent_scroll = 2;
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.agent_scroll, 3);
+    assert_eq!(app.agent_stats_scroll, 0);
+}
+
+#[test]
 fn uppercase_c_cancels_work_and_clears_the_agent_session() {
     let (mut app, _directory) = make_app();
     let cancelled = Arc::new(AtomicBool::new(false));

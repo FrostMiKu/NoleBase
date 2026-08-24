@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::*;
 
-pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -103,9 +103,6 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
     ];
     let mut lines = vec![Line::default()];
     for (label, value) in rows {
-        if lines.len() >= inner.height as usize {
-            break;
-        }
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{label:<8}"),
@@ -113,11 +110,59 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(value, Style::default().fg(app.theme.text_primary)),
         ]));
-        if lines.len() < inner.height as usize {
-            lines.push(Line::default());
-        }
+        lines.push(Line::default());
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    append_job_summary(app, &mut lines, inner.width);
+    let height = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = app.agent_stats_scroll.min(max_scroll);
+    app.agent_stats_scroll = scroll;
+    let visible = lines[scroll..(scroll + height).min(lines.len())].to_vec();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+/// Append the background-job section after the fixed statistics rows: one
+/// summary row, then one line per job naming what it runs via its label.
+/// Running jobs list first; settled ones stay until their retention expires.
+fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
+    use crate::agent::JobStatus;
+
+    let mut job_rows = app.agent_jobs.rows();
+    if job_rows.is_empty() {
+        return;
+    }
+    job_rows.sort_by_key(|row| row.status.is_settled());
+    let mut counts = [(0usize, "running"), (0, "done"), (0, "failed"), (0, "cancelled")];
+    for row in &job_rows {
+        let slot = match row.status {
+            JobStatus::Running => &mut counts[0],
+            JobStatus::Done => &mut counts[1],
+            JobStatus::Failed => &mut counts[2],
+            JobStatus::Cancelled => &mut counts[3],
+        };
+        slot.0 += 1;
+    }
+    let summary = counts
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, name)| format!("{count} {name}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<8}", "Jobs"),
+            Style::default().fg(app.theme.text_muted),
+        ),
+        Span::styled(summary, Style::default().fg(app.theme.text_primary)),
+    ]));
+    for row in &job_rows {
+        let (marker, style) = job_marker(row.status, app.animation_tick, &app.theme);
+        let prefix = format!("{marker} {} · ", row.kind.as_str());
+        let suffix = format!(" · {}", format_job_elapsed(row));
+        let label_budget = usize::from(width).saturating_sub(prefix.width() + suffix.width());
+        let label = truncate_job_label(&row.label, label_budget);
+        lines.push(Line::styled(format!("{prefix}{label}{suffix}"), style));
+    }
 }
 
 pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {

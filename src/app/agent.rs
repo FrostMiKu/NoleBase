@@ -37,6 +37,33 @@ impl App {
         };
     }
 
+    pub(in crate::app) fn scroll_agent_stats_by(&mut self, delta: i32) {
+        self.agent_stats_scroll = if delta > 0 {
+            self.agent_stats_scroll.saturating_add(delta as usize)
+        } else {
+            self.agent_stats_scroll
+                .saturating_sub(delta.unsigned_abs() as usize)
+        };
+    }
+
+    /// Scroll whichever agent view is on screen: the statistics panel while
+    /// the center shows chat, the output panel otherwise.
+    pub(in crate::app) fn scroll_agent_view_by(&mut self, delta: i32) {
+        if self.center_view == CenterView::Chat {
+            self.scroll_agent_stats_by(delta);
+        } else {
+            self.scroll_agent_by(delta);
+        }
+    }
+
+    pub(in crate::app) fn agent_view_at_top(&self) -> bool {
+        if self.center_view == CenterView::Chat {
+            self.agent_stats_scroll == 0
+        } else {
+            self.agent_scroll == 0
+        }
+    }
+
     pub fn poll_agent(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -962,6 +989,7 @@ impl App {
             buffer.clear();
         }
         self.agent_scroll = 0;
+        self.agent_stats_scroll = 0;
         self.agent_follow_tail = false;
         self.agent_usage = TokenUsage::default();
         self.agent_context_window = 0;

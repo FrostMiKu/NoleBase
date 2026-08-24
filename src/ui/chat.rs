@@ -404,6 +404,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::agent::JobKind;
     use crate::agent_session::{AgentPanelEntry, TokenUsage};
     use crate::storage::Storage;
 
@@ -819,6 +820,78 @@ mod tests {
         assert_eq!(state_y, statistics_area.y + 2);
         assert_eq!(effort_y, state_y + 2);
         assert_eq!(context_y, effort_y + 2);
+    }
+
+    #[test]
+    fn chat_statistics_lists_background_jobs_below_the_stat_rows() {
+        let (mut app, _directory) = make_app();
+        open_chat(&mut app);
+        app.agent_jobs
+            .start_background(JobKind::Shell, "cargo build --release")
+            .unwrap();
+        app.agent_jobs
+            .start_background(JobKind::Download, "model.bin <- example.com")
+            .unwrap();
+        let test_run = app
+            .agent_jobs
+            .start_background(JobKind::Shell, "npm test")
+            .unwrap();
+        app.agent_jobs
+            .settle(&test_run.id, Ok("all passed".to_string()));
+
+        // A tall terminal keeps the whole panel, including the trailing job
+        // section, inside the statistics viewport.
+        let terminal = render(&mut app, 180, 60);
+        let statistics_area = app.layout.agent.expect("statistics panel");
+        let statistics = area_text(&terminal, statistics_area);
+        let (_, retries_y) = find_text(&terminal, "Retries");
+        let (_, jobs_y) = find_text(&terminal, "Jobs");
+
+        assert!(statistics.contains("2 running · 1 done"));
+        assert!(statistics.contains("shell · cargo build --release"));
+        assert!(statistics.contains("download · model.bin <- example.com"));
+        assert!(statistics.contains("✓ shell · npm test"));
+        // The job section sits after every fixed statistics row.
+        assert!(jobs_y > retries_y);
+        assert!(app.agent_jobs.has_running());
+    }
+
+    #[test]
+    fn chat_statistics_job_list_scrolls_when_content_overflows() {
+        let (mut app, _directory) = make_app();
+        open_chat(&mut app);
+        app.agent_jobs.set_max_running(64);
+        for index in 0..40 {
+            app.agent_jobs
+                .start_background(JobKind::Shell, &format!("job-{index:02}"))
+                .unwrap();
+        }
+
+        // Jobs list newest-first, so the oldest job sits on the very last
+        // line: it stays hidden until the panel is scrolled to the bottom.
+        let terminal = render(&mut app, 180, 40);
+        let statistics_area = app.layout.agent.expect("statistics panel");
+        assert!(area_text(&terminal, statistics_area).contains("State"));
+        assert!(
+            !area_text(&terminal, statistics_area).contains("job-00"),
+            "the overflowing job tail must be hidden until scrolled"
+        );
+
+        app.agent_stats_scroll = usize::MAX;
+        let terminal = render(&mut app, 180, 40);
+        let statistics = area_text(&terminal, statistics_area);
+        assert!(
+            statistics.contains("job-00"),
+            "the job tail must be reachable by scrolling"
+        );
+        assert!(
+            !statistics.contains("State"),
+            "scrolling to the bottom hides the leading statistics rows"
+        );
+        assert!(
+            app.agent_stats_scroll < usize::MAX,
+            "the renderer clamps the scroll offset to the content height"
+        );
     }
 
     #[test]

@@ -32,19 +32,11 @@ pub(super) fn draw_agent_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
         .style(Style::default().bg(app.theme.surface_panel));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let spinner = spinner_frame(app.animation_tick);
     let label_budget = inner.width.saturating_sub(16) as usize;
     let lines: Vec<Line> = rows
         .iter()
         .map(|row| {
-            let (marker, style) = match row.status {
-                JobStatus::Running => (spinner, Style::default().fg(app.theme.ui_action_ai)),
-                JobStatus::Done => ('✓', Style::default().fg(app.theme.ui_task_done)),
-                JobStatus::Failed | JobStatus::Cancelled => {
-                    ('✗', Style::default().fg(app.theme.ui_error))
-                }
-            };
-            let marker = marker.to_string();
+            let (marker, style) = job_marker(row.status, app.animation_tick, &app.theme);
             Line::styled(
                 format!(
                     "{marker} {} · {} · {}",
@@ -59,7 +51,25 @@ pub(super) fn draw_agent_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn format_job_elapsed(row: &JobRow) -> String {
+/// Shared status marker for job rows: a spinner while running, an outcome
+/// glyph once settled, paired with its theme color.
+pub(super) fn job_marker(status: JobStatus, tick: u64, theme: &Theme) -> (String, Style) {
+    match status {
+        JobStatus::Running => (
+            spinner_frame(tick).to_string(),
+            Style::default().fg(theme.ui_action_ai),
+        ),
+        JobStatus::Done => (
+            '✓'.to_string(),
+            Style::default().fg(theme.ui_task_done),
+        ),
+        JobStatus::Failed | JobStatus::Cancelled => {
+            ('✗'.to_string(), Style::default().fg(theme.ui_error))
+        }
+    }
+}
+
+pub(super) fn format_job_elapsed(row: &JobRow) -> String {
     let seconds = row.elapsed.as_secs();
     if seconds < 60 {
         format!("{seconds}s")
@@ -68,7 +78,7 @@ fn format_job_elapsed(row: &JobRow) -> String {
     }
 }
 
-fn truncate_job_label(label: &str, width: usize) -> String {
+pub(super) fn truncate_job_label(label: &str, width: usize) -> String {
     if UnicodeWidthStr::width(label) <= width {
         return label.to_string();
     }

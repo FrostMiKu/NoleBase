@@ -241,24 +241,26 @@ impl App {
                 self.focus = Focus::Center;
                 None
             }
-            code if is_up_key(code) && self.agent_scroll == 0 => {
+            // While chat holds the center, the sidebar shows the statistics
+            // panel, so vertical keys scroll it instead of the output list.
+            code if is_up_key(code) && self.agent_view_at_top() => {
                 self.focus = Focus::Center;
                 None
             }
             code if is_up_key(code) => {
-                self.scroll_agent_by(-1);
+                self.scroll_agent_view_by(-1);
                 None
             }
             code if is_down_key(code) => {
-                self.scroll_agent_by(1);
+                self.scroll_agent_view_by(1);
                 None
             }
             KeyCode::PageUp => {
-                self.scroll_agent_by(-i32::from(AGENT_PAGE_STEP));
+                self.scroll_agent_view_by(-i32::from(AGENT_PAGE_STEP));
                 None
             }
             KeyCode::PageDown => {
-                self.scroll_agent_by(i32::from(AGENT_PAGE_STEP));
+                self.scroll_agent_view_by(i32::from(AGENT_PAGE_STEP));
                 None
             }
             KeyCode::Char('c') if self.ai_running => {
