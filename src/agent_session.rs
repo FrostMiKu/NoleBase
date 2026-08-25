@@ -7,6 +7,13 @@ use crate::provider::Message;
 #[serde(deny_unknown_fields)]
 pub struct AgentConversation {
     pub(crate) messages: Vec<Message>,
+    /// Input tokens (cache-inclusive) the provider billed for the most recent
+    /// request on this conversation. Runtime observation for compaction, not
+    /// conversation content: never persisted, starts at zero after a restore,
+    /// and the local estimate covers the gap until the next request reports a
+    /// real figure.
+    #[serde(skip)]
+    pub(crate) last_request_input_tokens: u64,
 }
 
 impl AgentConversation {
@@ -20,6 +27,7 @@ impl AgentConversation {
     pub(crate) fn seeded_for_test() -> Self {
         Self {
             messages: vec![Message::user("previous prompt")],
+            last_request_input_tokens: 0,
         }
     }
 }
@@ -184,6 +192,7 @@ impl AgentSession {
         (
             AgentConversation {
                 messages: self.messages,
+                last_request_input_tokens: 0,
             },
             panel,
             self.usage,

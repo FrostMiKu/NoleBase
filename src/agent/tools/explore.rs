@@ -133,10 +133,6 @@ mod tests {
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
         }
-
-        fn count_tokens<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
-            Box::pin(async { Ok(None) })
-        }
     }
 
     fn response(parts: Vec<MessagePart>, stop_reason: StopReason) -> AssistantMessage {

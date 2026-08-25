@@ -249,10 +249,6 @@ impl Provider for CompletionsProvider {
             cancel,
         }
     }
-
-    fn count_tokens<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
-        Box::pin(async { Ok(None) })
-    }
 }
 
 #[derive(Default)]

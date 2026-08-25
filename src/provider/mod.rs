@@ -377,7 +377,6 @@ pub trait Provider: Send + Sync {
         &self,
         request: ProviderRequest,
     ) -> Observable<AssistantMessage, ProviderEvent>;
-    fn count_tokens<'a>(&'a self, request: ProviderRequest) -> BoxFuture<'a, Option<u64>>;
 }
 
 pub(crate) fn tool_input_error(reason: impl std::fmt::Display) -> String {

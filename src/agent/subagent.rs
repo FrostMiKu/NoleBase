@@ -431,10 +431,6 @@ mod tests {
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
         }
-
-        fn count_tokens<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
-            Box::pin(async { Ok(None) })
-        }
     }
 
     struct FlakyProvider {
@@ -463,10 +459,6 @@ mod tests {
                 events: receiver,
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
-        }
-
-        fn count_tokens<'a>(&'a self, _request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
-            Box::pin(async { Ok(None) })
         }
     }
 

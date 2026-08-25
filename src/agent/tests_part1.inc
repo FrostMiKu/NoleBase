@@ -230,7 +230,7 @@
             }),
         ];
         let compacted = agent
-            .compact_context_if_needed(&mut messages, &[])
+            .compact_context_if_needed(&mut messages, 0, &[])
             .unwrap();
         assert!(compacted);
         let healed = stored_tool_result(&messages[2]);
@@ -248,7 +248,7 @@
             }]),
         ];
         let error = agent
-            .compact_context_if_needed(&mut messages, &[])
+            .compact_context_if_needed(&mut messages, 0, &[])
             .unwrap_err();
         assert!(error
             .to_string()
@@ -285,7 +285,7 @@
         // no safe cut and nothing truncatable it reports the failure instead
         // of silently sending an over-budget request.
         let error = agent
-            .compact_context_if_needed(&mut messages, &[])
+            .compact_context_if_needed(&mut messages, 0, &[])
             .unwrap_err();
         assert!(error
             .to_string()
@@ -297,20 +297,103 @@
         let agent = small_budget_agent();
         let budget = agent.input_token_budget();
         let margin = budget * CONTEXT_COUNT_SAFETY_MARGIN_PERCENT / 100;
-        let gate = budget * CONTEXT_COUNT_THRESHOLD_PERCENT / 100;
-        let mut messages = conversation_estimating(&agent, gate + (budget - margin - gate) / 2);
+        let mut messages = conversation_estimating(&agent, budget * 4 / 5);
 
         let estimate = estimate_request_tokens(&agent.system, &messages, &[]);
-        assert!(estimate >= gate, "estimate {estimate} should pass the gate");
         assert!(
             estimate + margin < budget,
             "estimate {estimate} should clear the safety margin"
         );
 
         assert!(!agent
-            .compact_context_if_needed(&mut messages, &[])
+            .compact_context_if_needed(&mut messages, 0, &[])
             .unwrap());
         assert_eq!(messages.len(), 2);
+    }
+
+    /// A provider whose `call` answers every request (compaction summaries)
+    /// with the same text while counting the calls.
+    struct SummarizingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::provider::Provider for SummarizingProvider {
+        fn call<'a>(
+            &'a self,
+            _request: crate::provider::ProviderRequest,
+        ) -> crate::observable::BoxFuture<'a, AssistantMessage> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(AssistantMessage {
+                    message: Message::assistant(vec![MessagePart::Text {
+                        text: "mock summary".to_string(),
+                    }]),
+                    stop_reason: StopReason::End,
+                    token_usage: TokenUsage::default(),
+                    generation_duration: Duration::ZERO,
+                    tool_input_errors: HashMap::new(),
+                })
+            })
+        }
+
+        fn call_streaming(
+            &self,
+            _request: crate::provider::ProviderRequest,
+        ) -> crate::observable::Observable<AssistantMessage, crate::provider::ProviderEvent>
+        {
+            unreachable!("compaction tests never stream")
+        }
+    }
+
+    #[test]
+    fn compaction_engages_on_reported_usage_despite_low_estimate() {
+        let mut agent = small_budget_agent();
+        let budget = agent.input_token_budget();
+        let margin = budget * CONTEXT_COUNT_SAFETY_MARGIN_PERCENT / 100;
+        // A conversation whose local estimate sits well below the margin...
+        let mut messages = conversation_estimating(&agent, budget * 3 / 5);
+        messages.push(Message::user("latest request"));
+        let estimate = estimate_request_tokens(&agent.system, &messages, &[]);
+        assert!(
+            estimate + margin < budget,
+            "estimate {estimate} should sit well below the margin"
+        );
+        // ...while the provider billed the previous request for nearly the
+        // whole budget: the character estimate must not silence compaction,
+        // and the cut must keep the latest user turn verbatim.
+        let reported = budget - margin / 2;
+        let provider = Arc::new(SummarizingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        agent.provider = provider.clone();
+
+        let compacted = agent
+            .compact_context_if_needed(&mut messages, reported, &[])
+            .unwrap();
+        assert!(compacted);
+        // The pre-compaction turns are replaced by one summary message and
+        // exactly one summarization happens: the stale reported figure must
+        // not loop the compaction.
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(messages.len(), 2);
+        let summary = messages[0].text();
+        assert!(summary.contains("Context summary from earlier turns"));
+        assert!(summary.contains("mock summary"));
+        assert_eq!(messages[1].text(), "latest request");
+    }
+
+    #[test]
+    fn compaction_idles_when_estimate_and_reported_usage_stay_low() {
+        let agent = small_budget_agent();
+        let budget = agent.input_token_budget();
+        let mut messages = conversation_estimating(&agent, budget * 3 / 5);
+        messages.push(Message::user("latest request"));
+
+        assert!(!agent
+            .compact_context_if_needed(&mut messages, budget * 3 / 5, &[])
+            .unwrap());
+        assert_eq!(messages.len(), 3);
     }
 
     #[test]
@@ -2793,7 +2876,7 @@
             ),
         )
         .unwrap();
-        let mut messages = vec![Message::user_parts(vec![MessagePart::Image(ImageBlock {
+        let messages = vec![Message::user_parts(vec![MessagePart::Image(ImageBlock {
             source: ImageSource::LocalFile {
                 path: directory.path().join("missing.png"),
             },
@@ -2804,11 +2887,8 @@
             bytes: None,
         })])];
 
-        let count = test_runtime()
-            .block_on(agent.count_input_tokens(&mut messages, &[]))
-            .unwrap();
-
-        assert!(count > 0);
+        let estimate = estimate_request_tokens(&agent.system, &messages, &[]);
+        assert!(estimate > 0);
         assert!(matches!(
             &messages[0].parts[0],
             MessagePart::Image(block) if block.bytes.is_none()

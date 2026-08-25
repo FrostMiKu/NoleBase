@@ -2,12 +2,12 @@
 
 use crate::provider::{Message, MessagePart, MessageRole, SystemBlock, ToolSpec};
 
-pub(crate) const CONTEXT_COUNT_THRESHOLD_PERCENT: u64 = 75;
-pub(crate) const CONTEXT_COMPACTION_TARGET_PERCENT: u64 = 50;
-/// Counted input tokens this far below the budget still trigger
-/// compaction: token counts can drift below what the real request is
-/// charged, so a count just under the budget is not safe to trust.
+/// Observed input tokens (the larger of the local estimate and the input the
+/// provider billed for the previous request) this far below the budget still
+/// trigger compaction: the next request only grows the conversation, so a
+/// figure just under the budget is not safe to trust.
 pub(crate) const CONTEXT_COUNT_SAFETY_MARGIN_PERCENT: u64 = 10;
+pub(crate) const CONTEXT_COMPACTION_TARGET_PERCENT: u64 = 50;
 pub(crate) const CONTEXT_ESTIMATE_OVERHEAD: u64 = 1_024;
 pub(crate) const MAX_CONTEXT_COMPACTIONS_PER_ROUND: usize = 3;
 /// Share of the per-request input budget a single tool result may occupy.

@@ -936,7 +936,11 @@ impl Agent {
             self.ensure_active()?;
             let _ = self.events.send(AgentEvent::Round { current: round });
             if self
-                .compact_context_if_needed(&mut conversation.messages, definitions)
+                .compact_context_if_needed(
+                    &mut conversation.messages,
+                    conversation.last_request_input_tokens,
+                    definitions,
+                )
                 .await?
             {
                 self.checkpoint_conversation(conversation);
@@ -944,6 +948,10 @@ impl Agent {
             let response = self
                 .request_message(&mut conversation.messages, definitions)
                 .await?;
+            let reported_input_tokens = response.token_usage.total_input();
+            if reported_input_tokens > 0 {
+                conversation.last_request_input_tokens = reported_input_tokens;
+            }
             let content = response.message.parts.clone();
             let stop_reason = response.stop_reason.clone();
             let tool_uses = response.message.tool_calls().cloned().collect::<Vec<_>>();
@@ -1260,26 +1268,39 @@ impl Agent {
     async fn compact_context_if_needed(
         &self,
         messages: &mut Vec<Message>,
+        reported_input_tokens: u64,
         definitions: &[ToolSpec],
     ) -> Result<bool> {
         let input_budget = self.input_token_budget();
-        let count_threshold = input_budget.saturating_mul(CONTEXT_COUNT_THRESHOLD_PERCENT) / 100;
-        if estimate_request_tokens(&self.system, messages, definitions) < count_threshold {
+        // The character estimate drifts from what the provider actually
+        // charges — in either direction — so the provider-billed input from
+        // the previous request keeps a low estimate from silently disabling
+        // compaction while the sidebar already reads 100%.
+        let observed =
+            estimate_request_tokens(&self.system, messages, definitions).max(reported_input_tokens);
+        // The observed figure is also not safe to trust just under the
+        // budget: the next request only grows the conversation, so engage
+        // once it stops clearing the budget with the safety margin consumed.
+        let safety_margin = input_budget.saturating_mul(CONTEXT_COUNT_SAFETY_MARGIN_PERCENT) / 100;
+        if observed.saturating_add(safety_margin) < input_budget {
             return Ok(false);
         }
 
         let mut compacted_any = false;
-        // Token counts can drift below what the real request is charged,
-        // so only trust counts that clear the budget with slack to spare.
-        let safety_margin = input_budget.saturating_mul(CONTEXT_COUNT_SAFETY_MARGIN_PERCENT) / 100;
+        let target = input_budget.saturating_mul(CONTEXT_COMPACTION_TARGET_PERCENT) / 100;
         for _ in 0..MAX_CONTEXT_COMPACTIONS_PER_ROUND {
-            self.ensure_active()?;
-            let input_tokens = self.count_input_tokens(messages, definitions).await?;
-            if input_tokens.saturating_add(safety_margin) < input_budget {
-                return Ok(compacted_any);
+            // The reported figure still describes the pre-compaction request,
+            // so only the estimate can say whether another pass is needed; a
+            // reported-driven trigger (estimate low) is done after one pass
+            // because the real size only comes back with the next request.
+            if compacted_any
+                && estimate_request_tokens(&self.system, messages, definitions)
+                    .saturating_add(safety_margin)
+                    < input_budget
+            {
+                break;
             }
-
-            let target = input_budget.saturating_mul(CONTEXT_COMPACTION_TARGET_PERCENT) / 100;
+            self.ensure_active()?;
             let cut = match context_compaction_cut_for_request(
                 &self.system,
                 messages,
@@ -1297,7 +1318,7 @@ impl Agent {
                         continue;
                     }
                     bail!(
-                        "context needs {input_tokens} input tokens but the configured budget is {input_budget}; the current turn cannot be compacted safely"
+                        "context needs {observed} observed input tokens but the configured budget is {input_budget}; the current turn cannot be compacted safely"
                     );
                 }
             };
@@ -1311,48 +1332,13 @@ impl Agent {
             compacted_any = true;
         }
 
-        let input_tokens = self.count_input_tokens(messages, definitions).await?;
-        if input_tokens >= input_budget {
+        let estimate = estimate_request_tokens(&self.system, messages, definitions);
+        if estimate >= input_budget {
             bail!(
-                "context remains at {input_tokens} input tokens after compaction; configured budget is {input_budget}"
+                "context remains at {estimate} estimated input tokens after compaction; configured budget is {input_budget}"
             );
         }
         Ok(compacted_any)
-    }
-
-    async fn count_input_tokens(
-        &self,
-        messages: &mut [Message],
-        definitions: &[ToolSpec],
-    ) -> Result<u64> {
-        if !self.config.supports_images
-            && messages
-                .iter()
-                .flat_map(|message| &message.parts)
-                .any(|part| matches!(part, MessagePart::Image(_)))
-        {
-            bail!("{DISABLED_IMAGE_ERROR}");
-        }
-        if self.config.api_format == ApiFormat::Completions {
-            return Ok(estimate_request_tokens(&self.system, messages, definitions));
-        }
-        // Messages has an exact count endpoint and therefore needs resolved
-        // pixels. Completions has no count endpoint and stays on the metadata-
-        // only estimate above, avoiding unnecessary source reads.
-        prepare_provider_messages(messages, &self.attachments, &self.client).await?;
-        let request = ProviderRequest {
-            model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
-            effort: self.config.effort,
-            system: self.system.clone(),
-            messages: messages.to_vec(),
-            tools: definitions.to_vec(),
-        };
-        Ok(self
-            .provider
-            .count_tokens(request)
-            .await?
-            .unwrap_or_else(|| estimate_request_tokens(&self.system, messages, definitions)))
     }
 
     async fn summarize_context(&self, messages: &[Message]) -> Result<String> {
@@ -1427,7 +1413,10 @@ impl Agent {
                         message: tool_deferred_activity(&tool_call_value(call)),
                         preview: None,
                     });
-                    (index + offset, ToolCallOutput::text(deferred_tool_result(call)))
+                    (
+                        index + offset,
+                        ToolCallOutput::text(deferred_tool_result(call)),
+                    )
                 }));
                 break;
             }

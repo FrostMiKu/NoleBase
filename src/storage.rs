@@ -2382,6 +2382,7 @@ mod tests {
         let first = AgentSession::from_parts(
             &AgentConversation {
                 messages: vec![crate::provider::Message::user("first")],
+                last_request_input_tokens: 0,
             },
             &[AgentPanelEntry::Prompt {
                 text: "first".to_string(),
@@ -2397,6 +2398,7 @@ mod tests {
         let second = AgentSession::from_parts(
             &AgentConversation {
                 messages: vec![crate::provider::Message::user("second")],
+                last_request_input_tokens: 0,
             },
             &[AgentPanelEntry::Assistant {
                 text: "second reply".to_string(),

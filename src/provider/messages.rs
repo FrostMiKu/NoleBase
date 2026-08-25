@@ -44,10 +44,6 @@ impl MessagesProvider {
         format!("{}/v1/messages", self.base_url)
     }
 
-    fn count_url(&self) -> String {
-        format!("{}/v1/messages/count_tokens", self.base_url)
-    }
-
     fn body(request: &ProviderRequest, stream: bool) -> Result<Value> {
         let mut body = json!({
             "model": request.model,
@@ -238,40 +234,6 @@ impl Provider for MessagesProvider {
             events,
             cancel,
         }
-    }
-
-    fn count_tokens<'a>(&'a self, request: ProviderRequest) -> BoxFuture<'a, Option<u64>> {
-        Box::pin(async move {
-            let body = Self::body(&request, false)?;
-            let request_body = json!({
-                "model": request.model,
-                "system": body["system"],
-                "messages": body["messages"],
-                "tools": body["tools"],
-            });
-            let cancel = CancellationToken::new();
-            let response = self
-                .send(&self.count_url(), &request_body, None, &cancel)
-                .await?;
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .context("reading Messages token count response")?;
-            if matches!(status.as_u16(), 404 | 405 | 501) {
-                return Ok(None);
-            }
-            if !status.is_success() {
-                bail!(
-                    "Messages token counting returned {status}: {}",
-                    error_message(&text)
-                );
-            }
-            Ok(serde_json::from_str::<Value>(&text)
-                .context("decoding Messages token count response")?
-                .get("input_tokens")
-                .and_then(Value::as_u64))
-        })
     }
 }
 
