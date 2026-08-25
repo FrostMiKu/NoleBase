@@ -1809,6 +1809,49 @@ fn tool_started_adopts_a_stranded_preparation_entry_when_the_id_chain_breaks() {
 }
 
 #[test]
+fn deferred_tool_finished_retires_the_spinning_preparation_entry() {
+    let (mut app, _directory) = make_app();
+    let sender = install_agent_observable(&mut app);
+    app.ai_running = true;
+    sender
+        .send(AgentEvent::ToolPreparing {
+            index: 0,
+            message: "Preparing Edit...\ndata/Note.md · 3 lines · 38 B\n…+revised".to_string(),
+        })
+        .unwrap();
+    sender
+        .send(AgentEvent::ToolPreparationFinished {
+            index: 0,
+            id: Some("call_edit".to_string()),
+        })
+        .unwrap();
+    app.poll_agent();
+    let preparation_entry = Arc::as_ptr(&app.agent_panel[0]);
+    assert_eq!(app.status, "Preparing Edit...");
+
+    // Buffered user input defers the call before execution: the batch emits
+    // ToolFinished directly, which must retire the spinning preparation row
+    // and clear the stale status instead of leaving both hung.
+    sender
+        .send(AgentEvent::ToolFinished {
+            id: "call_edit".to_string(),
+            message: "Deferred Edit.\ndata/Note.md".to_string(),
+            preview: None,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    assert_eq!(app.agent_panel.len(), 1);
+    assert_eq!(Arc::as_ptr(&app.agent_panel[0]), preparation_entry);
+    assert!(matches!(
+        app.agent_panel[0].as_ref(),
+        AgentPanelEntry::Tool { text, active: false, .. }
+            if text == "Deferred Edit.\ndata/Note.md"
+    ));
+    assert_eq!(app.status, "Deferred Edit.\ndata/Note.md");
+}
+
+#[test]
 fn tool_finished_adopts_a_stranded_preparation_entry_without_a_started_event() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);

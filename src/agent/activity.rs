@@ -97,6 +97,22 @@ pub(crate) fn tool_finish_activity(call: &Value, error: Option<&str>) -> String 
     }
 }
 
+pub(crate) fn tool_deferred_activity(call: &Value) -> String {
+    let name = tool_display_name(call.get("name").and_then(Value::as_str).unwrap_or(""));
+    let target = tool_activity_target(call)
+        .map(|target| format!("\n{target}"))
+        .unwrap_or_default();
+    format!("Deferred {name}.{target}")
+}
+
+pub(crate) fn tool_skipped_activity(call: &Value) -> String {
+    let name = tool_display_name(call.get("name").and_then(Value::as_str).unwrap_or(""));
+    let target = tool_activity_target(call)
+        .map(|target| format!("\n{target}"))
+        .unwrap_or_default();
+    format!("Skipped {name}.{target}")
+}
+
 pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
     let name = call.get("name").and_then(Value::as_str).unwrap_or("");
     let input = call.get("input")?;

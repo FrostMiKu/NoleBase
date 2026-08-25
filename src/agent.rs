@@ -1419,10 +1419,15 @@ impl Agent {
             if !pending.is_empty() {
                 buffered.extend(pending);
                 outputs.extend(tool_uses[index..].iter().enumerate().map(|(offset, call)| {
-                    (
-                        index + offset,
-                        ToolCallOutput::text(deferred_tool_result(call)),
-                    )
+                    // The call never executes, so no ToolStarted/ToolFinished
+                    // pair will arrive from the executor: retire its streamed
+                    // preparation row here or it spins forever.
+                    let _ = self.events.send(AgentEvent::ToolFinished {
+                        id: call.id.clone(),
+                        message: tool_deferred_activity(&tool_call_value(call)),
+                        preview: None,
+                    });
+                    (index + offset, ToolCallOutput::text(deferred_tool_result(call)))
                 }));
                 break;
             }
@@ -1462,6 +1467,13 @@ impl Agent {
             }
             if denied {
                 outputs.extend(tool_uses[end..].iter().enumerate().map(|(offset, call)| {
+                    // Skipped without execution: retire the preparation row
+                    // the same way the deferral path does.
+                    let _ = self.events.send(AgentEvent::ToolFinished {
+                        id: call.id.clone(),
+                        message: tool_skipped_activity(&tool_call_value(call)),
+                        preview: None,
+                    });
                     (
                         end + offset,
                         ToolCallOutput::text(skipped_after_denial_tool_result(call)),

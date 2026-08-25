@@ -2698,7 +2698,7 @@
         let input_buffer = Arc::new(Mutex::new(vec!["Hold on".to_string()]));
         let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (event_sender, _event_receiver) = event_channel();
+        let (event_sender, mut event_receiver) = event_channel();
         let mut agent = Agent::from_config(
             &storage.ai_config_path,
             &storage.root,
@@ -2752,6 +2752,18 @@
             .iter()
             .flat_map(|message| &message.parts)
             .all(|part| !matches!(part, MessagePart::Image(_))));
+        // The deferred call never executes, so the batch itself must retire
+        // its streamed preparation row: a ToolFinished arrives with a
+        // "Deferred" activity instead of leaving the row spinning forever.
+        let events = drain_events(&mut event_receiver);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolFinished { id, message, .. }
+                    if id == "a" && message.starts_with("Deferred Image Probe A")
+            )),
+            "deferred call must emit a Deferred ToolFinished, got: {events:?}"
+        );
     }
 
     #[test]
