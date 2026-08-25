@@ -59,10 +59,7 @@ pub(super) fn job_marker(status: JobStatus, tick: u64, theme: &Theme) -> (String
             spinner_frame(tick).to_string(),
             Style::default().fg(theme.ui_action_ai),
         ),
-        JobStatus::Done => (
-            '✓'.to_string(),
-            Style::default().fg(theme.ui_task_done),
-        ),
+        JobStatus::Done => ('✓'.to_string(), Style::default().fg(theme.ui_task_done)),
         JobStatus::Failed | JobStatus::Cancelled => {
             ('✗'.to_string(), Style::default().fg(theme.ui_error))
         }

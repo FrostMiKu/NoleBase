@@ -675,7 +675,7 @@ mod tests {
     fn workspace() -> (tempfile::TempDir, PathBuf) {
         let directory = tempdir().unwrap();
         let root = directory.path().join("root");
-        fs::create_dir_all(root.join("workspace/main")).unwrap();
+        fs::create_dir_all(root.join("workspace")).unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
         fs::create_dir(root.join("config")).unwrap();
         (directory, root)
@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn tag_mismatch_is_rejected() {
         let (_directory, root) = workspace();
-        let raw = root.join("workspace/main/note.md");
+        let raw = root.join("workspace/note.md");
         fs::write(&raw, "line\n").unwrap();
         let path = fs::canonicalize(&raw).unwrap();
         let reads = Arc::new(SnapshotStore::default());
@@ -851,7 +851,7 @@ mod tests {
 
         let error = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": "[workspace/main/note.md#DEAD]\nPUT 1.=1:\n+x\n"
+                "patch": "[workspace/note.md#DEAD]\nPUT 1.=1:\n+x\n"
             })))
             .unwrap_err();
         assert!(error.to_string().contains("snapshot tag mismatch"));
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn editing_an_unread_line_is_rejected() {
         let (_directory, root) = workspace();
-        let raw = root.join("workspace/main/note.md");
+        let raw = root.join("workspace/note.md");
         fs::write(&raw, "alpha\nbeta\ngamma\n").unwrap();
         let path = fs::canonicalize(&raw).unwrap();
         let reads = Arc::new(SnapshotStore::default());
@@ -879,7 +879,7 @@ mod tests {
 
         let error = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": format!("[workspace/main/note.md#{tag}]\nPUT 3.=3:\n+changed\n")
+                "patch": format!("[workspace/note.md#{tag}]\nPUT 3.=3:\n+changed\n")
             })))
             .unwrap_err();
         assert!(error.to_string().contains("must read lines"));
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn rem_deletes_the_file_and_its_snapshot_history() {
         let (_directory, root) = workspace();
-        let raw = root.join("workspace/main/note.md");
+        let raw = root.join("workspace/note.md");
         fs::write(&raw, "keep me?\n").unwrap();
         let path = fs::canonicalize(&raw).unwrap();
         let reads = Arc::new(SnapshotStore::default());
@@ -898,10 +898,10 @@ mod tests {
 
         let result = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": format!("[workspace/main/note.md#{tag}]\nREM\n")
+                "patch": format!("[workspace/note.md#{tag}]\nREM\n")
             })))
             .unwrap();
-        assert!(result.contains("removed workspace/main/note.md"));
+        assert!(result.contains("removed workspace/note.md"));
         assert!(!path.exists());
         assert!(reads.head(&path).unwrap().is_none());
     }
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn mv_publishes_edited_content_and_relocates_the_snapshot() {
         let (_directory, root) = workspace();
-        let raw = root.join("workspace/main/from.md");
+        let raw = root.join("workspace/from.md");
         fs::write(&raw, "first\nsecond\n").unwrap();
         let from = fs::canonicalize(&raw).unwrap();
         let reads = Arc::new(SnapshotStore::default());
@@ -919,26 +919,26 @@ mod tests {
         let result = test_runtime()
             .block_on(edit.execute(&json!({
                 "patch": format!(
-                    "[workspace/main/from.md#{tag}]\nPUT 1.=1:\n+MOVED\nMV workspace/main/to.md\n"
+                    "[workspace/from.md#{tag}]\nPUT 1.=1:\n+MOVED\nMV workspace/to.md\n"
                 )
             })))
             .unwrap();
-        assert!(result.contains("moved workspace/main/from.md -> workspace/main/to.md"));
+        assert!(result.contains("moved workspace/from.md -> workspace/to.md"));
         assert!(!from.exists());
-        let to = fs::canonicalize(root.join("workspace/main/to.md")).unwrap();
+        let to = fs::canonicalize(root.join("workspace/to.md")).unwrap();
         assert_eq!(fs::read_to_string(&to).unwrap(), "MOVED\nsecond\n");
         assert!(reads.head(&from).unwrap().is_none());
         let anchored = reads
             .head(&to)
             .unwrap()
             .expect("moved snapshot is anchored");
-        assert_eq!(anchored.tag, extract_tag(&result, "workspace/main/to.md"));
+        assert_eq!(anchored.tag, extract_tag(&result, "workspace/to.md"));
     }
 
     #[test]
     fn drifted_file_edits_are_recovered_through_the_retained_text() {
         let (_directory, root) = workspace();
-        let raw = root.join("workspace/main/note.md");
+        let raw = root.join("workspace/note.md");
         fs::write(&raw, "alpha\nbeta\ngamma\n").unwrap();
         let path = fs::canonicalize(&raw).unwrap();
         let reads = Arc::new(SnapshotStore::default());
@@ -959,10 +959,10 @@ mod tests {
 
         let result = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": format!("[workspace/main/note.md#{tag}]\nPUT 2.=2:\n+BETA\n")
+                "patch": format!("[workspace/note.md#{tag}]\nPUT 2.=2:\n+BETA\n")
             })))
             .unwrap();
-        assert!(result.contains("edited workspace/main/note.md"));
+        assert!(result.contains("edited workspace/note.md"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "alpha\nBETA\nchanged-externally\ngamma\n"

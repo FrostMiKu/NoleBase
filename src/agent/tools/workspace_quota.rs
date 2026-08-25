@@ -1,9 +1,9 @@
-//! Central capacity limits for the Agent workspace (`workspace/main`).
+//! Central capacity limits for the Agent workspace (`workspace`).
 //!
 //! Every Agent tool that creates or grows files under the workspace enforces
 //! the per-file and total byte limits through this module so the quota has a
 //! single source of truth: 64 MiB per file and 512 MiB across the whole
-//! `workspace/main` tree. Limits are checked before an operation starts and
+//! `workspace` tree. Limits are checked before an operation starts and
 //! re-enforced while streaming, so a source that grows during a copy can
 //! never push the workspace past its quota.
 
@@ -13,19 +13,19 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::storage::{AGENT_WORKSPACE_SUBDIR, WORKSPACE_DIR};
+use crate::storage::WORKSPACE_DIR;
 
-/// Maximum bytes for any single file under `workspace/main` (64 MiB).
+/// Maximum bytes for any single file under `workspace` (64 MiB).
 pub(crate) const MAX_WORKSPACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-/// Maximum total bytes across all files under `workspace/main` (512 MiB).
+/// Maximum total bytes across all files under `workspace` (512 MiB).
 pub(crate) const MAX_WORKSPACE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The `workspace/main` sandbox directory for a Nole root.
+/// The `workspace` sandbox directory for a Nole root.
 pub(crate) fn workspace_dir(root: &Path) -> PathBuf {
-    root.join(WORKSPACE_DIR).join(AGENT_WORKSPACE_SUBDIR)
+    root.join(WORKSPACE_DIR)
 }
 
-/// Resolve a new destination relative to `workspace/main`, creating safe
+/// Resolve a new destination relative to `workspace`, creating safe
 /// missing parents without following symlinks or escaping the sandbox.
 pub(crate) fn workspace_destination(root: &Path, input: &str) -> Result<PathBuf> {
     let workspace = workspace_dir(root);
@@ -41,7 +41,7 @@ pub(crate) fn workspace_destination(root: &Path, input: &str) -> Result<PathBuf>
             )
         })
     {
-        bail!("destination must stay within workspace/main");
+        bail!("destination must stay within workspace");
     }
     let file_name = relative
         .file_name()
@@ -71,7 +71,7 @@ pub(crate) fn workspace_destination(root: &Path, input: &str) -> Result<PathBuf>
         current = fs::canonicalize(&candidate)
             .with_context(|| format!("resolving {}", candidate.display()))?;
         if !current.starts_with(&workspace) {
-            bail!("destination escapes workspace/main");
+            bail!("destination escapes workspace");
         }
     }
     let destination = current.join(file_name);
@@ -309,7 +309,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(root.join("workspace/main")).unwrap();
+        fs::create_dir_all(root.join("workspace")).unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
         (directory, root)
     }
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn per_file_limit_rejects_oversized_writes() {
         let (_directory, root) = fresh_root();
-        let destination = root.join("workspace/main/big.bin");
+        let destination = root.join("workspace/big.bin");
         let error =
             check_workspace_write(&root, &destination, MAX_WORKSPACE_FILE_BYTES + 1).unwrap_err();
         assert!(error.to_string().contains("64 MiB"));
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn total_limit_counts_replacement_conservatively() {
         let (_directory, root) = fresh_root();
-        let existing = root.join("workspace/main/large.bin");
+        let existing = root.join("workspace/large.bin");
         // Sparse file: logical size counts toward the quota without disk use.
         fs::File::create(&existing)
             .unwrap()
@@ -339,7 +339,7 @@ mod tests {
         assert!(error.to_string().contains("512 MiB"));
         // A 12 MiB replacement stays within the conservative accounting.
         check_workspace_write(&root, &existing, 12 * 1024 * 1024).unwrap();
-        let second = root.join("workspace/main/other.bin");
+        let second = root.join("workspace/other.bin");
         assert!(check_workspace_write(&root, &second, 13 * 1024 * 1024).is_err());
         check_workspace_write(&root, &second, 12 * 1024 * 1024).unwrap();
     }
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn batch_limit_charges_all_destinations_together() {
         let (_directory, root) = fresh_root();
-        let workspace = root.join("workspace/main");
+        let workspace = root.join("workspace");
         fs::File::create(workspace.join("existing.bin"))
             .unwrap()
             .set_len(500 * 1024 * 1024)
@@ -386,7 +386,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let (_directory, root) = fresh_root();
-        let workspace = root.join("workspace/main");
+        let workspace = root.join("workspace");
         fs::write(workspace.join("a.txt"), "12345").unwrap();
         let outside = tempfile::tempdir().unwrap();
         let secret = outside.path().join("secret.bin");
@@ -404,7 +404,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_WORKSPACE_FILE_BYTES + 1)
             .unwrap();
-        let destination = root.join("workspace/main/copy.bin");
+        let destination = root.join("workspace/copy.bin");
         let error = copy_with_workspace_limits(&root, &source, &destination).unwrap_err();
         assert!(error.to_string().contains("64 MiB"));
         assert!(!destination.exists(), "no partial file may remain");
@@ -415,7 +415,7 @@ mod tests {
         let (_directory, root) = fresh_root();
         let source = root.join("data/growing.bin");
         fs::write(&source, vec![0u8; 4096]).unwrap();
-        let destination = root.join("workspace/main/bounded.bin");
+        let destination = root.join("workspace/bounded.bin");
         // A budget below the source size aborts mid-stream and cleans up.
         let error = copy_bounded(&source, &destination, 1024).unwrap_err();
         assert!(error.to_string().contains("workspace limit"));
@@ -452,10 +452,10 @@ mod tests {
         let error = test_runtime()
             .block_on(copy.execute(&json!({
                 "source": source.to_string_lossy(),
-                "destination": "workspace/main/big.bin"
+                "destination": "workspace/big.bin"
             })))
             .unwrap_err();
         assert!(error.to_string().contains("64 MiB"));
-        assert!(!root.join("workspace/main/big.bin").exists());
+        assert!(!root.join("workspace/big.bin").exists());
     }
 }

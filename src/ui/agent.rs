@@ -132,7 +132,12 @@ fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
         return;
     }
     job_rows.sort_by_key(|row| row.status.is_settled());
-    let mut counts = [(0usize, "running"), (0, "done"), (0, "failed"), (0, "cancelled")];
+    let mut counts = [
+        (0usize, "running"),
+        (0, "done"),
+        (0, "failed"),
+        (0, "cancelled"),
+    ];
     for row in &job_rows {
         let slot = match row.status {
             JobStatus::Running => &mut counts[0],

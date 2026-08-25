@@ -338,7 +338,7 @@ impl Tool for HttpRequest {
                 "save_to": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "New file path relative to workspace/main; streams the response body to disk instead of returning it inline and reports path, byte count, sha256, media type, and final URL"
+                    "description": "New file path relative to workspace; streams the response body to disk instead of returning it inline and reports path, byte count, sha256, media type, and final URL"
                 },
                 "background": {
                     "type": "boolean",
@@ -863,7 +863,7 @@ mod tests {
     }
 
     fn workspace(root: &Path) -> PathBuf {
-        Storage::new(root).unwrap().agent_workspace_dir()
+        workspace_dir(root)
     }
 
     fn entries(workspace: &Path) -> Vec<String> {
@@ -1059,7 +1059,7 @@ mod tests {
         .unwrap();
         handle.join().unwrap();
 
-        assert_eq!(result["path"], "workspace/main/binaries/blob.bin");
+        assert_eq!(result["path"], "workspace/binaries/blob.bin");
         assert_eq!(result["bytes"], body.len() as u64);
         assert_eq!(result["media_type"], "application/octet-stream");
         assert!(result["url"].as_str().unwrap().starts_with("http://"));

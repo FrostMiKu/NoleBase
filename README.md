@@ -287,15 +287,16 @@ data/          # flat note storage
   <name>.mb
 attachments/   # mutable UUID-addressed managed attachments and trash
 cache/         # disposable validated index snapshots; safe to delete
-workspace/
-  main/         # Agent-owned scratch files; preserved across restarts
+workspace/      # Agent-owned scratch files; agent-maintained, persists across sessions
 ```
 
 The Agent may create, edit, move, and delete files freely inside
-`workspace/main/`. Clearing the Agent session clears and recreates this
-directory. Moving a source from elsewhere remains approval-gated because it
-transfers user-owned data. The `http_request` tool's `save_to` option streams any
-http(s) URL into a new file under `workspace/main/` (see below). Generic file
+`workspace/`. The workspace is the Agent's default home for task intermediate
+artifacts and is never cleared automatically — not even when the Agent session
+is cleared; the Agent maintains it itself. Moving a source from elsewhere
+remains approval-gated because it transfers user-owned data. The
+`http_request` tool's `save_to` option streams any http(s) URL into a new file
+under `workspace/` (see below). Generic file
 tools route attachment operations through dedicated APIs; the Agent uses those
 APIs to import, read, list, check out, update, and delete attachments.
 `checkout_attachment` creates an editable
@@ -578,7 +579,7 @@ call. Paths under the Nole root are returned in root-relative form so they can b
 passed directly to other file tools.
 While `read` inspects content (HTML is converted to Markdown, and results are
 capped at 1 MB), the `http_request` tool preserves a remote response's exact
-bytes as a new file under `workspace/main/` when given `save_to`. It accepts a
+bytes as a new file under `workspace/` when given `save_to`. It accepts a
 required http(s) `url`, an optional `method` (GET, POST, PUT, PATCH, DELETE, or
 HEAD), optional `headers`, an optional string `body`, and an optional `range`
 object (`offset` + `limit`) for byte-range requests. Inline mode returns the
@@ -659,7 +660,7 @@ read-before-`edit` snapshots, collision preflight, and rollback for a failed
 `move_many`. Relative paths still resolve under Nole. Generic tools route
 `config/`, attachment internals, and files directly inside `daily/` through
 dedicated APIs; recursive
-directory removal inside Nole remains limited to `workspace/main/`.
+directory removal inside Nole remains limited to `workspace/`.
 
 `export_file` renders a UTF-8 `.md` or `.mb` source as standalone HTML at a
 new external destination. Preparation validates the source and destination

@@ -607,7 +607,19 @@
     #[test]
     fn system_prompt_stays_compact() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.len() < 2_100, "system prompt grew to {} bytes", prompt.len());
+        assert!(prompt.len() < 2_500, "system prompt grew to {} bytes", prompt.len());
+    }
+
+    #[test]
+    fn system_prompt_describes_the_agent_maintained_workspace() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains("Your workspace: /tmp/nole/workspace"));
+        assert!(prompt.contains(
+            "unless the user explicitly specifies another location; organize its layout as you see fit"
+        ));
+        assert!(prompt.contains(
+            "The workspace persists across sessions; nothing clears it for you. Maintain it yourself"
+        ));
     }
 
     #[test]

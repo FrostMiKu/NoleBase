@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use super::util::{display_path, range_schema, required_string, RangeSelector};
 use super::workspace_quota::{
-    check_workspace_write, workspace_destination, MAX_WORKSPACE_FILE_BYTES,
+    check_workspace_write, workspace_destination, workspace_dir, MAX_WORKSPACE_FILE_BYTES,
 };
 use crate::agent::{canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool};
 use crate::attachment::{
@@ -88,25 +88,25 @@ fn attachment_metadata_json(metadata: &AttachmentMetadata) -> Value {
     })
 }
 
-/// Resolve an update source under `workspace/main`: an existing regular file
+/// Resolve an update source under `workspace`: an existing regular file
 /// whose path follows real filesystem entries and remains inside the sandbox.
 /// Every component exists and is a real directory (the final one a regular
 /// file); each step is canonicalized and checked against the workspace root so
 /// the resolved read stays inside the sandbox.
 fn workspace_source(root: &Path, input: &str) -> Result<PathBuf> {
-    let workspace_main = Storage::new(root)?.agent_workspace_dir();
-    match fs::symlink_metadata(&workspace_main) {
+    let workspace = workspace_dir(root);
+    match fs::symlink_metadata(&workspace) {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
-        Ok(_) => bail!("workspace/main must be a real directory, not a symlink"),
+        Ok(_) => bail!("workspace must be a real directory, not a symlink"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("workspace/main does not exist; check the attachment out first")
+            bail!("workspace does not exist; check the attachment out first")
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("checking {}", workspace_main.display()));
+            return Err(error).with_context(|| format!("checking {}", workspace.display()));
         }
     }
-    let workspace_canonical = fs::canonicalize(&workspace_main)
-        .with_context(|| format!("resolving {}", workspace_main.display()))?;
+    let workspace_canonical = fs::canonicalize(&workspace)
+        .with_context(|| format!("resolving {}", workspace.display()))?;
     let relative = Path::new(input);
     if relative.is_absolute()
         || relative.components().any(|component| {
@@ -116,7 +116,7 @@ fn workspace_source(root: &Path, input: &str) -> Result<PathBuf> {
             )
         })
     {
-        bail!("source must stay within workspace/main");
+        bail!("source must stay within workspace");
     }
     let mut current = workspace_canonical.clone();
     for component in relative.components() {
@@ -129,7 +129,7 @@ fn workspace_source(root: &Path, input: &str) -> Result<PathBuf> {
         current = fs::canonicalize(&candidate)
             .with_context(|| format!("resolving {}", candidate.display()))?;
         if !current.starts_with(&workspace_canonical) {
-            bail!("source escapes workspace/main: {input}");
+            bail!("source escapes workspace: {input}");
         }
     }
     let metadata = fs::symlink_metadata(&current)
@@ -363,7 +363,7 @@ impl Tool for CheckoutAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Materialize an attachment as a new editable file in workspace/main; returns the content token required to publish changes to the same attachment."
+        "Materialize an attachment as a new editable file in workspace; returns the content token required to publish changes to the same attachment."
     }
 
     fn input_schema(&self) -> Value {
@@ -376,7 +376,7 @@ impl Tool for CheckoutAttachment {
                 },
                 "destination": {
                     "type": "string",
-                    "description": "New file path relative to workspace/main"
+                    "description": "New file path relative to workspace"
                 }
             },
             "required": ["uri", "destination"], "additionalProperties": false
@@ -442,7 +442,7 @@ impl Tool for UpdateAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Publish a workspace/main file over the same attachment using its checkout content token; atomically refuses stale content."
+        "Publish a workspace file over the same attachment using its checkout content token; atomically refuses stale content."
     }
 
     fn input_schema(&self) -> Value {
@@ -455,7 +455,7 @@ impl Tool for UpdateAttachment {
                 },
                 "source": {
                     "type": "string",
-                    "description": "Existing file path relative to workspace/main containing the new content"
+                    "description": "Existing file path relative to workspace containing the new content"
                 },
                 "expected_content_token": {
                     "type": "string",
@@ -496,7 +496,7 @@ impl Tool for UpdateAttachment {
                 title: "Update attachment content".to_string(),
                 message: format!(
                     "Replace the content of attachment {uri} ({}), {} bytes, with the {} bytes \
-                     from workspace/main/{source_text}? The attachment keeps its URI and identity, \
+                     from workspace/{source_text}? The attachment keeps its URI and identity, \
                      so every existing note reference observes the updated content.",
                     metadata.display_name, metadata.size, source_len
                 ),
@@ -860,9 +860,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(result["path"], "workspace/main/docs/plan.pdf");
+        assert_eq!(result["path"], "workspace/docs/plan.pdf");
         assert_eq!(result["bytes"], 19);
-        let written = root.join("workspace/main/docs/plan.pdf");
+        let written = root.join("workspace/docs/plan.pdf");
         assert_eq!(fs::read(&written).unwrap(), b"%PDF-1.4 plan bytes");
 
         // Existing destinations, traversal, absolute paths, and symlinked
@@ -888,7 +888,7 @@ mod tests {
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
-            std::os::unix::fs::symlink(outside.path(), root.join("workspace/main/linked")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.join("workspace/linked")).unwrap();
             assert!(copy
                 .execute(&json!({"uri": uri, "destination": "linked/x.pdf"}))
                 .returns_err());
@@ -900,9 +900,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(again["path"], "workspace/main/plan-copy.pdf");
+        assert_eq!(again["path"], "workspace/plan-copy.pdf");
         assert_eq!(
-            fs::read(root.join("workspace/main/plan-copy.pdf")).unwrap(),
+            fs::read(root.join("workspace/plan-copy.pdf")).unwrap(),
             b"%PDF-1.4 plan bytes"
         );
 
@@ -911,7 +911,7 @@ mod tests {
         assert!(copy
             .execute(&json!({"uri": unknown, "destination": "x.pdf"}))
             .returns_err());
-        assert!(!root.join("workspace/main/x.pdf").exists());
+        assert!(!root.join("workspace/x.pdf").exists());
     }
 
     #[test]
@@ -936,7 +936,7 @@ mod tests {
             token,
             "sha256:0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5"
         );
-        fs::write(root.join("workspace/main/draft.txt"), b"agent edit").unwrap();
+        fs::write(root.join("workspace/draft.txt"), b"agent edit").unwrap();
 
         let update = UpdateAttachment::new(&root, bypass_gate()).unwrap();
         let updated: Value = serde_json::from_str(
@@ -959,7 +959,7 @@ mod tests {
         assert_ne!(updated["content_token"], token);
 
         let current_token = updated["content_token"].as_str().unwrap();
-        fs::write(root.join("workspace/main/draft.txt"), b"stale overwrite").unwrap();
+        fs::write(root.join("workspace/draft.txt"), b"stale overwrite").unwrap();
         fs::write(store.open(id).unwrap(), b"concurrent user edit").unwrap();
         let error = update
             .execute(&json!({
@@ -984,7 +984,7 @@ mod tests {
         let id = AttachmentUri::parse(&uri).unwrap().id();
         let store = store_for(&root).unwrap();
         let token = store.content_token(id).unwrap();
-        fs::write(root.join("workspace/main/keep.txt"), b"unapproved edit").unwrap();
+        fs::write(root.join("workspace/keep.txt"), b"unapproved edit").unwrap();
 
         let unsafe_update = UpdateAttachment::new(&root, bypass_gate()).unwrap();
         assert!(unsafe_update

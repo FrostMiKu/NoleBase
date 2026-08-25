@@ -740,11 +740,9 @@ impl Agent {
             nole_root,
             gate.clone(),
             cancelled.clone(),
-            jobs_handle.clone().with_workspace(
-                crate::storage::Storage::new(nole_root)
-                    .map(|storage| storage.agent_workspace_dir())
-                    .unwrap_or_else(|_| nole_root.to_path_buf()),
-            ),
+            jobs_handle
+                .clone()
+                .with_workspace(nole_root.join(crate::storage::WORKSPACE_DIR)),
             agent.input_buffer.clone(),
             agent.config.auto_background,
             agent.config.auto_background_threshold_seconds,

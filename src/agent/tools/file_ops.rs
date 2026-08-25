@@ -91,7 +91,7 @@ pub(crate) enum PathZone {
     /// `attachments/`: application-managed attachment internals; generic tools
     /// must never read or mutate these paths. Use dedicated attachment tools instead.
     Attachments,
-    /// `workspace/main`: the current persisted main Agent session's sandbox.
+    /// `workspace/`: the Agent's persistent, self-maintained sandbox.
     /// Mutations here proceed without approval.
     Workspace,
     /// Everything else (`data/`, `archives/`, `themes/`, `skills/`, root files).
@@ -960,8 +960,7 @@ fn resolve_new_directory(root: &Path, input: &str) -> Result<PathBuf> {
             }
         }
     }
-    let existing =
-        deepest_existing.with_context(|| format!("checking {}", full.display()))?;
+    let existing = deepest_existing.with_context(|| format!("checking {}", full.display()))?;
     if *existing == full {
         bail!("destination already exists: {input}");
     }
@@ -1060,14 +1059,14 @@ impl Tool for RemoveDir {
     }
 
     fn description(&self) -> &'static str {
-        "Recursively remove a directory tree without following symlinks: inside workspace/main, or an external absolute directory."
+        "Recursively remove a directory tree without following symlinks: inside workspace, or an external absolute directory."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory path relative to the Nole root inside workspace/main, or an external absolute directory" }
+                "path": { "type": "string", "description": "Directory path relative to the Nole root inside workspace, or an external absolute directory" }
             },
             "required": ["path"], "additionalProperties": false
         })
@@ -1091,7 +1090,7 @@ impl Tool for RemoveDir {
         if path.starts_with(&self.root)
             && !matches!(path_zone(&self.root, &path), PathZone::Workspace)
         {
-            bail!("recursive removal is only allowed inside workspace/main");
+            bail!("recursive removal is only allowed inside workspace");
         }
         self.gate
             .request_for_paths(
@@ -1195,7 +1194,7 @@ mod tests {
     fn workspace_edit_and_delete_bypass_approval_but_keep_snapshot_checks() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("root");
-        let workspace = root.join("workspace/main");
+        let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
 
         let draft = workspace.join("draft.md");
@@ -1218,10 +1217,10 @@ mod tests {
         let edit = Edit::new(&root, gate, reads.clone(), registers).unwrap();
         let tag = reads.head(&canonical_draft).unwrap().unwrap().tag;
         let input = json!({
-            "patch": format!("[workspace/main/draft.md#{tag}]\nPUT 1.=1:\n+edited\n")
+            "patch": format!("[workspace/draft.md#{tag}]\nPUT 1.=1:\n+edited\n")
         });
         let output = execute_unapproved(move || test_runtime().block_on(edit.execute(&input)));
-        assert!(output.contains("edited workspace/main/draft.md"));
+        assert!(output.contains("edited workspace/draft.md"));
         assert_eq!(fs::read_to_string(&draft).unwrap(), "edited\n");
         assert_no_approval_requested(drain_events(&mut events));
 
@@ -1243,7 +1242,7 @@ mod tests {
         let (gate, _) = gate_without_decisions(&root);
         let edit = Edit::new(&root, gate, reads, registers).unwrap();
         let input = json!({
-            "patch": "[workspace/main/draft.md#DEAD]\nPUT 1.=1:\n+again\n"
+            "patch": "[workspace/draft.md#DEAD]\nPUT 1.=1:\n+again\n"
         });
         let error = test_runtime().block_on(edit.execute(&input)).unwrap_err();
         assert!(error.to_string().contains("snapshot tag mismatch"));
@@ -1253,9 +1252,9 @@ mod tests {
         fs::write(&removed, "remove").unwrap();
         let (gate, mut events) = gate_without_decisions(&root);
         let delete = Delete::new(&root, gate).unwrap();
-        let input = json!({"path": "workspace/main/trash.md"});
+        let input = json!({"path": "workspace/trash.md"});
         let output = execute_unapproved(move || test_runtime().block_on(delete.execute(&input)));
-        assert!(output.contains("deleted workspace/main/trash.md"));
+        assert!(output.contains("deleted workspace/trash.md"));
         assert!(!removed.exists());
         assert_no_approval_requested(drain_events(&mut events));
     }
@@ -1264,18 +1263,17 @@ mod tests {
     fn workspace_transfers_and_directory_tools_bypass_approval() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("root");
-        let workspace = root.join("workspace/main");
+        let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
 
-        // move and rename inside workspace/main proceed without approval.
+        // move and rename inside workspace proceed without approval.
         let moved = workspace.join("a.txt");
         fs::write(&moved, "a").unwrap();
         let (event_sender, mut events) = event_channel();
         let (gate, mut gate_events) = gate_without_decisions(&root);
         let mover = Move::new(&root, event_sender, gate).unwrap();
-        let input =
-            json!({"source": "workspace/main/a.txt", "destination": "workspace/main/b.txt"});
+        let input = json!({"source": "workspace/a.txt", "destination": "workspace/b.txt"});
         let output = execute_unapproved(move || test_runtime().block_on(mover.execute(&input)));
         assert!(output.contains("moved"));
         assert!(!moved.exists());
@@ -1286,7 +1284,7 @@ mod tests {
         let (event_sender, _) = event_channel();
         let (gate, mut gate_events) = gate_without_decisions(&root);
         let renamer = Rename::new(&root, event_sender, gate).unwrap();
-        let input = json!({"path": "workspace/main/b.txt", "new_name": "c.txt"});
+        let input = json!({"path": "workspace/b.txt", "new_name": "c.txt"});
         let output = execute_unapproved(move || test_runtime().block_on(renamer.execute(&input)));
         assert!(output.contains("renamed"));
         assert!(!workspace.join("b.txt").exists());
@@ -1298,29 +1296,29 @@ mod tests {
         let mkdir = Mkdir::new(&root, gate).unwrap();
         let output = execute_unapproved(move || {
             test_runtime().block_on(mkdir.execute(&json!({
-                "path": "workspace/main/newdir/sub"
+                "path": "workspace/newdir/sub"
             })))
         });
-        assert!(output.contains("created directory workspace/main/newdir/sub"));
+        assert!(output.contains("created directory workspace/newdir/sub"));
         assert!(workspace.join("newdir/sub").is_dir());
         assert_no_approval_requested(drain_events(&mut mkdir_events));
 
         let (gate, mut remove_events) = gate_without_decisions(&root);
         let remover = RemoveDir::new(&root, gate).unwrap();
         let output = execute_unapproved(move || {
-            test_runtime().block_on(remover.execute(&json!({"path": "workspace/main/newdir"})))
+            test_runtime().block_on(remover.execute(&json!({"path": "workspace/newdir"})))
         });
-        assert!(output.contains("removed directory workspace/main/newdir"));
+        assert!(output.contains("removed directory workspace/newdir"));
         assert!(!workspace.join("newdir").exists());
 
         assert_no_approval_requested(drain_events(&mut remove_events));
-        // remove_dir refuses trees outside workspace/main.
+        // remove_dir refuses trees outside workspace.
         fs::create_dir_all(root.join("data/notes")).unwrap();
         let remover = RemoveDir::new(&root, bypass_gate()).unwrap();
         let error = test_runtime()
             .block_on(remover.execute(&json!({"path": "data/notes"})))
             .unwrap_err();
-        assert!(error.to_string().contains("workspace/main"));
+        assert!(error.to_string().contains("workspace"));
         assert!(root.join("data/notes").is_dir());
     }
 
@@ -1551,7 +1549,7 @@ mod tests {
 
         let directory = tempdir().unwrap();
         let root = directory.path().join("root");
-        let workspace = root.join("workspace/main");
+        let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
         let outside = tempdir().unwrap();
@@ -1572,7 +1570,7 @@ mod tests {
         let edit = Edit::new(&root, gate, reads, registers).unwrap();
         let error = test_runtime()
             .block_on(edit.execute(&json!({
-                "patch": "[workspace/main/escape.md#0000]\nPUT 1.=1:\n+x\n"
+                "patch": "[workspace/escape.md#0000]\nPUT 1.=1:\n+x\n"
             })))
             .unwrap_err();
         assert!(error.to_string().contains("symlink"));
@@ -1580,7 +1578,7 @@ mod tests {
         let (gate, _) = gate_without_decisions(&root);
         let delete = Delete::new(&root, gate).unwrap();
         assert!(delete
-            .execute(&json!({"path": "workspace/main/escape.md"}))
+            .execute(&json!({"path": "workspace/escape.md"}))
             .returns_err());
         assert!(escape.exists());
         assert!(outside_file.exists());
@@ -1591,7 +1589,7 @@ mod tests {
         symlink(&outside_dir, &linked_dir).unwrap();
         let remover = RemoveDir::new(&root, bypass_gate()).unwrap();
         assert!(remover
-            .execute(&json!({"path": "workspace/main/linked"}))
+            .execute(&json!({"path": "workspace/linked"}))
             .returns_err());
         assert!(linked_dir.exists());
         assert!(outside_dir.is_dir());
@@ -1600,7 +1598,7 @@ mod tests {
         let (gate, _) = gate_without_decisions(&root);
         assert!(Move::new(&root, event_sender, gate)
             .unwrap()
-            .execute(&json!({"source": "workspace/main/escape.md", "destination": "workspace/main/copy.md"}))
+            .execute(&json!({"source": "workspace/escape.md", "destination": "workspace/copy.md"}))
             .returns_err());
     }
 
@@ -1608,7 +1606,7 @@ mod tests {
     fn auto_mode_requires_approval_for_external_files_and_directories() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("root");
-        fs::create_dir_all(root.join("workspace/main")).unwrap();
+        fs::create_dir_all(root.join("workspace")).unwrap();
         let outside = tempdir().unwrap();
         let outside_root = fs::canonicalize(outside.path()).unwrap();
         let file = outside_root.join("created.txt");

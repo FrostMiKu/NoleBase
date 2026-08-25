@@ -266,7 +266,7 @@ fn process_workspace_events(
     events: &WatchEvents,
     app: &mut App,
 ) -> (Vec<std::path::PathBuf>, bool) {
-    // The agent workspace sandbox (workspace/main) churns constantly while an
+    // The agent workspace sandbox (workspace/) churns constantly while an
     // Agent task runs. It stays outside the watcher, and the check below adds
     // defense in depth. Workspace events leave workspace UI and note/attachment
     // indexes unchanged; session file handling is the workspace policy's job.
@@ -792,7 +792,7 @@ mod tests {
 
         // Agent workspace churn stays outside the notify queue because the
         // workspace is unregistered; a settle window therefore remains empty.
-        let workspace = storage.agent_workspace_dir();
+        let workspace = storage.workspace_dir.clone();
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("session.json"), "{}").unwrap();
         fs::write(workspace.join("scratch.md"), "# scratch").unwrap();

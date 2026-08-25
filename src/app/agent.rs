@@ -968,7 +968,8 @@ impl App {
             self.cancel_agent();
         }
         self.agent_terminal.terminate();
-        // Cancel jobs before the workspace reset removes their spill files.
+        // Cancel jobs that belong to the session being cleared; the Agent
+        // workspace itself persists and keeps its files.
         self.agent_jobs.terminate();
         let had_saved_session = match self.storage.clear_agent_session() {
             Ok(had_saved_session) => had_saved_session,

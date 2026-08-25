@@ -96,12 +96,16 @@ fn system_prompt_text(root: &Path) -> String {
 Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`, and closed BBCode tags: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=COLOR]`, `[bg=COLOR]`, `[link=URL]`, `[center]`, `[right]`, `[indent first=N]`, `[box title="..." width=fit/full/N border=none/single border-color=COLOR bg=COLOR px=N py=N]` (`title`/`border-color` require `border=single`), `[cols gap=N]`, and `[col width=N/Nfr]`. Colors may be names, palette indexes, or `#RRGGBB`. Close every tag. Resolve wikilinks before creating or changing their targets. Local links in notes are relative to the containing note; links in chat are relative to the Nole root. Never emit terminal escape sequences.
 
 ## Workspace
-Root: {root}
+Nole root: {root}
+Your workspace: {workspace}
+- Keep task work and its intermediate artifacts (scratch files, downloads, generated data) in the workspace unless the user explicitly specifies another location; organize its layout as you see fit.
+- The workspace persists across sessions; nothing clears it for you. Maintain it yourself and remove files you no longer need.
 - `MEMORY.md` at the Nole root is persistent Agent memory. Its full contents are already provided in your Memory section, so never read it back—update it with focused edits when durable user preferences, project facts, or workflow decisions should survive future tasks. Do not store secrets or transient task details there.
 - Never read or expose `config/ai.toml`, and access attachments only through attachment tools.
 
 Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Change files only with `edit`, `append`, or `write`; shell edits (`sed -i`, redirections) desync read snapshots and are rejected. Search and inspect with `grep`/`read`, never shell search tools like `rg` or `cat`. If an edit or write fails validation, fix the cause—never bypass it via `shell`. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."#,
         root = root.display(),
+        workspace = root.join(crate::storage::WORKSPACE_DIR).display(),
     )
 }
 
