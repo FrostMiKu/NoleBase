@@ -189,6 +189,7 @@ Nole remains running.
 | Key | Action |
 | --- | --- |
 | type / paste | edit the compose buffer; multiline paste is preserved |
+| type `[[` | open the wiki-link completion popup above the input (see below) |
 | `Enter` | send to Daily, or append to the article currently being viewed |
 | `Ctrl+Enter` | send the buffer directly to Agent as a standalone prompt |
 | `Ctrl+U` | undo the last Compose append and restore it to the buffer |
@@ -197,6 +198,16 @@ Nole remains running.
 | `Esc` | focus Daily |
 | `Tab` | toggle Agent permission mode |
 | `Ctrl+C` | clear the input; quit when already empty |
+
+While the cursor follows an unclosed `[[` (or `![[`) in the compose buffer,
+Nole shows a compact completion popup floating above the input with matching
+daily files, notes, and archives — prefix matches first, then substring
+matches, alphabetical within each tier. The popup keeps a fixed window of
+eight rows and scrolls it as the selection moves, so long result lists stay
+compact. While the popup is open, arrows move the selection, `Enter`/`Tab`
+accept the highlighted stem as `[[name]]`, and `Esc` dismisses the popup
+until the query changes; every other key keeps editing and filtering. Closed
+links, nested markers, and queries with no matches never open it.
 
 ### Daily
 

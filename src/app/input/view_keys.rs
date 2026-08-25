@@ -5,6 +5,30 @@ use super::super::*;
 impl App {
     pub(in crate::app) fn handle_compose(&mut self, key: KeyEvent) -> Option<Command> {
         let modifiers = key.modifiers;
+        // While the wiki completion popup is open, arrow keys navigate it and
+        // Enter/Tab accept; only unmodified keys are intercepted so newline
+        // and submit shortcuts keep working.
+        if self.wiki_completion.is_some() {
+            match key.code {
+                KeyCode::Up if modifiers.is_empty() => {
+                    self.move_wiki_completion(-1);
+                    return None;
+                }
+                KeyCode::Down if modifiers.is_empty() => {
+                    self.move_wiki_completion(1);
+                    return None;
+                }
+                KeyCode::Enter | KeyCode::Tab if modifiers.is_empty() => {
+                    self.accept_wiki_completion();
+                    return None;
+                }
+                KeyCode::Esc => {
+                    self.dismiss_wiki_completion();
+                    return None;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.submit_compose_to_agent();
@@ -52,8 +76,7 @@ impl App {
                 if self.input.is_empty() {
                     Some(Command::Quit)
                 } else {
-                    self.input.clear();
-                    self.input_cursor = 0;
+                    self.clear_compose_input();
                     None
                 }
             }

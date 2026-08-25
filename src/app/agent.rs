@@ -742,8 +742,7 @@ impl App {
             self.start_agent(prompt, display_prompt)
         };
         if accepted {
-            self.input.clear();
-            self.input_cursor = 0;
+            self.clear_compose_input();
         }
     }
 

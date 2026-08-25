@@ -963,6 +963,11 @@ impl Storage {
         self.daily_dir.join(date_file_name(date))
     }
 
+    /// The `YYYY-MM-DD.md` file name for a daily date.
+    pub fn daily_file_name(date: NaiveDate) -> PathBuf {
+        PathBuf::from(date_file_name(date))
+    }
+
     /// Return the physical path for a validated `YYYY-MM-DD` daily date.
     pub fn daily_file_path(&self, date: &str) -> Result<PathBuf> {
         Ok(self.daily_path(parse_daily_date(date)?))

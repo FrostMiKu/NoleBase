@@ -48,8 +48,7 @@ impl App {
             document.scroll = u16::MAX;
             document.target_line = None;
         }
-        self.input.clear();
-        self.input_cursor = 0;
+        self.clear_compose_input();
         self.reload_files();
         self.status.clear();
         Ok(())
@@ -72,8 +71,7 @@ impl App {
             document.scroll = u16::MAX;
             document.target_line = None;
         }
-        self.input.clear();
-        self.input_cursor = 0;
+        self.clear_compose_input();
         self.set_status("Appended to skill");
         Ok(())
     }
@@ -92,8 +90,7 @@ impl App {
         if let Some(document) = self.document.as_mut() {
             document.replace_source(note.body);
         }
-        self.input.clear();
-        self.input_cursor = 0;
+        self.clear_compose_input();
         self.reload();
         self.reload_todos();
         self.notifications
@@ -112,8 +109,7 @@ impl App {
             receipt,
             input: original_input.to_string(),
         });
-        self.input.clear();
-        self.input_cursor = 0;
+        self.clear_compose_input();
         self.reload();
         self.reload_todos();
         self.selected = self.daily_notes.len().saturating_sub(1);
@@ -176,6 +172,7 @@ impl App {
             self.input.push_str(&current);
         }
         self.input_cursor = self.input.chars().count();
+        self.refresh_wiki_completion();
     }
 
     pub(in crate::app) fn undo(&mut self) {

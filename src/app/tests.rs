@@ -4449,3 +4449,112 @@ fn paste_clipboard_shortcut_is_ignored_outside_compose_and_by_terminal_overlay()
         0
     );
 }
+
+#[test]
+fn wiki_completion_opens_filters_accepts_and_stays_dismissed_after_esc() {
+    let (mut app, _directory) = make_app();
+    app.storage.create_named_file("Alpha").unwrap();
+    app.storage.create_named_file("Alpine").unwrap();
+    app.storage.create_named_file("Salad").unwrap();
+    app.reload_files();
+    app.focus = Focus::Compose;
+
+    // Typing [[ opens the popup; further typing filters it.
+    for character in "[[al".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let state = app.wiki_completion.as_ref().unwrap();
+    let stems: Vec<_> = state
+        .candidates
+        .iter()
+        .filter_map(crate::app::stem_label)
+        .collect();
+    assert_eq!(stems, ["Alpha", "Alpine", "Salad"]);
+    assert_eq!(state.index, 0);
+
+    // Down selects the next row; Enter accepts and splices the link closed.
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.wiki_completion.as_ref().unwrap().index, 1);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.input, "[[Alpine]]");
+    assert_eq!(app.input_cursor, app.input.chars().count());
+    assert!(app.wiki_completion.is_none());
+
+    // A query with no matches never opens the popup.
+    app.input.clear();
+    app.input_cursor = 0;
+    app.wiki_completion = None;
+    app.wiki_completion_dismissed = None;
+    for character in "[[q".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(app.wiki_completion.is_none());
+
+    // Esc dismisses for the current query; more typing reopens.
+    app.clear_compose_input();
+    for character in "[[a".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(app.wiki_completion.is_some());
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.wiki_completion.is_none());
+    app.handle_key(key(KeyCode::Char('l')));
+    assert!(app.wiki_completion.is_some());
+
+    // Closing the marker ends completion.
+    app.handle_key(key(KeyCode::Char(']')));
+    app.handle_key(key(KeyCode::Char(']')));
+    assert!(app.wiki_completion.is_none());
+
+    // Clearing the input clears the completion state with it.
+    for character in "[[al".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    assert!(app.wiki_completion.is_some());
+    app.clear_compose_input();
+    assert!(app.wiki_completion.is_none());
+    assert_eq!(app.input, "");
+}
+
+#[test]
+fn wiki_completion_selection_clamps_at_the_edges() {
+    let (mut app, _directory) = make_app();
+    for index in 0..12 {
+        app.storage
+            .create_named_file(&format!("Cycle {index:02}"))
+            .unwrap();
+    }
+    app.reload_files();
+    app.focus = Focus::Compose;
+
+    for character in "[[".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    let state = app.wiki_completion.as_ref().unwrap();
+    // Every note matches an empty query: nothing is truncated to a page.
+    assert!(state
+        .candidates
+        .iter()
+        .all(|candidate| crate::app::stem_label(candidate)
+            .unwrap()
+            .starts_with("Cycle")));
+    let count = state.candidates.len();
+    assert!(count >= 12, "all twelve notes match, got {count}");
+
+    // The selection clamps at both ends instead of wrapping, matching the
+    // command palette. Up at the top stays put.
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.wiki_completion.as_ref().unwrap().index, 0);
+    // Down walks to the last match and stays there.
+    for _ in 0..count {
+        app.handle_key(key(KeyCode::Down));
+    }
+    assert_eq!(app.wiki_completion.as_ref().unwrap().index, count - 1);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.wiki_completion.as_ref().unwrap().index, count - 1);
+    // Up walks back to the first match and stays there.
+    for _ in 0..count {
+        app.handle_key(key(KeyCode::Up));
+    }
+    assert_eq!(app.wiki_completion.as_ref().unwrap().index, 0);
+}

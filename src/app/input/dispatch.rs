@@ -70,7 +70,7 @@ impl App {
             }
         }
 
-        match self.focus {
+        let command = match self.focus {
             Focus::Compose => self.handle_compose(key),
             Focus::Files => self.handle_files(key),
             Focus::Views => self.handle_workspace_views(key),
@@ -84,7 +84,11 @@ impl App {
                 CenterView::Tags => self.handle_tags(key),
                 CenterView::Attachments => self.handle_attachments(key),
             },
+        };
+        if self.focus == Focus::Compose {
+            self.refresh_wiki_completion();
         }
+        command
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -142,7 +146,8 @@ impl App {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match (self.focus, self.center_view, self.files_context) {
             (Focus::Compose, CenterView::Daily | CenterView::Chat | CenterView::Document, _) => {
-                paste_into(&mut self.input, &mut self.input_cursor, &text)
+                paste_into(&mut self.input, &mut self.input_cursor, &text);
+                self.refresh_wiki_completion();
             }
             (Focus::Center, CenterView::Search | CenterView::DocumentSearch, _) => {
                 paste_into(
@@ -289,6 +294,7 @@ impl App {
             .collect::<Vec<_>>()
             .join("\n");
         paste_into(&mut self.input, &mut self.input_cursor, &references);
+        self.refresh_wiki_completion();
         self.recompute_attachments();
         let summary = metadata
             .iter()

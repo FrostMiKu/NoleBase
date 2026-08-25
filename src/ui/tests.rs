@@ -3600,3 +3600,239 @@ fn agent_sidebar_lists_running_background_jobs() {
     let screen = buffer_string(&terminal);
     assert!(!screen.contains("cargo build"));
 }
+
+#[test]
+fn wiki_completion_popup_is_opaque_over_body_content() {
+    let (mut app, directory) = make_app();
+    // A long document scrolled to its end so body text reaches the rows the
+    // popup floats over.
+    app.document = Some(Document {
+        kind: DocumentKind::File(app.storage.data_dir.join("Behind.md")),
+        title: "Behind".to_string(),
+        source: ["BEHIND BEHIND"; 24].join("\n"),
+        // At this scroll the last line lands on the row the popup's title
+        // row floats over.
+        scroll: 14,
+        target_line: None,
+        return_to: DocumentReturn::Daily,
+        render_cache: None,
+    });
+    app.center_view = CenterView::Document;
+    app.input = "[[pro".to_string();
+    app.input_cursor = 4;
+    app.wiki_completion = Some(crate::app::WikiCompletionState {
+        span_start: 0,
+        query: "pro".to_string(),
+        candidates: vec![WikiLinkCandidate {
+            path: directory.path().join("data/Project.md"),
+            location: WikiLinkLocation::Notes,
+        }],
+        index: 0,
+        scroll: 0,
+    });
+    app.focus = Focus::Compose;
+
+    let terminal = render(&mut app, 100, 24);
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area();
+    let screen = buffer_string(&terminal);
+    let title_row = (0..area.height)
+        .find(|y| {
+            let row: String = (0..area.width).map(|x| buffer[(x, *y)].symbol()).collect();
+            row.contains("Link")
+        })
+        .expect("popup title row");
+    let compose_row = (0..area.height)
+        .find(|y| {
+            let row: String = (0..area.width).map(|x| buffer[(x, *y)].symbol()).collect();
+            row.contains("Compose")
+        })
+        .expect("compose title row");
+    assert!(title_row < compose_row);
+    // The top border row spans the whole block; use it to find the popup's
+    // x range instead of asserting the full screen width.
+    let non_blank = |x: &u16| !buffer[(*x, title_row)].symbol().trim().is_empty();
+    let left = (0..area.width).find(non_blank).unwrap_or(0);
+    let right = (0..area.width)
+        .rfind(non_blank)
+        .map_or(area.width, |x| x + 1);
+    // Every cell of the popup block carries the panel background: nothing
+    // from the body behind it shows through.
+    for y in title_row..compose_row {
+        for x in left..right {
+            assert_eq!(
+                buffer[(x, y)].bg,
+                app.theme.surface_panel,
+                "popup cell ({x},{y}) is not opaque"
+            );
+        }
+        // The body rows underneath were erased, not just tinted over.
+        let row: String = (left..right).map(|x| buffer[(x, y)].symbol()).collect();
+        assert!(!row.contains("BEHIND"));
+    }
+    assert!(screen.contains("Project"));
+}
+
+#[test]
+fn wiki_completion_popup_is_compact_and_marks_the_selected_row() {
+    let (mut app, directory) = make_app();
+    app.input = "[[pro".to_string();
+    app.input_cursor = 4;
+    app.wiki_completion = Some(crate::app::WikiCompletionState {
+        span_start: 0,
+        query: "pro".to_string(),
+        candidates: vec![
+            WikiLinkCandidate {
+                path: directory.path().join("data/Project.md"),
+                location: WikiLinkLocation::Notes,
+            },
+            WikiLinkCandidate {
+                path: directory.path().join("archives/Process.md"),
+                location: WikiLinkLocation::Archives,
+            },
+        ],
+        index: 1,
+        scroll: 0,
+    });
+    app.focus = Focus::Compose;
+
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    // Compact: both candidate rows render, with the header row directly above
+    // the first candidate — no blank spacer row.
+    assert!(screen.contains("Project"));
+    assert!(screen.contains("Process"));
+    let first = screen.find("Project").unwrap();
+    let title = screen.find(" Link ").unwrap();
+    assert!(title < first);
+    // Location metadata rides each row.
+    assert!(screen.contains("Notes"));
+    assert!(screen.contains("Archives"));
+    // The popup floats above the compose block.
+    let compose = screen.find("Compose").unwrap();
+    assert!(first < compose);
+
+    // The shared selection indicator covers the selected row.
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area();
+    let indicator = app.theme.selection_indicator;
+    let selected_row_has_indicator = (0..area.height).any(|y| {
+        let row_text: String = (0..area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        row_text.contains("Process") && (0..area.width).any(|x| buffer[(x, y)].fg == indicator)
+    });
+    assert!(
+        selected_row_has_indicator,
+        "selection indicator spans the selected row"
+    );
+}
+
+#[test]
+fn wiki_completion_popup_window_scrolls_with_the_selection() {
+    let (mut app, directory) = make_app();
+    app.input = "[[pro".to_string();
+    app.input_cursor = 4;
+    let candidates: Vec<WikiLinkCandidate> = (0..12u16)
+        .map(|index| WikiLinkCandidate {
+            path: directory.path().join(format!("data/Item {index:02}.md")),
+            location: WikiLinkLocation::Notes,
+        })
+        .collect();
+    app.wiki_completion = Some(crate::app::WikiCompletionState {
+        span_start: 0,
+        query: "pro".to_string(),
+        candidates,
+        index: 9,
+        scroll: 2,
+    });
+    app.focus = Focus::Compose;
+
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    // The window stays eight rows and follows the selection: rows 0..1 and
+    // 10..11 scrolled out of view, the selected row pinned to the window's
+    // bottom edge.
+    assert!(screen.contains("Item 02"), "{screen}");
+    assert!(screen.contains("Item 09"), "{screen}");
+    assert!(!screen.contains("Item 00"), "{screen}");
+    assert!(!screen.contains("Item 01"), "{screen}");
+    assert!(!screen.contains("Item 10"), "{screen}");
+    assert!(!screen.contains("Item 11"), "{screen}");
+
+    // The popup never grows past the window: ten rows (eight + borders),
+    // whatever the candidate count.
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area();
+    let row_of = |needle: &str| -> u16 {
+        (0..area.height)
+            .find(|y| {
+                let row: String = (0..area.width).map(|x| buffer[(x, *y)].symbol()).collect();
+                row.contains(needle)
+            })
+            .unwrap_or_else(|| panic!("row {needle:?} not found"))
+    };
+    assert_eq!(row_of("Compose"), row_of("Link") + 10);
+}
+
+#[test]
+fn wiki_completion_popup_selection_leads_list_follows() {
+    // The selection leads and the list follows only at the edge it reaches
+    // (the command-palette model). This is the state after the user scrolled
+    // down to the window's bottom edge (index 9, window [2..10)) and then
+    // moved the selection up one row: the selection is now at index 8, still
+    // inside the window, so the window must NOT scroll up with it.
+    let (mut app, directory) = make_app();
+    app.input = "[[pro".to_string();
+    app.input_cursor = 4;
+    let candidates: Vec<WikiLinkCandidate> = (0..12u16)
+        .map(|index| WikiLinkCandidate {
+            path: directory.path().join(format!("data/Item {index:02}.md")),
+            location: WikiLinkLocation::Notes,
+        })
+        .collect();
+    app.wiki_completion = Some(crate::app::WikiCompletionState {
+        span_start: 0,
+        query: "pro".to_string(),
+        candidates,
+        index: 8,
+        scroll: 2,
+    });
+    app.focus = Focus::Compose;
+
+    let terminal = render(&mut app, 100, 24);
+    let screen = buffer_string(&terminal);
+    // The window still spans [2..10): the row *below* the selection (Item 09)
+    // stays visible, and the row above the window's top (Item 01) stays
+    // hidden. A "fix the selection and scroll the list" model would show
+    // [1..9) here instead.
+    assert!(screen.contains("Item 02"), "{screen}");
+    assert!(screen.contains("Item 08"), "{screen}");
+    assert!(screen.contains("Item 09"), "{screen}");
+    assert!(!screen.contains("Item 01"), "{screen}");
+    assert!(!screen.contains("Item 10"), "{screen}");
+
+    // The selection indicator marks the selected row (Item 08), which is the
+    // window's second-to-last row — not its last row.
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area();
+    let indicator = app.theme.selection_indicator;
+    let row_has_indicator = |y: u16| (0..area.width).any(|x| buffer[(x, y)].fg == indicator);
+    let row_of = |needle: &str| -> u16 {
+        (0..area.height)
+            .find(|y| {
+                let row: String = (0..area.width).map(|x| buffer[(x, *y)].symbol()).collect();
+                row.contains(needle)
+            })
+            .unwrap_or_else(|| panic!("row {needle:?} not found"))
+    };
+    let selected_row = row_of("Item 08");
+    assert!(
+        row_has_indicator(selected_row),
+        "selection indicator marks the selected row (Item 08)"
+    );
+    assert!(
+        !row_has_indicator(selected_row + 1),
+        "the row below the selection (Item 09) is not the selected row"
+    );
+}

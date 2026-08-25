@@ -1,4 +1,6 @@
 use super::*;
+use crate::app::{stem_label, WIKI_COMPLETION_WINDOW};
+use crate::model::{WikiLinkCandidate, WikiLinkLocation};
 
 const BODY_TOP_MARGIN: u16 = 2;
 const BODY_BOTTOM_GAP: u16 = 2;
@@ -44,7 +46,7 @@ pub(super) fn floating_compose_layout(content: Rect) -> FloatingComposeLayout {
 
 pub(super) fn draw_floating_compose(
     frame: &mut Frame,
-    app: &App,
+    app: &mut App,
     layout: FloatingComposeLayout,
     interactive: bool,
     cursor_position: &mut Option<Position>,
@@ -53,7 +55,115 @@ pub(super) fn draw_floating_compose(
         return;
     }
     clear_widget(frame, layout.compose);
-    draw_compose(frame, app, layout.compose, interactive, cursor_position);
+    draw_compose(frame, &*app, layout.compose, interactive, cursor_position);
+    draw_wiki_completion(frame, app, layout);
+}
+
+/// Compact inline completion popup floating directly above the compose input.
+/// One row per candidate with no leading blank row: an inline popup is space
+/// constrained, unlike full selectable lists. The popup shows a fixed window
+/// of candidate rows and scrolls it as the selection moves, so long result
+/// lists stay compact. The shared vertical selection indicator still spans
+/// the complete selected row.
+///
+/// The selection leads and the list follows only at the edge it reaches,
+/// exactly like the command palette: `index` moves on every key press, and
+/// `scroll` (the first visible row) is reconciled from it here and held
+/// steady while the selection still fits inside the window.
+pub(super) fn draw_wiki_completion(
+    frame: &mut Frame,
+    app: &mut App,
+    layout: FloatingComposeLayout,
+) {
+    // Copy the values out before drawing so the immutable borrow of the
+    // completion state ends before the reconciled scroll is written back.
+    let (total, scroll, index) = match &app.wiki_completion {
+        Some(state) => (state.candidates.len(), state.scroll, state.index),
+        None => return,
+    };
+    if total == 0 {
+        return;
+    }
+    let rows = total as u16;
+    let window = rows.min(WIKI_COMPLETION_WINDOW as u16);
+    let wanted = window + 2; // borders
+    let available = layout.compose.y.saturating_sub(layout.body.y);
+    if available < 3 {
+        return;
+    }
+    let height = wanted.min(available);
+    let area = Rect::new(
+        layout.compose.x,
+        layout.compose.y - height,
+        layout.compose.width,
+        height,
+    );
+    // Clear first so body content behind the floating popup cannot show
+    // through; the block style alone does not reset existing cell styles.
+    clear_widget(frame, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(PANEL_PADDING))
+        .title(" Link ")
+        .style(Style::default().bg(app.theme.surface_panel))
+        .border_style(focus_border(app.focus == Focus::Compose, app.theme));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let visible = inner.height.min(rows) as usize;
+    let start = selection_viewport_start(scroll, index, visible, total);
+    if let Some(state) = app.wiki_completion.as_mut() {
+        state.scroll = start;
+    }
+    if let Some(state) = &app.wiki_completion {
+        draw_wiki_completion_rows(
+            frame,
+            &state.candidates,
+            start,
+            visible,
+            index,
+            inner,
+            app.theme,
+        );
+    }
+}
+
+/// One row per candidate in the popup window, starting at `start`.
+fn draw_wiki_completion_rows(
+    frame: &mut Frame,
+    candidates: &[WikiLinkCandidate],
+    start: usize,
+    visible: usize,
+    index: usize,
+    inner: Rect,
+    theme: Theme,
+) {
+    for (row, candidate) in candidates.iter().skip(start).take(visible).enumerate() {
+        let selected = start + row == index;
+        let row_area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        // Reserve the first cell so the selection indicator marks the row
+        // without covering the label's first character.
+        let text_area = Rect::new(
+            row_area.x + 1,
+            row_area.y,
+            row_area.width.saturating_sub(1),
+            1,
+        );
+        let label = stem_label(candidate).unwrap_or_default();
+        let location = match candidate.location {
+            WikiLinkLocation::Daily => "Daily",
+            WikiLinkLocation::Notes => "Notes",
+            WikiLinkLocation::Archives => "Archives",
+        };
+        if selected {
+            draw_left_right_line(frame, text_area, &label, location, theme.text_primary);
+            draw_selection_indicator(frame, row_area, theme);
+        } else {
+            draw_left_right_line(frame, text_area, &label, location, theme.text_muted);
+        }
+    }
 }
 
 pub(super) fn draw_compose(

@@ -52,10 +52,12 @@ mod terminal;
 mod tests;
 mod text_input;
 mod vlist;
+mod wiki_completion;
 
 pub(crate) use self::documents::human_size;
 pub(in crate::app) use self::text_input::{edit_single_line, TextInputEdit};
 pub(crate) use self::vlist::*;
+pub(crate) use self::wiki_completion::{stem_label, WikiCompletionState, WIKI_COMPLETION_WINDOW};
 pub use self::{dialog::*, document::*, model::*};
 
 pub(in crate::app) const DAILY_PAGE_STEP: u16 = 5;
@@ -240,6 +242,9 @@ pub struct App {
     pub input: String,
     /// Insertion point in `input`, as a character index.
     pub input_cursor: usize,
+    /// Inline `[[` completion popup state, derived from `input`.
+    pub wiki_completion: Option<WikiCompletionState>,
+    wiki_completion_dismissed: Option<(usize, String)>,
 
     /// The single source of truth for the files pane, sorted recent-first.
     pub note_files: Vec<NoteFile>,
@@ -514,6 +519,8 @@ impl App {
             reveal_selected_daily: true,
             input: String::new(),
             input_cursor: 0,
+            wiki_completion: None,
+            wiki_completion_dismissed: None,
             note_files,
             file_index: 0,
             selected_file: first_note,

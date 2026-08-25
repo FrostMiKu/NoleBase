@@ -755,8 +755,7 @@ fn spawn_terminal_watch(
                         let keep = carry.len() - TERMINAL_WATCH_CARRY_BYTES;
                         carry.drain(..keep);
                     }
-                    let exited_hit =
-                        (sample.exited && wait_exit) || (sample.exited && pattern.is_none());
+                    let exited_hit = sample.exited && (wait_exit || pattern.is_none());
                     if let Some(payload) = watch_payload(
                         &pattern,
                         &carry,
