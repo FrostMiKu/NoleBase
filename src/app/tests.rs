@@ -1412,7 +1412,6 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     }));
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
-            kind: AskUserKind::Tool,
             question: "Choose a format".to_string(),
             options: vec!["Markdown".to_string(), "MBDown".to_string()],
         }))
@@ -1449,7 +1448,6 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
 
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
-            kind: AskUserKind::Tool,
             question: "Anything else?".to_string(),
             options: vec!["No".to_string()],
         }))
@@ -1541,39 +1539,6 @@ fn private_terminal_input_escape_cancels_without_touching_agent_activity() {
 }
 
 #[test]
-fn round_limit_dialog_submits_continue_and_escape_submits_stop() {
-    let (mut app, _directory) = make_app();
-    let event_sender = install_agent_observable(&mut app);
-    let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
-    app.ai_user_sender = Some(answer_sender);
-    let request = AskUserRequest {
-        kind: AskUserKind::RoundLimit,
-        question: "Continue for another segment?".to_string(),
-        options: vec!["Continue".to_string(), "Stop".to_string()],
-    };
-
-    event_sender
-        .send(AgentEvent::AskUser(request.clone()))
-        .unwrap();
-    app.poll_agent();
-    app.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        answer_receiver.try_recv().unwrap(),
-        AskUserResponse::Answer("Continue".to_string())
-    );
-    assert_eq!(app.status, "Agent continuing");
-
-    event_sender.send(AgentEvent::AskUser(request)).unwrap();
-    app.poll_agent();
-    app.handle_key(key(KeyCode::Esc));
-    assert_eq!(
-        answer_receiver.try_recv().unwrap(),
-        AskUserResponse::Answer("Stop".to_string())
-    );
-    assert_eq!(app.status, "Agent stopping at the request-round limit");
-}
-
-#[test]
 fn agent_panel_appends_streaming_activity_and_final_reply() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
@@ -1601,12 +1566,7 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
             message: "Calling Read File...".to_string(),
         })
         .unwrap();
-    sender
-        .send(AgentEvent::Round {
-            current: 2,
-            limit: 25,
-        })
-        .unwrap();
+    sender.send(AgentEvent::Round { current: 2 }).unwrap();
     sender
         .send(AgentEvent::Usage(TokenUsage {
             input_tokens: 1_000,
@@ -1639,7 +1599,6 @@ fn agent_panel_appends_streaming_activity_and_final_reply() {
         AgentPanelEntry::Tool { text, active: true, .. } if text == "Calling Read File..."
     ));
     assert_eq!(app.agent_round, 2);
-    assert_eq!(app.agent_round_limit, 25);
     assert_eq!(app.agent_usage.total_input(), 2_000);
     assert_eq!(app.agent_context_window, 1_700);
     assert_eq!(app.agent_context_capacity, 200_000);
@@ -2323,21 +2282,6 @@ fn agent_terminal_outcomes_send_distinct_notifications() {
     let (mut app, _directory) = make_app();
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
-
-    sender
-        .send(AgentEvent::Stopped(AgentStopReason::RequestRoundLimit))
-        .unwrap();
-    app.poll_agent();
-
-    assert_eq!(app.status, "Agent paused at the request-round limit");
-    assert_eq!(
-        app.notifications.visible().as_deref(),
-        Some("Agent stopped at the request-round limit")
-    );
-    assert_eq!(app.notifications.take_bells(), 1);
-
-    let sender = install_agent_observable(&mut app);
-    app.ai_running = true;
     install_agent_terminal_snapshot(&mut app);
     sender
         .send(AgentEvent::Stopped(AgentStopReason::ToolApprovalDenied))
@@ -2420,12 +2364,7 @@ fn next_round_replaces_a_failed_tool_status_with_working_state() {
             preview: None,
         })
         .unwrap();
-    sender
-        .send(AgentEvent::Round {
-            current: 2,
-            limit: 25,
-        })
-        .unwrap();
+    sender.send(AgentEvent::Round { current: 2 }).unwrap();
 
     app.poll_agent();
 

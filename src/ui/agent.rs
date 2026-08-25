@@ -93,10 +93,10 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
         ("Tools", tools.to_string()),
         (
             "Round",
-            if app.agent_round_limit == 0 {
+            if app.agent_round == 0 {
                 "--".to_string()
             } else {
-                format!("{} / {}", app.agent_round, app.agent_round_limit)
+                app.agent_round.to_string()
             },
         ),
         ("Retries", app.agent_retry_count.to_string()),
@@ -183,14 +183,12 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
             human_token_count(app.agent_context_capacity)
         )
     };
-    let title = if app.agent_round_limit == 0 {
-        format!(" Agent · {context} ")
+    let rounds = if app.agent_round == 0 {
+        String::new()
     } else {
-        format!(
-            " Agent · ↻{}/{} · {context} ",
-            app.agent_round, app.agent_round_limit,
-        )
+        format!("↻{} · ", app.agent_round)
     };
+    let title = format!(" Agent · {rounds}{context} ");
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(PANEL_PADDING))

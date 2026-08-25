@@ -598,31 +598,6 @@ impl App {
     }
 
     pub(crate) fn handle_select_or_input_dialog(&mut self, key: KeyEvent) -> Option<Command> {
-        if self
-            .ask_user_request
-            .as_ref()
-            .is_some_and(|request| request.kind == AskUserKind::RoundLimit)
-        {
-            match key.code {
-                KeyCode::Esc => {
-                    let _ = self.send_user_response(AskUserResponse::Answer("Stop".to_string()));
-                }
-                KeyCode::Up => self.move_dialog_selection(-1),
-                KeyCode::Down => self.move_dialog_selection(1),
-                KeyCode::Enter => {
-                    if let Some(answer) = self
-                        .dialog
-                        .as_ref()
-                        .and_then(DialogState::selected_option)
-                        .map(|option| option.label.clone())
-                    {
-                        let _ = self.send_user_response(AskUserResponse::Answer(answer));
-                    }
-                }
-                _ => {}
-            }
-            return None;
-        }
         let option_count = self
             .dialog
             .as_ref()

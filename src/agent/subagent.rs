@@ -24,7 +24,7 @@ pub(crate) struct SubagentRuntime {
     model: String,
     max_tokens: u32,
     effort: Option<ReasoningEffort>,
-    max_rounds: u32,
+    max_subagent_rounds: u32,
     supports_images: bool,
     provider: Arc<dyn Provider>,
     system: Vec<SystemBlock>,
@@ -45,7 +45,7 @@ impl SubagentRuntime {
         Self {
             model: config.model.clone(),
             max_tokens: config.max_tokens,
-            max_rounds: config.max_rounds,
+            max_subagent_rounds: config.max_subagent_rounds,
             supports_images: config.supports_images,
             effort: config.effort,
             provider,
@@ -131,9 +131,9 @@ impl SubagentRunner {
             task,
             chrono::Local::now(),
         ))];
-        for round in 0..self.runtime.max_rounds {
+        for round in 0..self.runtime.max_subagent_rounds {
             self.ensure_active()?;
-            let final_round = round.saturating_add(1) == self.runtime.max_rounds;
+            let final_round = round.saturating_add(1) == self.runtime.max_subagent_rounds;
             if final_round {
                 messages.push(Message::user(self.profile.final_round_prompt.clone()));
             }
@@ -481,7 +481,7 @@ mod tests {
     }
 
     fn runtime(
-        max_rounds: u32,
+        max_subagent_rounds: u32,
         provider: Arc<dyn Provider>,
         cancelled: Arc<AtomicBool>,
     ) -> SubagentRuntime {
@@ -494,7 +494,7 @@ mod tests {
             max_tokens: 1_024,
             effort: None,
             context_window_tokens: 8_192,
-            max_rounds,
+            max_subagent_rounds,
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,
@@ -527,7 +527,7 @@ mod tests {
     }
 
     fn image_support_runtime(
-        max_rounds: u32,
+        max_subagent_rounds: u32,
         provider: Arc<dyn Provider>,
         cancelled: Arc<AtomicBool>,
     ) -> SubagentRuntime {
@@ -540,7 +540,7 @@ mod tests {
             max_tokens: 1_024,
             effort: None,
             context_window_tokens: 8_192,
-            max_rounds,
+            max_subagent_rounds,
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,

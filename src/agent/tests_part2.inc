@@ -1,5 +1,5 @@
     #[test]
-    fn post_write_diagnostic_is_returned_before_the_round_limit_can_stop_repair() {
+    fn post_write_diagnostic_is_returned_to_the_model_for_repair() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let responses = [
@@ -60,7 +60,7 @@
         fs::write(
             &storage.ai_config_path,
             format!(
-                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 1\n"
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\n"
             ),
         )
         .unwrap();
@@ -99,125 +99,6 @@
             fs::read_to_string(storage.data_dir.join("invalid.md")).unwrap(),
             "[box border=double]\nbody\n[/box]\n"
         );
-    }
-
-    #[test]
-    fn stopping_at_round_limit_preserves_context_for_a_manual_followup() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let responses = [
-            json!({
-                "content": [{
-                    "type": "tool_use", "id": "notify-1", "name": "notify",
-                    "input": {"message": "Still working"}
-                }],
-                "stop_reason": "tool_use",
-                "usage": {"input_tokens": 10, "output_tokens": 3}
-            }),
-            json!({
-                "content": [{"type": "text", "text": "Finished after follow-up"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 15, "output_tokens": 4}
-            }),
-        ];
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            for response in responses {
-                let (stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream);
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        content_length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut request = vec![0; content_length];
-                reader.read_exact(&mut request).unwrap();
-                requests.push(serde_json::from_slice::<Value>(&request).unwrap());
-                let body = serde_json::to_vec(&response).unwrap();
-                write!(
-                    reader.get_mut(),
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                reader.get_mut().write_all(&body).unwrap();
-                reader.get_mut().flush().unwrap();
-            }
-            requests
-        });
-
-        let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::new(directory.path()).unwrap();
-        storage.ensure_files().unwrap();
-        fs::write(
-            &storage.ai_config_path,
-            format!(
-                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 1\n"
-            ),
-        )
-        .unwrap();
-        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
-        user_sender
-            .send(AskUserResponse::Answer("Stop".to_string()))
-            .unwrap();
-        let (event_sender, mut event_receiver) = event_channel();
-        let agent = Agent::from_config(
-            &storage.ai_config_path,
-            &storage.root,
-            AgentRuntime::new(
-                event_sender,
-                approval_receiver,
-                user_receiver,
-                private_terminal_input_receiver(),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(AtomicU8::new(PermissionMode::Approve.code())),
-                Arc::new(AtomicBool::new(false)),
-            ),
-        )
-        .unwrap();
-        let mut conversation = AgentConversation::default();
-
-        assert_eq!(
-            run_agent(&agent, "Start the task", &mut conversation).unwrap(),
-            ""
-        );
-        assert_eq!(conversation.messages.len(), 3);
-        assert_eq!(
-            run_agent(&agent, "Please continue", &mut conversation).unwrap(),
-            "Finished after follow-up"
-        );
-        let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 2);
-        let messages = requests[1]["messages"].as_array().unwrap();
-        let latest_user_content = messages.last().unwrap()["content"].as_array().unwrap();
-        assert!(latest_user_content
-            .iter()
-            .any(|part| part["type"] == "tool_result"));
-        assert!(latest_user_content.iter().any(|part| {
-            part["type"] == "text"
-                && part["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("Please continue"))
-        }));
-        let events = drain_events(&mut event_receiver);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::AskUser(AskUserRequest {
-                kind: AskUserKind::RoundLimit,
-                ..
-            })
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::Notification(message) if message.contains("request rounds")
-        )));
     }
 
     #[test]
@@ -274,7 +155,7 @@
         fs::write(
             &storage.ai_config_path,
             format!(
-                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 4\n"
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\n"
             ),
         )
         .unwrap();
@@ -367,7 +248,7 @@
         fs::write(
             &storage.ai_config_path,
             format!(
-                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 4\n"
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\n"
             ),
         )
         .unwrap();
@@ -481,7 +362,7 @@
     }
 
     #[test]
-    fn buffered_prompt_starts_a_fresh_round_budget() {
+    fn buffered_prompt_restarts_round_counting() {
         struct BufferFollowup(Arc<Mutex<Vec<String>>>);
 
         #[async_trait::async_trait]
@@ -567,7 +448,7 @@
         fs::write(
             &storage.ai_config_path,
             format!(
-                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\nmax_rounds = 2\n"
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\n"
             ),
         )
         .unwrap();
@@ -597,11 +478,11 @@
         let rounds = drain_events(&mut event_receiver)
             .into_iter()
             .filter_map(|event| match event {
-                AgentEvent::Round { current, limit } => Some((current, limit)),
+                AgentEvent::Round { current } => Some(current),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rounds, vec![(1, 2), (2, 2), (1, 2)]);
+        assert_eq!(rounds, vec![1, 2, 1]);
     }
 
     #[test]

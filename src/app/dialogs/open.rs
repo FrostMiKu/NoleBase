@@ -391,22 +391,12 @@ impl App {
             }
             Overlay::AskUser => {
                 let request = self.ask_user_request.as_ref();
-                let round_limit =
-                    request.is_some_and(|request| request.kind == AskUserKind::RoundLimit);
                 let mut dialog = DialogState::new(
-                    if round_limit {
-                        "Agent round limit"
-                    } else {
-                        "Agent question"
-                    },
+                    "Agent question",
                     request
                         .map(|request| request.question.clone())
                         .unwrap_or_default(),
-                    if round_limit {
-                        DialogMode::SingleSelect
-                    } else {
-                        DialogMode::SelectOrInput
-                    },
+                    DialogMode::SelectOrInput,
                     DialogPurpose::AskUser,
                     request
                         .map(|request| {

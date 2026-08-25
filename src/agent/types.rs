@@ -155,7 +155,6 @@ pub enum AgentEvent {
     Retry,
     Round {
         current: u32,
-        limit: u32,
     },
     ConversationUpdated(AgentConversation),
     Notification(String),
@@ -173,7 +172,6 @@ pub enum AgentEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentStopReason {
-    RequestRoundLimit,
     ToolApprovalDenied,
 }
 
@@ -231,8 +229,9 @@ pub(crate) enum ToolCallExecution {
 pub(crate) enum ToolBatchExecution {
     Completed {
         messages: Vec<Message>,
-        turn_boundary: bool,
-        retry_after_error: bool,
+        /// A user follow-up was folded into the trailing message, so round
+        /// counting restarts on the next provider request.
+        followup_delivered: bool,
     },
     Denied(Vec<Message>),
 }
@@ -253,15 +252,8 @@ impl ToolExecutionPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AskUserRequest {
-    pub kind: AskUserKind,
     pub question: String,
     pub options: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AskUserKind {
-    Tool,
-    RoundLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

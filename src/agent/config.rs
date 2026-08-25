@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::agent::types::ToolExecutionPolicy;
 use crate::provider::{ApiFormat, ReasoningEffort};
 
-pub(crate) const DEFAULT_MAX_ROUNDS: u32 = 25;
+pub(crate) const DEFAULT_MAX_SUBAGENT_ROUNDS: u32 = 25;
 pub(crate) const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 pub(crate) const DEFAULT_MAX_CONCURRENT_LOCAL_READS: usize = 8;
 pub(crate) const DEFAULT_MAX_CONCURRENT_NETWORK_TOOLS: usize = 8;
@@ -76,8 +76,11 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: u64,
-    #[serde(default = "default_max_rounds")]
-    pub max_rounds: u32,
+    /// Round budget for non-interactive subagents (explore, review, and the
+    /// subagent tool). The main Agent conversation has no round limit; the
+    /// user interrupts it directly.
+    #[serde(default = "default_max_subagent_rounds")]
+    pub max_subagent_rounds: u32,
     #[serde(default = "default_max_concurrent_local_reads")]
     pub max_concurrent_local_reads: usize,
     #[serde(default = "default_max_concurrent_network_tools")]
@@ -112,8 +115,8 @@ const fn default_context_window_tokens() -> u64 {
     DEFAULT_CONTEXT_WINDOW_TOKENS
 }
 
-const fn default_max_rounds() -> u32 {
-    DEFAULT_MAX_ROUNDS
+const fn default_max_subagent_rounds() -> u32 {
+    DEFAULT_MAX_SUBAGENT_ROUNDS
 }
 
 const fn default_max_concurrent_local_reads() -> usize {
@@ -164,8 +167,8 @@ impl AgentConfig {
         if config.context_window_tokens <= u64::from(config.max_tokens) {
             bail!("context_window_tokens must be greater than max_tokens");
         }
-        if config.max_rounds == 0 {
-            bail!("max_rounds must be greater than zero");
+        if config.max_subagent_rounds == 0 {
+            bail!("max_subagent_rounds must be greater than zero");
         }
         if config.max_concurrent_local_reads == 0 {
             bail!("max_concurrent_local_reads must be greater than zero");

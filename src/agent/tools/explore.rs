@@ -150,7 +150,7 @@ mod tests {
     }
 
     fn runtime(
-        max_rounds: u32,
+        max_subagent_rounds: u32,
         provider: Arc<dyn Provider>,
         events: tokio::sync::broadcast::Sender<AgentEvent>,
     ) -> SubagentRuntime {
@@ -163,7 +163,7 @@ mod tests {
             max_tokens: 1_024,
             effort: None,
             context_window_tokens: 8_192,
-            max_rounds,
+            max_subagent_rounds,
             max_concurrent_local_reads: 8,
             max_concurrent_network_tools: 8,
             max_concurrent_subagents: 4,

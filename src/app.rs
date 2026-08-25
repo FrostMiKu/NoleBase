@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::agent::{
     AgentConfig, AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision,
-    ApprovalKind, ApprovalRequest, AskUserKind, AskUserRequest, AskUserResponse, PermissionMode,
+    ApprovalKind, ApprovalRequest, AskUserRequest, AskUserResponse, PermissionMode,
     PrivateTerminalInputDecision, PrivateTerminalInputRequest, AGENT_STREAM_BUFFER,
 };
 use crate::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
@@ -385,7 +385,6 @@ pub struct App {
     pub agent_response_duration: Duration,
     pub agent_retry_count: u64,
     pub agent_round: u32,
-    pub agent_round_limit: u32,
     /// Reasoning-effort tier label from the active AI config, published by the
     /// worker at run start; `None` until the first run announces it.
     pub agent_effort: Option<String>,
@@ -628,7 +627,6 @@ impl App {
             agent_response_duration,
             agent_retry_count: 0,
             agent_round: 0,
-            agent_round_limit: 0,
             agent_effort,
             agent_conversation,
             ai_prompt_input: String::new(),

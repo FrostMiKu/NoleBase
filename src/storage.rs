@@ -596,7 +596,8 @@ impl Storage {
             "effort = \"high\"\n",
             "max_tokens = 8192\n",
             "context_window_tokens = 200000\n",
-            "max_rounds = 25\n",
+            "# Round budget for non-interactive subagents; the main Agent has no round limit.\n",
+            "max_subagent_rounds = 25\n",
             "max_concurrent_local_reads = 8\n",
             "max_concurrent_network_tools = 8\n",
             "max_concurrent_subagents = 4\n",
@@ -2343,7 +2344,7 @@ mod tests {
         assert!(config.contains("max_tokens = 8192"));
         assert!(config.contains("effort = \"high\""));
         assert!(config.contains("context_window_tokens = 200000"));
-        assert!(config.contains("max_rounds = 25"));
+        assert!(config.contains("max_subagent_rounds = 25"));
         assert!(config.contains("max_concurrent_local_reads = 8"));
         assert!(config.contains("max_concurrent_network_tools = 8"));
         assert!(config.contains("max_concurrent_subagents = 4"));

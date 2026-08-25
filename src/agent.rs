@@ -397,7 +397,6 @@ pub struct Agent {
     definitions: Vec<ToolSpec>,
     system: Vec<SystemBlock>,
     events: AgentEventSender,
-    user_responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>>>,
     input_buffer: Arc<Mutex<Vec<String>>>,
     cancelled: Arc<AtomicBool>,
     concurrency: ToolConcurrencyLimits,
@@ -713,7 +712,6 @@ impl Agent {
             definitions: Vec::new(),
             system,
             events: events.clone(),
-            user_responses: user_responses.clone(),
             input_buffer,
             cancelled: cancelled.clone(),
             jobs: jobs_handle.clone(),
@@ -912,8 +910,6 @@ impl Agent {
         let mut empty_response_retries = 0usize;
         let mut truncation_retries = 0usize;
         let mut round = 0u32;
-        let mut round_limit = self.config.max_rounds;
-        let mut error_recovery_used = false;
 
         loop {
             let buffered = self.take_buffered_prompts()?;
@@ -935,23 +931,10 @@ impl Agent {
                 }
                 self.checkpoint_conversation(conversation);
                 round = 0;
-                round_limit = self.config.max_rounds;
-                error_recovery_used = false;
-            }
-            if round >= round_limit {
-                if !self.request_round_limit_decision(round).await? {
-                    return Ok(AgentRunCompletion::Stopped(
-                        AgentStopReason::RequestRoundLimit,
-                    ));
-                }
-                round_limit = round_limit.saturating_add(self.config.max_rounds);
             }
             round = round.saturating_add(1);
             self.ensure_active()?;
-            let _ = self.events.send(AgentEvent::Round {
-                current: round,
-                limit: round_limit,
-            });
+            let _ = self.events.send(AgentEvent::Round { current: round });
             if self
                 .compact_context_if_needed(&mut conversation.messages, definitions)
                 .await?
@@ -985,7 +968,6 @@ impl Agent {
                     );
                     self.checkpoint_conversation(conversation);
                     round = 0;
-                    round_limit = self.config.max_rounds;
                     empty_response_retries = 0;
                     truncation_retries = 0;
                     continue;
@@ -1045,18 +1027,12 @@ impl Agent {
             match results {
                 ToolBatchExecution::Completed {
                     messages,
-                    turn_boundary,
-                    retry_after_error,
+                    followup_delivered,
                 } => {
                     conversation.messages.extend(messages);
                     self.checkpoint_conversation(conversation);
-                    if turn_boundary {
+                    if followup_delivered {
                         round = 0;
-                        round_limit = self.config.max_rounds;
-                    }
-                    if retry_after_error && round >= round_limit && !error_recovery_used {
-                        round = round.saturating_sub(1);
-                        error_recovery_used = true;
                     }
                 }
                 ToolBatchExecution::Denied(results) => {
@@ -1074,28 +1050,6 @@ impl Agent {
         let _ = self
             .events
             .send(AgentEvent::ConversationUpdated(conversation.clone()));
-    }
-
-    async fn request_round_limit_decision(&self, completed_rounds: u32) -> Result<bool> {
-        let additional = self.config.max_rounds;
-        let message = format!("Agent reached {completed_rounds} request rounds");
-        let _ = self.events.send(AgentEvent::Notification(message));
-        self.events
-            .send(AgentEvent::AskUser(AskUserRequest {
-                kind: AskUserKind::RoundLimit,
-                question: format!(
-                    "Agent has used {completed_rounds} request rounds without finishing. Continue for up to {additional} more?"
-                ),
-                options: vec!["Continue".to_string(), "Stop".to_string()],
-            }))
-            .context("asking whether to continue Agent")?;
-        let response = recv_while_active(
-            &self.user_responses,
-            &self.cancelled,
-            "waiting for round-limit decision",
-        )
-        .await?;
-        Ok(matches!(response, AskUserResponse::Answer(answer) if answer == "Continue"))
     }
 
     async fn request_message(
@@ -1458,7 +1412,6 @@ impl Agent {
         tool_input_errors: &HashMap<String, String>,
     ) -> Result<ToolBatchExecution> {
         let mut outputs = Vec::with_capacity(tool_uses.len());
-        let mut retry_after_error = false;
         let mut buffered = Vec::new();
         let mut index = 0usize;
         while index < tool_uses.len() {
@@ -1505,8 +1458,6 @@ impl Agent {
                         output
                     }
                 };
-                retry_after_error |= output.result.is_error
-                    || output.result.content.contains(REPAIR_REQUIRED_MARKER);
                 outputs.push((global_offset, output));
             }
             if denied {
@@ -1524,14 +1475,13 @@ impl Agent {
             index = end;
         }
         buffered.extend(self.take_buffered_prompts()?);
-        let turn_boundary = !buffered.is_empty();
+        let followup_delivered = !buffered.is_empty();
         let messages = self
             .finalize_tool_messages(tool_uses, outputs, buffered)
             .await?;
         Ok(ToolBatchExecution::Completed {
             messages,
-            turn_boundary,
-            retry_after_error,
+            followup_delivered,
         })
     }
 

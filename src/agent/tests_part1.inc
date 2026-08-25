@@ -6,12 +6,12 @@
     }
 
     #[test]
-    fn agent_config_defaults_to_twenty_five_rounds_and_validates_overrides() {
+    fn agent_config_defaults_apply_and_overrides_validate() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ai.toml");
         fs::write(&path, TEST_MESSAGES_CONFIG).unwrap();
         let config = AgentConfig::load(&path).unwrap();
-        assert_eq!(config.max_rounds, 25);
+        assert_eq!(config.max_subagent_rounds, 25);
         assert_eq!(config.max_tokens, 8192);
         assert_eq!(config.context_window_tokens, 200_000);
         assert_eq!(config.max_concurrent_local_reads, 8);
@@ -39,22 +39,26 @@
         fs::write(
             &path,
             format!(
-                "{TEST_MESSAGES_CONFIG}max_rounds = 40\nmax_concurrent_local_reads = 3\nmax_concurrent_network_tools = 5\nmax_concurrent_subagents = 2\n"
+                "{TEST_MESSAGES_CONFIG}max_subagent_rounds = 40\nmax_concurrent_local_reads = 3\nmax_concurrent_network_tools = 5\nmax_concurrent_subagents = 2\n"
             ),
         )
         .unwrap();
         let configured = AgentConfig::load(&path).unwrap();
-        assert_eq!(configured.max_rounds, 40);
+        assert_eq!(configured.max_subagent_rounds, 40);
         let concurrency = ToolConcurrencyLimits::from_config(&configured);
         assert_eq!(concurrency.local_reads.available_permits(), 3);
         assert_eq!(concurrency.network.available_permits(), 5);
         assert_eq!(concurrency.subagents.available_permits(), 2);
 
-        fs::write(&path, format!("{TEST_MESSAGES_CONFIG}max_rounds = 0\n")).unwrap();
+        fs::write(
+            &path,
+            format!("{TEST_MESSAGES_CONFIG}max_subagent_rounds = 0\n"),
+        )
+        .unwrap();
         assert!(AgentConfig::load(&path)
             .unwrap_err()
             .to_string()
-            .contains("max_rounds must be greater than zero"));
+            .contains("max_subagent_rounds must be greater than zero"));
 
         for field in [
             "max_concurrent_local_reads",
@@ -2621,7 +2625,7 @@
                 input: json!({}),
             },
         ];
-        let (messages, turn_boundary) = match test_runtime()
+        let messages = match test_runtime()
             .block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(5),
@@ -2631,14 +2635,9 @@
                 .expect("buffered image tool wave timed out")
                 .unwrap()
             }) {
-            ToolBatchExecution::Completed {
-                messages,
-                turn_boundary,
-                ..
-            } => (messages, turn_boundary),
+            ToolBatchExecution::Completed { messages, .. } => messages,
             _ => panic!("expected a completed batch"),
         };
-        assert!(turn_boundary);
         // tool results, then ONE trailing user message with every image
         // followed by the buffered (datetime-prefixed) user text appended in
         // the same message.
@@ -2725,7 +2724,7 @@
             name: "image_probe_a".to_string(),
             input: json!({}),
         }];
-        let (messages, turn_boundary) = match test_runtime()
+        let messages = match test_runtime()
             .block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(5),
@@ -2735,14 +2734,9 @@
                 .expect("deferred tool wave timed out")
                 .unwrap()
             }) {
-            ToolBatchExecution::Completed {
-                messages,
-                turn_boundary,
-                ..
-            } => (messages, turn_boundary),
+            ToolBatchExecution::Completed { messages, .. } => messages,
             _ => panic!("expected a completed batch"),
         };
-        assert!(turn_boundary);
         assert_eq!(messages.len(), 2);
         match &messages[0].parts[0] {
             MessagePart::ToolResult(result) => {

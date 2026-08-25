@@ -150,7 +150,6 @@ fn render_daily_note(
 fn animated_color(position: usize, tick: u64) -> Color {
     super::animated_color(position, tick, Theme::default())
 }
-use crate::agent::AskUserKind;
 use crate::agent::{
     AgentTerminalSnapshot, AgentTerminalStatus, ApprovalKind, ApprovalRequest, CommandApproval,
     PrivateTerminalInputRequest,
@@ -237,7 +236,6 @@ fn agent_header_shows_rounds_usage_stream_speed_and_cache_reads() {
 
     let (mut app, _directory) = make_app();
     app.agent_round = 3;
-    app.agent_round_limit = 25;
     app.agent_usage = crate::agent_session::TokenUsage {
         input_tokens: 500,
         output_tokens: 1_234,
@@ -251,7 +249,7 @@ fn agent_header_shows_rounds_usage_stream_speed_and_cache_reads() {
     app.agent_retry_count = 2;
     let terminal = render(&mut app, 220, 24);
     let screen = buffer_string(&terminal);
-    assert!(screen.contains("Agent · ↻3/25"));
+    assert!(screen.contains("Agent · ↻3"));
     assert!(screen.contains("Ctx 6.8k/200k"));
     assert!(screen.contains("↑3.5k↓1.2k"));
     assert!(screen.contains("617.0t/s"));
@@ -2554,7 +2552,6 @@ fn side_by_side_diff_aligns_context_insertions_and_deletions() {
 fn ask_user_overlay_renders_choices_and_free_text_input() {
     let (mut app, _directory) = make_app();
     app.ask_user_request = Some(crate::agent::AskUserRequest {
-        kind: AskUserKind::Tool,
         question: "Which output format should be used?".to_string(),
         options: vec!["Markdown".to_string(), "MBDown".to_string()],
     });
@@ -2615,7 +2612,6 @@ fn ask_user_long_options_wrap_instead_of_clipping() {
     let (mut app, _directory) = make_app();
     let long_option = "Refactor the storage layer to stream attachments instead of buffering whole files in memory";
     app.ask_user_request = Some(crate::agent::AskUserRequest {
-        kind: AskUserKind::Tool,
         question: "How should we fix the attachment pipeline?".to_string(),
         options: vec![long_option.to_string(), "Ship as-is".to_string()],
     });
@@ -2669,7 +2665,6 @@ fn ask_user_long_options_wrap_instead_of_clipping() {
 fn ask_user_wrapped_options_stay_selectable_by_keyboard() {
     let (mut app, _directory) = make_app();
     app.ask_user_request = Some(crate::agent::AskUserRequest {
-        kind: AskUserKind::Tool,
         question: "Pick one".to_string(),
         options: vec![
             "A very long first option that will need to wrap across several rows in a narrow terminal window".to_string(),
@@ -2704,26 +2699,6 @@ fn private_terminal_input_renders_only_a_mask() {
     assert!(screen.contains(&"•".repeat("never-render-this".chars().count())));
     assert!(!screen.contains("never-render-this"));
     assert!(screen.contains("Enter submit · Esc cancel"));
-}
-
-#[test]
-fn round_limit_dialog_only_offers_continue_or_stop() {
-    let (mut app, _directory) = make_app();
-    app.ask_user_request = Some(crate::agent::AskUserRequest {
-        kind: AskUserKind::RoundLimit,
-        question: "Continue for up to 25 more rounds?".to_string(),
-        options: vec!["Continue".to_string(), "Stop".to_string()],
-    });
-    app.set_overlay(Overlay::AskUser);
-
-    let terminal = render(&mut app, 100, 24);
-    let screen = buffer_string(&terminal);
-    assert!(screen.contains("Agent round limit"));
-    assert!(screen.contains("Continue"));
-    assert!(screen.contains("Stop"));
-    assert!(!screen.contains("Other answer"));
-    assert!(!screen.contains("Your answer"));
-    assert!(screen.contains("Esc stop"));
 }
 
 #[test]

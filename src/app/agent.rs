@@ -409,9 +409,8 @@ impl App {
                     self.preparing_agent_tools.clear();
                     self.active_agent_tools.clear();
                 }
-                AgentEvent::Round { current, limit } => {
+                AgentEvent::Round { current } => {
                     self.agent_round = current;
-                    self.agent_round_limit = limit;
                     if self.active_agent_tools.is_empty() {
                         self.set_status("AI is working...");
                     }
@@ -449,11 +448,7 @@ impl App {
                     self.set_overlay(Overlay::Approval);
                 }
                 AgentEvent::AskUser(request) => {
-                    self.set_status(if request.kind == AskUserKind::RoundLimit {
-                        "Agent reached its request-round limit"
-                    } else {
-                        "Agent is waiting for your answer"
-                    });
+                    self.set_status("Agent is waiting for your answer");
                     self.ask_user_option = 0;
                     self.ask_user_input.clear();
                     self.ask_user_cursor = 0;
@@ -478,10 +473,6 @@ impl App {
                     self.ai_running = false;
                     self.ai_cancel = None;
                     let (notification, status) = match reason {
-                        AgentStopReason::RequestRoundLimit => (
-                            "Agent stopped at the request-round limit",
-                            "Agent paused at the request-round limit",
-                        ),
                         AgentStopReason::ToolApprovalDenied => (
                             "Agent stopped after tool approval was denied",
                             "Agent stopped after tool approval was denied",
@@ -849,7 +840,6 @@ impl App {
         }
         self.ai_running = true;
         self.agent_round = 0;
-        self.agent_round_limit = 0;
         self.set_status("AI is working...");
         let cancelled = self.agent_worker.cancellation_token();
         cancelled.store(false, Ordering::Relaxed);
@@ -999,7 +989,6 @@ impl App {
         self.agent_response_duration = Duration::ZERO;
         self.agent_retry_count = 0;
         self.agent_round = 0;
-        self.agent_round_limit = 0;
         if was_running || had_saved_session || had_history || had_panel_content {
             self.set_status("Agent session cleared");
         } else {
@@ -1023,10 +1012,6 @@ impl App {
     }
 
     pub(super) fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {
-        let round_limit = self
-            .ask_user_request
-            .as_ref()
-            .is_some_and(|request| request.kind == AskUserKind::RoundLimit);
         let sender = self
             .ai_user_sender
             .as_ref()
@@ -1034,40 +1019,31 @@ impl App {
         sender
             .send(response.clone())
             .context("sending response to Agent")?;
-        if !round_limit {
-            if let AskUserResponse::Answer(answer) = &response {
-                let answer = answer.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !answer.is_empty() {
-                    if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
-                        matches!(
-                            entry.as_ref(),
-                            AgentPanelEntry::Tool {
-                                text,
-                                active: true,
-                                ..
-                            } if text.starts_with("Calling Ask...")
-                        )
-                    }) {
-                        if let AgentPanelEntry::Tool { text, .. } = Arc::make_mut(entry) {
-                            if text.lines().count() < 3 {
-                                text.push('\n');
-                                text.push_str(&answer);
-                            }
+        if let AskUserResponse::Answer(answer) = &response {
+            let answer = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !answer.is_empty() {
+                if let Some(entry) = self.agent_panel.iter_mut().rev().find(|entry| {
+                    matches!(
+                        entry.as_ref(),
+                        AgentPanelEntry::Tool {
+                            text,
+                            active: true,
+                            ..
+                        } if text.starts_with("Calling Ask...")
+                    )
+                }) {
+                    if let AgentPanelEntry::Tool { text, .. } = Arc::make_mut(entry) {
+                        if text.lines().count() < 3 {
+                            text.push('\n');
+                            text.push_str(&answer);
                         }
                     }
                 }
             }
         }
-        self.set_status(if round_limit {
-            match &response {
-                AskUserResponse::Answer(answer) if answer == "Continue" => "Agent continuing",
-                _ => "Agent stopping at the request-round limit",
-            }
-        } else {
-            match response {
-                AskUserResponse::Answer(_) => "Answer sent to Agent",
-                AskUserResponse::Cancelled => "Agent question cancelled",
-            }
+        self.set_status(match response {
+            AskUserResponse::Answer(_) => "Answer sent to Agent",
+            AskUserResponse::Cancelled => "Agent question cancelled",
         });
         self.clear_ask_user();
         Ok(())

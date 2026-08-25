@@ -370,7 +370,7 @@ model = "claude-sonnet-4-5"
 base_url = "https://api.anthropic.com"
 max_tokens = 8192
 context_window_tokens = 200000
-max_rounds = 25
+max_subagent_rounds = 25
 max_concurrent_local_reads = 8
 max_concurrent_network_tools = 8
 max_concurrent_subagents = 4
@@ -393,13 +393,12 @@ intermediate text, and final responses; Todo uses the upper third.
 While a long `write`, `edit`, or `append` input is still streaming, its tool activity row
 shows the target, decoded line/byte progress, and latest non-empty content line;
 the complete JSON is still validated before approval or execution.
-`max_rounds` is the request-round budget for each user prompt and, independently,
-for each `explore` and `review` invocation; each response may call several tools
-within that request-round budget. A user follow-up received while the Agent is
-running starts a fresh budget after the in-flight tool finishes. At the main
-Agent's limit, Nole rings the terminal bell and asks whether to continue or
-stop. On an `explore` or `review` subagent's last allowed request, Nole appends
-its finalization prompt and removes all tools. Subagent provider responses stream
+`max_subagent_rounds` is the request-round budget for each `explore` and
+`review` invocation; each response may call several tools within that budget.
+The main Agent conversation has no round limit — the user watches the timeline
+and interrupts directly. On an `explore` or `review` subagent's last allowed
+request, Nole appends its finalization prompt and removes all tools. Subagent
+provider responses stream
 internally so long generations stay active, but their text and thinking deltas
 remain isolated; only the completed report is returned to the parent. If a
 subagent reaches `max_tokens` before that final request, its partial response is
@@ -542,7 +541,8 @@ You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
 An in-flight concurrent wave is allowed to finish, while later unstarted calls
 from the old plan are deferred so the Agent can reconsider them with the new
-input and a fresh `max_rounds` budget. A follow-up appears at the end of the
+input; round counting restarts once the follow-up is delivered. A follow-up
+appears at the end of the
 timeline in muted text while queued, then
 uses normal MBDown colors once the Agent consumes it. Final responses and later
 prompts append to the same virtual-scrolling timeline. Only clearing the Agent

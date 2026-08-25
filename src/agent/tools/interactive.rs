@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use super::util::{display_path, required_string};
 use crate::agent::{
     canonical_root, recv_while_active, AgentEvent, AgentEventSender, AgentTerminalHandle,
-    AskUserKind, AskUserRequest, AskUserResponse, PrivateTerminalInputDecision,
-    PrivateTerminalInputRequest, Tool,
+    AskUserRequest, AskUserResponse, PrivateTerminalInputDecision, PrivateTerminalInputRequest,
+    Tool,
 };
 use crate::storage::Storage;
 
@@ -173,7 +173,6 @@ impl Tool for Ask {
         }
         self.events
             .send(AgentEvent::AskUser(AskUserRequest {
-                kind: AskUserKind::Tool,
                 question: question.to_string(),
                 options,
             }))
