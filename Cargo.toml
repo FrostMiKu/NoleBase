@@ -21,38 +21,38 @@ mbdown = "0.1.4"
 mbtui = "0.1.4"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 clipboard-rs = { version = "0.3.5", features = ["image"] }
-base64 = "0.22"
+base64 = "0.23"
 brush-builtins = "0.2.0"
 brush-core = "0.5.0"
 brush-interactive = { version = "0.4.0", features = ["basic"] }
 brush-parser = "0.4.0"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 anyhow = "1"
-anydoc = "0.2.0"
+anydoc = "0.2.3"
 async-trait = "0.1"
 cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "5"
+dirs = "6"
 fastrand = "2"
 globset = "0.4"
 ignore = "0.4"
 fasteval = "0.2.4"
-jsonschema = { version = "0.49", default-features = false }
+jsonschema = { version = "0.51", default-features = false }
 htmd = "0.5.5"
 notify = "8"
 open = "5"
 portable-pty = "0.9"
 unicode-width = "0.2.2"
 zeroize = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.13"
-sha2 = "0.10"
-similar = { version = "2", features = ["unicode"] }
-toml = "0.8"
-toml_edit = "0.22"
+sha2 = "0.11"
+similar = { version = "3", features = ["unicode"] }
+toml = "1"
+toml_edit = "0.25"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
