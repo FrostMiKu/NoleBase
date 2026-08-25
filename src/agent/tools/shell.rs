@@ -5,11 +5,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::agent::{
-    run_noninteractive_shell, terminal_input_bytes, terminal_input_display, validate_shell_command,
+    run_noninteractive_shell, run_noninteractive_shell_untimed, terminal_input_bytes,
+    terminal_input_display, validate_shell_command,
     AgentJobsHandle, AgentTerminalHandle, ApprovalGate, ApprovalKind, ApprovalRequest,
     CommandApproval, JobKind, StartedJob, Tool,
 };
@@ -139,7 +140,7 @@ impl Tool for Shell {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_TIMEOUT_SECONDS,
-                    "description": "Maximum runtime in seconds; defaults to 120."
+                    "description": "Maximum runtime in seconds for a foreground command; defaults to 120. Explicitly backgrounded commands have no timeout: they run until they finish or are cancelled with the jobs tool."
                 },
                 "background": {
                     "type": "boolean",
@@ -157,14 +158,20 @@ impl Tool for Shell {
         let command = required_string(input, "command")?;
         let cwd = resolve_shell_cwd(&self.root, optional_string(input, "cwd")?)?;
         validate_shell_command(command, &cwd, &self.root)?;
-        let timeout_seconds = input
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+        let timeout_seconds = input.get("timeout_seconds");
         let background = input
             .get("background")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if background && timeout_seconds.is_some() {
+            bail!(
+                "timeout_seconds does not apply to background commands: they run until they \
+                 finish or are cancelled with the jobs tool. Drop it, or run in the foreground."
+            );
+        }
+        let timeout_seconds = timeout_seconds
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
         self.gate
             .request_host_action(command_approval(
                 "Run shell command",
@@ -189,7 +196,12 @@ impl Tool for Shell {
             } else {
                 self.jobs.start_raced(JobKind::Shell, command)?
             };
-            self.spawn_shell_job_body(&started, &cwd, command, timeout);
+            // A backgrounded command has no timeout: only `jobs cancel` or
+            // clearing the session stops it, exactly as the tool docs state.
+            // `timeout_seconds` bounds foreground execution (and the race's
+            // foreground wait) only.
+            let job_timeout = if background { None } else { Some(timeout) };
+            self.spawn_shell_job_body(&started, &cwd, command, job_timeout);
             if background {
                 return Ok(serde_json::to_string_pretty(&json!({
                     "backgrounded": true,
@@ -251,12 +263,14 @@ impl Shell {
     /// Spawn the job body thread for a backgrounded shell command. The body
     /// runs with the job's own cancellation flag, so it survives interruption
     /// of the current Agent run; only `jobs cancel` and session clear stop it.
+    /// `timeout` is `None` for explicitly backgrounded commands, which have
+    /// no deadline at all.
     fn spawn_shell_job_body(
         &self,
         started: &StartedJob,
         cwd: &Path,
         command: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) {
         let jobs = self.jobs.clone();
         let id = started.id.clone();
@@ -264,9 +278,12 @@ impl Shell {
         let cwd = cwd.to_path_buf();
         let command = command.to_string();
         std::thread::spawn(move || {
-            let outcome = run_noninteractive_shell(&cwd, &command, timeout, &cancel)
-                .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
-                .map_err(|error| format!("{error:#}"));
+            let outcome = match timeout {
+                Some(timeout) => run_noninteractive_shell(&cwd, &command, timeout, &cancel),
+                None => run_noninteractive_shell_untimed(&cwd, &command, &cancel),
+            }
+            .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
+            .map_err(|error| format!("{error:#}"));
             jobs.settle(&id, outcome);
         });
     }
@@ -985,6 +1002,37 @@ mod tests {
         let deliveries = jobs.take_deliveries();
         assert!(deliveries.iter().all(|delivery| delivery.id == job));
         let _ = receiver.try_recv();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_background_rejects_timeout_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _) = tokio::sync::broadcast::channel::<AgentEvent>(8);
+        let jobs = AgentJobsHandle::new(events);
+        let shell = Shell::new(
+            directory.path(),
+            yolo_gate(directory.path()),
+            Arc::new(AtomicBool::new(false)),
+            jobs.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+            60,
+        );
+        // Backgrounded commands have no timeout, so an explicit
+        // timeout_seconds is a contradiction the tool must surface instead
+        // of silently ignoring.
+        let error = shell
+            .execute(&json!({
+                "purpose": "Long task",
+                "command": "sleep 150",
+                "background": true,
+                "timeout_seconds": 1
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timeout_seconds does not apply to background"));
+        assert!(jobs.rows().is_empty());
     }
 
     #[cfg(unix)]

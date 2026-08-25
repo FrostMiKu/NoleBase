@@ -451,6 +451,25 @@ pub(crate) fn run_noninteractive_shell(
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<Value> {
+    run_shell_with_deadline(root, command, Some(timeout), cancelled)
+}
+
+/// Run a backgrounded shell command with no deadline: it ends when the
+/// process exits or the job's cancellation flag is set — nothing else.
+pub(crate) fn run_noninteractive_shell_untimed(
+    root: &Path,
+    command: &str,
+    cancelled: &AtomicBool,
+) -> Result<Value> {
+    run_shell_with_deadline(root, command, None, cancelled)
+}
+
+fn run_shell_with_deadline(
+    root: &Path,
+    command: &str,
+    timeout: Option<Duration>,
+    cancelled: &AtomicBool,
+) -> Result<Value> {
     if command.contains('\0') {
         bail!("shell command cannot contain NUL bytes");
     }
@@ -481,19 +500,19 @@ pub(crate) fn run_noninteractive_shell(
     let stderr = child.stderr.take().context("capturing shell stderr")?;
     let stdout_reader = std::thread::spawn(move || read_limited(stdout));
     let stderr_reader = std::thread::spawn(move || read_limited(stderr));
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let status = loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
             bail!("agent task cancelled");
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
                 "shell command timed out after {} seconds",
-                timeout.as_secs()
+                timeout.expect("deadline implies a timeout").as_secs()
             );
         }
         if let Some(status) = child.try_wait().context("waiting for Brush command")? {
@@ -649,6 +668,29 @@ mod tests {
         assert_eq!(output.bytes.len(), OUTPUT_LIMIT);
         assert_eq!(output.total_bytes, (OUTPUT_LIMIT + 37) as u64);
         assert!(output.truncated());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untimed_shell_runs_past_the_timed_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let cancelled = AtomicBool::new(false);
+        // The timed variant kills a 2s sleep at its 1s deadline...
+        let timed = run_noninteractive_shell(
+            directory.path(),
+            "sleep 2",
+            Duration::from_secs(1),
+            &cancelled,
+        );
+        assert!(timed.is_err());
+        assert!(timed
+            .unwrap_err()
+            .to_string()
+            .contains("timed out after 1 seconds"));
+        // ...while the untimed variant lets the same command finish.
+        let untimed =
+            run_noninteractive_shell_untimed(directory.path(), "sleep 2", &cancelled).unwrap();
+        assert_eq!(untimed["exit_code"], 0);
     }
 
     #[test]
