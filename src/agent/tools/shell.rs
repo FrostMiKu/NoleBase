@@ -194,7 +194,7 @@ impl Tool for Shell {
                 return Ok(serde_json::to_string_pretty(&json!({
                     "backgrounded": true,
                     "job": started.id,
-                    "note": "The command keeps running; its result will be delivered automatically as a [background job] frame."
+                    "note": "The command keeps running; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it."
                 }))?);
             }
             let wait = Duration::from_secs(self.auto_background_threshold_seconds)
@@ -626,7 +626,7 @@ impl Tool for TerminalRead {
                 return Ok(serde_json::to_string_pretty(&json!({
                     "backgrounded": true,
                     "job": started.id,
-                    "note": "Watch converted to a background job; the result will be delivered automatically on match, exit, or timeout."
+                    "note": "Watch converted to a background job; the result will be delivered automatically on match, exit, or timeout. Continue with other work or end your turn—do not wait for it."
                 }))?);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

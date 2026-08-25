@@ -488,7 +488,7 @@
     #[test]
     fn system_prompt_stays_compact() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.len() < 2_500, "system prompt grew to {} bytes", prompt.len());
+        assert!(prompt.len() < 2_800, "system prompt grew to {} bytes", prompt.len());
     }
 
     #[test]

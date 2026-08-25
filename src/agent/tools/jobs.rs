@@ -116,7 +116,7 @@ impl Tool for JobWait {
     }
 
     fn description(&self) -> &'static str {
-        "Block until one background job settles, or until the timeout. Use this only when you need a job's result before continuing; otherwise let the result arrive as an automatic [background job] frame. The wait suppresses that job's automatic delivery and returns its result directly. If a new user message arrives mid-wait the wait returns immediately with the job still running so the message can be handled."
+        "Block until one background job settles, or until the timeout. Only use it when a later step in this turn needs the job's result before any other action—never just to await completion. Ending the turn is the normal way to wait: the result arrives automatically as a [background job] frame that wakes the Agent. The wait suppresses that job's automatic delivery and returns its result directly. If a new user message arrives mid-wait the wait returns immediately with the job still running so the message can be handled."
     }
 
     fn input_schema(&self) -> Value {

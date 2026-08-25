@@ -434,7 +434,7 @@ impl Tool for HttpRequest {
                 return Ok(serde_json::to_string_pretty(&json!({
                     "backgrounded": true,
                     "job": started.id,
-                    "note": "The download keeps running in the background; its result will be delivered automatically as a [background job] frame."
+                    "note": "The download keeps running in the background; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it."
                 }))?);
             }
             let response = request.send().await.context("sending HTTP request")?;

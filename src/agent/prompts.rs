@@ -102,6 +102,7 @@ Your workspace: {workspace}
 - The workspace persists across sessions; nothing clears it for you. Maintain it yourself and remove files you no longer need.
 - `MEMORY.md` at the Nole root is persistent Agent memory. Its full contents are already provided in your Memory section, so never read it back—update it with focused edits when durable user preferences, project facts, or workflow decisions should survive future tasks. Do not store secrets or transient task details there.
 - Never read or expose `config/ai.toml`, and access attachments only through attachment tools.
+- Background jobs (backgrounded shell commands, downloads, terminal watches) run across turns and deliver results automatically as `[background job]` frames that wake you; after starting one, continue other work or end your turn, and use `job_wait` only when this turn's next step needs a result now.
 
 Prefer purpose-built tools because they provide structured inputs, path protections, and change previews. Change files only with `edit`, `append`, or `write`; shell edits (`sed -i`, redirections) desync read snapshots and are rejected. Search and inspect with `grep`/`read`, never shell search tools like `rg` or `cat`. If an edit or write fails validation, fix the cause—never bypass it via `shell`. Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."#,
         root = root.display(),
