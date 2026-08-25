@@ -494,7 +494,10 @@
     #[test]
     fn system_prompt_describes_the_agent_maintained_workspace() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains("Your workspace: /tmp/nole/workspace"));
+        assert!(prompt.contains(&format!(
+            "Your workspace: {}",
+            Path::new("/tmp/nole").join(crate::storage::WORKSPACE_DIR).display()
+        )));
         assert!(prompt.contains(
             "unless the user explicitly specifies another location; organize its layout as you see fit"
         ));
