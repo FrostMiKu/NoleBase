@@ -121,9 +121,14 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+/// Job rows indent past the fixed 8-column statistics label ("Jobs    ").
+const JOB_ROW_INDENT: &str = "        ";
+const JOB_ROW_INDENT_WIDTH: usize = JOB_ROW_INDENT.len();
+
 /// Append the background-job section after the fixed statistics rows: one
 /// summary row, then one line per job naming what it runs via its label.
 /// Running jobs list first; settled ones stay until their retention expires.
+
 fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
     use crate::agent::JobStatus;
 
@@ -160,13 +165,20 @@ fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
         ),
         Span::styled(summary, Style::default().fg(app.theme.text_primary)),
     ]));
+    // Indent job rows past the "Jobs" label column so they read as children
+    // of the summary row rather than its siblings.
     for row in &job_rows {
         let (marker, style) = job_marker(row.status, app.animation_tick, &app.theme);
         let prefix = format!("{marker} {} · ", row.kind.as_str());
         let suffix = format!(" · {}", format_job_elapsed(row));
-        let label_budget = usize::from(width).saturating_sub(prefix.width() + suffix.width());
+        let label_budget = usize::from(width)
+            .saturating_sub(prefix.width() + suffix.width())
+            .saturating_sub(JOB_ROW_INDENT_WIDTH);
         let label = truncate_job_label(&row.label, label_budget);
-        lines.push(Line::styled(format!("{prefix}{label}{suffix}"), style));
+        lines.push(Line::styled(
+            format!("{JOB_ROW_INDENT}{prefix}{label}{suffix}"),
+            style,
+        ));
     }
 }
 

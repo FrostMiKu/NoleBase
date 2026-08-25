@@ -203,6 +203,7 @@ impl Tool for Shell {
             loop {
                 if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     self.jobs.cancel(&started.id);
+                    self.jobs.remove(&started.id);
                     anyhow::bail!("agent task cancelled");
                 }
                 if self.has_buffered_prompts() {
@@ -214,6 +215,9 @@ impl Tool for Shell {
                     }))?);
                 }
                 if let Ok(outcome) = started.completion.try_recv() {
+                    // Consumed inline: the raced job was never backgrounded,
+                    // so it must not linger in the registry or the UI.
+                    self.jobs.remove(&started.id);
                     return match outcome {
                         Ok(text) => Ok(text),
                         Err(error) => Err(anyhow::anyhow!(error)),
@@ -596,6 +600,7 @@ impl Tool for TerminalRead {
         loop {
             if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 self.jobs.cancel(&started.id);
+                self.jobs.remove(&started.id);
                 anyhow::bail!("agent task cancelled");
             }
             if let Some(sample) = self.terminal.sample_watch(&session_id, offset) {
@@ -612,7 +617,7 @@ impl Tool for TerminalRead {
                     sample.exit_code,
                     &sample.screen,
                 ) {
-                    self.jobs.acknowledge(&started.id);
+                    self.jobs.remove(&started.id);
                     return Ok(serde_json::to_string_pretty(&payload)?);
                 }
             }
@@ -1005,10 +1010,11 @@ mod tests {
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["stdout"], json!("raced\n"));
         assert!(value.get("backgrounded").is_none());
-        // Inline consumption acknowledged delivery.
+        // Inline consumption removes the raced job entirely: no delivery,
+        // and no lingering row in the registry or the statistics panel.
         assert!(!jobs.has_pending_deliveries());
+        assert!(jobs.rows().is_empty());
     }
 
     #[cfg(unix)]
@@ -1039,6 +1045,9 @@ mod tests {
         let value: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["backgrounded"], json!(true));
         let job = value["job"].as_str().unwrap();
+        // Converted to background: the job is now listed and running.
+        assert!(jobs.rows().iter().any(|row| row.id == job));
+        assert!(jobs.has_running());
         assert!(jobs.cancel(job));
     }
 
@@ -1163,6 +1172,40 @@ mod terminal_watch_tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(!jobs.has_pending_deliveries());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_read_wait_for_inline_hit_removes_the_raced_job() {
+        use crate::agent::AgentTerminalHandle;
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _receiver) = event_channel();
+        let jobs = AgentJobsHandle::new(events);
+        let terminal = AgentTerminalHandle::default();
+        let session = terminal
+            .open_process_for_test(directory.path(), "echo MARKER_HIT; sleep 30")
+            .unwrap();
+        let read_tool = TerminalRead::new(
+            terminal.clone(),
+            Arc::new(AtomicBool::new(false)),
+            jobs.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let output = read_tool
+            .execute(&json!({
+                "session_id": session,
+                "purpose": "Wait for marker",
+                "wait_for": { "pattern": "MARKER_HIT", "timeout_ms": 15000 }
+            }))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+        // The pattern hits inside the foreground budget, so the payload comes
+        // back inline and the raced job is removed instead of lingering as a
+        // settled row in the statistics panel.
+        assert!(value.get("backgrounded").is_none());
+        assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
     }
 }

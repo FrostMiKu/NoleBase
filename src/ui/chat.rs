@@ -830,7 +830,7 @@ mod tests {
             .start_background(JobKind::Shell, "cargo build --release")
             .unwrap();
         app.agent_jobs
-            .start_background(JobKind::Download, "model.bin <- example.com")
+            .start_background(JobKind::Download, "model.bin")
             .unwrap();
         let test_run = app
             .agent_jobs
@@ -845,14 +845,21 @@ mod tests {
         let statistics_area = app.layout.agent.expect("statistics panel");
         let statistics = area_text(&terminal, statistics_area);
         let (_, retries_y) = find_text(&terminal, "Retries");
-        let (_, jobs_y) = find_text(&terminal, "Jobs");
+        let (jobs_x, jobs_y) = find_text(&terminal, "Jobs");
 
         assert!(statistics.contains("2 running · 1 done"));
         assert!(statistics.contains("shell · cargo build --release"));
-        assert!(statistics.contains("download · model.bin <- example.com"));
+        assert!(statistics.contains("download · model.bin"));
         assert!(statistics.contains("✓ shell · npm test"));
         // The job section sits after every fixed statistics row.
         assert!(jobs_y > retries_y);
+        // Job items indent past the "Jobs" label column instead of sitting
+        // flush with it; running jobs list newest-first under the summary.
+        let (first_x, first_y) = find_text(&terminal, "download · model.bin");
+        assert!(first_x > jobs_x + 4, "job rows must be indented under Jobs");
+        assert_eq!(first_y, jobs_y + 1);
+        let (_, cargo_y) = find_text(&terminal, "shell · cargo build --release");
+        assert_eq!(cargo_y, first_y + 1);
         assert!(app.agent_jobs.has_running());
     }
 

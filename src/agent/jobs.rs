@@ -110,6 +110,10 @@ struct JobEntry {
     /// True once the delivery has been handed to the conversation. A settled
     /// job with `false` that is later resumed re-enqueues.
     delivered: bool,
+    /// Listed as a background job. A foreground-raced job starts hidden and
+    /// only becomes visible once [`AgentJobsHandle::resume`] backgrounds it;
+    /// until then it is invisible to `rows`, `has_running`, and events.
+    backgrounded: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -203,8 +207,9 @@ impl AgentJobsHandle {
             .unwrap_or(true)
     }
 
-    /// Start a job. `suppress` acknowledges delivery up front for the
-    /// foreground race; a background-only start passes `false`.
+    /// Start a job. `suppress` marks a foreground-raced start: delivery is
+    /// acknowledged up front and the job stays hidden until `resume`
+    /// backgrounds it; a background-only start passes `false`.
     fn start(&self, kind: JobKind, label: &str, suppress: bool) -> Result<StartedJob> {
         let (sender, completion) = tokio::sync::oneshot::channel();
         let mut state = self
@@ -232,6 +237,7 @@ impl AgentJobsHandle {
             waiter: Some(sender),
             suppressed: suppress,
             delivered: false,
+            backgrounded: !suppress,
             cancel: Arc::new(AtomicBool::new(false)),
         });
         state.revision += 1;
@@ -242,10 +248,14 @@ impl AgentJobsHandle {
             .cancel
             .clone();
         drop(state);
-        let _ = self.events.send(AgentEvent::JobStarted {
-            id: id.clone(),
-            label: label.to_string(),
-        });
+        // A foreground-raced job is not a background job yet: announce it
+        // only once `resume` actually backgrounds it.
+        if !suppress {
+            let _ = self.events.send(AgentEvent::JobStarted {
+                id: id.clone(),
+                label: label.to_string(),
+            });
+        }
         Ok(StartedJob {
             id,
             cancel,
@@ -259,9 +269,11 @@ impl AgentJobsHandle {
         self.start(kind, label, false)
     }
 
-    /// Start a job for the foreground auto-background race. Delivery is
-    /// suppressed while the tool foreground-waits; if the wait converts to a
-    /// background job, call [`AgentJobsHandle::resume`].
+    /// Start a job for the foreground auto-background race. The job is
+    /// invisible (no rows, no events) while the tool foreground-waits; if the
+    /// wait converts to a background job, call [`AgentJobsHandle::resume`] to
+    /// list it. If the outcome is consumed inline instead, call
+    /// [`AgentJobsHandle::remove`].
     pub(crate) fn start_raced(&self, kind: JobKind, label: &str) -> Result<StartedJob> {
         self.start(kind, label, true)
     }
@@ -331,9 +343,11 @@ impl AgentJobsHandle {
         // stay silent instead of emitting JobSettled.
     }
 
-    /// Lift a suppression. A job that settled while suppressed has its
+    /// Background a foreground-raced job: lift its delivery suppression,
+    /// list it, and announce it. A job that settled while suppressed has its
     /// delivery re-enqueued exactly once.
     pub(crate) fn resume(&self, id: &str) {
+        let mut announced = false;
         let reenqueue = {
             let Ok(mut state) = self.inner.lock() else {
                 return;
@@ -341,18 +355,20 @@ impl AgentJobsHandle {
             let Some(index) = state.entries.iter().position(|entry| entry.id == id) else {
                 return;
             };
-            if !state.entries[index].suppressed {
-                return;
+            let entry = &mut state.entries[index];
+            let mut changed = false;
+            if !entry.backgrounded {
+                entry.backgrounded = true;
+                announced = true;
+                changed = true;
             }
-            state.entries[index].suppressed = false;
-            state.revision += 1;
-            let reenqueue =
-                state.entries[index].status.is_settled() && !state.entries[index].delivered;
-            if reenqueue {
-                state.entries[index].delivered = true;
-            }
-            if reenqueue {
-                let entry = &state.entries[index];
+            let reenqueue = if entry.suppressed {
+                entry.suppressed = false;
+                changed = true;
+                let reenqueue = entry.status.is_settled() && !entry.delivered;
+                if reenqueue {
+                    entry.delivered = true;
+                }
                 Some(JobDelivery {
                     id: entry.id.clone(),
                     kind: entry.kind,
@@ -364,10 +380,23 @@ impl AgentJobsHandle {
                         .unwrap_or_default(),
                     result: entry.result.clone().unwrap_or_default(),
                 })
+                .filter(|_| reenqueue)
             } else {
                 None
+            };
+            if changed {
+                state.revision += 1;
             }
+            reenqueue
         };
+        if announced {
+            if let Some(row) = self.rows().into_iter().find(|row| row.id == id) {
+                let _ = self.events.send(AgentEvent::JobStarted {
+                    id: row.id,
+                    label: row.label,
+                });
+            }
+        }
         if let Some(delivery) = reenqueue {
             self.enqueue(delivery);
         }
@@ -384,13 +413,17 @@ impl AgentJobsHandle {
         Some(row_of(&state.entries[index]))
     }
 
-    /// Permanently suppress a job's delivery: the foreground race consumed the
-    /// completion inline, so no frame must ever be delivered.
-    pub(crate) fn acknowledge(&self, id: &str) {
+    /// Remove a job from the registry entirely. Used when the foreground
+    /// auto-background race consumes the outcome inline or abandons the job
+    /// before it ever backgrounded: the entry must not linger as a settled
+    /// row for the retention window. A late `settle` from the body thread
+    /// finds no entry and stays silent.
+    pub(crate) fn remove(&self, id: &str) {
         if let Ok(mut state) = self.inner.lock() {
             if let Some(index) = state.entries.iter().position(|entry| entry.id == id) {
-                state.entries[index].suppressed = true;
-                state.entries[index].delivered = true;
+                if let Some(spill) = state.entries.remove(index).spill {
+                    let _ = fs::remove_file(spill);
+                }
                 state.revision += 1;
             }
         }
@@ -429,20 +462,31 @@ impl AgentJobsHandle {
         cancelled
     }
 
-    /// Snapshot the listed rows, newest first.
+    /// Snapshot the listed background-job rows, newest first. Foreground
+    /// raced jobs that have not been backgrounded yet are not listed.
     pub(crate) fn rows(&self) -> Vec<JobRow> {
         let Ok(mut state) = self.inner.lock() else {
             return Vec::new();
         };
         state.evict_expired();
-        state.entries.iter().map(row_of).rev().collect::<Vec<_>>()
+        state
+            .entries
+            .iter()
+            .filter(|entry| entry.backgrounded)
+            .map(row_of)
+            .rev()
+            .collect::<Vec<_>>()
     }
 
+    /// Whether any *listed* background job is running; foreground raced jobs
+    /// waiting inline do not count.
     pub(crate) fn has_running(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|state| state.running_count() > 0)
-            .unwrap_or(false)
+        self.inner.lock().map_or(false, |state| {
+            state
+                .entries
+                .iter()
+                .any(|entry| entry.backgrounded && entry.status == JobStatus::Running)
+        })
     }
 
     /// Take every queued delivery, marking the jobs delivered.
@@ -651,13 +695,18 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_settlement_never_delivers() {
+    fn foreground_race_removal_drops_the_row_and_late_settle_stays_silent() {
         let jobs = handle();
         let started = jobs.start_raced(JobKind::Shell, "build").unwrap();
-        jobs.acknowledge(&started.id);
+        // The foreground race consumed the outcome inline, so the raced job
+        // is removed instead of lingering as a settled row.
         jobs.settle(&started.id, Ok("inline".to_string()));
+        jobs.remove(&started.id);
+        assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
-        jobs.resume(&started.id);
+        // A late settle from the body thread finds no entry and stays silent.
+        jobs.settle(&started.id, Ok("late".to_string()));
+        assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
     }
 
@@ -677,6 +726,34 @@ mod tests {
                 "suppressed settlement emitted JobSettled"
             );
         }
+    }
+
+    #[test]
+    fn raced_job_stays_hidden_until_resumed_then_announces() {
+        let (events, mut receiver) = event_channel();
+        let jobs = AgentJobsHandle::new(events);
+        let started = jobs.start_raced(JobKind::Shell, "build").unwrap();
+        // While the tool foreground-waits, the raced job is not a background
+        // job: no rows, no running flag, and no JobStarted announcement.
+        assert!(jobs.rows().is_empty());
+        assert!(!jobs.has_running());
+        while let Ok(event) = receiver.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::JobStarted { .. }),
+                "hidden raced job emitted JobStarted"
+            );
+        }
+        // The threshold expires: resume backgrounds and lists the job.
+        jobs.resume(&started.id);
+        assert_eq!(jobs.rows().len(), 1);
+        assert!(jobs.has_running());
+        let mut announced = false;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(event, AgentEvent::JobStarted { ref id, .. } if *id == started.id) {
+                announced = true;
+            }
+        }
+        assert!(announced, "resume must announce the backgrounded job");
     }
 
     #[test]
