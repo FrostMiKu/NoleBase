@@ -338,6 +338,59 @@ fn conversation_update_overwrites_the_saved_agent_session() {
 }
 
 #[test]
+fn settled_background_job_wakes_the_idle_agent() {
+    let (mut app, _directory) = make_app();
+    assert!(!app.ai_running);
+    let started = app
+        .agent_jobs
+        .start_background(crate::agent::JobKind::Shell, "sleep 1 && echo done")
+        .unwrap();
+    // Settles while idle: with no active run there is no observable to poll,
+    // so only the permanent subscription can observe the settlement and
+    // start the delivery run.
+    app.agent_jobs.settle(&started.id, Ok("done".to_string()));
+    app.poll_agent();
+
+    assert!(app.ai_running, "a settled job must wake the idle agent");
+    assert!(app.agent_panel.iter().any(|entry| {
+        matches!(
+            entry.as_ref(),
+            AgentPanelEntry::Prompt { text, muted: true, .. } if text.starts_with("Job completed")
+        )
+    }));
+    assert!(app.agent_jobs.take_deliveries().is_empty());
+}
+
+#[test]
+fn settled_job_during_a_run_does_not_start_a_second_run() {
+    let (mut app, _directory) = make_app();
+    app.ai_running = true;
+    let sender = install_agent_observable(&mut app);
+    let started = app
+        .agent_jobs
+        .start_background(crate::agent::JobKind::Shell, "sleep 1")
+        .unwrap();
+    app.agent_jobs.settle(&started.id, Ok("done".to_string()));
+    // The run's own stream reports the settlement; its loop drains the
+    // delivery at the next round boundary.
+    sender
+        .send(AgentEvent::JobSettled {
+            id: started.id.clone(),
+            failed: false,
+        })
+        .unwrap();
+    app.poll_agent();
+
+    // The delivery stays queued for the run loop and the permanent
+    // subscription must not have started a duplicate delivery run.
+    assert!(!app.agent_jobs.take_deliveries().is_empty());
+    assert!(app
+        .agent_panel
+        .iter()
+        .all(|entry| { !matches!(entry.as_ref(), AgentPanelEntry::Prompt { muted: true, .. }) }));
+}
+
+#[test]
 fn failed_session_delete_keeps_the_in_memory_session() {
     let (mut app, _directory) = make_app();
     app.agent_conversation = AgentConversation::seeded_for_test();

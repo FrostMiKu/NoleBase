@@ -89,6 +89,21 @@ impl App {
                 }
             }
         }
+        // Jobs can settle while no run is active, and without an active run
+        // there is no observable to poll above — a settled job's delivery
+        // would sit queued forever. The permanent subscription fills that
+        // gap; every other event it sees is a duplicate of the run's own
+        // stream and is dropped.
+        let idle = self.active_agent.is_none();
+        loop {
+            match self.agent_events_rx.try_recv() {
+                Ok(event @ AgentEvent::JobSettled { .. }) if idle => events.push(event),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            }
+        }
         for event in events {
             if self.ai_cancelling
                 && !matches!(&event, AgentEvent::Stopped(_) | AgentEvent::Finished(_))

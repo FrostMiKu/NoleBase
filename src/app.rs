@@ -394,6 +394,10 @@ pub struct App {
     /// worker at run start; `None` until the first run announces it.
     pub agent_effort: Option<String>,
     pub(crate) agent_conversation: AgentConversation,
+    /// Permanent subscription to the agent event channel. Runs deliver their
+    /// stream through their own subscription in `active_agent`; this one only
+    /// exists so `JobSettled` can still be observed while the agent is idle.
+    agent_events_rx: tokio::sync::broadcast::Receiver<AgentEvent>,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
     ai_source_date: Option<NaiveDate>,
@@ -468,7 +472,7 @@ impl App {
         let permission_mode_atomic = Arc::new(AtomicU8::new(PermissionMode::Approve.code()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let agent_terminal = crate::agent::AgentTerminalHandle::default();
-        let (event_sender, _) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
+        let (event_sender, agent_events_rx) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
         let agent_jobs = crate::agent::AgentJobsHandle::new(event_sender.clone());
         let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -636,6 +640,7 @@ impl App {
             agent_round: 0,
             agent_effort,
             agent_conversation,
+            agent_events_rx,
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,
             ai_source_date: None,
