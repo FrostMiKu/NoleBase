@@ -3,6 +3,23 @@ use std::time::Duration;
 
 use crate::provider::Message;
 
+/// One step of the agent-maintained task plan for the current conversation.
+/// Unrelated to the note vault's todo tasks: this list tracks the agent's own
+/// multi-step work and renders in the Agent sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConversation {
@@ -14,12 +31,17 @@ pub struct AgentConversation {
     /// real figure.
     #[serde(skip)]
     pub(crate) last_request_input_tokens: u64,
+    /// The agent's current task plan, mirrored from the shared todo handle
+    /// after every tool batch so checkpoints and restarts keep it.
+    #[serde(default)]
+    pub(crate) todos: Vec<TodoItem>,
 }
 
 impl AgentConversation {
     pub fn clear(&mut self) -> bool {
         let had_history = !self.messages.is_empty();
         self.messages.clear();
+        self.todos.clear();
         had_history
     }
 
@@ -28,6 +50,7 @@ impl AgentConversation {
         Self {
             messages: vec![Message::user("previous prompt")],
             last_request_input_tokens: 0,
+            todos: Vec::new(),
         }
     }
 }
@@ -117,6 +140,8 @@ pub enum AgentPanelEntry {
 #[serde(deny_unknown_fields)]
 pub struct AgentSession {
     messages: Vec<Message>,
+    #[serde(default)]
+    todos: Vec<TodoItem>,
     panel: Vec<AgentPanelEntry>,
     usage: TokenUsage,
     timed_output_tokens: u64,
@@ -163,6 +188,7 @@ impl AgentSession {
             .collect();
         Self {
             messages: conversation.messages.clone(),
+            todos: conversation.todos.clone(),
             panel,
             usage,
             timed_output_tokens,
@@ -193,6 +219,7 @@ impl AgentSession {
             AgentConversation {
                 messages: self.messages,
                 last_request_input_tokens: 0,
+                todos: self.todos,
             },
             panel,
             self.usage,

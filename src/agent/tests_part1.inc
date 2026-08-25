@@ -397,6 +397,51 @@
     }
 
     #[test]
+    fn compaction_restates_the_todo_plan_at_the_new_context_start() {
+        use crate::agent_session::{TodoItem, TodoStatus};
+
+        let mut agent = small_budget_agent();
+        let budget = agent.input_token_budget();
+        let margin = budget * CONTEXT_COUNT_SAFETY_MARGIN_PERCENT / 100;
+        let reported = budget - margin / 2;
+        agent.todos.replace(vec![
+            TodoItem {
+                content: "Add renderer tests".to_string(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                content: "Draft the compaction summary".to_string(),
+                status: TodoStatus::InProgress,
+            },
+        ]);
+        let provider = Arc::new(SummarizingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        agent.provider = provider.clone();
+
+        let mut messages = conversation_estimating(&agent, budget * 3 / 5);
+        messages.push(Message::user("latest request"));
+        assert!(agent
+            .compact_context_if_needed(&mut messages, reported, &[])
+            .unwrap());
+        let replacement = messages[0].text();
+        assert!(replacement.contains("Current todo list"));
+        assert!(replacement.contains("supersedes it"));
+        assert!(replacement.contains("○ Add renderer tests"));
+        assert!(replacement
+            .contains("◐ Draft the compaction summary"));
+
+        // An empty plan injects nothing.
+        agent.todos.replace(Vec::new());
+        let mut fresh = conversation_estimating(&agent, budget * 3 / 5);
+        fresh.push(Message::user("latest request"));
+        assert!(agent
+            .compact_context_if_needed(&mut fresh, reported, &[])
+            .unwrap());
+        assert!(!fresh[0].text().to_lowercase().contains("todo list"));
+    }
+
+    #[test]
     fn agent_conversation_is_clearable() {
         let mut conversation = AgentConversation::default();
         conversation.messages.push(Message::user("first turn"));

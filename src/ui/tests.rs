@@ -3602,6 +3602,69 @@ fn agent_sidebar_lists_running_background_jobs() {
 }
 
 #[test]
+fn agent_sidebar_renders_the_todo_plan_above_jobs() {
+    use crate::agent_session::{TodoItem, TodoStatus};
+
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Chat;
+    app.agent_conversation.todos = vec![
+        TodoItem {
+            content: "Draft the compaction summary".to_string(),
+            status: TodoStatus::InProgress,
+        },
+        TodoItem {
+            content: "Cover the sidebar with renderer tests".to_string(),
+            status: TodoStatus::Pending,
+        },
+        TodoItem {
+            content: "Design the todo_write contract".to_string(),
+            status: TodoStatus::Completed,
+        },
+    ];
+    app.agent_jobs
+        .start_background(crate::agent::JobKind::Shell, "cargo build --release")
+        .unwrap();
+
+    let terminal = render(&mut app, 220, 60);
+    let screen = buffer_string(&terminal);
+    let todos_at = screen.find("Todos").expect("todos section");
+    let jobs_at = screen.find("Jobs").expect("jobs section");
+    assert!(todos_at < jobs_at, "todos must render before jobs");
+    assert!(screen.contains("1 running · 1 pending · 1 done"));
+    assert!(screen.contains("Draft the compaction summary"));
+    // Long content truncates with an ellipsis inside the panel width.
+    assert!(screen.contains("Cover the sidebar with renderer t…"));
+    assert!(screen.contains("Design the todo_write contract"));
+
+    // An empty plan renders no section at all.
+    app.agent_conversation.todos.clear();
+    let terminal = render(&mut app, 220, 60);
+    assert!(!buffer_string(&terminal).contains("Todos"));
+}
+
+#[test]
+fn agent_sidebar_does_not_cap_long_todo_plans() {
+    use crate::agent_session::{TodoItem, TodoStatus};
+
+    let (mut app, _directory) = make_app();
+    app.center_view = CenterView::Chat;
+    app.agent_conversation.todos = (0..24)
+        .map(|index| TodoItem {
+            content: format!("Follow-up step {index}"),
+            status: TodoStatus::Pending,
+        })
+        .collect();
+
+    // Every item renders — there is no "+N more" truncation — and the
+    // section itself scrolls once it outgrows the viewport.
+    let terminal = render(&mut app, 220, 80);
+    let screen = buffer_string(&terminal);
+    assert!(screen.contains("24 pending"));
+    assert!(screen.contains("Follow-up step 23"));
+    assert!(!screen.contains("more"));
+}
+
+#[test]
 fn wiki_completion_popup_is_opaque_over_body_content() {
     let (mut app, directory) = make_app();
     // A long document scrolled to its end so body text reaches the rows the

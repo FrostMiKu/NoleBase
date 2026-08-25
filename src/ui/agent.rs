@@ -112,6 +112,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
         ]));
         lines.push(Line::default());
     }
+    append_todo_summary(app, &mut lines, inner.width);
     append_job_summary(app, &mut lines, inner.width);
     let height = inner.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
@@ -124,6 +125,61 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
 /// Job rows indent past the fixed 8-column statistics label ("Jobs    ").
 const JOB_ROW_INDENT: &str = "        ";
 const JOB_ROW_INDENT_WIDTH: usize = JOB_ROW_INDENT.len();
+
+/// Append the agent's task-plan section between the statistics rows and the
+/// background jobs: one summary row, then one line per todo in list order —
+/// no cap, the sidebar scroll covers long plans. In-progress items borrow the
+/// running-job visual language (animated spinner, action color) so "what to
+/// do" reads before "what is running"; empty plans render nothing.
+fn append_todo_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
+    use crate::agent_session::TodoStatus;
+
+    let todos = &app.agent_conversation.todos;
+    if todos.is_empty() {
+        return;
+    }
+    let mut counts = [(0usize, "running"), (0, "pending"), (0, "done")];
+    for item in todos {
+        let slot = match item.status {
+            TodoStatus::Pending => &mut counts[1],
+            TodoStatus::InProgress => &mut counts[0],
+            TodoStatus::Completed => &mut counts[2],
+        };
+        slot.0 += 1;
+    }
+    let summary = counts
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, name)| format!("{count} {name}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<8}", "Todos"),
+            Style::default().fg(app.theme.text_muted),
+        ),
+        Span::styled(summary, Style::default().fg(app.theme.text_primary)),
+    ]));
+    for item in todos {
+        let (marker, style) = match item.status {
+            TodoStatus::InProgress => (
+                spinner_frame(app.animation_tick).to_string(),
+                Style::default().fg(app.theme.ui_action_ai),
+            ),
+            TodoStatus::Pending => ("○".to_string(), Style::default().fg(app.theme.text_muted)),
+            TodoStatus::Completed => ("✓".to_string(), Style::default().fg(app.theme.ui_task_done)),
+        };
+        let budget = usize::from(width).saturating_sub(JOB_ROW_INDENT_WIDTH + marker.width() + 1);
+        let content = super::jobs::truncate_job_label(&item.content, budget);
+        lines.push(Line::styled(
+            format!("{JOB_ROW_INDENT}{marker} {content}"),
+            style,
+        ));
+    }
+    // Keep a blank row between the last todo and the next section, matching
+    // the spacing after the fixed statistics rows.
+    lines.push(Line::default());
+}
 
 /// Append the background-job section after the fixed statistics rows: one
 /// summary row, then one line per job naming what it runs via its label.

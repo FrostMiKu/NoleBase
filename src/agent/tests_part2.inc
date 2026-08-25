@@ -2043,3 +2043,123 @@
             .unwrap();
         assert!(receiver.try_recv().is_err());
     }
+
+    #[test]
+    fn todo_write_updates_the_conversation_plan_and_echoes_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses = [
+            json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "todos-1",
+                    "name": "todo_write",
+                    "input": {"todos": [
+                        {"content": "Plan the work", "status": "completed"},
+                        {"content": "Write the implementation", "status": "in_progress"},
+                        {"content": "Verify with tests", "status": "pending"}
+                    ]}
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            }),
+            json!({
+                "content": [{"type": "text", "text": "Plan is on the sidebar."}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 14, "output_tokens": 6}
+            }),
+        ];
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
+                requests.push(serde_json::from_slice::<Value>(&request).unwrap());
+                let body = serde_json::to_vec(&response).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                reader.get_mut().write_all(&body).unwrap();
+                reader.get_mut().flush().unwrap();
+            }
+            requests
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        fs::write(
+            &storage.ai_config_path,
+            format!(
+                "api_format = 'messages'\napi_key = 'test'\nmodel = 'test-model'\nbase_url = 'http://{address}'\n"
+            ),
+        )
+        .unwrap();
+        let (_approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = event_channel();
+        let agent = Agent::from_config(
+            &storage.ai_config_path,
+            &storage.root,
+            AgentRuntime::new(
+                event_sender,
+                approval_receiver,
+                user_receiver,
+                private_terminal_input_receiver(),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicU8::new(PermissionMode::Auto.code())),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+
+        let mut conversation = AgentConversation::default();
+        assert_eq!(
+            run_agent(&agent, "Plan this out", &mut conversation).unwrap(),
+            "Plan is on the sidebar."
+        );
+        // The completed tool batch mirrored the handle into the conversation.
+        assert_eq!(
+            conversation.todos,
+            vec![
+                crate::agent_session::TodoItem {
+                    content: "Plan the work".to_string(),
+                    status: crate::agent_session::TodoStatus::Completed,
+                },
+                crate::agent_session::TodoItem {
+                    content: "Write the implementation".to_string(),
+                    status: crate::agent_session::TodoStatus::InProgress,
+                },
+                crate::agent_session::TodoItem {
+                    content: "Verify with tests".to_string(),
+                    status: crate::agent_session::TodoStatus::Pending,
+                },
+            ]
+        );
+        // The second request carries the full list echo as the tool result.
+        let requests = server.join().unwrap();
+        let messages = requests[1]["messages"].as_array().unwrap();
+        let result = &messages[2]["content"][0];
+        assert_eq!(result["tool_use_id"], "todos-1");
+        assert!(result["content"].as_str().unwrap().contains("Todos updated:"));
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("◐ Write the implementation"));
+    }

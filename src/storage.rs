@@ -2383,6 +2383,10 @@ mod tests {
             &AgentConversation {
                 messages: vec![crate::provider::Message::user("first")],
                 last_request_input_tokens: 0,
+                todos: vec![crate::agent_session::TodoItem {
+                    content: "Keep the plan across restarts".to_string(),
+                    status: crate::agent_session::TodoStatus::InProgress,
+                }],
             },
             &[AgentPanelEntry::Prompt {
                 text: "first".to_string(),
@@ -2399,6 +2403,7 @@ mod tests {
             &AgentConversation {
                 messages: vec![crate::provider::Message::user("second")],
                 last_request_input_tokens: 0,
+                todos: Vec::new(),
             },
             &[AgentPanelEntry::Assistant {
                 text: "second reply".to_string(),
@@ -2422,6 +2427,27 @@ mod tests {
         assert!(storage.clear_agent_session().unwrap());
         assert!(!storage.agent_session_path.exists());
         assert!(!storage.clear_agent_session().unwrap());
+    }
+
+    #[test]
+    fn agent_session_without_the_todos_field_still_loads() {
+        let (_directory, storage) = fresh();
+        // A checkpoint written before the plan existed must keep loading.
+        let legacy = serde_json::json!({
+            "messages": [{"role": "user", "parts": [{"type": "text", "text": "old"}]}],
+            "panel": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "timed_output_tokens": 0,
+            "response_duration": {"secs": 1, "nanos": 0}
+        });
+        fs::write(&storage.agent_session_path, legacy.to_string()).unwrap();
+        let conversation = storage
+            .load_agent_session()
+            .unwrap()
+            .expect("legacy session loads")
+            .into_parts()
+            .0;
+        assert!(conversation.todos.is_empty());
     }
 
     #[test]

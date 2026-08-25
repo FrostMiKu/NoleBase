@@ -393,7 +393,7 @@ pub struct App {
     /// Reasoning-effort tier label from the active AI config, published by the
     /// worker at run start; `None` until the first run announces it.
     pub agent_effort: Option<String>,
-    agent_conversation: AgentConversation,
+    pub(crate) agent_conversation: AgentConversation,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
     ai_source_date: Option<NaiveDate>,

@@ -407,6 +407,9 @@ pub struct Agent {
     /// sources with the exact same network policy as the read tool.
     client: Client,
     jobs: AgentJobsHandle,
+    /// Shared task-plan state behind the `todo_write` tool; the conversation
+    /// snapshot re-arms it at every run start.
+    todos: TodoHandle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,6 +708,7 @@ impl Agent {
         let concurrency = ToolConcurrencyLimits::from_config(&config);
         let agent_client = client.clone();
         let attachments = AttachmentStore::new(nole_root.join(ATTACHMENTS_DIR));
+        let todos = TodoHandle::default();
         let mut agent = Self {
             config,
             provider,
@@ -718,6 +722,7 @@ impl Agent {
             concurrency,
             attachments,
             client: agent_client,
+            todos: todos.clone(),
         };
         let gate = ApprovalGate::new(
             permission_mode,
@@ -733,6 +738,7 @@ impl Agent {
         }
         agent.register(LoadSkill::new(&skills));
         agent.register(Calculate);
+        agent.register(TodoWrite::new(todos));
         agent.register(Wait::new(cancelled.clone()));
         agent.register(Shell::new(
             nole_root,
@@ -901,6 +907,10 @@ impl Agent {
         prompt: &str,
         conversation: &mut AgentConversation,
     ) -> Result<AgentRunCompletion> {
+        // The conversation snapshot is the plan's source of truth across
+        // restarts and session switches; re-arm the shared handle from it
+        // before any tool or compaction can read or write it.
+        self.todos.replace(conversation.todos.clone());
         let prompt = prompt_with_datetime(prompt, Local::now());
         let parsed =
             parse_user_message(prompt, &self.attachments, self.config.supports_images).await?;
@@ -1038,6 +1048,10 @@ impl Agent {
                     followup_delivered,
                 } => {
                     conversation.messages.extend(messages);
+                    // A completed batch is the only place the plan can change
+                    // (todo_write is a tool), so mirror the handle into the
+                    // conversation before the checkpoint persists it.
+                    conversation.todos = self.todos.snapshot();
                     self.checkpoint_conversation(conversation);
                     if followup_delivered {
                         round = 0;
@@ -1323,10 +1337,26 @@ impl Agent {
                 }
             };
             let summary = self.summarize_context(&messages[..cut]).await?;
-            let mut compacted = Vec::with_capacity(messages.len() - cut + 1);
-            compacted.push(Message::user(format!(
+            let mut replacement = format!(
                     "Context summary from earlier turns (preserve these facts and decisions):\n\n{summary}"
-                )));
+                );
+            // The summarized turns contain every earlier todo_write echo, so
+            // restate the authoritative plan at the new context start; a
+            // later todo_write result in the kept tail supersedes it.
+            let todos = self.todos.snapshot();
+            if !todos.is_empty() {
+                replacement.push_str(
+                    "\n\nCurrent todo list (as of compaction; a later todo_write result supersedes it):",
+                );
+                for item in &todos {
+                    replacement.push('\n');
+                    replacement.push_str(todo_marker(item.status));
+                    replacement.push(' ');
+                    replacement.push_str(&item.content);
+                }
+            }
+            let mut compacted = Vec::with_capacity(messages.len() - cut + 1);
+            compacted.push(Message::user(replacement));
             compacted.extend(messages.drain(cut..));
             *messages = compacted;
             compacted_any = true;
