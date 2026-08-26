@@ -15,7 +15,7 @@ use crate::agent::{
     CommandApproval, JobKind, StartedJob, Tool,
 };
 
-use super::util::required_string;
+use super::util::{backgrounded_job_result, required_string};
 use crate::agent::resolve_shell_cwd;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
@@ -203,11 +203,10 @@ impl Tool for Shell {
             let job_timeout = if background { None } else { Some(timeout) };
             self.spawn_shell_job_body(&started, &cwd, command, job_timeout);
             if background {
-                return Ok(serde_json::to_string_pretty(&json!({
-                    "backgrounded": true,
-                    "job": started.id,
-                    "note": "The command keeps running; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it."
-                }))?);
+                return backgrounded_job_result(
+                    &started.id,
+                    "The command keeps running; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it.",
+                );
             }
             let wait = Duration::from_secs(self.auto_background_threshold_seconds)
                 .min(timeout.saturating_sub(Duration::from_secs(1)));
@@ -220,11 +219,10 @@ impl Tool for Shell {
                 }
                 if self.has_buffered_prompts() {
                     self.jobs.resume(&started.id);
-                    return Ok(serde_json::to_string_pretty(&json!({
-                        "backgrounded": true,
-                        "job": started.id,
-                        "note": "Backgrounded early to handle an incoming message; the command keeps running and its result will be delivered automatically."
-                    }))?);
+                    return backgrounded_job_result(
+                        &started.id,
+                        "Backgrounded early to handle an incoming message; the command keeps running and its result will be delivered automatically.",
+                    );
                 }
                 if let Ok(outcome) = started.completion.try_recv() {
                     // Consumed inline: the raced job was never backgrounded,
@@ -237,11 +235,10 @@ impl Tool for Shell {
                 }
                 if std::time::Instant::now() >= deadline {
                     self.jobs.resume(&started.id);
-                    return Ok(serde_json::to_string_pretty(&json!({
-                        "backgrounded": true,
-                        "job": started.id,
-                        "note": "Still running after the foreground wait; backgrounded and its result will be delivered automatically."
-                    }))?);
+                    return backgrounded_job_result(
+                        &started.id,
+                        "Still running after the foreground wait; backgrounded and its result will be delivered automatically.",
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -569,12 +566,11 @@ impl Tool for TerminalRead {
                     .with_context(|| format!("invalid terminal watch regex {source:?}"))
             })
             .transpose()?;
-        if pattern.is_none()
-            && !wait_for
-                .get("exit")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        {
+        let wait_exit = wait_for
+            .get("exit")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if pattern.is_none() && !wait_exit {
             anyhow::bail!("wait_for requires a pattern or exit: true");
         }
         let timeout_ms = wait_for
@@ -586,27 +582,28 @@ impl Tool for TerminalRead {
             .get("background")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let started = self.jobs.start_raced(JobKind::TerminalWatch, &session_id)?;
+        // An explicit background watch is a background job from the start;
+        // only the foreground race needs the suppressed, hidden start.
+        let started = if background {
+            self.jobs.start_background(JobKind::TerminalWatch, &session_id)?
+        } else {
+            self.jobs.start_raced(JobKind::TerminalWatch, &session_id)?
+        };
         spawn_terminal_watch(
             self.jobs.clone(),
             self.terminal.clone(),
             started.id.clone(),
             session_id.clone(),
             pattern.clone(),
-            wait_for
-                .get("exit")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
             Duration::from_millis(timeout_ms),
             Arc::clone(&started.cancel),
         );
         // Explicit background: deliver via the job only.
         if background {
-            return Ok(serde_json::to_string_pretty(&json!({
-                "backgrounded": true,
-                "job": started.id,
-                "note": "Watching the terminal; the result will be delivered automatically on match, exit, or timeout."
-            }))?);
+            return backgrounded_job_result(
+                &started.id,
+                "Watching the terminal; the result will be delivered automatically on match, exit, or timeout.",
+            );
         }
         // Foreground race: inline hit, else convert at the budget (or steering).
         let budget = Duration::from_millis(TERMINAL_WATCH_FOREGROUND_BUDGET_MS)
@@ -640,11 +637,10 @@ impl Tool for TerminalRead {
             }
             if self.has_buffered_prompts() || std::time::Instant::now() >= deadline {
                 self.jobs.resume(&started.id);
-                return Ok(serde_json::to_string_pretty(&json!({
-                    "backgrounded": true,
-                    "job": started.id,
-                    "note": "Watch converted to a background job; the result will be delivered automatically on match, exit, or timeout. Continue with other work or end your turn—do not wait for it."
-                }))?);
+                return backgrounded_job_result(
+                    &started.id,
+                    "Watch converted to a background job; the result will be delivered automatically on match, exit, or timeout. Continue with other work or end your turn—do not wait for it.",
+                );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -744,7 +740,9 @@ fn watch_payload(
 }
 
 /// Background watcher body: polls the raw stream until the pattern matches,
-/// the process exits, the timeout elapses, or the job/session is gone.
+/// the process exits, the timeout elapses, or the job/session is gone. A
+/// process exit always settles the watch — after it the pattern can never
+/// match, so spinning to the timeout would only hide the exit code.
 #[allow(clippy::too_many_arguments)]
 fn spawn_terminal_watch(
     jobs: AgentJobsHandle,
@@ -752,7 +750,6 @@ fn spawn_terminal_watch(
     id: String,
     session_id: String,
     pattern: Option<regex::Regex>,
-    wait_exit: bool,
     timeout: Duration,
     cancel: Arc<AtomicBool>,
 ) {
@@ -777,11 +774,10 @@ fn spawn_terminal_watch(
                         let keep = carry.len() - TERMINAL_WATCH_CARRY_BYTES;
                         carry.drain(..keep);
                     }
-                    let exited_hit = sample.exited && (wait_exit || pattern.is_none());
                     if let Some(payload) = watch_payload(
                         &pattern,
                         &carry,
-                        exited_hit,
+                        sample.exited,
                         sample.exit_code,
                         &sample.screen,
                     ) {
@@ -1255,5 +1251,56 @@ mod terminal_watch_tests {
         assert!(value.get("backgrounded").is_none());
         assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_watch_settles_with_the_exit_when_the_process_dies() {
+        use crate::agent::{AgentTerminalHandle, JobStatus};
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _receiver) = event_channel();
+        let jobs = AgentJobsHandle::new(events);
+        let terminal = AgentTerminalHandle::default();
+        // The process exits immediately without ever printing the pattern:
+        // the watch must settle with the exit payload right away instead of
+        // spinning to its timeout with nothing left to match.
+        let session = terminal
+            .open_process_for_test(directory.path(), "echo bye")
+            .unwrap();
+        let read_tool = TerminalRead::new(
+            terminal.clone(),
+            Arc::new(AtomicBool::new(false)),
+            jobs.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let output = read_tool
+            .execute(&json!({
+                "session_id": session,
+                "purpose": "Wait for a marker that never appears",
+                "wait_for": { "pattern": "NEVER_PRINTED", "timeout_ms": 60000 },
+                "background": true
+            }))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let job = value["job"].as_str().unwrap().to_string();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let deliveries = jobs.take_deliveries();
+            if let Some(delivery) = deliveries.first() {
+                assert_eq!(delivery.id, job);
+                assert_eq!(delivery.status, JobStatus::Done);
+                let payload: Value = serde_json::from_str(&delivery.result).unwrap();
+                assert_eq!(payload["exited"], json!(true));
+                assert_eq!(payload["exit_code"], json!(0));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher never settled after the process exited"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

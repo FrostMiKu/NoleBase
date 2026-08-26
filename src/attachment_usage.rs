@@ -7,7 +7,7 @@
 //! [`AttachmentUsageHandle::trash`], the single deletion boundary around
 //! `AttachmentStore::remove`.
 //!
-//! `trash` enforces the review's deletion rules:
+//! `delete_attachment` enforces the review's deletion rules:
 //!
 //! - requires the index's initial authoritative snapshot
 //!   ([`TrashError::NotReady`]);

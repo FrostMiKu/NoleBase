@@ -4,12 +4,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::{
-    Backlinks, Calculate, Grep, ListNotes, ListTags, LoadSkill, Read, ResolveWikilink, SearchFiles,
-    SearchTag, SearchWeb,
+    Backlinks, Calculate, Grep, Notes, Read, SearchNotes, SearchTag, SearchWeb, SkillParser,
+    Tags, Wikilink,
 };
 use crate::agent::subagent::SubagentRunner;
 use crate::agent::SnapshotStore;
-use crate::skill::Skill;
 use crate::wiki_link_index::WikiLinkIndexHandle;
 use crate::workspace_index::WorkspaceIndexHandle;
 
@@ -23,19 +22,20 @@ pub(super) fn register_read_only_tools(
     wiki_links: WikiLinkIndexHandle,
     client: reqwest::Client,
     tavily_api_key: String,
-    skills: &[Skill],
+    skills: &[crate::skill::Skill],
 ) -> Result<()> {
     let reads = Arc::new(SnapshotStore::default());
-    runner.register(Read::new(root, reads, client.clone())?);
-    runner.register(ListNotes::new(root)?);
+    let mut read = Read::new(root, reads, client.clone())?;
+    read.register(SkillParser::new(skills));
+    runner.register(read);
+    runner.register(Notes::new(root)?);
     runner.register(Grep::new(root)?);
-    runner.register(SearchFiles::new(root)?);
-    runner.register(ListTags::new(workspace_index.clone()));
+    runner.register(SearchNotes::new(root)?);
+    runner.register(Tags::new(workspace_index.clone()));
     runner.register(SearchTag::new(root, workspace_index)?);
-    runner.register(ResolveWikilink::new(root, wiki_links.clone())?);
+    runner.register(Wikilink::new(root, wiki_links.clone())?);
     runner.register(Backlinks::new(root, wiki_links)?);
     runner.register(Calculate);
-    runner.register(LoadSkill::new(skills));
     if !tavily_api_key.is_empty() {
         runner.register(SearchWeb {
             client,

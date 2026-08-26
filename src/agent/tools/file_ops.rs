@@ -280,12 +280,12 @@ impl Tool for Copy {
     }
 }
 
-pub struct ExportFile {
+pub struct Export {
     storage: Storage,
     gate: ApprovalGate,
 }
 
-impl ExportFile {
+impl Export {
     pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             storage: Storage::new(canonical_root(root)?)?,
@@ -295,9 +295,9 @@ impl ExportFile {
 }
 
 #[async_trait::async_trait]
-impl Tool for ExportFile {
+impl Tool for Export {
     fn name(&self) -> &'static str {
-        "export_file"
+        "export"
     }
 
     fn description(&self) -> &'static str {
@@ -1038,12 +1038,12 @@ impl Tool for Mkdir {
     }
 }
 
-pub struct RemoveDir {
+pub struct Rmdir {
     root: PathBuf,
     gate: ApprovalGate,
 }
 
-impl RemoveDir {
+impl Rmdir {
     pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -1053,9 +1053,9 @@ impl RemoveDir {
 }
 
 #[async_trait::async_trait]
-impl Tool for RemoveDir {
+impl Tool for Rmdir {
     fn name(&self) -> &'static str {
-        "remove_dir"
+        "rmdir"
     }
 
     fn description(&self) -> &'static str {
@@ -1081,7 +1081,7 @@ impl Tool for RemoveDir {
             bail!("refusing to remove a directory through a symlink");
         }
         if !metadata.is_dir() {
-            bail!("remove_dir only removes directories; use delete for regular files");
+            bail!("rmdir only removes directories; use delete for regular files");
         }
         let path = fs::canonicalize(&unresolved)
             .with_context(|| format!("resolving {}", unresolved.display()))?;
@@ -1291,7 +1291,7 @@ mod tests {
         assert_eq!(fs::read_to_string(workspace.join("c.txt")).unwrap(), "a");
         assert_no_approval_requested(drain_events(&mut gate_events));
 
-        // mkdir and remove_dir manage directories inside the workspace freely.
+        // mkdir and rmdir manage directories inside the workspace freely.
         let (gate, mut mkdir_events) = gate_without_decisions(&root);
         let mkdir = Mkdir::new(&root, gate).unwrap();
         let output = execute_unapproved(move || {
@@ -1304,7 +1304,7 @@ mod tests {
         assert_no_approval_requested(drain_events(&mut mkdir_events));
 
         let (gate, mut remove_events) = gate_without_decisions(&root);
-        let remover = RemoveDir::new(&root, gate).unwrap();
+        let remover = Rmdir::new(&root, gate).unwrap();
         let output = execute_unapproved(move || {
             test_runtime().block_on(remover.execute(&json!({"path": "workspace/newdir"})))
         });
@@ -1312,9 +1312,9 @@ mod tests {
         assert!(!workspace.join("newdir").exists());
 
         assert_no_approval_requested(drain_events(&mut remove_events));
-        // remove_dir refuses trees outside workspace.
+        // rmdir refuses trees outside workspace.
         fs::create_dir_all(root.join("data/notes")).unwrap();
-        let remover = RemoveDir::new(&root, bypass_gate()).unwrap();
+        let remover = Rmdir::new(&root, bypass_gate()).unwrap();
         let error = test_runtime()
             .block_on(remover.execute(&json!({"path": "data/notes"})))
             .unwrap_err();
@@ -1535,7 +1535,7 @@ mod tests {
             .unwrap()
             .execute(&json!({"path": "attachments/newdir"}))
             .returns_err());
-        assert!(RemoveDir::new(&root, bypass_gate())
+        assert!(Rmdir::new(&root, bypass_gate())
             .unwrap()
             .execute(&json!({"path": "attachments/objects"}))
             .returns_err());
@@ -1587,7 +1587,7 @@ mod tests {
         fs::create_dir(&outside_dir).unwrap();
         let linked_dir = workspace.join("linked");
         symlink(&outside_dir, &linked_dir).unwrap();
-        let remover = RemoveDir::new(&root, bypass_gate()).unwrap();
+        let remover = Rmdir::new(&root, bypass_gate()).unwrap();
         assert!(remover
             .execute(&json!({"path": "workspace/linked"}))
             .returns_err());
@@ -1674,7 +1674,7 @@ mod tests {
         let remove_root = outside_root.join("new");
         let (events, _receiver) = event_channel();
         let (decisions, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let remove = RemoveDir::new(
+        let remove = Rmdir::new(
             &root,
             gate(PermissionMode::Auto, &root, events, decision_receiver),
         )
@@ -1705,7 +1705,7 @@ mod tests {
             event_sender,
             decision_receiver,
         );
-        let tool = ExportFile::new(&root, gate).unwrap();
+        let tool = Export::new(&root, gate).unwrap();
         assert_eq!(
             tool.description(),
             "Render one Nole Markdown file as safe standalone HTML at a new external destination."

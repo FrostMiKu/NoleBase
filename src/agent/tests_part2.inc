@@ -613,11 +613,11 @@
             .unwrap()
             .contains("search_web"));
         for name in [
-            "http_request",
+            "http",
             "write",
             "edit",
             "copy",
-            "export_file",
+            "export",
             "move",
             "move_many",
             "rename",
@@ -625,15 +625,16 @@
             "open",
             "ask",
             "notify",
-            "add_daily_entry",
+            "daily",
             "explore",
             "review",
             "calculate",
             "wait",
-            "load_skill",
+            "read",
         ] {
             assert!(without_key.tools.contains_key(name), "missing tool {name}");
         }
+        assert!(!without_key.tools.contains_key("skill"));
         let serialized_system = serde_json::to_string(&without_key.system).unwrap();
         assert!(serialized_system.contains("Available skills"));
         assert!(serialized_system.contains("create-skill"));
@@ -1423,7 +1424,7 @@
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let add = AddDailyEntry::new(directory.path()).unwrap();
+        let add = Daily::new(directory.path()).unwrap();
 
         add.execute(&json!({"date": "2026-07-27", "content": "first"}))
             .unwrap();
@@ -1593,7 +1594,7 @@
         handle.replace(crate::workspace_index::WorkspaceIndex::build(&storage));
 
         let listed: Value = serde_json::from_str(
-            &ListTags::new(handle.clone())
+            &Tags::new(handle.clone())
                 .execute(&json!({"query": "rust"}))
                 .unwrap(),
         )
@@ -1679,7 +1680,7 @@
         handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
 
         let resolved: Value = serde_json::from_str(
-            &ResolveWikilink::new(directory.path(), handle.clone())
+            &Wikilink::new(directory.path(), handle.clone())
                 .unwrap()
                 .execute(&json!({"target": "Project"}))
                 .unwrap(),
@@ -1693,7 +1694,7 @@
             .ends_with("data/Project.md"));
 
         let missing: Value = serde_json::from_str(
-            &ResolveWikilink::new(directory.path(), handle.clone())
+            &Wikilink::new(directory.path(), handle.clone())
                 .unwrap()
                 .execute(&json!({"target": "Nope"}))
                 .unwrap(),
@@ -2045,7 +2046,7 @@
     }
 
     #[test]
-    fn todo_write_updates_the_conversation_plan_and_echoes_it() {
+    fn todo_updates_the_conversation_plan_and_echoes_it() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let responses = [
@@ -2053,7 +2054,7 @@
                 "content": [{
                     "type": "tool_use",
                     "id": "todos-1",
-                    "name": "todo_write",
+                    "name": "todo",
                     "input": {"todos": [
                         {"content": "Plan the work", "status": "completed"},
                         {"content": "Write the implementation", "status": "in_progress"},

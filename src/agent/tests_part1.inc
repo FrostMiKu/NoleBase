@@ -177,7 +177,7 @@
         let calls = [
             ToolCall {
                 id: "one".to_string(),
-                name: "http_request".to_string(),
+                name: "http".to_string(),
                 input: json!({"url": "https://example.com/blob"}),
             },
             ToolCall {
@@ -220,7 +220,7 @@
             Message::user("fetch the report"),
             Message::assistant(vec![MessagePart::ToolUse(ToolCall {
                 id: "one".to_string(),
-                name: "http_request".to_string(),
+                name: "http".to_string(),
                 input: json!({"url": "https://example.com/big"}),
             })]),
             Message::tool(ToolResult {
@@ -745,7 +745,7 @@
         assert!(paths.contains(&"data/RustProject.md"));
         assert!(paths.contains(&"archives/RustHistory.md"));
 
-        let files = SearchFiles::new(directory.path()).unwrap();
+        let files = SearchNotes::new(directory.path()).unwrap();
         let result: Value = serde_json::from_str(
             &files
                 .execute(&json!({"query": "rsprj", "range": "1-10"}))
@@ -928,7 +928,7 @@
         fs::write(directory.path().join("data/Alpha.md"), "one\ntwo\nthree\n").unwrap();
         fs::write(directory.path().join("data/Beta.mb"), "one\n").unwrap();
         fs::write(directory.path().join("data/ignored.txt"), "ignored").unwrap();
-        let list = ListNotes::new(directory.path()).unwrap();
+        let list = Notes::new(directory.path()).unwrap();
 
         let result: Value = serde_json::from_str(
             &list
@@ -1165,10 +1165,11 @@
             assert!(names.contains(&name), "missing registered tool {name}");
         }
         assert!(!names.contains(&"copy_attachment_to_workspace"));
+        assert!(!names.contains(&"skill"));
     }
 
     #[test]
-    fn http_request_tool_is_registered_for_the_main_agent() {
+    fn http_tool_is_registered_for_the_main_agent() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
@@ -1192,14 +1193,14 @@
         .unwrap();
         let registered = agent
             .tools
-            .get("http_request")
-            .expect("http_request is registered");
+            .get("http")
+            .expect("http is registered");
         assert_eq!(registered.execution_policy(), ToolExecutionPolicy::Network);
         let definition = agent
             .definitions
             .iter()
-            .find(|definition| definition.name == "http_request")
-            .expect("http_request has a model-facing definition");
+            .find(|definition| definition.name == "http")
+            .expect("http has a model-facing definition");
         let schema = &definition.input_schema;
         let required = schema["required"]
             .as_array()
@@ -1259,7 +1260,7 @@
             tool_finish_activity(&read, None),
             "Completed Read.\ndata/project notes.md"
         );
-        assert_eq!(tool_display_name("add_daily_entry"), "Add Daily Entry");
+        assert_eq!(tool_display_name("daily"), "Add Daily Entry");
 
         let explore = json!({
             "name": "explore",
@@ -1317,7 +1318,7 @@
         );
 
         let private_input = json!({
-            "name": "terminal_request_private_input",
+            "name": "ask_private",
             "input": {
                 "session_id": "terminal-1",
                 "purpose": "Authenticate the deployment",
@@ -1326,7 +1327,7 @@
         });
         assert_eq!(
             tool_start_activity(&private_input),
-            "Calling Terminal Request Private Input...\nterminal-1: Authenticate the deployment"
+            "Calling Ask Private...\nterminal-1: Authenticate the deployment"
         );
         assert!(!tool_start_activity(&private_input).contains("passphrase"));
 
@@ -1336,25 +1337,25 @@
         );
 
         let download = json!({
-            "name": "http_request",
+            "name": "http",
             "input": {"url": "https://example.com/blob.bin", "save_to": "binaries/blob.bin"}
         });
         assert_eq!(
             tool_start_activity(&download),
-            "Calling Http Request...\nGET https://example.com/blob.bin -> binaries/blob.bin"
+            "Calling Http...\nGET https://example.com/blob.bin -> binaries/blob.bin"
         );
         assert_eq!(
             tool_finish_activity(&download, None),
-            "Completed Http Request.\nGET https://example.com/blob.bin -> binaries/blob.bin"
+            "Completed Http.\nGET https://example.com/blob.bin -> binaries/blob.bin"
         );
 
         let request = json!({
-            "name": "http_request",
+            "name": "http",
             "input": {"url": "https://api.example.com:8443/v1/items?page=2", "method": "POST"}
         });
         assert_eq!(
             tool_start_activity(&request),
-            "Calling Http Request...\nPOST https://api.example.com:8443/v1/items?page=2"
+            "Calling Http...\nPOST https://api.example.com:8443/v1/items?page=2"
         );
     }
 

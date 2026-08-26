@@ -193,7 +193,7 @@ mod tests {
                 response(
                     vec![MessagePart::ToolUse(ToolCall {
                         id: "lookup".to_string(),
-                        name: "search_files".to_string(),
+                        name: "search_notes".to_string(),
                         input: json!({"query": "answer"}),
                     })],
                     StopReason::ToolUse,
@@ -232,11 +232,11 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(tool_names.contains(&"read"));
-        assert!(tool_names.contains(&"search_files"));
+        assert!(tool_names.contains(&"search_notes"));
         assert!(tool_names.contains(&"calculate"));
         assert!(!tool_names.contains(&"explore"));
         assert!(!tool_names.contains(&"edit"));
-        assert!(!tool_names.contains(&"http_request"));
+        assert!(!tool_names.contains(&"http"));
         assert!(!tool_names.contains(&"ask"));
         assert_eq!(requests[1].messages.len(), 3);
         assert_eq!(
@@ -259,7 +259,7 @@ mod tests {
                 response(
                     vec![MessagePart::ToolUse(ToolCall {
                         id: "first".to_string(),
-                        name: "search_files".to_string(),
+                        name: "search_notes".to_string(),
                         input: json!({"query": "first"}),
                     })],
                     StopReason::ToolUse,

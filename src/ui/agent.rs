@@ -103,13 +103,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
     ];
     let mut lines = vec![Line::default()];
     for (label, value) in rows {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{label:<8}"),
-                Style::default().fg(app.theme.text_muted),
-            ),
-            Span::styled(value, Style::default().fg(app.theme.text_primary)),
-        ]));
+        lines.push(stats_label_row(app, label, value));
         lines.push(Line::default());
     }
     append_todo_summary(app, &mut lines, inner.width);
@@ -120,6 +114,27 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
     app.agent_stats_scroll = scroll;
     let visible = lines[scroll..(scroll + height).min(lines.len())].to_vec();
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+/// One statistics row: a fixed 8-column muted label and its value.
+fn stats_label_row(app: &App, label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<8}"),
+            Style::default().fg(app.theme.text_muted),
+        ),
+        Span::styled(value, Style::default().fg(app.theme.text_primary)),
+    ])
+}
+
+/// "3 running · 1 done": non-zero (count, name) pairs joined with a middot.
+fn count_summary(counts: &[(usize, &str)]) -> String {
+    counts
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, name)| format!("{count} {name}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Job rows indent past the fixed 8-column statistics label ("Jobs    ").
@@ -147,19 +162,7 @@ fn append_todo_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
         };
         slot.0 += 1;
     }
-    let summary = counts
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, name)| format!("{count} {name}"))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:<8}", "Todos"),
-            Style::default().fg(app.theme.text_muted),
-        ),
-        Span::styled(summary, Style::default().fg(app.theme.text_primary)),
-    ]));
+    lines.push(stats_label_row(app, "Todos", count_summary(&counts)));
     for item in todos {
         let (marker, style) = match item.status {
             TodoStatus::InProgress => (
@@ -184,7 +187,6 @@ fn append_todo_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
 /// Append the background-job section after the fixed statistics rows: one
 /// summary row, then one line per job naming what it runs via its label.
 /// Running jobs list first; settled ones stay until their retention expires.
-
 fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
     use crate::agent::JobStatus;
 
@@ -208,19 +210,7 @@ fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
         };
         slot.0 += 1;
     }
-    let summary = counts
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, name)| format!("{count} {name}"))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:<8}", "Jobs"),
-            Style::default().fg(app.theme.text_muted),
-        ),
-        Span::styled(summary, Style::default().fg(app.theme.text_primary)),
-    ]));
+    lines.push(stats_label_row(app, "Jobs", count_summary(&counts)));
     // Indent job rows past the "Jobs" label column so they read as children
     // of the summary row rather than its siblings.
     for row in &job_rows {

@@ -481,7 +481,7 @@ impl AgentJobsHandle {
     /// Whether any *listed* background job is running; foreground raced jobs
     /// waiting inline do not count.
     pub(crate) fn has_running(&self) -> bool {
-        self.inner.lock().map_or(false, |state| {
+        self.inner.lock().is_ok_and(|state| {
             state
                 .entries
                 .iter()
@@ -502,6 +502,9 @@ impl AgentJobsHandle {
         deliveries
     }
 
+    /// Whether a delivery is still queued; used by tests to observe the
+    /// enqueue/suppress contract.
+    #[cfg(test)]
     pub(crate) fn has_pending_deliveries(&self) -> bool {
         self.inner
             .lock()

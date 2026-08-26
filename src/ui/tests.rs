@@ -3617,7 +3617,7 @@ fn agent_sidebar_renders_the_todo_plan_above_jobs() {
             status: TodoStatus::Pending,
         },
         TodoItem {
-            content: "Design the todo_write contract".to_string(),
+            content: "Design the todo contract".to_string(),
             status: TodoStatus::Completed,
         },
     ];
@@ -3634,7 +3634,7 @@ fn agent_sidebar_renders_the_todo_plan_above_jobs() {
     assert!(screen.contains("Draft the compaction summary"));
     // Long content truncates with an ellipsis inside the panel width.
     assert!(screen.contains("Cover the sidebar with renderer t…"));
-    assert!(screen.contains("Design the todo_write contract"));
+    assert!(screen.contains("Design the todo contract"));
 
     // An empty plan renders no section at all.
     app.agent_conversation.todos.clear();

@@ -81,21 +81,26 @@ pub(crate) fn open_wiki_span(input: &str, cursor: usize) -> Option<WikiSpan> {
 /// Filter and rank candidates for a query: case-insensitive stem matches,
 /// prefix hits before substring hits, alphabetical within each tier. The
 /// full ranked list is returned; the popup window scrolls through it.
+/// Stems containing wiki-link syntax characters are skipped: splicing them
+/// into `[[stem]]` would produce a broken link.
 pub(crate) fn filter_wiki_completions(
     candidates: &[WikiLinkCandidate],
     query: &str,
 ) -> Vec<WikiLinkCandidate> {
-    let query = query.trim();
+    let query = query.trim().to_lowercase();
     let mut prefix = Vec::new();
     let mut substring = Vec::new();
     for candidate in candidates {
         let Some(stem) = stem_label(candidate) else {
             continue;
         };
+        if stem.contains(['[', ']', '|', '#']) {
+            continue;
+        }
         let lower = stem.to_lowercase();
-        if query.is_empty() || lower.starts_with(&query.to_lowercase()) {
+        if query.is_empty() || lower.starts_with(&query) {
             prefix.push(candidate.clone());
-        } else if lower.contains(&query.to_lowercase()) {
+        } else if lower.contains(&query) {
             substring.push(candidate.clone());
         }
     }
@@ -308,6 +313,19 @@ mod tests {
         let (input, cursor) = apply_wiki_completion("see ![[al and more", 5, 9, "alpha");
         assert_eq!(input, "see ![[alpha]] and more");
         assert_eq!(cursor, "see ![[alpha]]".len());
+    }
+
+    #[test]
+    fn stems_that_would_break_wiki_syntax_are_not_offered() {
+        let candidates: Vec<WikiLinkCandidate> = ["al|pha", "x]", "[y]", "#h", "ok"]
+            .iter()
+            .map(|stem| candidate(stem, WikiLinkLocation::Notes))
+            .collect();
+        let ranked = filter_wiki_completions(&candidates, "");
+        assert_eq!(
+            ranked.iter().filter_map(stem_label).collect::<Vec<_>>(),
+            ["ok"]
+        );
     }
 
     #[test]

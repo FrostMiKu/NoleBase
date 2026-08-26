@@ -306,7 +306,7 @@ The Agent may create, edit, move, and delete files freely inside
 artifacts and is never cleared automatically — not even when the Agent session
 is cleared; the Agent maintains it itself. Moving a source from elsewhere
 remains approval-gated because it transfers user-owned data. The
-`http_request` tool's `save_to` option streams any http(s) URL into a new file
+`http` tool's `save_to` option streams any http(s) URL into a new file
 under `workspace/` (see below). Generic file
 tools route attachment operations through dedicated APIs; the Agent uses those
 APIs to import, read, list, check out, update, and delete attachments.
@@ -460,7 +460,7 @@ as intermediate output and automatically requests continuation. A response
 with an empty text body is retried a limited number of times; persistent failures report
 the stop reason and returned content-block types.
 Agent output enters a daily card only when the Agent explicitly calls
-`add_daily_entry`; omitting its date records the content on the current local
+`daily`; omitting its date records the content on the current local
 date.
 
 Set `tavily_api_key` to enable the Agent's Tavily `search_web` tool. When the
@@ -493,7 +493,7 @@ task, copy its latest visible output, clear its saved session, create or manage
 notes, or open `template.mb`, `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the
 configured editor.
 `File: Export…` is available when Center is previewing a file, Skill, or Daily
-document. The UI retains its Original/HTML picker; the Agent's `export_file`
+document. The UI retains its Original/HTML picker; the Agent's `export`
 tool exposes HTML rendering only because exact-byte external copies use `copy`.
 Press `Ctrl+\`` or run `Terminal: Open` from the command palette to open a
 PTY-backed floating terminal. Its shell starts in the active Nole directory
@@ -524,7 +524,7 @@ instructions, and the final message content block. The moving message
 breakpoint makes the unchanged conversation prefix reusable while edits to
 MEMORY.md, skills, or project instructions can still fall back to an earlier
 stable prefix. The current timestamp remains in the newest user message.
-The Agent can inspect the same shared tag index with `list_tags` and
+The Agent can inspect the same shared tag index with `tags` and
 `search_tag`. Its `rename_tag` tool follows the active permission policy before
 changing exact Hashtag source spans across a multi-file diff.
 Broad exploration, discovery, comparison, and research run through the
@@ -589,7 +589,7 @@ date and time. File reads default to 200 lines and accept at most 2,000 lines pe
 call. Paths under the Nole root are returned in root-relative form so they can be
 passed directly to other file tools.
 While `read` inspects content (HTML is converted to Markdown, and results are
-capped at 1 MB), the `http_request` tool preserves a remote response's exact
+capped at 1 MB), the `http` tool preserves a remote response's exact
 bytes as a new file under `workspace/` when given `save_to`. It accepts a
 required http(s) `url`, an optional `method` (GET, POST, PUT, PATCH, DELETE, or
 HEAD), optional `headers`, an optional string `body`, and an optional `range`
@@ -620,7 +620,7 @@ nested descendants with symlink-aware traversal. Each item includes its type,
 depth, extension, byte size, streaming line count, and creation and modification
 timestamps. Results support metadata sorting and range pagination.
 
-`list_notes` returns active `data/` notes with their line count, creation and
+`notes` returns active `data/` notes with their line count, creation and
 modification timestamps, and byte size. Results can be sorted ascending or
 descending by name or any of those metadata fields and paginated with `range`.
 
@@ -628,7 +628,7 @@ descending by name or any of those metadata fields and paginated with `range`.
 directory, with optional case-insensitive or fixed-string matching and include
 globs. It reads files of any size line by line, respects standard ignore files,
 keeps discovered symlinks outside traversal, and returns one-based line and byte-column
-positions with range pagination. `search_files` remains the case-insensitive
+positions with range pagination. `search_notes` remains the case-insensitive
 fuzzy filename search used by the Files sidebar.
 
 `write` creates a complete new file and always refuses an existing path. Ordinary
@@ -658,7 +658,7 @@ rejected. Each successful edit returns the new tag, line count, and renumbered
 changed windows, so another edit can use the returned state directly. Existing
 `daily/YYYY-MM-DD.md` files use the same `read`, `edit`, and `delete` operations
 as other Markdown files.
-`add_daily_entry` remains the high-level create-or-append operation and runs
+`daily` remains the high-level create-or-append operation and runs
 directly. Its optional `date` uses `YYYY-MM-DD`; an omitted value records
 content on the current local date.
 The Agent can list `daily/` to discover available dates before reading the
@@ -673,7 +673,7 @@ read-before-`edit` snapshots, collision preflight, and rollback for a failed
 dedicated APIs; recursive
 directory removal inside Nole remains limited to `workspace/`.
 
-`export_file` renders a UTF-8 `.md` or `.mb` source as standalone HTML at a
+`export` renders a UTF-8 `.md` or `.mb` source as standalone HTML at a
 new external destination. Preparation validates the source and destination
 before the permission gate; preparation and publication run off the Agent
 async runtime. Publication revalidates source content and destination afterward,
@@ -733,7 +733,7 @@ Cancelling the Agent interrupts the wait promptly while preserving those
 external processes.
 
 When a PTY asks for a password, passphrase, or MFA code, the Agent can call
-`terminal_request_private_input`. Nole opens a masked, single-line dialog and
+`ask_private`. Nole opens a masked, single-line dialog and
 sends the submitted value plus Enter directly from the TUI to the selected PTY.
 The value stays within the TUI-to-PTY channel and remains outside Agent context,
 tool arguments or results, activity text, and the persisted Agent session; the

@@ -1,6 +1,6 @@
-//! Note search and listing tools: `list_notes` and `search_files`.
+//! Note search and listing tools: `notes` and `search_notes`.
 //!
-//! Both operate on `data/` `.md`/`.mb` note files (`search_files` also covers
+//! Both operate on `data/` `.md`/`.mb` note files (`search_notes` also covers
 //! `archives/`) and share the `range` pagination shape.
 
 use std::path::{Path, PathBuf};
@@ -28,12 +28,12 @@ struct NoteMetadata {
     size: u64,
 }
 
-pub struct ListNotes {
+pub struct Notes {
     data_dir: PathBuf,
     root: PathBuf,
 }
 
-impl ListNotes {
+impl Notes {
     pub fn new(root: &Path) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
@@ -44,9 +44,9 @@ impl ListNotes {
 }
 
 #[async_trait::async_trait]
-impl Tool for ListNotes {
+impl Tool for Notes {
     fn name(&self) -> &'static str {
-        "list_notes"
+        "notes"
     }
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::LocalRead
@@ -157,12 +157,12 @@ async fn note_metadata(path: PathBuf) -> Result<NoteMetadata> {
     })
 }
 
-pub struct SearchFiles {
+pub struct SearchNotes {
     directories: [PathBuf; 2],
     root: PathBuf,
 }
 
-impl SearchFiles {
+impl SearchNotes {
     pub fn new(root: &Path) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
@@ -173,9 +173,9 @@ impl SearchFiles {
 }
 
 #[async_trait::async_trait]
-impl Tool for SearchFiles {
+impl Tool for SearchNotes {
     fn name(&self) -> &'static str {
-        "search_files"
+        "search_notes"
     }
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::LocalRead

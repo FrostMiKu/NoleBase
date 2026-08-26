@@ -18,20 +18,20 @@ use crate::model::SearchHit;
 use crate::storage::Storage;
 use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};
 
-pub struct ListTags {
+pub struct Tags {
     index: WorkspaceIndexHandle,
 }
 
-impl ListTags {
+impl Tags {
     pub fn new(index: WorkspaceIndexHandle) -> Self {
         Self { index }
     }
 }
 
 #[async_trait::async_trait]
-impl Tool for ListTags {
+impl Tool for Tags {
     fn name(&self) -> &'static str {
-        "list_tags"
+        "tags"
     }
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::LocalRead
@@ -306,11 +306,11 @@ impl Tool for RenameTag {
     }
 }
 
-pub struct AddDailyEntry {
+pub struct Daily {
     storage: Storage,
 }
 
-impl AddDailyEntry {
+impl Daily {
     pub fn new(root: &Path) -> Result<Self> {
         Ok(Self {
             storage: Storage::new(root)?,
@@ -319,9 +319,9 @@ impl AddDailyEntry {
 }
 
 #[async_trait::async_trait]
-impl Tool for AddDailyEntry {
+impl Tool for Daily {
     fn name(&self) -> &'static str {
-        "add_daily_entry"
+        "daily"
     }
 
     fn description(&self) -> &'static str {

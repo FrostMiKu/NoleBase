@@ -407,7 +407,7 @@ pub struct Agent {
     /// sources with the exact same network policy as the read tool.
     client: Client,
     jobs: AgentJobsHandle,
-    /// Shared task-plan state behind the `todo_write` tool; the conversation
+    /// Shared task-plan state behind the `todo` tool; the conversation
     /// snapshot re-arms it at every run start.
     todos: TodoHandle,
 }
@@ -736,9 +736,8 @@ impl Agent {
                 "Skill warning: {warning}"
             )));
         }
-        agent.register(LoadSkill::new(&skills));
         agent.register(Calculate);
-        agent.register(TodoWrite::new(todos));
+        agent.register(Todo::new(todos));
         agent.register(Wait::new(cancelled.clone()));
         agent.register(Shell::new(
             nole_root,
@@ -775,30 +774,32 @@ impl Agent {
             agent.jobs.clone(),
             agent.input_buffer.clone(),
         ));
-        agent.register(TerminalRequestPrivateInput {
+        agent.register(AskPrivate {
             events: agent.events.clone(),
             responses: private_terminal_input,
             terminal: terminal.clone(),
             cancelled: cancelled.clone(),
         });
         agent.register(TerminalClose::new(terminal));
-        agent.register(Read::new(nole_root, reads.clone(), client.clone())?);
-        agent.register(HttpRequest::new(
+        let mut read = Read::new(nole_root, reads.clone(), client.clone())?;
+        read.register(SkillParser::new(&skills));
+        agent.register(read);
+        agent.register(Http::new(
             nole_root,
             client.clone(),
             agent.jobs.clone(),
         )?);
-        agent.register(ListNotes::new(nole_root)?);
+        agent.register(Notes::new(nole_root)?);
         agent.register(Grep::new(nole_root)?);
-        agent.register(SearchFiles::new(nole_root)?);
-        agent.register(ListTags::new(workspace_index.clone()));
+        agent.register(SearchNotes::new(nole_root)?);
+        agent.register(Tags::new(workspace_index.clone()));
         agent.register(SearchTag::new(nole_root, workspace_index.clone())?);
         agent.register(RenameTag::new(
             nole_root,
             workspace_index.clone(),
             gate.clone(),
         )?);
-        agent.register(ResolveWikilink::new(nole_root, wiki_links.clone())?);
+        agent.register(Wikilink::new(nole_root, wiki_links.clone())?);
         agent.register(Backlinks::new(nole_root, wiki_links.clone())?);
         agent.register(RenameWikilink::new(
             nole_root,
@@ -813,16 +814,16 @@ impl Agent {
             registers.clone(),
         )?);
         agent.register(Copy::new(nole_root, gate.clone())?);
-        agent.register(ExportFile::new(nole_root, gate.clone())?);
+        agent.register(Export::new(nole_root, gate.clone())?);
         agent.register(Mkdir::new(nole_root, gate.clone())?);
-        agent.register(RemoveDir::new(nole_root, gate.clone())?);
+        agent.register(Rmdir::new(nole_root, gate.clone())?);
         let file_events = agent.events.clone();
         agent.register(Move::new(nole_root, file_events.clone(), gate.clone())?);
         agent.register(MoveMany::new(nole_root, file_events.clone(), gate.clone())?);
         agent.register(Rename::new(nole_root, file_events, gate.clone())?);
         agent.register(Delete::new(nole_root, gate.clone())?);
         agent.register(Edit::new(nole_root, gate.clone(), reads, registers)?);
-        agent.register(AddDailyEntry::new(nole_root)?);
+        agent.register(Daily::new(nole_root)?);
         agent.register(Open::new(nole_root, agent.events.clone())?);
         agent.register(Notify {
             events: agent.events.clone(),
@@ -1049,7 +1050,7 @@ impl Agent {
                 } => {
                     conversation.messages.extend(messages);
                     // A completed batch is the only place the plan can change
-                    // (todo_write is a tool), so mirror the handle into the
+                    // (todo is a tool), so mirror the handle into the
                     // conversation before the checkpoint persists it.
                     conversation.todos = self.todos.snapshot();
                     self.checkpoint_conversation(conversation);
@@ -1133,51 +1134,13 @@ impl Agent {
             tokio::select! {
                 event = events.recv(), if events_open => {
                     match event {
-                        Ok(ProviderEvent::TextDelta(text)) => {
-                            let _ = self.events.send(AgentEvent::AssistantDelta(text));
-                        }
-                        Ok(ProviderEvent::ThinkingDelta(text)) => {
-                            let _ = self.events.send(AgentEvent::ThinkingDelta(text));
-                        }
-                        Ok(ProviderEvent::ThinkingFinished) => {
-                            let _ = self.events.send(AgentEvent::ThinkingFinished);
-                        }
-                        Ok(ProviderEvent::ToolCallDelta { index, name, arguments, .. }) => {
-                            if let Some(message) = tool_previews
-                                .entry(index)
-                                .or_default()
-                                .push(&name, &arguments)
-                            {
-                                let _ = self.events.send(AgentEvent::ToolPreparing {
-                                    index,
-                                    message,
-                                });
-                            }
-                        }
-                        Ok(ProviderEvent::ToolCallFinished { index, id }) => {
-                            if tool_previews
-                                .remove(&index)
-                                .is_some_and(|preview| preview.is_visible())
-                            {
-                                let _ = self.events.send(AgentEvent::ToolPreparationFinished {
-                                    index,
-                                    id: (!id.is_empty()).then_some(id),
-                                });
-                            }
-                        }
-                        Ok(ProviderEvent::Usage { usage, generation_duration }) => {
-                            report_provider_metrics(
-                                &self.events,
-                                &mut reported_usage,
-                                &mut reported_duration,
-                                usage,
-                                generation_duration,
-                                context_input_capacity,
-                            );
-                        }
-                        Ok(ProviderEvent::Retry) => {
-                            let _ = self.events.send(AgentEvent::Retry);
-                        }
+                        Ok(event) => self.forward_provider_event(
+                            event,
+                            &mut tool_previews,
+                            &mut reported_usage,
+                            &mut reported_duration,
+                            context_input_capacity,
+                        ),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             events_open = false;
@@ -1186,53 +1149,13 @@ impl Agent {
                 }
                 result = &mut output => {
                     while let Ok(event) = events.try_recv() {
-                        match event {
-                            ProviderEvent::TextDelta(text) => {
-                                let _ = self.events.send(AgentEvent::AssistantDelta(text));
-                            }
-                            ProviderEvent::ThinkingDelta(text) => {
-                                let _ = self.events.send(AgentEvent::ThinkingDelta(text));
-                            }
-                            ProviderEvent::ThinkingFinished => {
-                                let _ = self.events.send(AgentEvent::ThinkingFinished);
-                            }
-                            ProviderEvent::ToolCallDelta { index, name, arguments, .. } => {
-                                if let Some(message) = tool_previews
-                                    .entry(index)
-                                    .or_default()
-                                    .push(&name, &arguments)
-                                {
-                                    let _ = self.events.send(AgentEvent::ToolPreparing {
-                                        index,
-                                        message,
-                                    });
-                                }
-                            }
-                            ProviderEvent::ToolCallFinished { index, id } => {
-                                if tool_previews
-                                    .remove(&index)
-                                    .is_some_and(|preview| preview.is_visible())
-                                {
-                                    let _ = self.events.send(AgentEvent::ToolPreparationFinished {
-                                        index,
-                                        id: (!id.is_empty()).then_some(id),
-                                    });
-                                }
-                            }
-                            ProviderEvent::Usage { usage, generation_duration } => {
-                                report_provider_metrics(
-                                    &self.events,
-                                    &mut reported_usage,
-                                    &mut reported_duration,
-                                    usage,
-                                    generation_duration,
-                                    context_input_capacity,
-                                );
-                            }
-                            ProviderEvent::Retry => {
-                                let _ = self.events.send(AgentEvent::Retry);
-                            }
-                        }
+                        self.forward_provider_event(
+                            event,
+                            &mut tool_previews,
+                            &mut reported_usage,
+                            &mut reported_duration,
+                            context_input_capacity,
+                        );
                     }
                     if let Ok(answer) = &result {
                         report_provider_metrics(
@@ -1261,6 +1184,65 @@ impl Agent {
                         bail!("agent task cancelled");
                     }
                 }
+            }
+        }
+    }
+
+    /// Forward one provider stream event to the App as agent events: text,
+    /// thinking, tool-call previews, usage metrics, and retry notices.
+    fn forward_provider_event(
+        &self,
+        event: ProviderEvent,
+        tool_previews: &mut HashMap<usize, ToolCallStreamPreview>,
+        reported_usage: &mut TokenUsage,
+        reported_duration: &mut Duration,
+        context_input_capacity: u64,
+    ) {
+        match event {
+            ProviderEvent::TextDelta(text) => {
+                let _ = self.events.send(AgentEvent::AssistantDelta(text));
+            }
+            ProviderEvent::ThinkingDelta(text) => {
+                let _ = self.events.send(AgentEvent::ThinkingDelta(text));
+            }
+            ProviderEvent::ThinkingFinished => {
+                let _ = self.events.send(AgentEvent::ThinkingFinished);
+            }
+            ProviderEvent::ToolCallDelta { index, name, arguments, .. } => {
+                if let Some(message) = tool_previews
+                    .entry(index)
+                    .or_default()
+                    .push(&name, &arguments)
+                {
+                    let _ = self.events.send(AgentEvent::ToolPreparing {
+                        index,
+                        message,
+                    });
+                }
+            }
+            ProviderEvent::ToolCallFinished { index, id } => {
+                if tool_previews
+                    .remove(&index)
+                    .is_some_and(|preview| preview.is_visible())
+                {
+                    let _ = self.events.send(AgentEvent::ToolPreparationFinished {
+                        index,
+                        id: (!id.is_empty()).then_some(id),
+                    });
+                }
+            }
+            ProviderEvent::Usage { usage, generation_duration } => {
+                report_provider_metrics(
+                    &self.events,
+                    reported_usage,
+                    reported_duration,
+                    usage,
+                    generation_duration,
+                    context_input_capacity,
+                );
+            }
+            ProviderEvent::Retry => {
+                let _ = self.events.send(AgentEvent::Retry);
             }
         }
     }
@@ -1340,13 +1322,13 @@ impl Agent {
             let mut replacement = format!(
                     "Context summary from earlier turns (preserve these facts and decisions):\n\n{summary}"
                 );
-            // The summarized turns contain every earlier todo_write echo, so
+            // The summarized turns contain every earlier todo echo, so
             // restate the authoritative plan at the new context start; a
-            // later todo_write result in the kept tail supersedes it.
+            // later todo result in the kept tail supersedes it.
             let todos = self.todos.snapshot();
             if !todos.is_empty() {
                 replacement.push_str(
-                    "\n\nCurrent todo list (as of compaction; a later todo_write result supersedes it):",
+                    "\n\nCurrent todo list (as of compaction; a later todo result supersedes it):",
                 );
                 for item in &todos {
                     replacement.push('\n');
@@ -1440,7 +1422,7 @@ impl Agent {
                     // preparation row here or it spins forever.
                     let _ = self.events.send(AgentEvent::ToolFinished {
                         id: call.id.clone(),
-                        message: tool_deferred_activity(&tool_call_value(call)),
+                        message: tool_abandoned_activity(&tool_call_value(call), "Deferred"),
                         preview: None,
                     });
                     (
@@ -1490,7 +1472,7 @@ impl Agent {
                     // the same way the deferral path does.
                     let _ = self.events.send(AgentEvent::ToolFinished {
                         id: call.id.clone(),
-                        message: tool_skipped_activity(&tool_call_value(call)),
+                        message: tool_abandoned_activity(&tool_call_value(call), "Skipped"),
                         preview: None,
                     });
                     (

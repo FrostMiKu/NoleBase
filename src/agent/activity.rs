@@ -97,20 +97,15 @@ pub(crate) fn tool_finish_activity(call: &Value, error: Option<&str>) -> String 
     }
 }
 
-pub(crate) fn tool_deferred_activity(call: &Value) -> String {
+/// Activity row for a tool call that never executed — deferred because
+/// buffered user input arrived mid-batch, or skipped after a denial — with
+/// `verb` naming which of the two happened.
+pub(crate) fn tool_abandoned_activity(call: &Value, verb: &str) -> String {
     let name = tool_display_name(call.get("name").and_then(Value::as_str).unwrap_or(""));
     let target = tool_activity_target(call)
         .map(|target| format!("\n{target}"))
         .unwrap_or_default();
-    format!("Deferred {name}.{target}")
-}
-
-pub(crate) fn tool_skipped_activity(call: &Value) -> String {
-    let name = tool_display_name(call.get("name").and_then(Value::as_str).unwrap_or(""));
-    let target = tool_activity_target(call)
-        .map(|target| format!("\n{target}"))
-        .unwrap_or_default();
-    format!("Skipped {name}.{target}")
+    format!("{verb} {name}.{target}")
 }
 
 pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
@@ -146,7 +141,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
             Some(format!("{session}: {input}"))
         }
         "terminal_read" | "terminal_close" => text("session_id"),
-        "terminal_request_private_input" => {
+        "ask_private" => {
             Some(format!("{}: {}", text("session_id")?, text("purpose")?))
         }
         "read" => text("path").map(|path| {
@@ -156,7 +151,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
                 path
             }
         }),
-        "http_request" => text("url").map(|url| {
+        "http" => text("url").map(|url| {
             let method = input
                 .get("method")
                 .and_then(Value::as_str)
@@ -168,10 +163,10 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
             }
         }),
         "grep" => text("pattern"),
-        "search_web" | "search_files" | "list_tags" => text("query"),
+        "search_web" | "search_notes" | "tags" => text("query"),
         "search_tag" => text("tag"),
-        "resolve_wikilink" | "backlinks" => text("target"),
-        "add_daily_entry" => Some(text("date").unwrap_or_else(|| "Today".to_string())),
+        "wikilink" | "backlinks" => text("target"),
+        "daily" => Some(text("date").unwrap_or_else(|| "Today".to_string())),
         "copy" | "move" => Some(format!("{} -> {}", text("source")?, text("destination")?)),
         "import_attachment" => text("source"),
         "attachment_info" | "delete_attachment" => text("uri"),
@@ -231,6 +226,10 @@ fn is_url(value: &str) -> bool {
 }
 
 pub(crate) fn tool_display_name(name: &str) -> String {
+    // Bare tool names whose activity label needs its noun to read well.
+    if name == "daily" {
+        return "Add Daily Entry".to_string();
+    }
     name.split('_')
         .filter(|part| !part.is_empty())
         .map(|part| {

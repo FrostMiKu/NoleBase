@@ -190,7 +190,7 @@ impl Tool for Ask {
     }
 }
 
-pub struct TerminalRequestPrivateInput {
+pub struct AskPrivate {
     pub events: AgentEventSender,
     pub responses:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PrivateTerminalInputDecision>>>,
@@ -199,9 +199,9 @@ pub struct TerminalRequestPrivateInput {
 }
 
 #[async_trait::async_trait]
-impl Tool for TerminalRequestPrivateInput {
+impl Tool for AskPrivate {
     fn name(&self) -> &'static str {
-        "terminal_request_private_input"
+        "ask_private"
     }
 
     fn description(&self) -> &'static str {
@@ -287,14 +287,14 @@ mod tests {
     fn private_input_tool(
         terminal: AgentTerminalHandle,
     ) -> (
-        TerminalRequestPrivateInput,
+        AskPrivate,
         tokio::sync::broadcast::Receiver<AgentEvent>,
         tokio::sync::mpsc::UnboundedSender<PrivateTerminalInputDecision>,
     ) {
         let (events, event_receiver) = tokio::sync::broadcast::channel(8);
         let (response_sender, responses) = tokio::sync::mpsc::unbounded_channel();
         (
-            TerminalRequestPrivateInput {
+            AskPrivate {
                 events,
                 responses: Arc::new(tokio::sync::Mutex::new(responses)),
                 terminal,

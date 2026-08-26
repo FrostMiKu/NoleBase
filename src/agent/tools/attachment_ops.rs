@@ -363,7 +363,7 @@ impl Tool for CheckoutAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Materialize an attachment as a new editable file in workspace; returns the content token required to publish changes to the same attachment."
+        "Materialize an attachment as a new editable file in workspace; returns the content token required to update the same attachment."
     }
 
     fn input_schema(&self) -> Value {
@@ -442,7 +442,7 @@ impl Tool for UpdateAttachment {
     }
 
     fn description(&self) -> &'static str {
-        "Publish a workspace file over the same attachment using its checkout content token; atomically refuses stale content."
+        "Update the content of an existing attachment from a workspace file using its checkout content token; atomically refuses stale content."
     }
 
     fn input_schema(&self) -> Value {

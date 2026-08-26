@@ -363,23 +363,7 @@ impl App {
                         format!("Background job {id} finished: {label}")
                     });
                     if !self.ai_running && !self.ai_cancelling {
-                        let deliveries = self.agent_jobs.take_deliveries();
-                        if !deliveries.is_empty() {
-                            let prompt = crate::agent::format_job_deliveries(&deliveries);
-                            self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
-                                text: format!(
-                                    "{} {}",
-                                    if failed {
-                                        "Job failed"
-                                    } else {
-                                        "Job completed"
-                                    },
-                                    deliveries[0].label
-                                ),
-                                muted: true,
-                            }));
-                            self.start_agent_worker(prompt);
-                        }
+                        self.start_job_delivery_run();
                     }
                 }
                 AgentEvent::JobDelivered(ids) => {
@@ -510,6 +494,11 @@ impl App {
                         self.mark_buffered_prompts_consumed(pending.len());
                         self.start_agent_worker(pending.join("\n\n"));
                     }
+                    // A job that settled during the denied stop needs its
+                    // wake-up run too; one started above drains the rest.
+                    if !self.ai_running && !self.ai_cancelling {
+                        self.start_job_delivery_run();
+                    }
                 }
                 AgentEvent::Finished(result) => {
                     self.active_agent = None;
@@ -564,18 +553,14 @@ impl App {
                             self.mark_buffered_prompts_consumed(pending.len());
                             self.start_agent_worker(pending.join("\n\n"));
                         }
-                    } else if self.agent_jobs.has_pending_deliveries() {
-                        // A job settled between the run's last drain and this
-                        // Finished event; deliver it now.
-                        let deliveries = self.agent_jobs.take_deliveries();
-                        if !deliveries.is_empty() {
-                            let prompt = crate::agent::format_job_deliveries(&deliveries);
-                            self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
-                                text: format!("Job settled: {}", deliveries[0].label),
-                                muted: true,
-                            }));
-                            self.start_agent_worker(prompt);
-                        }
+                    }
+                    // A job that settled while the final answer streamed (or
+                    // while a denied run unwound) has a queued delivery no
+                    // run will drain anymore: only the paths below can reach
+                    // it. A run started for buffered input drains the rest
+                    // itself at its first round boundary.
+                    if !self.ai_running && !self.ai_cancelling {
+                        self.start_job_delivery_run();
                     }
                 }
             }
@@ -876,6 +861,33 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Start one wake-up run for every queued background-job delivery.
+    /// Called whenever the Agent is or has just gone idle: an idle settlement
+    /// (no run to observe it), or a delivery that settled while the previous
+    /// run was already finishing its last answer. A delivery left queued
+    /// here would strand its job's result until an unrelated future run.
+    pub(super) fn start_job_delivery_run(&mut self) -> bool {
+        let deliveries = self.agent_jobs.take_deliveries();
+        if deliveries.is_empty() {
+            return false;
+        }
+        let first = &deliveries[0];
+        let label = first.label.clone();
+        let text = if deliveries.len() > 1 {
+            format!("Jobs settled: {label} (+{} more)", deliveries.len() - 1)
+        } else if first.status == crate::agent::JobStatus::Failed {
+            format!("Job failed: {label}")
+        } else {
+            format!("Job completed: {label}")
+        };
+        let prompt = crate::agent::format_job_deliveries(&deliveries);
+        self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
+            text,
+            muted: true,
+        }));
+        self.start_agent_worker(prompt)
     }
 
     pub(super) fn mark_buffered_prompts_consumed(&mut self, count: usize) {

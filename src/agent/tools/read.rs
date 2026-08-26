@@ -1,16 +1,17 @@
 //! Read-only filesystem, note search, and unified read tools.
 //!
 //! The `read` tool is a parser registry: a target (file path, directory path,
-//! http(s) URL, or attachment URI) is resolved once, then each registered
-//! [`ReadParser`] is asked in order whether it handles that target. Registering
-//! a new format (for example a PDF parser) requires no change to the dispatch
-//! logic — only a new parser registered before the generic text-file parser.
-//! Attachment reads are read-only: they never register an edit snapshot.
+//! http(s) URL, attachment URI, or skill URI) is resolved once, then each
+//! registered [`ReadParser`] is asked in order whether it handles that target.
+//! Registering a new format (for example a PDF parser) requires no change to
+//! the dispatch logic — only a new parser registered before the generic
+//! text-file parser. Attachment reads are read-only: they never register an
+//! edit snapshot.
 //!
 //! The registry, target resolution, and shared filesystem helpers live here;
 //! ranges and pagination live in [`paging`], each parser family has its own
-//! submodule ([`text`], [`documents`], [`attachments`], [`directory`], [`web`]),
-//! and the note search tools live in [`notes`].
+//! submodule ([`text`], [`documents`], [`attachments`], [`directory`],
+//! [`web`], [`skill`]), and the note search tools live in [`notes`].
 
 mod attachments;
 mod directory;
@@ -18,6 +19,7 @@ mod document;
 mod documents;
 mod notes;
 mod paging;
+mod skill;
 mod text;
 mod web;
 
@@ -46,7 +48,8 @@ use self::paging::{line_range, LineRange};
 use self::text::TextFileParser;
 use self::web::WebParser;
 
-pub use self::notes::{ListNotes, SearchFiles};
+pub use self::notes::{Notes, SearchNotes};
+pub use self::skill::SkillParser;
 pub(crate) use self::web::fetch_web_response;
 
 const DEFAULT_READ_LINES: usize = 200;
@@ -77,6 +80,9 @@ pub(crate) enum Target {
         uri: AttachmentUri,
         range: Option<LineRange>,
     },
+    Skill {
+        name: String,
+    },
 }
 
 impl Target {
@@ -86,16 +92,18 @@ impl Target {
             Target::Directory { .. } => "directory",
             Target::Web { .. } => "web",
             Target::Attachment { .. } => "attachment",
+            Target::Skill { .. } => "skill",
         }
     }
 
-    /// Root-relative form for local paths, the URL for web targets, and the
-    /// canonical URI for attachments.
+    /// Root-relative form for local paths, the URL for web targets, the
+    /// canonical URI for attachments, and `skill://<name>` for skills.
     pub(crate) fn display(&self, root: &Path) -> String {
         match self {
             Target::File { path, .. } | Target::Directory { path } => listed_path(root, path),
             Target::Web { url, .. } => url.clone(),
             Target::Attachment { uri, .. } => uri.to_string(),
+            Target::Skill { name } => format!("{}{name}", skill::SKILL_URI_SCHEME),
         }
     }
 }
@@ -161,7 +169,6 @@ impl Read {
 
     /// Registers a parser ahead of built-in file parsers so callers can
     /// override format handling before the generic fallbacks.
-    #[allow(dead_code)]
     pub fn register(&mut self, parser: impl ReadParser + 'static) {
         let file_index = self
             .parsers
@@ -182,7 +189,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, office documents, PDFs, and attachment URIs. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. The inclusive `range` selects lines from text and extracted documents or entries from directories; editable text returns tagged source lines. To fetch the raw unprocessed response body instead, use `http_request`."
+        "Read local files, directories, URLs, office documents, PDFs, attachment URIs, and skills. A skill URI (`skill://<name>`) returns the full body of one skill from the catalog listed in the system prompt. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. The inclusive `range` selects lines from text and extracted documents or entries from directories; editable text returns tagged source lines. To fetch the raw unprocessed response body instead, use `http`."
     }
 
     fn input_schema(&self) -> Value {
@@ -191,7 +198,7 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Local file or document path, http(s) URL, attachment URI, or directory path"
+                    "description": "Local file or document path, http(s) URL, attachment URI, skill URI (skill://<name>), or directory path"
                 },
                 "range": {
                     "type": "string",
@@ -280,6 +287,14 @@ async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
         return Ok(Target::Web {
             url: requested.to_string(),
             range: line_range(input)?,
+        });
+    }
+    if let Some(name) = requested.strip_prefix(skill::SKILL_URI_SCHEME) {
+        if name.is_empty() {
+            bail!("skill URI must name a skill");
+        }
+        return Ok(Target::Skill {
+            name: name.to_string(),
         });
     }
     if AttachmentUri::is_attachment_uri(requested) {

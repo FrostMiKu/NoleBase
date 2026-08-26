@@ -391,6 +391,34 @@ fn settled_job_during_a_run_does_not_start_a_second_run() {
 }
 
 #[test]
+fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
+    let (mut app, _directory) = make_app();
+    app.ai_running = true;
+    let sender = install_agent_observable(&mut app);
+    let started = app
+        .agent_jobs
+        .start_background(crate::agent::JobKind::Shell, "sleep 1 && echo done")
+        .unwrap();
+    // The job settles while the model streams its final answer: the run's
+    // loop has already passed its last delivery drain, so only the Finished
+    // handler can start the wake-up run for the queued delivery.
+    app.agent_jobs.settle(&started.id, Ok("done".to_string()));
+    sender
+        .send(AgentEvent::Finished(Ok("final answer".to_string())))
+        .unwrap();
+    app.poll_agent();
+
+    assert!(app.ai_running, "the queued delivery must start a wake-up run");
+    assert!(app.agent_panel.iter().any(|entry| {
+        matches!(
+            entry.as_ref(),
+            AgentPanelEntry::Prompt { text, muted: true, .. } if text.starts_with("Job completed")
+        )
+    }));
+    assert!(app.agent_jobs.take_deliveries().is_empty());
+}
+
+#[test]
 fn failed_session_delete_keeps_the_in_memory_session() {
     let (mut app, _directory) = make_app();
     app.agent_conversation = AgentConversation::seeded_for_test();
@@ -1522,7 +1550,7 @@ fn private_terminal_input_is_masked_and_sent_only_on_its_private_channel() {
     let (response_sender, mut response_receiver) = tokio::sync::mpsc::unbounded_channel();
     app.ai_private_terminal_input_sender = Some(response_sender);
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
-        text: "Calling Terminal Request Private Input...\nterminal-1: Authenticate".to_string(),
+        text: "Calling Ask Private...\nterminal-1: Authenticate".to_string(),
         active: true,
         preview: None,
     }));

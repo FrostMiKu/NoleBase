@@ -201,7 +201,7 @@ mod tests {
                 response(
                     vec![MessagePart::ToolUse(ToolCall {
                         id: "lookup".to_string(),
-                        name: "search_files".to_string(),
+                        name: "search_notes".to_string(),
                         input: json!({"query": "answer"}),
                     })],
                     StopReason::ToolUse,
@@ -230,7 +230,7 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(tool_names.contains(&"read"));
-        assert!(tool_names.contains(&"search_files"));
+        assert!(tool_names.contains(&"search_notes"));
         assert!(tool_names.contains(&"calculate"));
         assert!(!tool_names.contains(&"review"));
         assert!(!tool_names.contains(&"explore"));
@@ -253,7 +253,7 @@ mod tests {
                 response(
                     vec![MessagePart::ToolUse(ToolCall {
                         id: "first".to_string(),
-                        name: "search_files".to_string(),
+                        name: "search_notes".to_string(),
                         input: json!({"query": "first"}),
                     })],
                     StopReason::ToolUse,
@@ -365,15 +365,14 @@ mod tests {
             .collect::<Vec<_>>();
         for name in [
             "read",
-            "list_notes",
+            "notes",
             "grep",
-            "search_files",
-            "list_tags",
+            "search_notes",
+            "tags",
             "search_tag",
-            "resolve_wikilink",
+            "wikilink",
             "backlinks",
             "calculate",
-            "load_skill",
         ] {
             assert!(tool_names.contains(&name), "missing read-only tool {name}");
         }
@@ -386,10 +385,10 @@ mod tests {
             "rename",
             "delete",
             "mkdir",
-            "remove_dir",
+            "rmdir",
             "rename_tag",
             "rename_wikilink",
-            "add_daily_entry",
+            "daily",
             "open",
             "notify",
             "ask",
@@ -397,7 +396,7 @@ mod tests {
             "checkout_attachment",
             "update_attachment",
             "delete_attachment",
-            "http_request",
+            "http",
             "explore",
             "review",
         ] {

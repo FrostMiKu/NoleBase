@@ -968,7 +968,7 @@ mod cache_tests {
                 },
                 MessagePart::ToolUse(ToolCall {
                     id: "search-1".to_string(),
-                    name: "search_web".to_string(),
+                    name: "web".to_string(),
                     input: json!({"query": "example"}),
                 }),
             ]),

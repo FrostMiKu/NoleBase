@@ -88,12 +88,12 @@ fn resolve_paths(index: &WikiLinkIndexHandle, target: &str) -> Result<Vec<PathBu
         .context("wiki-link index is still building")
 }
 
-pub struct ResolveWikilink {
+pub struct Wikilink {
     root: PathBuf,
     index: WikiLinkIndexHandle,
 }
 
-impl ResolveWikilink {
+impl Wikilink {
     pub fn new(root: &Path, index: WikiLinkIndexHandle) -> Result<Self> {
         Ok(Self {
             root: crate::agent::canonical_root(root)?,
@@ -103,9 +103,9 @@ impl ResolveWikilink {
 }
 
 #[async_trait::async_trait]
-impl Tool for ResolveWikilink {
+impl Tool for Wikilink {
     fn name(&self) -> &'static str {
-        "resolve_wikilink"
+        "wikilink"
     }
 
     fn execution_policy(&self) -> ToolExecutionPolicy {

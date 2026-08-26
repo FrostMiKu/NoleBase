@@ -11,7 +11,7 @@ use crate::agent_session::{TodoItem, TodoStatus};
 const MAX_TODO_ITEMS: usize = 32;
 const MAX_TODO_CONTENT_CHARS: usize = 160;
 
-/// Shared plan state: replaced wholesale by the `todo_write` tool, read by
+/// Shared plan state: replaced wholesale by the `todo` tool, read by
 /// compaction injection, and mirrored into `AgentConversation::todos` after
 /// every tool batch so checkpoints and restarts keep it.
 #[derive(Clone, Default)]
@@ -57,20 +57,20 @@ fn render_todos(todos: &[TodoItem]) -> String {
     output
 }
 
-pub struct TodoWrite {
+pub struct Todo {
     todos: TodoHandle,
 }
 
-impl TodoWrite {
+impl Todo {
     pub fn new(todos: TodoHandle) -> Self {
         Self { todos }
     }
 }
 
 #[async_trait::async_trait]
-impl Tool for TodoWrite {
+impl Tool for Todo {
     fn name(&self) -> &'static str {
-        "todo_write"
+        "todo"
     }
 
     fn description(&self) -> &'static str {
@@ -149,7 +149,7 @@ mod tests {
 
     fn write(handle: &TodoHandle, todos: Value) -> Result<String> {
         crate::agent::test_support::test_runtime()
-            .block_on(TodoWrite::new(handle.clone()).execute(&json!({ "todos": todos })))
+            .block_on(Todo::new(handle.clone()).execute(&json!({ "todos": todos })))
     }
 
     #[test]
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn schema_binds_the_contract() {
-        let schema = TodoWrite::new(TodoHandle::default()).input_schema();
+        let schema = Todo::new(TodoHandle::default()).input_schema();
         assert_eq!(schema["required"], json!(["todos"]));
         assert_eq!(schema["properties"]["todos"]["maxItems"], 32);
         assert_eq!(

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use super::util::{display_path, optional_usize, required_string};
+use super::util::{backgrounded_job_result, display_path, optional_usize, required_string};
 use super::workspace_quota::{
     check_workspace_write, workspace_destination, workspace_dir, workspace_used_bytes,
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_TOTAL_BYTES,
@@ -24,7 +24,7 @@ const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_WEB_SEARCH_RESULTS: usize = 10;
 pub const MAX_WEB_SEARCH_DOMAINS: usize = 300;
 const MAX_FETCH_BYTES: u64 = 1_000_000;
-/// Largest body `http_request` returns inline; larger responses are truncated
+/// Largest body `http` returns inline; larger responses are truncated
 /// with `truncated: true` and may be fetched in `range` slices or saved to disk.
 const MAX_HTTP_RESPONSE_BYTES: u64 = 1_000_000;
 
@@ -119,14 +119,14 @@ impl Tool for SearchWeb {
     }
 }
 
-pub struct HttpRequest {
+pub struct Http {
     root: PathBuf,
     client: Client,
     workspace_write_lock: Arc<tokio::sync::Mutex<()>>,
     jobs: AgentJobsHandle,
 }
 
-impl HttpRequest {
+impl Http {
     pub fn new(root: &Path, client: Client, jobs: AgentJobsHandle) -> Result<Self> {
         Ok(Self {
             root: canonical_root(root)?,
@@ -279,9 +279,9 @@ impl HttpRequest {
 }
 
 #[async_trait::async_trait]
-impl Tool for HttpRequest {
+impl Tool for Http {
     fn name(&self) -> &'static str {
-        "http_request"
+        "http"
     }
 
     fn execution_policy(&self) -> ToolExecutionPolicy {
@@ -355,7 +355,7 @@ impl Tool for HttpRequest {
         let url = reqwest::Url::parse(required_string(input, "url")?)
             .context("parsing HTTP request URL")?;
         if !matches!(url.scheme(), "http" | "https") {
-            bail!("http_request URL must use http or https");
+            bail!("http URL must use http or https");
         }
         let method_text = input
             .get("method")
@@ -431,11 +431,10 @@ impl Tool for HttpRequest {
                     .map_err(|error| format!("{error:#}"));
                     jobs.settle(&id, outcome);
                 });
-                return Ok(serde_json::to_string_pretty(&json!({
-                    "backgrounded": true,
-                    "job": started.id,
-                    "note": "The download keeps running in the background; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it."
-                }))?);
+                return backgrounded_job_result(
+                    &started.id,
+                    "The download keeps running in the background; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it.",
+                );
             }
             let response = request.send().await.context("sending HTTP request")?;
             return Self::save_response(
@@ -454,14 +453,13 @@ impl Tool for HttpRequest {
 
 /// Compact job label for a background download: file name plus host.
 fn download_label(url: &reqwest::Url, destination_text: &str) -> String {
-    let url_text = url.as_str();
     let file = destination_text
         .rsplit('/')
         .next()
         .unwrap_or(destination_text);
-    let host = reqwest::Url::parse(url_text)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
+    let host = url
+        .host_str()
+        .map(str::to_string)
         .unwrap_or_default();
     format!("{file} <- {host}")
 }
@@ -857,9 +855,9 @@ mod tests {
         (directory, storage.root)
     }
 
-    fn http_request(root: &Path) -> HttpRequest {
+    fn http_tool(root: &Path) -> Http {
         let (events, _receiver) = crate::agent::test_support::event_channel();
-        HttpRequest::new(root, reqwest::Client::new(), AgentJobsHandle::new(events)).unwrap()
+        Http::new(root, reqwest::Client::new(), AgentJobsHandle::new(events)).unwrap()
     }
 
     fn workspace(root: &Path) -> PathBuf {
@@ -923,7 +921,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn http_request_preserves_json_body_status_and_repeated_headers() {
+    async fn http_preserves_json_body_status_and_repeated_headers() {
         let body = br#"{"answer":42,"raw":"  spaced  "}"#.to_vec();
         let (url, server) = serve_response(
             "422 Unprocessable Entity",
@@ -935,7 +933,7 @@ mod tests {
             body.clone(),
         );
         let (_directory, root) = fresh_root();
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
 
         let output = tool.execute(&json!({ "url": url })).await.unwrap();
         server.join().unwrap();
@@ -953,7 +951,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn http_request_base64_encodes_binary_body() {
+    async fn http_base64_encodes_binary_body() {
         let body = vec![0xff, 0x00, 0x80];
         let (url, server) = serve_response(
             "200 OK",
@@ -961,7 +959,7 @@ mod tests {
             body.clone(),
         );
         let (_directory, root) = fresh_root();
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
 
         let output = tool.execute(&json!({ "url": url })).await.unwrap();
         server.join().unwrap();
@@ -975,10 +973,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn http_request_sends_method_headers_and_body() {
+    async fn http_sends_method_headers_and_body() {
         let (url, server) = serve_echo();
         let (_directory, root) = fresh_root();
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
 
         let output = tool
             .execute(&json!({
@@ -1006,7 +1004,7 @@ mod tests {
     #[test]
     fn schema_requires_url_and_uses_network_policy() {
         let (_directory, root) = fresh_root();
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
         let schema = tool.input_schema();
         let required = schema["required"]
             .as_array()
@@ -1024,7 +1022,7 @@ mod tests {
     #[test]
     fn rejects_non_http_urls_and_empty_save_to() {
         let (_directory, root) = fresh_root();
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
         let cases = [
             json!({"url": "ftp://example.com/a.bin", "save_to": "a.bin"}),
             json!({"url": "file:///etc/passwd", "save_to": "a.bin"}),
@@ -1051,7 +1049,7 @@ mod tests {
             Some("application/octet-stream; charset=binary"),
         )]);
         let result: Value = serde_json::from_str(
-            &http_request(&root)
+            &http_tool(&root)
                 .execute(&json!({"url": url, "save_to": "binaries/blob.bin"}))
                 .await
                 .unwrap(),
@@ -1085,7 +1083,7 @@ mod tests {
         let (url, handle) = server(vec![ok_response(body.clone(), None)]);
         let (events, _receiver) = crate::agent::test_support::event_channel();
         let jobs = AgentJobsHandle::new(events);
-        let tool = HttpRequest::new(&root, reqwest::Client::new(), jobs.clone()).unwrap();
+        let tool = Http::new(&root, reqwest::Client::new(), jobs.clone()).unwrap();
         let started = std::time::Instant::now();
         let output = tool
             .execute(&json!({
@@ -1131,7 +1129,7 @@ mod tests {
     async fn background_requires_save_to() {
         let (_directory, root) = fresh_root();
         let (url, _handle) = server(vec![ok_response(b"x".to_vec(), None)]);
-        let error = http_request(&root)
+        let error = http_tool(&root)
             .execute(&json!({"url": url, "background": true}))
             .await
             .unwrap_err();
@@ -1150,7 +1148,7 @@ mod tests {
             ok_response(b"redirected".to_vec(), None),
         ]);
         let result: Value = serde_json::from_str(
-            &http_request(&root)
+            &http_tool(&root)
                 .execute(&json!({"url": url, "save_to": "redirected.bin"}))
                 .await
                 .unwrap(),
@@ -1173,7 +1171,7 @@ mod tests {
             headers: vec![("Content-Length".to_string(), "9".to_string())],
             body: b"not found".to_vec(),
         }]);
-        let error = http_request(&root)
+        let error = http_tool(&root)
             .execute(&json!({"url": url, "save_to": "missing.bin"}))
             .await
             .unwrap_err();
@@ -1187,7 +1185,7 @@ mod tests {
     async fn save_to_refuses_existing_destinations_without_touching_them() {
         let (_directory, root) = fresh_root();
         fs::write(workspace(&root).join("existing.bin"), b"keep me").unwrap();
-        let error = http_request(&root)
+        let error = http_tool(&root)
             .execute(&json!({
                 "url": "https://example.invalid/new.bin",
                 "save_to": "existing.bin"
@@ -1216,7 +1214,7 @@ mod tests {
             json!({"url": url, "save_to": "a/../../outside.bin"}),
         ];
         for input in cases {
-            let error = http_request(&root).execute(&input).await.unwrap_err();
+            let error = http_tool(&root).execute(&input).await.unwrap_err();
             assert!(
                 error.to_string().contains("workspace") || error.to_string().contains("symlink")
             );
@@ -1236,7 +1234,7 @@ mod tests {
             )],
             body: b"tiny".to_vec(),
         }]);
-        let error = http_request(&root)
+        let error = http_tool(&root)
             .execute(&json!({"url": url, "save_to": "oversized.bin"}))
             .await
             .unwrap_err();
@@ -1259,7 +1257,7 @@ mod tests {
             headers: vec![],
             body: oversized,
         }]);
-        let error = http_request(&root)
+        let error = http_tool(&root)
             .execute(&json!({"url": url, "save_to": "overflow.bin"}))
             .await
             .unwrap_err();
@@ -1281,7 +1279,7 @@ mod tests {
             .set_len(MAX_WORKSPACE_TOTAL_BYTES)
             .unwrap();
         let (url, handle) = server(vec![ok_response(b"one byte too many".to_vec(), None)]);
-        let error = http_request(&root)
+        let error = http_tool(&root)
             .execute(&json!({"url": url, "save_to": "nope.bin"}))
             .await
             .unwrap_err();
@@ -1308,7 +1306,7 @@ mod tests {
                 body: Vec::new(),
             },
         ]);
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
         let first_input = json!({"url": url.clone(), "save_to": "first.bin"});
         let second_input = json!({"url": url, "save_to": "second.bin"});
 
@@ -1339,7 +1337,7 @@ mod tests {
             stream.flush().unwrap();
             thread::sleep(Duration::from_millis(200));
         });
-        let tool = http_request(&root);
+        let tool = http_tool(&root);
         let input = json!({
             "url": format!("http://{address}"),
             "save_to": "cancelled.bin"
@@ -1367,7 +1365,7 @@ mod tests {
             body,
         }]);
         let (_directory, root) = fresh_root();
-        let output = http_request(&root)
+        let output = http_tool(&root)
             .execute(&json!({"url": url}))
             .await
             .unwrap();
@@ -1410,7 +1408,7 @@ mod tests {
             body: vec![b'x'; 100],
         }]);
         let (_directory, root) = fresh_root();
-        let output = http_request(&root)
+        let output = http_tool(&root)
             .execute(&json!({"url": url, "range": {"offset": 0, "limit": 100}}))
             .await
             .unwrap();
