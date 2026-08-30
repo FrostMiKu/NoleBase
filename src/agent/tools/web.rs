@@ -1301,14 +1301,9 @@ mod tests {
             .set_len(MAX_WORKSPACE_TOTAL_BYTES - headroom)
             .unwrap();
         let body = vec![0u8; 700 * 1024];
-        let rejected_length = body.len();
         let (url, handle) = server(vec![
+            ok_response(body.clone(), None),
             ok_response(body, None),
-            RawResponse {
-                status: 200,
-                headers: vec![("Content-Length".to_string(), rejected_length.to_string())],
-                body: Vec::new(),
-            },
         ]);
         let tool = http_tool(&root);
         let first_input = json!({"url": url.clone(), "save_to": "first.bin"});
