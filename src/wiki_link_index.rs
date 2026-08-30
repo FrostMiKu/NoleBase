@@ -23,6 +23,7 @@ use std::sync::{Arc, RwLock};
 use mbdown::{Event, Node};
 
 use crate::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
+use crate::markdown::visit_markdown;
 #[cfg(test)]
 use crate::storage::Storage;
 
@@ -176,28 +177,16 @@ pub fn matching_wiki_link_spans(source: &str, from: &str) -> Vec<Range<usize>> {
 }
 
 fn collect_matching_wiki_link_spans(nodes: &[Node<'_>], from: &str, spans: &mut Vec<Range<usize>>) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => {
-                for event in markdown.events() {
-                    if let Event::WikiLink(target) = &event.event {
-                        if target.eq_ignore_ascii_case(from) {
-                            let offset = markdown.source_span().start;
-                            spans.push(offset + event.span.start..offset + event.span.end);
-                        }
-                    }
+    visit_markdown(nodes, &mut |markdown| {
+        for event in markdown.events() {
+            if let Event::WikiLink(target) = &event.event {
+                if target.eq_ignore_ascii_case(from) {
+                    let offset = markdown.source_span().start;
+                    spans.push(offset + event.span.start..offset + event.span.end);
                 }
             }
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => {
-                collect_matching_wiki_link_spans(children, from, spans)
-            }
         }
-    }
+    });
 }
 
 /// Replace every span in `spans` (the full `[[...]]` region) with `[[to]]`,
@@ -229,23 +218,13 @@ pub(crate) fn collect_wiki_links(nodes: &[Node<'_>]) -> Vec<String> {
 }
 
 fn collect_node_wiki_links(nodes: &[Node<'_>], links: &mut Vec<String>) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => {
-                for item in markdown.events() {
-                    if let Event::WikiLink(target) = &item.event {
-                        links.push(target.to_string());
-                    }
-                }
+    visit_markdown(nodes, &mut |markdown| {
+        for item in markdown.events() {
+            if let Event::WikiLink(target) = &item.event {
+                links.push(target.to_string());
             }
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => collect_node_wiki_links(children, links),
         }
-    }
+    });
 }
 
 #[cfg(test)]

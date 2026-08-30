@@ -24,10 +24,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use anyhow::Result;
 use mbdown::{Container, Event, InlineTag, Node, SpannedEvent};
 
 use crate::attachment::AttachmentUri;
 use crate::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
+use crate::markdown::visit_markdown;
 use crate::storage::Storage;
 
 /// Derived reference index: canonical attachment URI -> referencing notes.
@@ -47,8 +49,15 @@ impl AttachmentReferenceIndex {
         Self { references }
     }
     /// Scan every managed Markdown/MBDown file and index its attachment URIs.
+    #[cfg(test)]
     pub fn build(storage: &Storage) -> Self {
         Self::from_documents(&DocumentIndex::build(storage))
+    }
+
+    pub(crate) fn build_checked(storage: &Storage) -> Result<Self> {
+        Ok(Self::from_documents(&DocumentIndex::build_checked(
+            storage,
+        )?))
     }
 
     #[cfg(test)]
@@ -96,17 +105,9 @@ pub(crate) fn collect_attachment_uris(nodes: &[Node<'_>]) -> Vec<String> {
 }
 
 fn collect_node_attachment_uris(nodes: &[Node<'_>], uris: &mut Vec<String>) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => collect_event_attachment_uris(markdown.events(), uris),
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => collect_node_attachment_uris(children, uris),
-        }
-    }
+    visit_markdown(nodes, &mut |markdown| {
+        collect_event_attachment_uris(markdown.events(), uris)
+    });
 }
 
 fn collect_event_attachment_uris(events: &[SpannedEvent<'_>], uris: &mut Vec<String>) {

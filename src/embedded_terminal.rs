@@ -282,6 +282,7 @@ impl TerminalSnapshot {
 
 /// A raw PTY output stream. Agent terminals spool the complete stream to their
 /// session directory; other embedded terminals retain a capped in-memory tap.
+#[derive(Default)]
 pub struct RawTap {
     bytes: std::collections::VecDeque<u8>,
     base_offset: u64,
@@ -293,17 +294,6 @@ struct RawSpool {
     path: PathBuf,
     writer: std::fs::File,
     length: u64,
-}
-
-impl Default for RawTap {
-    fn default() -> Self {
-        Self {
-            bytes: std::collections::VecDeque::new(),
-            base_offset: 0,
-            spool: None,
-            spool_error: None,
-        }
-    }
 }
 
 impl RawTap {

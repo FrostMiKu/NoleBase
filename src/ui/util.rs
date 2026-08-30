@@ -1,5 +1,9 @@
 use super::*;
 
+pub(super) fn saturating_u16(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
 /// Draw the shared filter header used by the search and tags views: a bordered
 /// single-line input centered at the top of `content`, followed by the list
 /// area below it. Returns the list area.

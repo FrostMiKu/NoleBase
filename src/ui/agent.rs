@@ -291,18 +291,7 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = inner.width as usize;
     let view_height = inner.height as usize;
     sync_agent_vlist(app, width);
-    let tail_pinned = app.agent_follow_tail || app.agent_scroll == u16::MAX;
-    let mut scroll = app.agent_vlist.geometry.scroll_offset(
-        app.agent_scroll,
-        app.agent_follow_tail,
-        view_height,
-    );
-    scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
-    evict_agent_caches(app, scroll, view_height);
-    app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
-    if app.agent_vlist.geometry.is_at_end(scroll, view_height) {
-        app.agent_follow_tail = true;
-    }
+    let scroll = reconcile_agent_scroll(app, view_height);
     let (visible, rendered_links, rendered_images) = visible_agent_lines(app, scroll, view_height);
     let message_rows = Rect::new(
         area.x.saturating_add(1),
@@ -529,6 +518,24 @@ pub(super) fn measure_visible_agent_entries(
         };
         scroll = scroll.min(app.agent_vlist.geometry.max_scroll(view_height));
     }
+}
+
+/// Reconcile the shared Agent scroll state after either view has synchronized
+/// virtual-list geometry with its own rendering style.
+pub(super) fn reconcile_agent_scroll(app: &mut App, view_height: usize) -> usize {
+    let tail_pinned = app.agent_follow_tail || app.agent_scroll == u16::MAX;
+    let mut scroll = app.agent_vlist.geometry.scroll_offset(
+        app.agent_scroll,
+        app.agent_follow_tail,
+        view_height,
+    );
+    scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
+    evict_agent_caches(app, scroll, view_height);
+    app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
+    if app.agent_vlist.geometry.is_at_end(scroll, view_height) {
+        app.agent_follow_tail = true;
+    }
+    scroll
 }
 
 /// Drop render caches (and their measurements) for entries far outside the viewport

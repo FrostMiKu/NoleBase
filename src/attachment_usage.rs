@@ -24,7 +24,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::attachment::{AttachmentId, AttachmentStore, AttachmentUri};
 use crate::attachment_index::AttachmentReferenceIndex;
@@ -57,6 +57,8 @@ pub enum TrashError {
     Referenced { locations: Vec<PathBuf> },
     /// Underlying store failure while moving the attachment to trash.
     Store(String),
+    /// The final reference scan could not inspect every managed document.
+    Scan(String),
 }
 
 impl fmt::Display for TrashError {
@@ -84,6 +86,12 @@ impl fmt::Display for TrashError {
                     .join(", ")
             ),
             TrashError::Store(message) => write!(formatter, "{message}"),
+            TrashError::Scan(message) => {
+                write!(
+                    formatter,
+                    "could not verify attachment references: {message}"
+                )
+            }
         }
     }
 }
@@ -126,7 +134,7 @@ impl AttachmentUsageHandle {
     /// revision. Older snapshots are discarded so consumers always observe
     /// monotonic state even when publishers race.
     pub fn publish_snapshot(&self, revision: u64, references: AttachmentReferenceIndex) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         if inner.ready && revision <= inner.revision {
             return;
         }
@@ -137,7 +145,7 @@ impl AttachmentUsageHandle {
 
     /// The current snapshot (readiness, revision, and references).
     pub fn snapshot(&self) -> AttachmentUsageSnapshot {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         AttachmentUsageSnapshot {
             revision: inner.revision,
             ready: inner.ready,
@@ -147,7 +155,7 @@ impl AttachmentUsageHandle {
 
     /// True once at least one index snapshot has been published.
     pub fn is_ready(&self) -> bool {
-        self.inner.lock().unwrap().ready
+        self.lock_inner().ready
     }
 
     /// Trash `id` after enforcing the deletion rules, using the store's atomic
@@ -166,7 +174,7 @@ impl AttachmentUsageHandle {
         expected_revision: u64,
     ) -> Result<TrashResult, TrashError> {
         {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.lock_inner();
             if !inner.ready {
                 return Err(TrashError::NotReady);
             }
@@ -181,7 +189,8 @@ impl AttachmentUsageHandle {
         // the managed notes on disk, so deletion proceeds only when the scan
         // finds zero managed-note references.
         let uri = AttachmentUri::from_id(id).to_string();
-        let authoritative = AttachmentReferenceIndex::build(storage);
+        let authoritative = AttachmentReferenceIndex::build_checked(storage)
+            .map_err(|error| TrashError::Scan(format!("{error:#}")))?;
         let locations = authoritative.locations(&uri);
         if !locations.is_empty() {
             // Publish the fresh scan so UI/agents observe the real state.
@@ -201,9 +210,15 @@ impl AttachmentUsageHandle {
     /// the revision (the scan reflects the same event stream; the indexer's
     /// next publish advances it).
     fn publish_authoritative(&self, references: AttachmentReferenceIndex) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.ready = true;
         inner.references = references;
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, UsageInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -217,6 +232,41 @@ mod tests {
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         storage
+    }
+
+    #[test]
+    fn poisoned_usage_lock_recovers_the_last_snapshot() {
+        let handle = AttachmentUsageHandle::new();
+        handle.publish_snapshot(7, AttachmentReferenceIndex::default());
+        let poisoned = handle.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.inner.lock().unwrap();
+            panic!("poison usage state");
+        })
+        .join();
+
+        let snapshot = handle.snapshot();
+        assert!(snapshot.ready);
+        assert_eq!(snapshot.revision, 7);
+    }
+
+    #[test]
+    fn trash_fails_closed_when_reference_scan_is_incomplete() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let store = AttachmentStore::new(storage.attachments_dir.clone());
+        store.ensure_layout().unwrap();
+        let attachment = store.import_bytes(b"payload", Some("item.bin")).unwrap();
+        let handle = AttachmentUsageHandle::new();
+        handle.publish_snapshot(1, AttachmentReferenceIndex::default());
+        fs::remove_dir(&storage.daily_dir).unwrap();
+
+        let error = handle
+            .trash(&store, &storage, attachment.id, 1)
+            .unwrap_err();
+
+        assert!(matches!(error, TrashError::Scan(_)));
+        assert!(store.lookup(attachment.id).unwrap().is_some());
     }
 
     #[test]

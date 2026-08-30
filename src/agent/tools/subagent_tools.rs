@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::{
-    Backlinks, Calculate, Grep, Notes, Read, SearchNotes, SearchTag, SearchWeb, SkillParser,
-    Tags, Wikilink,
+    Backlinks, Calculate, Grep, Notes, Read, SearchNotes, SearchTag, SearchWeb, SkillParser, Tags,
+    Wikilink,
 };
 use crate::agent::subagent::SubagentRunner;
 use crate::agent::SnapshotStore;

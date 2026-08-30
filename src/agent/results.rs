@@ -89,6 +89,18 @@ pub(crate) fn result_path(nole_root: &Path, id: u64) -> PathBuf {
         .join(id.to_string())
 }
 
+/// Resolve a result owned by this session without allowing a filesystem link
+/// to turn the opaque result URI into an arbitrary-file read primitive.
+pub(crate) fn resolve_result_path(nole_root: &Path, id: u64) -> Result<PathBuf> {
+    let path = result_path(nole_root, id);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("reading session result {RESULT_URI_PREFIX}{id}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("session result is not a regular stored result: {RESULT_URI_PREFIX}{id}");
+    }
+    Ok(path)
+}
+
 pub(crate) fn text_line_count(text: &str) -> usize {
     if text.is_empty() {
         0

@@ -14,8 +14,8 @@ use crate::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
 
 use super::{shell_helper_command, NONINTERACTIVE_ENVIRONMENT};
 
-const TERMINAL_ROWS: u16 = 24;
-const INITIAL_COLS: u16 = 80;
+pub(crate) const AGENT_TERMINAL_ROWS: u16 = 24;
+pub(crate) const AGENT_TERMINAL_INITIAL_COLS: u16 = 80;
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const SETTLE_INTERVAL: Duration = Duration::from_millis(150);
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
@@ -129,13 +129,9 @@ impl AgentTerminalHandle {
         state.next_id = state.next_id.saturating_add(1);
         let id = format!("terminal-{}", state.next_id);
         let helper = shell_helper_command(nole_root)?;
-        let output_path = nole_root
-            .join("agent-session")
-            .join("pty")
-            .join(&id);
-        let mut terminal =
-            EmbeddedTerminal::spawn_command_with_raw_log(root, helper, output_path)?;
-        terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
+        let output_path = nole_root.join("agent-session").join("pty").join(&id);
+        let mut terminal = EmbeddedTerminal::spawn_command_with_raw_log(root, helper, output_path)?;
+        terminal.resize(AGENT_TERMINAL_ROWS, AGENT_TERMINAL_INITIAL_COLS)?;
         let mut bytes = command.as_bytes().to_vec();
         bytes.push(b'\r');
         terminal.write_raw(&bytes)?;
@@ -363,7 +359,7 @@ impl AgentTerminalHandle {
         if !matches!(session.status, AgentTerminalStatus::Running) {
             return None;
         }
-        let _ = session.terminal.resize(TERMINAL_ROWS, cols.max(1));
+        let _ = session.terminal.resize(AGENT_TERMINAL_ROWS, cols.max(1));
         Some(AgentTerminalSnapshot {
             title: session.title.clone(),
             status: session.status.clone(),
@@ -394,7 +390,7 @@ impl AgentTerminalHandle {
         let output_path = root.join("agent-session").join("pty").join(&id);
         let mut terminal =
             EmbeddedTerminal::spawn_command_with_raw_log(root, command, output_path)?;
-        terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
+        terminal.resize(AGENT_TERMINAL_ROWS, AGENT_TERMINAL_INITIAL_COLS)?;
         state.session = Some(AgentTerminalSession {
             id: id.clone(),
             title: compact_title(script),
@@ -856,7 +852,9 @@ mod tests {
             .open_process_for_test(directory.path(), "exit 7")
             .unwrap();
         assert!(terminal.is_running());
-        assert!(terminal.monitor_snapshot(INITIAL_COLS).is_some());
+        assert!(terminal
+            .monitor_snapshot(AGENT_TERMINAL_INITIAL_COLS)
+            .is_some());
         assert!(terminal.poll_monitor_change());
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_running = false;
@@ -878,7 +876,9 @@ mod tests {
             "final screen must remain readable"
         );
         assert!(!terminal.is_running());
-        assert!(terminal.monitor_snapshot(INITIAL_COLS).is_none());
+        assert!(terminal
+            .monitor_snapshot(AGENT_TERMINAL_INITIAL_COLS)
+            .is_none());
         // The exit surfaces as exactly one monitor change, but which call
         // observes it is racy: the poll above may fold in the transition when
         // the process dies fast enough, so require a pending change only when

@@ -9,7 +9,9 @@ pub(super) fn draw_notification(frame: &mut Frame, root: Rect, message: &str, th
     let rows = wrap_spans_to_width(&[Span::raw(message.to_string())], text_width)
         .len()
         .max(1);
-    let height = (rows as u16).saturating_add(2).min(root.height.min(8));
+    let height = saturating_u16(rows)
+        .saturating_add(2)
+        .min(root.height.min(8));
     let area = Rect::new(
         root.x + root.width.saturating_sub(width).saturating_sub(1),
         root.y.saturating_add(1),

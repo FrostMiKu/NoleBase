@@ -15,6 +15,25 @@ use crate::attachment::AttachmentUri;
 use crate::model::LinkTarget;
 use crate::theme::Theme;
 
+/// Visit every Markdown leaf in document order, hiding MBDown's structural
+/// container recursion from consumers that only inspect parsed events.
+pub(crate) fn visit_markdown<'a>(
+    nodes: &[Node<'a>],
+    visitor: &mut impl FnMut(&mbdown::Markdown<'a>),
+) {
+    for node in nodes {
+        match node {
+            Node::Markdown(markdown) => visitor(markdown),
+            Node::Box { children, .. }
+            | Node::Center { children }
+            | Node::Right { children }
+            | Node::Indent { children, .. }
+            | Node::Columns { children, .. }
+            | Node::Column { children, .. } => visit_markdown(children, visitor),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedMarkup {
     pub lines: Vec<Line<'static>>,
@@ -170,17 +189,9 @@ fn code_block_specs(nodes: &[Node<'_>]) -> Vec<CodeBlockSpec> {
 }
 
 fn collect_code_block_specs(nodes: &[Node<'_>], blocks: &mut Vec<CodeBlockSpec>) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => collect_event_code_blocks(markdown.events(), blocks),
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => collect_code_block_specs(children, blocks),
-        }
-    }
+    visit_markdown(nodes, &mut |markdown| {
+        collect_event_code_blocks(markdown.events(), blocks)
+    });
 }
 
 fn collect_event_code_blocks(events: &[mbdown::SpannedEvent<'_>], blocks: &mut Vec<CodeBlockSpec>) {
@@ -349,17 +360,9 @@ fn link_specs(nodes: &[Node<'_>]) -> Vec<LinkSpec> {
 }
 
 fn collect_link_specs(nodes: &[Node<'_>], links: &mut Vec<LinkSpec>) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => collect_event_links(markdown.events(), links),
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => collect_link_specs(children, links),
-        }
-    }
+    visit_markdown(nodes, &mut |markdown| {
+        collect_event_links(markdown.events(), links)
+    });
 }
 
 fn collect_event_links(events: &[mbdown::SpannedEvent<'_>], links: &mut Vec<LinkSpec>) {

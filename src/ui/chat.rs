@@ -71,18 +71,7 @@ fn draw_chat_messages(
     let render_height = area.height as usize;
     let view_height = visible_area.height.min(area.height) as usize;
     sync_chat_vlist(app, width);
-    let tail_pinned = app.agent_follow_tail || app.agent_scroll == u16::MAX;
-    let mut scroll = app.agent_vlist.geometry.scroll_offset(
-        app.agent_scroll,
-        app.agent_follow_tail,
-        view_height,
-    );
-    scroll = measure_visible_agent_entries(app, scroll, view_height, tail_pinned);
-    evict_agent_caches(app, scroll, view_height);
-    app.agent_scroll = scroll.min(u16::MAX as usize) as u16;
-    if app.agent_vlist.geometry.is_at_end(scroll, view_height) {
-        app.agent_follow_tail = true;
-    }
+    let scroll = reconcile_agent_scroll(app, view_height);
     let (visible, rendered_links, rendered_images) =
         visible_agent_lines(app, scroll, render_height);
 

@@ -368,8 +368,8 @@ impl ToolOutput {
     }
 
     pub fn structured_json(text: &str, body_fields: &[&str]) -> Result<Self> {
-        let Value::Object(mut metadata) = serde_json::from_str::<Value>(text)
-            .context("decoding structured tool output")?
+        let Value::Object(mut metadata) =
+            serde_json::from_str::<Value>(text).context("decoding structured tool output")?
         else {
             bail!("structured tool output must be a JSON object");
         };
@@ -858,11 +858,7 @@ impl Agent {
         let mut read = Read::new(nole_root, reads.clone(), client.clone())?;
         read.register(SkillParser::new(&skills));
         agent.register(read);
-        agent.register(Http::new(
-            nole_root,
-            client.clone(),
-            agent.jobs.clone(),
-        )?);
+        agent.register(Http::new(nole_root, client.clone(), agent.jobs.clone())?);
         agent.register(Notes::new(nole_root)?);
         agent.register(Grep::new(nole_root)?);
         agent.register(SearchNotes::new(nole_root)?);
@@ -1282,16 +1278,20 @@ impl Agent {
             ProviderEvent::ThinkingFinished => {
                 let _ = self.events.send(AgentEvent::ThinkingFinished);
             }
-            ProviderEvent::ToolCallDelta { index, name, arguments, .. } => {
+            ProviderEvent::ToolCallDelta {
+                index,
+                name,
+                arguments,
+                ..
+            } => {
                 if let Some(message) = tool_previews
                     .entry(index)
                     .or_default()
                     .push(&name, &arguments)
                 {
-                    let _ = self.events.send(AgentEvent::ToolPreparing {
-                        index,
-                        message,
-                    });
+                    let _ = self
+                        .events
+                        .send(AgentEvent::ToolPreparing { index, message });
                 }
             }
             ProviderEvent::ToolCallFinished { index, id } => {
@@ -1305,7 +1305,10 @@ impl Agent {
                     });
                 }
             }
-            ProviderEvent::Usage { usage, generation_duration } => {
+            ProviderEvent::Usage {
+                usage,
+                generation_duration,
+            } => {
                 report_provider_metrics(
                     &self.events,
                     reported_usage,
@@ -1751,23 +1754,21 @@ impl Agent {
                 } else {
                     let images = std::mem::take(&mut output.images);
                     match self.materialize_tool_output(output) {
-                        Ok(content) => ToolCallExecution::Completed(
-                            ToolCallOutput::with_images(
-                                ToolResult {
-                                    tool_use_id: id.to_string(),
-                                    content,
-                                    is_error: false,
-                                },
-                                images,
-                            ),
-                        ),
-                        Err(error) => ToolCallExecution::Completed(ToolCallOutput::text(
+                        Ok(content) => ToolCallExecution::Completed(ToolCallOutput::with_images(
                             ToolResult {
+                                tool_use_id: id.to_string(),
+                                content,
+                                is_error: false,
+                            },
+                            images,
+                        )),
+                        Err(error) => {
+                            ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
                                 tool_use_id: id.to_string(),
                                 content: tool_error_message(&error),
                                 is_error: true,
-                            },
-                        )),
+                            }))
+                        }
                     }
                 }
             }
@@ -1817,17 +1818,12 @@ impl Agent {
                         bail!("structured tool output field {} is duplicated", body.field);
                     }
                     let mut inline_candidate = metadata.clone();
-                    inline_candidate.insert(
-                        body.field.clone(),
-                        Value::String(body.content.clone()),
-                    );
+                    inline_candidate
+                        .insert(body.field.clone(), Value::String(body.content.clone()));
                     let inline_rendered =
                         serde_json::to_string_pretty(&Value::Object(inline_candidate))
                             .context("encoding structured tool output")?;
-                    if should_externalize_text(
-                        &inline_rendered,
-                        self.tool_result_token_cap(),
-                    ) {
+                    if should_externalize_text(&inline_rendered, self.tool_result_token_cap()) {
                         let uri = self.results.store(&body.content)?;
                         metadata.insert(result_field, Value::String(uri));
                         metadata.insert(

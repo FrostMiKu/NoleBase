@@ -538,6 +538,9 @@ fn trash_error_message(uri: &AttachmentUri, error: TrashError) -> anyhow::Error 
              {current_revision}); review the current state and retry"
         ),
         TrashError::Store(message) => anyhow::anyhow!("{message}"),
+        TrashError::Scan(message) => anyhow::anyhow!(
+            "cannot delete attachment {uri}: reference verification failed: {message}"
+        ),
     }
 }
 

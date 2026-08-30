@@ -195,13 +195,15 @@ pub(super) fn draw_dialog(
             .unwrap_or(u16::MAX)
     });
     let message_rows = if dialog.purpose == DialogPurpose::Help {
-        help_lines(app.theme).len() as u16
+        saturating_u16(help_lines(app.theme).len())
     } else {
-        wrap_spans_to_width(&[Span::raw(dialog.message.clone())], text_width)
-            .len()
-            .max(1) as u16
+        saturating_u16(
+            wrap_spans_to_width(&[Span::raw(dialog.message.clone())], text_width)
+                .len()
+                .max(1),
+        )
     };
-    let option_count = dialog.options.len() as u16;
+    let option_count = saturating_u16(dialog.options.len());
     let select_option_height = if dialog.purpose == DialogPurpose::SkillBrowser {
         3
     } else {

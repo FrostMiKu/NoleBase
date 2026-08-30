@@ -10,9 +10,9 @@ use serde_json::{json, Value};
 
 use crate::agent::{
     run_noninteractive_shell, run_noninteractive_shell_untimed, terminal_input_bytes,
-    terminal_input_display, validate_shell_command,
-    AgentJobsHandle, AgentTerminalHandle, ApprovalGate, ApprovalKind, ApprovalRequest,
-    CommandApproval, JobKind, StartedJob, Tool, ToolOutput,
+    terminal_input_display, validate_shell_command, AgentJobsHandle, AgentTerminalHandle,
+    ApprovalGate, ApprovalKind, ApprovalRequest, CommandApproval, JobKind, StartedJob, Tool,
+    ToolOutput,
 };
 
 use super::util::{backgrounded_job_result, required_string};
@@ -21,6 +21,16 @@ use crate::agent::resolve_shell_cwd;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 3600;
 const MAX_TERMINAL_WAIT_MS: u64 = 30_000;
+
+async fn run_terminal_operation(
+    join_context: &'static str,
+    operation: impl FnOnce() -> Result<Value> + Send + 'static,
+) -> Result<String> {
+    let output = tokio::task::spawn_blocking(operation)
+        .await
+        .context(join_context)??;
+    serde_json::to_string_pretty(&output).context("encoding terminal operation result")
+}
 
 fn optional_string<'a>(input: &'a Value, key: &str) -> Result<Option<&'a str>> {
     input
@@ -365,12 +375,10 @@ impl Tool for TerminalOpen {
         let terminal = self.terminal.clone();
         let cancelled = Arc::clone(&self.cancelled);
         let settled_id = session_id.clone();
-        let observation = tokio::task::spawn_blocking(move || {
+        run_terminal_operation("joining terminal observation", move || {
             terminal.wait_until_settled(&settled_id, &cancelled)
         })
         .await
-        .context("joining terminal observation")??;
-        Ok(serde_json::to_string_pretty(&observation)?)
     }
 
     async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
@@ -464,12 +472,10 @@ impl Tool for TerminalInput {
         let terminal = self.terminal.clone();
         let cancelled = Arc::clone(&self.cancelled);
         let session_id = session_id.to_string();
-        let observation = tokio::task::spawn_blocking(move || {
+        run_terminal_operation("joining terminal observation", move || {
             terminal.wait_until_settled(&session_id, &cancelled)
         })
         .await
-        .context("joining terminal observation")??;
-        Ok(serde_json::to_string_pretty(&observation)?)
     }
 
     async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
@@ -580,7 +586,10 @@ impl Tool for TerminalRead {
 
     async fn execute(&self, input: &Value) -> Result<String> {
         let session_id = required_string(input, "session_id")?.to_string();
-        let mode = input.get("mode").and_then(Value::as_str).unwrap_or("screen");
+        let mode = input
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("screen");
         let wait_for = input.get("wait_for");
         let Some(wait_for) = wait_for else {
             return match mode {
@@ -624,7 +633,8 @@ impl Tool for TerminalRead {
         // An explicit background watch is a background job from the start;
         // only the foreground race needs the suppressed, hidden start.
         let started = if background {
-            self.jobs.start_background(JobKind::TerminalWatch, &session_id)?
+            self.jobs
+                .start_background(JobKind::TerminalWatch, &session_id)?
         } else {
             self.jobs.start_raced(JobKind::TerminalWatch, &session_id)?
         };
@@ -697,7 +707,7 @@ impl TerminalRead {
         let terminal = self.terminal.clone();
         let cancelled = Arc::clone(&self.cancelled);
         let session_id = session_id.to_string();
-        let observation = tokio::task::spawn_blocking(move || {
+        run_terminal_operation("joining terminal read", move || {
             if wait_ms == 0 {
                 terminal.observation(&session_id)
             } else {
@@ -705,8 +715,6 @@ impl TerminalRead {
             }
         })
         .await
-        .context("joining terminal read")??;
-        Ok(serde_json::to_string_pretty(&observation)?)
     }
 
     async fn read_output(&self, session_id: &str, input: &Value) -> Result<String> {
@@ -720,7 +728,7 @@ impl TerminalRead {
         let terminal = self.terminal.clone();
         let cancelled = Arc::clone(&self.cancelled);
         let session_id = session_id.to_string();
-        let observation = tokio::task::spawn_blocking(move || {
+        run_terminal_operation("joining terminal output read", move || {
             let initial = terminal.output_since(&session_id, cursor)?;
             let has_output = initial["output"]
                 .as_str()
@@ -729,16 +737,10 @@ impl TerminalRead {
             if wait_ms == 0 || has_output || !running {
                 return Ok(initial);
             }
-            terminal.wait_for_change(
-                &session_id,
-                Duration::from_millis(wait_ms),
-                &cancelled,
-            )?;
+            terminal.wait_for_change(&session_id, Duration::from_millis(wait_ms), &cancelled)?;
             terminal.output_since(&session_id, cursor)
         })
         .await
-        .context("joining terminal output read")??;
-        Ok(serde_json::to_string_pretty(&observation)?)
     }
 }
 
@@ -1103,7 +1105,9 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("timeout_seconds does not apply to background"));
+        assert!(error
+            .to_string()
+            .contains("timeout_seconds does not apply to background"));
         assert!(jobs.rows().is_empty());
     }
 

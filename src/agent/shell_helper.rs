@@ -20,6 +20,8 @@ pub(crate) const NONINTERACTIVE_ENVIRONMENT: [(&str, &str); 7] = [
     ("CI", "true"),
     ("NO_COLOR", "1"),
 ];
+pub(crate) const AGENT_SHELL_NAME: &str = "Brush (Bash-compatible)";
+const AGENT_INTERACTIVE_PROMPT: &str = "nole$ ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShellHelperMode {
@@ -166,6 +168,9 @@ async fn run_shell_helper_async(mode: ShellHelperMode) -> Result<u8> {
             Ok(u8::from(result.exit_code))
         }
         ShellHelperMode::Interactive(nole_root) => {
+            shell
+                .set_env_global("PS1", ShellVariable::new(AGENT_INTERACTIVE_PROMPT))
+                .context("setting Agent terminal prompt")?;
             let shell = Arc::new(tokio::sync::Mutex::new(shell));
             let mut input = SafetyInputBackend::new(nole_root);
             let options = brush_interactive::InteractiveOptions::default();

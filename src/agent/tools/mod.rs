@@ -29,6 +29,6 @@ mod write_policy;
 
 pub use self::{
     attachment_ops::*, calculator::*, explore::*, file_ops::*, file_patch::*, grep::*,
-    interactive::*, jobs::*, notes_tags::*, read::*, review::*, shell::*, todo::*, wait::*,
-    web::*, wiki_links::*,
+    interactive::*, jobs::*, notes_tags::*, read::*, review::*, shell::*, todo::*, wait::*, web::*,
+    wiki_links::*,
 };

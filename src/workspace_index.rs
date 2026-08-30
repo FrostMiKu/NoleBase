@@ -11,6 +11,7 @@ use mbdown::{Event, Node};
 use crate::document_index::{
     self, DocumentGroup as FileGroup, DocumentIndex, IndexedDocument, IndexedLine,
 };
+use crate::markdown::visit_markdown;
 use crate::model::SearchHit;
 use crate::storage::Storage;
 
@@ -459,7 +460,10 @@ fn build_index(storage: &Storage) -> WorkspaceIndex {
 }
 
 fn index_file(storage: &Storage, path: &Path) -> Option<IndexedFile> {
-    document_index::index_file(storage, path).map(indexed_file)
+    document_index::index_file(storage, path)
+        .ok()
+        .flatten()
+        .map(indexed_file)
 }
 
 fn indexed_file(document: IndexedDocument) -> IndexedFile {
@@ -475,34 +479,26 @@ pub(crate) fn collect_document_tags(
     source: &str,
     tags_by_line: &mut HashMap<usize, Vec<String>>,
 ) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => {
-                for event in markdown.events() {
-                    if let Event::Hashtag(tag) = &event.event {
-                        let document_offset = markdown.source_span().start + event.span.start;
-                        let line_no = source[..document_offset]
-                            .bytes()
-                            .filter(|byte| *byte == b'\n')
-                            .count()
-                            + 1;
-                        tags_by_line
-                            .entry(line_no)
-                            .or_default()
-                            .push(tag.to_string());
-                    }
-                }
-            }
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => {
-                collect_document_tags(children, source, tags_by_line)
+    let line_starts = std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        )
+        .collect::<Vec<_>>();
+    visit_markdown(nodes, &mut |markdown| {
+        for event in markdown.events() {
+            if let Event::Hashtag(tag) = &event.event {
+                let document_offset = markdown.source_span().start + event.span.start;
+                let line_no = line_starts.partition_point(|start| *start <= document_offset);
+                tags_by_line
+                    .entry(line_no)
+                    .or_default()
+                    .push(tag.to_string());
             }
         }
-    }
+    });
 }
 
 fn valid_tag_name(value: &str) -> Result<String> {
@@ -530,26 +526,16 @@ fn matching_tag_spans(source: &str, tag: &str) -> Result<Vec<Range<usize>>> {
 
 fn collect_matching_tag_spans(nodes: &[Node<'_>], tag: &str, spans: &mut Vec<Range<usize>>) {
     let normalized = normalize_tag(tag);
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => {
-                for event in markdown.events() {
-                    if let Event::Hashtag(found) = &event.event {
-                        if normalize_tag(found) == normalized {
-                            let offset = markdown.source_span().start;
-                            spans.push(offset + event.span.start..offset + event.span.end);
-                        }
-                    }
+    visit_markdown(nodes, &mut |markdown| {
+        for event in markdown.events() {
+            if let Event::Hashtag(found) = &event.event {
+                if normalize_tag(found) == normalized {
+                    let offset = markdown.source_span().start;
+                    spans.push(offset + event.span.start..offset + event.span.end);
                 }
             }
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => collect_matching_tag_spans(children, tag, spans),
         }
-    }
+    });
 }
 
 fn replace_tag_spans(source: &str, spans: &[Range<usize>], tag: &str) -> String {

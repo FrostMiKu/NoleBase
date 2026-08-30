@@ -10,6 +10,12 @@ use ratatui::Terminal;
 use tempfile::tempdir;
 
 use super::*;
+
+#[test]
+fn dynamic_layout_lengths_saturate_at_terminal_coordinate_limit() {
+    assert_eq!(saturating_u16(7), 7);
+    assert_eq!(saturating_u16(usize::MAX), u16::MAX);
+}
 use crate::app::{Command, CODE_COPY_FEEDBACK_TTL};
 
 #[test]

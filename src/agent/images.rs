@@ -15,6 +15,7 @@ use tokio::fs as async_fs;
 use crate::agent::tools::read::fetch_web_response;
 use crate::attachment::{AttachmentStore, AttachmentUri};
 use crate::image_data::{decode_image, MAX_IMAGE_BYTES};
+use crate::markdown::visit_markdown;
 use crate::provider::{ImageBlock, ImageMediaType, ImageSource, Message, MessagePart, MessageRole};
 
 /// Accumulated normalized byte cap for a single provider request, checked
@@ -218,40 +219,30 @@ fn collect_attachment_image_spans(
     nodes: &[Node<'_>],
     spans: &mut Vec<(usize, usize, String, String)>,
 ) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => {
-                let offset = markdown.source_span().start;
-                let events = markdown.events();
-                let mut index = 0;
-                while index < events.len() {
-                    if let Event::Start(Container::Image { target, .. }) = &events[index].event {
-                        let relative_end = events[index..]
-                            .iter()
-                            .position(|item| matches!(item.event, Event::End(ContainerEnd::Image)))
-                            .map(|end_offset| index + end_offset);
-                        if let Some(end_index) = relative_end {
-                            if let Ok(uri) = AttachmentUri::parse(target.as_ref()) {
-                                let start = offset + events[index].span.start;
-                                let end = offset + events[end_index].span.end;
-                                let alt = alt_text(&events[index + 1..end_index]);
-                                spans.push((start, end, alt, uri.to_string()));
-                            }
-                            index = end_index + 1;
-                            continue;
-                        }
+    visit_markdown(nodes, &mut |markdown| {
+        let offset = markdown.source_span().start;
+        let events = markdown.events();
+        let mut index = 0;
+        while index < events.len() {
+            if let Event::Start(Container::Image { target, .. }) = &events[index].event {
+                let relative_end = events[index..]
+                    .iter()
+                    .position(|item| matches!(item.event, Event::End(ContainerEnd::Image)))
+                    .map(|end_offset| index + end_offset);
+                if let Some(end_index) = relative_end {
+                    if let Ok(uri) = AttachmentUri::parse(target.as_ref()) {
+                        let start = offset + events[index].span.start;
+                        let end = offset + events[end_index].span.end;
+                        let alt = alt_text(&events[index + 1..end_index]);
+                        spans.push((start, end, alt, uri.to_string()));
                     }
-                    index += 1;
+                    index = end_index + 1;
+                    continue;
                 }
             }
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => collect_attachment_image_spans(children, spans),
+            index += 1;
         }
-    }
+    });
 }
 
 fn alt_text(events: &[mbdown::SpannedEvent<'_>]) -> String {

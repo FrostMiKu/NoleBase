@@ -84,8 +84,7 @@ pub(super) fn draw_wiki_completion(
     if total == 0 {
         return;
     }
-    let rows = total as u16;
-    let window = rows.min(WIKI_COMPLETION_WINDOW as u16);
+    let window = saturating_u16(total.min(WIKI_COMPLETION_WINDOW));
     let wanted = window + 2; // borders
     let available = layout.compose.y.saturating_sub(layout.body.y);
     if available < 3 {
@@ -112,7 +111,7 @@ pub(super) fn draw_wiki_completion(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let visible = inner.height.min(rows) as usize;
+    let visible = inner.height.min(window) as usize;
     let start = selection_viewport_start(scroll, index, visible, total);
     if let Some(state) = app.wiki_completion.as_mut() {
         state.scroll = start;

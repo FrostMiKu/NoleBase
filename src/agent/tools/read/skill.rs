@@ -109,9 +109,7 @@ mod tests {
             .execute(&json!({"path": "skill://missing"}))
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unknown or unavailable skill"));
+        assert!(error.to_string().contains("unknown or unavailable skill"));
     }
 
     #[tokio::test]

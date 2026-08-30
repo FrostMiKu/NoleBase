@@ -294,13 +294,11 @@ impl Read {
 async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     let requested = required_string(input, "path")?;
     if let Some(id) = crate::agent::parse_result_id(requested)? {
-        let path = crate::agent::result_path(&ctx.root, id);
-        let metadata = async_fs::metadata(&path)
-            .await
-            .with_context(|| format!("reading session result {requested}"))?;
-        if !metadata.is_file() {
-            bail!("session result is not a regular file: {requested}");
-        }
+        let root = ctx.root.clone();
+        let path =
+            tokio::task::spawn_blocking(move || crate::agent::resolve_result_path(&root, id))
+                .await
+                .context("joining session result resolution")??;
         return Ok(Target::Result {
             uri: requested.to_string(),
             path,
@@ -475,6 +473,32 @@ mod tests {
         assert!(output.chars().count() <= MAX_READ_RESPONSE_CHARACTERS);
         assert!(output.contains("[Showing lines 1-"));
         assert!(!output.contains("[Showing lines 1-200"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_result_uri_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let results = directory.path().join("agent-session/results");
+        fs::create_dir_all(&results).unwrap();
+        let private = directory.path().join("config/ai.toml");
+        fs::create_dir_all(private.parent().unwrap()).unwrap();
+        fs::write(&private, "secret").unwrap();
+        symlink(&private, results.join("1")).unwrap();
+
+        let read = Read::new(
+            directory.path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let error = read
+            .execute(&json!({"path": "nole://result/1"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a regular stored result"));
     }
 
     #[tokio::test(flavor = "current_thread")]

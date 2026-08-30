@@ -113,6 +113,9 @@ impl App {
             Err(TrashError::Store(message)) => {
                 self.set_error(format!("Attachment trash error: {message}"));
             }
+            Err(TrashError::Scan(message)) => {
+                self.set_error(format!("Attachment reference scan failed: {message}"));
+            }
         }
     }
 

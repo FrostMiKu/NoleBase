@@ -883,10 +883,8 @@ impl App {
             format!("Job completed: {label}")
         };
         let prompt = crate::agent::format_job_deliveries(&deliveries);
-        self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
-            text,
-            muted: true,
-        }));
+        self.agent_panel
+            .push(Arc::new(AgentPanelEntry::Prompt { text, muted: true }));
         self.start_agent_worker(prompt)
     }
 

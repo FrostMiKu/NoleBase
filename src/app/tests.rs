@@ -5,6 +5,14 @@ use crate::agent::CommandApproval;
 use crate::attachment::AttachmentStore;
 
 use super::*;
+
+#[test]
+fn move_index_handles_lengths_larger_than_signed_delta_type() {
+    let len = i32::MAX as usize + 10;
+    assert_eq!(move_index(len - 2, 1, len), len - 1);
+    assert_eq!(move_index(len - 1, i32::MAX, len), len - 1);
+    assert_eq!(move_index(1, i32::MIN, len), 0);
+}
 use std::fs;
 
 fn install_agent_observable(app: &mut App) -> tokio::sync::broadcast::Sender<AgentEvent> {
@@ -408,7 +416,10 @@ fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
         .unwrap();
     app.poll_agent();
 
-    assert!(app.ai_running, "the queued delivery must start a wake-up run");
+    assert!(
+        app.ai_running,
+        "the queued delivery must start a wake-up run"
+    );
     assert!(app.agent_panel.iter().any(|entry| {
         matches!(
             entry.as_ref(),

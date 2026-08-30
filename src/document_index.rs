@@ -159,8 +159,29 @@ pub(crate) struct CacheStats {
 }
 
 impl DocumentIndex {
+    #[cfg(test)]
     pub(crate) fn build(storage: &Storage) -> Self {
         Self::scan(storage, HashMap::new()).0
+    }
+
+    /// Build an index without skipping unreadable directories or documents.
+    /// Destructive decisions use this variant so incomplete evidence fails
+    /// closed instead of looking like an absence of references.
+    pub(crate) fn build_checked(storage: &Storage) -> Result<Self> {
+        let mut files = HashMap::new();
+        for directory in [&storage.daily_dir, &storage.data_dir, &storage.archives_dir] {
+            let entries = fs::read_dir(directory)
+                .with_context(|| format!("reading indexed directory {}", directory.display()))?;
+            for entry in entries {
+                let path = entry
+                    .with_context(|| format!("reading entry in {}", directory.display()))?
+                    .path();
+                if let Some(document) = index_file(storage, &path)? {
+                    files.insert(path, document);
+                }
+            }
+        }
+        Ok(Self { files })
     }
 
     pub(crate) fn load_or_build(storage: &Storage) -> (Self, CacheStats) {
@@ -177,18 +198,32 @@ impl DocumentIndex {
     pub(crate) fn refresh_paths(&mut self, storage: &Storage, paths: Vec<PathBuf>) -> bool {
         let mut changed = false;
         for path in paths.into_iter().collect::<HashSet<_>>() {
-            if self.files.remove(&path).is_some() {
-                changed = true;
-            }
-            if let Some(document) = index_file(storage, &path) {
-                self.files.insert(path, document);
-                changed = true;
-            }
+            changed |= self.apply_path_refresh(path.clone(), index_file(storage, &path));
         }
         if changed {
             let _ = self.persist(storage);
         }
         changed
+    }
+
+    fn apply_path_refresh(
+        &mut self,
+        path: PathBuf,
+        outcome: Result<Option<IndexedDocument>>,
+    ) -> bool {
+        match outcome {
+            Ok(Some(document)) => {
+                let changed = self.files.get(&path).is_none_or(|previous| {
+                    previous.group != document.group || previous.stamp != document.stamp
+                });
+                self.files.insert(path, document);
+                changed
+            }
+            Ok(None) => self.files.remove(&path).is_some(),
+            // Preserve the last valid snapshot across transient I/O failures;
+            // a later watcher event will retry the read.
+            Err(_) => false,
+        }
     }
 
     fn scan(
@@ -442,16 +477,26 @@ fn read_cache(storage: &Storage) -> Result<HashMap<PathBuf, IndexedDocument>> {
         .collect())
 }
 
-pub(crate) fn index_file(storage: &Storage, path: &Path) -> Option<IndexedDocument> {
-    let group = document_group(storage, path)?;
-    let metadata = fs::symlink_metadata(path).ok()?;
+pub(crate) fn index_file(storage: &Storage, path: &Path) -> Result<Option<IndexedDocument>> {
+    let Some(group) = document_group(storage, path) else {
+        return Ok(None);
+    };
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking indexed file {}", path.display()));
+        }
+    };
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return None;
+        return Ok(None);
     }
-    let content = fs::read(path).ok()?;
+    let content =
+        fs::read(path).with_context(|| format!("reading indexed file {}", path.display()))?;
     let stamp = FileStamp::from_metadata(&metadata, &content);
-    let source = String::from_utf8(content).ok()?;
-    Some(parse_source(&source, group, stamp))
+    let source = String::from_utf8(content)
+        .with_context(|| format!("indexed file is not UTF-8: {}", path.display()))?;
+    Ok(Some(parse_source(&source, group, stamp)))
 }
 
 fn parse_source(source: &str, group: DocumentGroup, stamp: FileStamp) -> IndexedDocument {
@@ -506,6 +551,22 @@ mod tests {
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         storage
+    }
+
+    #[test]
+    fn transient_refresh_failure_preserves_last_valid_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_with(&directory);
+        let path = storage.data_dir.join("Note.md");
+        fs::write(&path, "stable #tag\n").unwrap();
+        let mut index = DocumentIndex::build(&storage);
+        let original = index.files.get(&path).unwrap().clone();
+
+        let changed =
+            index.apply_path_refresh(path.clone(), Err(anyhow::anyhow!("temporary read failure")));
+
+        assert!(!changed);
+        assert_eq!(index.files.get(&path).unwrap(), &original);
     }
 
     fn uri() -> String {

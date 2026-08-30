@@ -864,12 +864,14 @@ impl Storage {
     }
 
     /// Scan task-list items from every daily file, newest day first.
-    pub fn load_todo_tasks(&self) -> Vec<TodoItem> {
+    pub fn load_todo_tasks(&self) -> Result<Vec<TodoItem>> {
         let mut items: Vec<TodoItem> = Vec::new();
-        let mut dates = self.daily_dates().unwrap_or_default();
+        let mut dates = self.daily_dates()?;
         dates.reverse();
         for date in dates {
-            let text = fs::read_to_string(self.daily_path(date)).unwrap_or_default();
+            let path = self.daily_path(date);
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("reading todo tasks from {}", path.display()))?;
             let mut active_task = None;
             for line in text.lines() {
                 if let Some((checked, body)) = parse_task_line(line) {
@@ -890,7 +892,7 @@ impl Storage {
                 }
             }
         }
-        items
+        Ok(items)
     }
 
     /// Flip the completion state of the indexed task across all daily files.
@@ -1927,7 +1929,7 @@ mod tests {
         st.append_daily("2026-07-27", "- [ ] buy milk\n- [x] write docs")
             .unwrap();
 
-        let items = st.load_todo_tasks();
+        let items = st.load_todo_tasks().unwrap();
         assert_eq!(items.len(), 3);
         assert!(!items[0].checked);
         assert_eq!(items[0].text, "buy milk");
@@ -1936,12 +1938,12 @@ mod tests {
 
         // Toggle the first task on, then back off.
         assert!(st.toggle_todo_task(0).unwrap());
-        let on = st.load_todo_tasks();
+        let on = st.load_todo_tasks().unwrap();
         assert!(on[0].checked);
         assert!(on[1].checked, "other tasks untouched");
 
         assert!(st.toggle_todo_task(0).unwrap());
-        let off = st.load_todo_tasks();
+        let off = st.load_todo_tasks().unwrap();
         assert!(!off[0].checked);
 
         // Out-of-range index toggles nothing.
@@ -2344,7 +2346,10 @@ mod tests {
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
         assert_eq!(st.settings_path.parent(), Some(st.config_dir.as_path()));
         let agent_session_dir = st.root.join("agent-session");
-        assert_eq!(st.agent_session_path.parent(), Some(agent_session_dir.as_path()));
+        assert_eq!(
+            st.agent_session_path.parent(),
+            Some(agent_session_dir.as_path())
+        );
         assert_eq!(st.themes_dir.parent(), Some(st.root.as_path()));
         assert_eq!(st.template_path.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();

@@ -464,10 +464,7 @@ fn download_label(url: &reqwest::Url, destination_text: &str) -> String {
         .rsplit('/')
         .next()
         .unwrap_or(destination_text);
-    let host = url
-        .host_str()
-        .map(str::to_string)
-        .unwrap_or_default();
+    let host = url.host_str().map(str::to_string).unwrap_or_default();
     format!("{file} <- {host}")
 }
 

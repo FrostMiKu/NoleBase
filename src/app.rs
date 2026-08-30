@@ -73,7 +73,11 @@ pub(in crate::app) fn move_index(current: usize, delta: i32, len: usize) -> usiz
         return 0;
     }
     let current = current.min(len - 1);
-    (current as i32 + delta).clamp(0, len as i32 - 1) as usize
+    if delta >= 0 {
+        current.saturating_add(delta as usize).min(len - 1)
+    } else {
+        current.saturating_sub(delta.unsigned_abs() as usize)
+    }
 }
 
 pub(in crate::app) fn is_up_key(code: KeyCode) -> bool {
@@ -462,7 +466,7 @@ impl App {
         let first_note = note_files.first().map(|file| file.path.clone());
         note_files.extend(storage.list_archived_note_files()?);
         let file_row = usize::from(first_note.is_some());
-        let todo_items = storage.load_todo_tasks();
+        let todo_items = storage.load_todo_tasks()?;
         let images = crate::media::ImageService::new(&storage.root);
         let attachment_store = AttachmentStore::new(storage.attachments_dir.clone());
         let attachment_usage = AttachmentUsageHandle::new();
@@ -767,9 +771,14 @@ impl App {
     }
 
     pub fn reload_todos(&mut self) {
-        self.todo_items = self.storage.load_todo_tasks();
-        self.todo_index = self.todo_index.min(self.todo_items.len().saturating_sub(1));
-        self.ensure_visible_todo_selection();
+        match self.storage.load_todo_tasks() {
+            Ok(items) => {
+                self.todo_items = items;
+                self.todo_index = self.todo_index.min(self.todo_items.len().saturating_sub(1));
+                self.ensure_visible_todo_selection();
+            }
+            Err(error) => self.set_error(format!("Error: {error:#}")),
+        }
     }
 
     fn apply_loaded_theme(&mut self, loaded: LoadedTheme) {

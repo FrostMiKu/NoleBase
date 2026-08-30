@@ -488,7 +488,15 @@
     #[test]
     fn system_prompt_stays_compact() {
         let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.len() < 2_800, "system prompt grew to {} bytes", prompt.len());
+        assert!(prompt.len() < 3_000, "system prompt grew to {} bytes", prompt.len());
+    }
+
+    #[test]
+    fn system_prompt_identifies_the_compiled_platform_shell_and_initial_pty_size() {
+        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
+        assert!(prompt.contains(&format!("target OS {}", std::env::consts::OS)));
+        assert!(prompt.contains("command shell Brush (Bash-compatible), not PowerShell"));
+        assert!(prompt.contains("Agent PTY starts at 80×24 cells (columns×rows)"));
     }
 
     #[test]
