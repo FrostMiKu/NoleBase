@@ -1317,10 +1317,21 @@ mod tests {
         let (first, second) = tokio::join!(tool.execute(&first_input), tool.execute(&second_input));
         handle.join().unwrap();
 
-        assert!(first.is_ok());
-        assert!(second.unwrap_err().to_string().contains("512 MiB"));
-        assert!(workspace(&root).join("first.bin").exists());
-        assert!(!workspace(&root).join("second.bin").exists());
+        let outcomes = [("first.bin", first), ("second.bin", second)];
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        for (file_name, result) in outcomes {
+            let saved = workspace(&root).join(file_name);
+            match result {
+                Ok(_) => assert!(saved.exists()),
+                Err(error) => {
+                    assert!(error.to_string().contains("512 MiB"));
+                    assert!(!saved.exists());
+                }
+            }
+        }
         assert!(workspace_used_bytes(&workspace(&root)).unwrap() <= MAX_WORKSPACE_TOTAL_BYTES);
     }
 
