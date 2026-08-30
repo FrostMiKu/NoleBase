@@ -1295,12 +1295,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn save_to_concurrent_requests_serialize_workspace_quota_accounting() {
         let (_directory, root) = fresh_root();
-        let headroom = 1024 * 1024;
+        let headroom = 1;
         fs::File::create(workspace(&root).join("filler.bin"))
             .unwrap()
             .set_len(MAX_WORKSPACE_TOTAL_BYTES - headroom)
             .unwrap();
-        let body = vec![0u8; 700 * 1024];
+        let body = vec![0u8; headroom as usize];
         let (url, handle) = server(vec![
             ok_response(body.clone(), None),
             ok_response(body, None),
