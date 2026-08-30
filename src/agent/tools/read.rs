@@ -19,6 +19,7 @@ mod document;
 mod documents;
 mod notes;
 mod paging;
+mod result;
 mod skill;
 mod text;
 mod web;
@@ -45,6 +46,7 @@ use self::directory::DirectoryParser;
 use self::document::DocumentCache;
 use self::documents::DocumentFileParser;
 use self::paging::{line_range, LineRange};
+use self::result::ResultParser;
 use self::text::TextFileParser;
 use self::web::WebParser;
 
@@ -54,9 +56,9 @@ pub(crate) use self::web::fetch_web_response;
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
-const MAX_READ_RESPONSE_BYTES: usize = 1_000_000;
+const MAX_READ_RESPONSE_CHARACTERS: usize = 8_192;
 const MAX_READ_LINE_BYTES: usize = 256 * 1024;
-const READ_RESPONSE_OVERHEAD: usize = 8 * 1024;
+const READ_RESPONSE_OVERHEAD_CHARACTERS: usize = 2 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTED_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIRECTORY_RESULTS: usize = 2_000;
@@ -83,6 +85,11 @@ pub(crate) enum Target {
     Skill {
         name: String,
     },
+    Result {
+        uri: String,
+        path: PathBuf,
+        range: Option<LineRange>,
+    },
 }
 
 impl Target {
@@ -93,6 +100,7 @@ impl Target {
             Target::Web { .. } => "web",
             Target::Attachment { .. } => "attachment",
             Target::Skill { .. } => "skill",
+            Target::Result { .. } => "result",
         }
     }
 
@@ -104,6 +112,7 @@ impl Target {
             Target::Web { url, .. } => url.clone(),
             Target::Attachment { uri, .. } => uri.to_string(),
             Target::Skill { name } => format!("{}{name}", skill::SKILL_URI_SCHEME),
+            Target::Result { uri, .. } => uri.clone(),
         }
     }
 }
@@ -162,6 +171,7 @@ impl Read {
             Box::new(DirectoryParser),
             Box::new(DocumentFileParser),
             Box::new(AttachmentParser),
+            Box::new(ResultParser),
             Box::new(TextFileParser),
         ];
         Ok(Self { ctx, parsers })
@@ -189,7 +199,7 @@ impl Tool for Read {
     }
 
     fn description(&self) -> &'static str {
-        "Read local files, directories, URLs, office documents, PDFs, attachment URIs, and skills. A skill URI (`skill://<name>`) returns the full body of one skill from the catalog listed in the system prompt. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. The inclusive `range` selects lines from text and extracted documents or entries from directories; editable text returns tagged source lines. To fetch the raw unprocessed response body instead, use `http`."
+        "Read local files, directories, URLs, office documents, PDFs, attachment URIs, session result URIs, and skills. A nole://result/<id> URI pages an oversized text result from the current Agent session. A skill URI (`skill://<name>`) returns the full body of one skill from the catalog listed in the system prompt. For http(s) URLs this returns reader-mode content: HTML is converted to Markdown, PDFs and office documents are extracted to text, and JSON/plain text is returned unchanged. Image files and image URLs are returned as images the model can see natively. The inclusive `range` selects lines from text and extracted documents or entries from directories; editable text returns tagged source lines. To fetch the raw unprocessed response body instead, use `http`."
     }
 
     fn input_schema(&self) -> Value {
@@ -198,7 +208,7 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Local file or document path, http(s) URL, attachment URI, skill URI (skill://<name>), or directory path"
+                    "description": "Local file or document path, http(s) URL, attachment URI, session result URI (nole://result/<id>), skill URI (skill://<name>), or directory path"
                 },
                 "range": {
                     "type": "string",
@@ -226,7 +236,7 @@ impl Tool for Read {
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
-        Ok(self.read_output(input).await?.text)
+        self.read_output(input).await?.into_inline_text()
     }
 
     async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
@@ -254,7 +264,7 @@ impl Read {
                             block.media_type.mime(),
                         );
                         Ok(ToolOutput {
-                            text: summary,
+                            content: crate::agent::ToolOutputContent::Text(summary),
                             images: vec![block],
                         })
                     }
@@ -283,6 +293,20 @@ impl Read {
 /// AI configuration and attachment internals before any parser sees them.
 async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     let requested = required_string(input, "path")?;
+    if let Some(id) = crate::agent::parse_result_id(requested)? {
+        let path = crate::agent::result_path(&ctx.root, id);
+        let metadata = async_fs::metadata(&path)
+            .await
+            .with_context(|| format!("reading session result {requested}"))?;
+        if !metadata.is_file() {
+            bail!("session result is not a regular file: {requested}");
+        }
+        return Ok(Target::Result {
+            uri: requested.to_string(),
+            path,
+            range: line_range(input)?,
+        });
+    }
     if requested.starts_with("https://") || requested.starts_with("http://") {
         return Ok(Target::Web {
             url: requested.to_string(),
@@ -409,6 +433,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn session_result_uris_survive_store_recreation_and_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::agent::SessionResultStore::new(directory.path()).unwrap();
+        let uri = store.store("one\ntwo\nthree\nfour\n").unwrap();
+        drop(store);
+
+        let read = Read::new(
+            directory.path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let output = read
+            .execute(&json!({"path": uri, "range": "2-3"}))
+            .await
+            .unwrap();
+        assert!(output.contains("2:two\n3:three"));
+        assert!(output.contains("[Showing lines 2-3 of 4]"));
+
+        let restored = crate::agent::SessionResultStore::new(directory.path()).unwrap();
+        assert_eq!(restored.store("next").unwrap(), "nole://result/2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_result_pages_fit_the_inline_character_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::agent::SessionResultStore::new(directory.path()).unwrap();
+        let content = (0..200)
+            .map(|index| format!("{index}:{}", "界".repeat(100)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let uri = store.store(&content).unwrap();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let output = read.execute(&json!({"path": uri})).await.unwrap();
+        assert!(output.chars().count() <= MAX_READ_RESPONSE_CHARACTERS);
+        assert!(output.contains("[Showing lines 1-"));
+        assert!(!output.contains("[Showing lines 1-200"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn malformed_attachment_uris_are_rejected_at_resolution() {
         let directory = tempfile::tempdir().unwrap();
         let ctx = attachment_ctx(directory.path());
@@ -488,7 +557,9 @@ mod tests {
             .await
             .unwrap();
         assert!(output
-            .text
+            .clone()
+            .into_inline_text()
+            .unwrap()
             .starts_with("Read image diagram.png (8x4, image/png, "));
         assert_eq!(output.images.len(), 1);
         assert!(output.images[0].bytes.is_some());

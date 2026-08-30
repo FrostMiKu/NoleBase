@@ -1,7 +1,7 @@
 //! A single PTY-backed terminal session embedded in the Nole UI.
 
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -280,18 +280,70 @@ impl TerminalSnapshot {
     }
 }
 
-/// A capped ring of the raw PTY output byte stream. Terminal watchers grep
-/// this original stream (ANSI escapes included) rather than the rendered grid.
-#[derive(Default)]
+/// A raw PTY output stream. Agent terminals spool the complete stream to their
+/// session directory; other embedded terminals retain a capped in-memory tap.
 pub struct RawTap {
     bytes: std::collections::VecDeque<u8>,
     base_offset: u64,
+    spool: Option<RawSpool>,
+    spool_error: Option<String>,
+}
+
+struct RawSpool {
+    path: PathBuf,
+    writer: std::fs::File,
+    length: u64,
+}
+
+impl Default for RawTap {
+    fn default() -> Self {
+        Self {
+            bytes: std::collections::VecDeque::new(),
+            base_offset: 0,
+            spool: None,
+            spool_error: None,
+        }
+    }
 }
 
 impl RawTap {
     const CAPACITY: usize = 256 * 1024;
 
+    fn spooled(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let writer = options
+            .open(&path)
+            .with_context(|| format!("creating PTY output log {}", path.display()))?;
+        Ok(Self {
+            spool: Some(RawSpool {
+                path,
+                writer,
+                length: 0,
+            }),
+            ..Self::default()
+        })
+    }
+
     fn push(&mut self, chunk: &[u8]) {
+        if let Some(spool) = self.spool.as_mut() {
+            if self.spool_error.is_none() {
+                match spool.writer.write_all(chunk) {
+                    Ok(()) => spool.length = spool.length.saturating_add(chunk.len() as u64),
+                    Err(error) => self.spool_error = Some(error.to_string()),
+                }
+            }
+            return;
+        }
         self.bytes.extend(chunk.iter().copied());
         let overflow = self.bytes.len().saturating_sub(Self::CAPACITY);
         if overflow > 0 {
@@ -302,12 +354,42 @@ impl RawTap {
 
     /// Bytes appended after `offset` (clamped to the retained window) and the
     /// offset to resume from next time.
-    pub fn read_since(&self, offset: u64) -> (u64, Vec<u8>) {
+    pub fn read_since(&self, offset: u64) -> Result<(u64, Vec<u8>)> {
+        if let Some(error) = &self.spool_error {
+            anyhow::bail!("recording PTY output failed: {error}");
+        }
+        if let Some(spool) = &self.spool {
+            if offset > spool.length {
+                anyhow::bail!(
+                    "PTY output cursor {offset} is beyond the current end {}",
+                    spool.length
+                );
+            }
+            let start = offset;
+            let mut file = std::fs::File::open(&spool.path)
+                .with_context(|| format!("opening PTY output log {}", spool.path.display()))?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            return Ok((spool.length, data));
+        }
         let skip = offset
             .saturating_sub(self.base_offset)
             .min(self.bytes.len() as u64) as usize;
         let data = self.bytes.iter().skip(skip).copied().collect();
-        (self.base_offset + self.bytes.len() as u64, data)
+        Ok((self.base_offset + self.bytes.len() as u64, data))
+    }
+
+    pub fn end_offset(&self) -> Result<u64> {
+        if let Some(error) = &self.spool_error {
+            anyhow::bail!("recording PTY output failed: {error}");
+        }
+        Ok(self
+            .spool
+            .as_ref()
+            .map_or(self.base_offset + self.bytes.len() as u64, |spool| {
+                spool.length
+            }))
     }
 }
 
@@ -333,7 +415,27 @@ impl EmbeddedTerminal {
         Self::spawn_command(root, command)
     }
 
-    pub(crate) fn spawn_command(root: &Path, mut command: CommandBuilder) -> Result<Self> {
+    pub(crate) fn spawn_command(root: &Path, command: CommandBuilder) -> Result<Self> {
+        Self::spawn_command_inner(root, command, None)
+    }
+
+    pub(crate) fn spawn_command_with_raw_log(
+        root: &Path,
+        command: CommandBuilder,
+        raw_log_path: PathBuf,
+    ) -> Result<Self> {
+        Self::spawn_command_inner(root, command, Some(raw_log_path))
+    }
+
+    fn spawn_command_inner(
+        root: &Path,
+        mut command: CommandBuilder,
+        raw_log_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let raw_tap = match raw_log_path {
+            Some(path) => RawTap::spooled(path)?,
+            None => RawTap::default(),
+        };
         let size = PtySize {
             rows: INITIAL_ROWS,
             cols: INITIAL_COLS,
@@ -380,7 +482,7 @@ impl EmbeddedTerminal {
         let event_listener = PtyEventListener {
             writer: Arc::clone(&writer),
         };
-        let raw_tap = Arc::new(Mutex::new(RawTap::default()));
+        let raw_tap = Arc::new(Mutex::new(raw_tap));
         let terminal = Arc::new(Mutex::new(Term::new(
             config,
             &terminal_size,

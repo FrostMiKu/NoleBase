@@ -380,9 +380,11 @@ mod tests {
         assert!(
             matches!(&block.source, ImageSource::Url { url: resolved } if resolved == &final_url)
         );
-        assert!(!output.text.contains("base64"));
+        let summary = output.clone().into_inline_text().unwrap();
+        assert!(!summary.contains("base64"));
         assert!(output
-            .text
+            .into_inline_text()
+            .unwrap()
             .starts_with(&format!("Read image {url} (4x2, image/png, ")));
 
         // A real image served with a non-image content type is still detected

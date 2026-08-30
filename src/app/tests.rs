@@ -423,7 +423,7 @@ fn failed_session_delete_keeps_the_in_memory_session() {
     let (mut app, _directory) = make_app();
     app.agent_conversation = AgentConversation::seeded_for_test();
     install_agent_terminal_snapshot(&mut app);
-    fs::create_dir(&app.storage.agent_session_path).unwrap();
+    fs::write(app.storage.agent_session_path.parent().unwrap(), "blocked").unwrap();
 
     app.clear_agent_session();
 

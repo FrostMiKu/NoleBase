@@ -126,15 +126,20 @@ impl AgentTerminalHandle {
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
         ensure_open_slot(&mut state)?;
+        state.next_id = state.next_id.saturating_add(1);
+        let id = format!("terminal-{}", state.next_id);
         let helper = shell_helper_command(nole_root)?;
-        let mut terminal = EmbeddedTerminal::spawn_command(root, helper)?;
+        let output_path = nole_root
+            .join("agent-session")
+            .join("pty")
+            .join(&id);
+        let mut terminal =
+            EmbeddedTerminal::spawn_command_with_raw_log(root, helper, output_path)?;
         terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
         let mut bytes = command.as_bytes().to_vec();
         bytes.push(b'\r');
         terminal.write_raw(&bytes)?;
 
-        state.next_id = state.next_id.saturating_add(1);
-        let id = format!("terminal-{}", state.next_id);
         state.session = Some(AgentTerminalSession {
             id: id.clone(),
             title: compact_title(command),
@@ -201,10 +206,39 @@ impl AgentTerminalHandle {
                 .context("no active Agent terminal session")?;
             ensure_session(session, session_id)?;
             let status_changed = refresh_status(session)?;
-            (status_changed, observation_value(session))
+            (status_changed, observation_value(session)?)
         };
         state.monitor_changed |= status_changed;
         Ok(observation)
+    }
+
+    pub(crate) fn output_since(&self, session_id: &str, from: u64) -> Result<Value> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
+        let (status_changed, value) = {
+            let session = state
+                .session
+                .as_mut()
+                .context("no active Agent terminal session")?;
+            ensure_session(session, session_id)?;
+            let status_changed = refresh_status(session)?;
+            let tap = session.terminal.raw_tap();
+            let tap = tap
+                .lock()
+                .map_err(|_| anyhow::anyhow!("terminal output state poisoned"))?;
+            let (cursor, bytes) = tap.read_since(from)?;
+            let value = json!({
+                "session_id": session.id,
+                "status": session.status.label(),
+                "cursor": cursor.to_string(),
+                "output": String::from_utf8_lossy(&bytes),
+            });
+            (status_changed, value)
+        };
+        state.monitor_changed |= status_changed;
+        Ok(value)
     }
 
     /// One watcher sample: new raw-stream bytes since `from`, the exit state,
@@ -222,7 +256,7 @@ impl AgentTerminalHandle {
         };
         let data = session.terminal.raw_tap();
         let tap = data.lock().ok()?;
-        let (offset, bytes) = tap.read_since(from);
+        let (offset, bytes) = tap.read_since(from).ok()?;
         drop(tap);
         let screen = session.terminal.snapshot().plain_text();
         Some(TerminalWatchSample {
@@ -352,13 +386,15 @@ impl AgentTerminalHandle {
             .lock()
             .map_err(|_| anyhow::anyhow!("terminal state poisoned"))?;
         ensure_open_slot(&mut state)?;
+        state.next_id = state.next_id.saturating_add(1);
+        let id = format!("terminal-{}", state.next_id);
         let mut command = portable_pty::CommandBuilder::new("/bin/sh");
         command.arg("-c");
         command.arg(script);
-        let mut terminal = EmbeddedTerminal::spawn_command(root, command)?;
+        let output_path = root.join("agent-session").join("pty").join(&id);
+        let mut terminal =
+            EmbeddedTerminal::spawn_command_with_raw_log(root, command, output_path)?;
         terminal.resize(TERMINAL_ROWS, INITIAL_COLS)?;
-        state.next_id = state.next_id.saturating_add(1);
-        let id = format!("terminal-{}", state.next_id);
         state.session = Some(AgentTerminalSession {
             id: id.clone(),
             title: compact_title(script),
@@ -399,12 +435,18 @@ fn refresh_status(session: &mut AgentTerminalSession) -> Result<bool> {
     Ok(false)
 }
 
-fn observation_value(session: &AgentTerminalSession) -> Value {
-    json!({
+fn observation_value(session: &AgentTerminalSession) -> Result<Value> {
+    let tap = session.terminal.raw_tap();
+    let cursor = tap
+        .lock()
+        .map_err(|_| anyhow::anyhow!("terminal output state poisoned"))?
+        .end_offset()?;
+    Ok(json!({
         "session_id": session.id,
         "status": session.status.label(),
         "screen": session.terminal.snapshot().plain_text(),
-    })
+        "cursor": cursor.to_string(),
+    }))
 }
 
 fn compact_title(command: &str) -> String {

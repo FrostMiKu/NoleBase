@@ -44,7 +44,8 @@ export_directory = "~"
 # Executable used by the floating terminal. Defaults to the system login shell.
 # shell = "fish"
 "#;
-const AGENT_SESSION_FILE: &str = "agent-session.json";
+const AGENT_SESSION_DIR: &str = "agent-session";
+const AGENT_SESSION_FILE: &str = "session.json";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
 const TEMPLATE_FILE: &str = "template.mb";
@@ -218,7 +219,7 @@ impl Storage {
             workspace_dir: root.join(WORKSPACE_DIR),
             ai_config_path: root.join(CONFIG_DIR).join(AI_CONFIG_FILE),
             settings_path: root.join(CONFIG_DIR).join(SETTINGS_FILE),
-            agent_session_path: root.join(CONFIG_DIR).join(AGENT_SESSION_FILE),
+            agent_session_path: root.join(AGENT_SESSION_DIR).join(AGENT_SESSION_FILE),
             themes_dir: root.join(THEMES_DIR),
             agents_path: root.join(CONFIG_DIR).join(AGENTS_FILE),
             memory_path: root.join(MEMORY_FILE),
@@ -733,9 +734,13 @@ impl Storage {
             self.clear_agent_session()?;
             return Ok(());
         }
-        fs::create_dir_all(&self.config_dir)
-            .with_context(|| format!("creating {}", self.config_dir.display()))?;
-        let temporary_path = self.config_dir.join(format!(
+        let session_dir = self
+            .agent_session_path
+            .parent()
+            .context("Agent session path has no parent")?;
+        fs::create_dir_all(session_dir)
+            .with_context(|| format!("creating {}", session_dir.display()))?;
+        let temporary_path = session_dir.join(format!(
             ".{AGENT_SESSION_FILE}.{}-{:016x}.tmp",
             std::process::id(),
             fastrand::u64(..)
@@ -773,15 +778,18 @@ impl Storage {
         result
     }
 
-    /// Remove the persisted Agent session file. The Agent workspace is
-    /// deliberately left untouched: it persists across sessions and the Agent
-    /// maintains its contents itself.
+    /// Remove all state owned by the current Agent session. The Agent workspace
+    /// is deliberately left untouched: it persists across sessions and the
+    /// Agent maintains its contents itself.
     pub fn clear_agent_session(&self) -> Result<bool> {
-        match fs::remove_file(&self.agent_session_path) {
+        let directory = self
+            .agent_session_path
+            .parent()
+            .context("Agent session path has no parent")?;
+        match fs::remove_dir_all(directory) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error)
-                .with_context(|| format!("removing {}", self.agent_session_path.display())),
+            Err(error) => Err(error).with_context(|| format!("removing {}", directory.display())),
         }
     }
 
@@ -2335,10 +2343,8 @@ mod tests {
         assert_eq!(fs::read_to_string(&st.template_path).unwrap(), "");
         assert_eq!(st.ai_config_path.parent(), Some(st.config_dir.as_path()));
         assert_eq!(st.settings_path.parent(), Some(st.config_dir.as_path()));
-        assert_eq!(
-            st.agent_session_path.parent(),
-            Some(st.config_dir.as_path())
-        );
+        let agent_session_dir = st.root.join("agent-session");
+        assert_eq!(st.agent_session_path.parent(), Some(agent_session_dir.as_path()));
         assert_eq!(st.themes_dir.parent(), Some(st.root.as_path()));
         assert_eq!(st.template_path.parent(), Some(st.root.as_path()));
         let config = fs::read_to_string(&st.ai_config_path).unwrap();
@@ -2440,6 +2446,7 @@ mod tests {
             "timed_output_tokens": 0,
             "response_duration": {"secs": 1, "nanos": 0}
         });
+        fs::create_dir_all(storage.agent_session_path.parent().unwrap()).unwrap();
         fs::write(&storage.agent_session_path, legacy.to_string()).unwrap();
         let conversation = storage
             .load_agent_session()
@@ -2472,6 +2479,9 @@ mod tests {
             std::time::Duration::ZERO,
         );
         storage.write_agent_session(&session).unwrap();
+        let results = storage.root.join("agent-session/results");
+        fs::create_dir_all(&results).unwrap();
+        fs::write(results.join("1"), "oversized output").unwrap();
         fs::create_dir_all(workspace.join("sub")).unwrap();
         fs::write(workspace.join("sub/draft.md"), "wip").unwrap();
 
@@ -2480,12 +2490,16 @@ mod tests {
         assert!(storage.clear_agent_session().unwrap());
         assert!(!storage.agent_session_path.exists());
         assert!(
+            !results.exists(),
+            "session results are cleared with the session"
+        );
+        assert!(
             workspace.join("sub/draft.md").exists(),
             "workspace content survives a session clear"
         );
 
         // A blocked session path still reports an error and touches nothing.
-        fs::create_dir(&storage.agent_session_path).unwrap();
+        fs::write(storage.agent_session_path.parent().unwrap(), "blocked").unwrap();
         assert!(storage.clear_agent_session().is_err());
         assert!(workspace.join("sub/draft.md").exists());
     }

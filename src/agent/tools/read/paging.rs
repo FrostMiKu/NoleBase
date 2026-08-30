@@ -1,7 +1,7 @@
 //! Line selectors and bounded text pagination shared by every read parser.
 //!
 //! This module owns the one-based inclusive line-range grammar, the bounded
-//! 1 MiB response budget, and the structured `range`/`returned`/`total`/
+//! character response budget, and the structured `range`/`returned`/`total`/
 //! `has_more`/`items` page shape used by document, attachment, and web parsers.
 
 use std::fs::File;
@@ -17,7 +17,7 @@ use crate::agent::{
 
 use super::{
     DEFAULT_READ_LINES, MAX_EXTRACTED_TEXT_BYTES, MAX_READ_LINES, MAX_READ_LINE_BYTES,
-    MAX_READ_RESPONSE_BYTES, READ_RESPONSE_OVERHEAD,
+    MAX_READ_RESPONSE_CHARACTERS, READ_RESPONSE_OVERHEAD_CHARACTERS,
 };
 use crate::agent::tools::util::parse_inclusive_range;
 
@@ -69,7 +69,7 @@ pub(super) struct TextPage {
     pub(super) full_text: Option<String>,
 }
 
-/// Read one UTF-8 line window with bounded response memory while scanning the
+/// Read one UTF-8 line window with bounded response characters while scanning the
 /// complete file to retain a strong edit identity, exact line count, and the
 /// bounded normalized text kept for drift recovery.
 pub(super) fn read_utf8_page(
@@ -87,7 +87,8 @@ pub(super) fn read_utf8_page(
     let mut line = Vec::new();
     let mut lines_seen = 0usize;
     let mut response_bytes = 0usize;
-    let response_budget = MAX_READ_RESPONSE_BYTES.saturating_sub(READ_RESPONSE_OVERHEAD);
+    let response_budget =
+        MAX_READ_RESPONSE_CHARACTERS.saturating_sub(READ_RESPONSE_OVERHEAD_CHARACTERS);
     let mut response_full = false;
     loop {
         line.clear();
@@ -127,7 +128,7 @@ pub(super) fn read_utf8_page(
                 response_bytes = response_bytes.saturating_add(cost);
             } else if selected.is_empty() {
                 bail!(
-                    "line {} cannot fit within the 1 MB read response limit",
+                    "line {} cannot fit within the {MAX_READ_RESPONSE_CHARACTERS}-character read response limit",
                     lines_seen + 1
                 );
             } else {
@@ -151,7 +152,7 @@ pub(super) fn read_utf8_page(
 }
 
 pub(super) fn plain_response_len(text: &str) -> usize {
-    text.len()
+    text.chars().count()
 }
 
 pub(super) fn json_response_len(text: &str) -> usize {
@@ -159,7 +160,7 @@ pub(super) fn json_response_len(text: &str) -> usize {
         .map(|character| match character {
             '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
             character if character <= '\u{001f}' => 6,
-            character => character.len_utf8(),
+            _ => 1,
         })
         .sum()
 }
@@ -178,7 +179,8 @@ pub(super) fn page_extracted_text(
     let mut selected = Vec::with_capacity(limit.min(DEFAULT_READ_LINES));
     let mut lines_seen = 0usize;
     let mut response_bytes = 0usize;
-    let response_budget = MAX_READ_RESPONSE_BYTES.saturating_sub(READ_RESPONSE_OVERHEAD);
+    let response_budget =
+        MAX_READ_RESPONSE_CHARACTERS.saturating_sub(READ_RESPONSE_OVERHEAD_CHARACTERS);
     let mut has_more = false;
     for raw in content.split_inclusive('\n') {
         let without_lf = raw.strip_suffix('\n').unwrap_or(raw);
@@ -197,7 +199,7 @@ pub(super) fn page_extracted_text(
                 response_bytes = response_bytes.saturating_add(cost);
             } else if selected.is_empty() {
                 bail!(
-                    "line {} cannot fit within the 1 MB read response limit",
+                    "line {} cannot fit within the {MAX_READ_RESPONSE_CHARACTERS}-character read response limit",
                     lines_seen + 1
                 );
             } else {
@@ -260,10 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn response_byte_cap_returns_a_continuable_partial_page() {
+    fn response_character_cap_returns_a_continuable_partial_page() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wide.txt");
-        let line = "x".repeat(250 * 1024);
+        let line = "界".repeat(2_500);
         fs::write(&path, vec![line; 5].join("\n")).unwrap();
         let page = read_utf8_page(&path, 0, 5, plain_response_len)
             .unwrap()

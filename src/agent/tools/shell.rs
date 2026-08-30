@@ -12,7 +12,7 @@ use crate::agent::{
     run_noninteractive_shell, run_noninteractive_shell_untimed, terminal_input_bytes,
     terminal_input_display, validate_shell_command,
     AgentJobsHandle, AgentTerminalHandle, ApprovalGate, ApprovalKind, ApprovalRequest,
-    CommandApproval, JobKind, StartedJob, Tool,
+    CommandApproval, JobKind, StartedJob, Tool, ToolOutput,
 };
 
 use super::util::{backgrounded_job_result, required_string};
@@ -254,6 +254,11 @@ impl Tool for Shell {
         .context("joining shell command")??;
         Ok(serde_json::to_string_pretty(&result)?)
     }
+
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        let text = self.execute(input).await?;
+        ToolOutput::structured_json(&text, &["stdout", "stderr"])
+    }
 }
 
 impl Shell {
@@ -316,7 +321,7 @@ impl Tool for TerminalOpen {
     }
 
     fn description(&self) -> &'static str {
-        "Start one persistent PTY command in the user's interactive Brush shell. A hard safety policy checks the initial command in every permission mode. Use terminal_input and terminal_read to interact with it. Only one Agent PTY process may run at a time; opening a new one replaces any exited session."
+        "Start one persistent interactive terminal command. Returns its current screen and output cursor. Use terminal_read with mode=screen for interactive state or mode=output without a cursor for all output since startup. Only one Agent terminal may run at a time."
     }
 
     fn input_schema(&self) -> Value {
@@ -367,6 +372,11 @@ impl Tool for TerminalOpen {
         .context("joining terminal observation")??;
         Ok(serde_json::to_string_pretty(&observation)?)
     }
+
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        let text = self.execute(input).await?;
+        ToolOutput::structured_json(&text, &["screen"])
+    }
 }
 
 pub struct TerminalInput {
@@ -396,7 +406,7 @@ impl Tool for TerminalInput {
     }
 
     fn description(&self) -> &'static str {
-        "Send one approved text entry or key to the active Agent PTY session, then return its updated screen."
+        "Send text or one key to the active interactive terminal, then return its updated screen and output cursor. To read everything produced by this interaction, keep the cursor from before sending input and pass it unchanged to terminal_read mode=output."
     }
 
     fn input_schema(&self) -> Value {
@@ -461,6 +471,11 @@ impl Tool for TerminalInput {
         .context("joining terminal observation")??;
         Ok(serde_json::to_string_pretty(&observation)?)
     }
+
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        let text = self.execute(input).await?;
+        ToolOutput::structured_json(&text, &["screen"])
+    }
 }
 
 /// How long a foreground terminal watch waits before converting into a
@@ -507,7 +522,7 @@ impl Tool for TerminalRead {
     }
 
     fn description(&self) -> &'static str {
-        "Read the Agent PTY screen or its retained final screen after exit. Optionally wait_for a regex in the raw output stream (ANSI escapes included) or for process exit; waits longer than ~10 seconds convert into a background job that reports the match automatically, or pass background: true to watch without waiting. This tool does not send input."
+        "Read an interactive terminal without sending input. mode=screen returns its current visible state. mode=output returns all output after cursor, including text that scrolled away, plus the next cursor to pass back unchanged. Omit cursor to read from startup. wait_for may watch for matching output or exit and can continue as a background job."
     }
 
     fn input_schema(&self) -> Value {
@@ -515,6 +530,17 @@ impl Tool for TerminalRead {
             "type": "object",
             "properties": {
                 "session_id": { "type": "string", "minLength": 1 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["screen", "output"],
+                    "default": "screen",
+                    "description": "screen returns current interactive state; output returns all output after cursor."
+                },
+                "cursor": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$",
+                    "description": "Cursor returned by a prior terminal response. Pass it back unchanged in output mode; omit it to read from startup."
+                },
                 "wait_ms": {
                     "type": "integer",
                     "minimum": 0,
@@ -554,10 +580,23 @@ impl Tool for TerminalRead {
 
     async fn execute(&self, input: &Value) -> Result<String> {
         let session_id = required_string(input, "session_id")?.to_string();
+        let mode = input.get("mode").and_then(Value::as_str).unwrap_or("screen");
         let wait_for = input.get("wait_for");
         let Some(wait_for) = wait_for else {
-            return self.read_screen(&session_id, input).await;
+            return match mode {
+                "screen" => {
+                    if input.get("cursor").is_some() {
+                        bail!("cursor applies only to terminal_read mode output");
+                    }
+                    self.read_screen(&session_id, input).await
+                }
+                "output" => self.read_output(&session_id, input).await,
+                _ => bail!("unsupported terminal_read mode {mode}"),
+            };
         };
+        if mode != "screen" || input.get("cursor").is_some() {
+            bail!("wait_for cannot be combined with output mode or cursor");
+        }
         let pattern = wait_for
             .get("pattern")
             .and_then(Value::as_str)
@@ -645,6 +684,11 @@ impl Tool for TerminalRead {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        let text = self.execute(input).await?;
+        ToolOutput::structured_json(&text, &["screen", "output"])
+    }
 }
 
 impl TerminalRead {
@@ -662,6 +706,38 @@ impl TerminalRead {
         })
         .await
         .context("joining terminal read")??;
+        Ok(serde_json::to_string_pretty(&observation)?)
+    }
+
+    async fn read_output(&self, session_id: &str, input: &Value) -> Result<String> {
+        let cursor = input
+            .get("cursor")
+            .and_then(Value::as_str)
+            .unwrap_or("0")
+            .parse::<u64>()
+            .context("terminal cursor is too large")?;
+        let wait_ms = input.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+        let terminal = self.terminal.clone();
+        let cancelled = Arc::clone(&self.cancelled);
+        let session_id = session_id.to_string();
+        let observation = tokio::task::spawn_blocking(move || {
+            let initial = terminal.output_since(&session_id, cursor)?;
+            let has_output = initial["output"]
+                .as_str()
+                .is_some_and(|output| !output.is_empty());
+            let running = initial["status"] == "running";
+            if wait_ms == 0 || has_output || !running {
+                return Ok(initial);
+            }
+            terminal.wait_for_change(
+                &session_id,
+                Duration::from_millis(wait_ms),
+                &cancelled,
+            )?;
+            terminal.output_since(&session_id, cursor)
+        })
+        .await
+        .context("joining terminal output read")??;
         Ok(serde_json::to_string_pretty(&observation)?)
     }
 }
@@ -1144,6 +1220,65 @@ mod terminal_watch_tests {
     fn sample_payload(pattern: &str, stream: &[u8]) -> Option<Value> {
         let regex = regex::Regex::new(pattern).unwrap();
         watch_payload(&Some(regex), stream, false, None, "screen")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_output_mode_reads_the_complete_spooled_stream_incrementally() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _receiver) = event_channel();
+        let terminal = AgentTerminalHandle::default();
+        let session = terminal
+            .open_process_for_test(
+                directory.path(),
+                "i=0; while [ $i -lt 40000 ]; do printf 'line-%05d\\n' \"$i\"; i=$((i+1)); done",
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let observation = terminal.observation(&session).unwrap();
+            if observation["status"] != "running" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "PTY did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let read = TerminalRead::new(
+            terminal,
+            Arc::new(AtomicBool::new(false)),
+            AgentJobsHandle::new(events),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let first: Value = serde_json::from_str(
+            &read
+                .execute(&json!({
+                    "session_id": session,
+                    "mode": "output",
+                    "cursor": "0"
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let output = first["output"].as_str().unwrap();
+        assert!(output.len() > 256 * 1024);
+        assert!(output.contains("line-00000"));
+        assert!(output.contains("line-39999"));
+        let cursor = first["cursor"].as_str().unwrap();
+
+        let second: Value = serde_json::from_str(
+            &read
+                .execute(&json!({
+                    "session_id": session,
+                    "mode": "output",
+                    "cursor": cursor
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["output"], "");
+        assert_eq!(second["cursor"], cursor);
     }
 
     #[test]

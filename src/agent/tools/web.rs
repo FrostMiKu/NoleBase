@@ -18,7 +18,9 @@ use super::workspace_quota::{
     check_workspace_write, workspace_destination, workspace_dir, workspace_used_bytes,
     MAX_WORKSPACE_FILE_BYTES, MAX_WORKSPACE_TOTAL_BYTES,
 };
-use crate::agent::{canonical_root, AgentJobsHandle, JobKind, Tool, ToolExecutionPolicy};
+use crate::agent::{
+    canonical_root, AgentJobsHandle, JobKind, Tool, ToolExecutionPolicy, ToolOutput,
+};
 
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const MAX_WEB_SEARCH_RESULTS: usize = 10;
@@ -448,6 +450,11 @@ impl Tool for Http {
         }
         let response = request.send().await.context("sending HTTP request")?;
         self.render_response(response).await
+    }
+
+    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+        let text = self.execute(input).await?;
+        ToolOutput::structured_json(&text, &["body"])
     }
 }
 

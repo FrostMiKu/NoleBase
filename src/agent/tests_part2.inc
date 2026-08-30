@@ -1944,7 +1944,8 @@
             runtime
                 .block_on(registered.execute(&json!({"message": "valid"})))
                 .unwrap()
-                .text,
+                .into_inline_text()
+                .unwrap(),
             "notification shown"
         );
         assert!(matches!(

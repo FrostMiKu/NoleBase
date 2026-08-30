@@ -319,7 +319,7 @@ impl SubagentRunner {
             },
         };
         match result {
-            Ok(output) => {
+            Ok(mut output) => {
                 if !output.images.is_empty() && !self.runtime.supports_images {
                     ToolCallOutput::text(ToolResult {
                         tool_use_id: call.id.clone(),
@@ -327,14 +327,22 @@ impl SubagentRunner {
                         is_error: true,
                     })
                 } else {
-                    ToolCallOutput::with_images(
-                        ToolResult {
+                    let images = std::mem::take(&mut output.images);
+                    match output.into_inline_text() {
+                        Ok(content) => ToolCallOutput::with_images(
+                            ToolResult {
+                                tool_use_id: call.id.clone(),
+                                content,
+                                is_error: false,
+                            },
+                            images,
+                        ),
+                        Err(error) => ToolCallOutput::text(ToolResult {
                             tool_use_id: call.id.clone(),
-                            content: output.text,
-                            is_error: false,
-                        },
-                        output.images,
-                    )
+                            content: super::tool_error_message(&error),
+                            is_error: true,
+                        }),
+                    }
                 }
             }
             Err(error) => ToolCallOutput::text(ToolResult {
@@ -883,7 +891,7 @@ mod tests {
                 let _ = sender.send(()).await;
             }
             Ok(crate::agent::ToolOutput {
-                text: format!("read {}", self.label),
+                content: crate::agent::ToolOutputContent::Text(format!("read {}", self.label)),
                 images: vec![crate::provider::ImageBlock {
                     source: crate::provider::ImageSource::Url {
                         url: format!("https://example.test/{}.png", self.label),

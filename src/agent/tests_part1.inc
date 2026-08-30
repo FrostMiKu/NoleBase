@@ -172,45 +172,80 @@
     }
 
     #[test]
-    fn tool_results_are_capped_before_entering_the_conversation() {
+    fn oversized_tool_results_are_stored_before_entering_the_conversation() {
         let agent = small_budget_agent();
-        let calls = [
-            ToolCall {
-                id: "one".to_string(),
-                name: "http".to_string(),
-                input: json!({"url": "https://example.com/blob"}),
-            },
-            ToolCall {
-                id: "two".to_string(),
-                name: "shell".to_string(),
-                input: json!({"command": "ls"}),
-            },
-        ];
-        let outputs = vec![
-            (
-                0,
-                ToolCallOutput::text(ToolResult {
-                    tool_use_id: "one".to_string(),
-                    content: "x".repeat(40_000),
-                    is_error: false,
-                }),
-            ),
-            (
-                1,
-                ToolCallOutput::text(ToolResult {
-                    tool_use_id: "two".to_string(),
-                    content: "small".to_string(),
-                    is_error: false,
-                }),
-            ),
-        ];
-        let messages = agent
-            .finalize_tool_messages(&calls, outputs, Vec::new())
+        let oversized = agent
+            .materialize_tool_output(ToolOutput::text("x".repeat(40_000)))
             .unwrap();
-        let oversized = stored_tool_result(&messages[0]);
-        assert!(oversized.contains("agent truncated this tool result"));
-        assert!(estimate_text_tokens(oversized) <= agent.tool_result_token_cap());
-        assert_eq!(stored_tool_result(&messages[1]), "small");
+        assert!(oversized.contains("Tool result stored at nole://result/1"));
+        assert!(estimate_text_tokens(&oversized) <= agent.tool_result_token_cap());
+        assert_eq!(
+            fs::read_to_string(agent.results.root.join("1")).unwrap(),
+            "x".repeat(40_000)
+        );
+        assert_eq!(
+            agent
+                .materialize_tool_output(ToolOutput::text("small"))
+                .unwrap(),
+            "small"
+        );
+    }
+
+    #[test]
+    fn structured_tool_results_store_only_the_declared_body() {
+        let agent = small_budget_agent();
+        let output = ToolOutput::structured(
+            json!({"status": 200, "url": "https://example.test"}),
+            vec![ToolTextBody {
+                field: "body".to_string(),
+                content: "你".repeat(10_000),
+            }],
+        )
+        .unwrap();
+        let rendered: Value = serde_json::from_str(
+            &agent.materialize_tool_output(output).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rendered["status"], 200);
+        assert_eq!(rendered["body_result"], "nole://result/1");
+        assert_eq!(rendered["body_characters"], 10_000);
+        assert_eq!(rendered["body_lines"], 1);
+        assert!(rendered.get("body").is_none());
+        assert_eq!(
+            fs::read_to_string(agent.results.root.join("1")).unwrap(),
+            "你".repeat(10_000)
+        );
+    }
+
+    #[test]
+    fn inline_tool_result_limit_counts_characters_not_utf8_bytes() {
+        assert!(!should_externalize_text(&"界".repeat(8_192), u64::MAX));
+        assert!(should_externalize_text(&"界".repeat(8_193), u64::MAX));
+        assert!(!should_externalize_text(&"x".repeat(8_192), u64::MAX));
+        assert!(should_externalize_text(&"x".repeat(8_193), u64::MAX));
+    }
+
+    #[test]
+    fn structured_output_budget_includes_metadata_and_all_inline_bodies() {
+        let agent = small_budget_agent();
+        let output = ToolOutput::structured(
+            json!({"status": "ok"}),
+            vec![
+                ToolTextBody {
+                    field: "stdout".to_string(),
+                    content: "a".repeat(3_000),
+                },
+                ToolTextBody {
+                    field: "stderr".to_string(),
+                    content: "b".repeat(3_000),
+                },
+            ],
+        )
+        .unwrap();
+        let rendered = agent.materialize_tool_output(output).unwrap();
+        assert!(rendered.chars().count() <= MAX_INLINE_TOOL_RESULT_CHARACTERS);
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert!(value.get("stdout_result").is_some() || value.get("stderr_result").is_some());
     }
 
     #[test]
@@ -560,11 +595,11 @@
         .unwrap();
 
         let first = read
-            .execute(&json!({"path": "data/large.md", "range": "1-200"}))
+            .execute(&json!({"path": "data/large.md", "range": "1-100"}))
             .unwrap();
         assert!(first.starts_with("[data/large.md#"));
         assert!(first.contains("\n1:line 0\n"));
-        assert!(first.ends_with("[Showing lines 1-200 of 450]"));
+        assert!(first.ends_with("[Showing lines 1-100 of 450]"));
         assert!(edit
             .execute(&json!({
                 "patch": format!(
@@ -2306,7 +2341,7 @@
                 let _ = sender.send(()).await;
             }
             Ok(ToolOutput {
-                text: format!("read {}", self.label),
+                content: ToolOutputContent::Text(format!("read {}", self.label)),
                 images: vec![ImageBlock {
                     source: ImageSource::LocalFile {
                         path: PathBuf::from(format!("{}.png", self.label)),
@@ -2687,7 +2722,7 @@
                 self.buffer.lock().unwrap().push("Squeeze extra".to_string());
             }
             Ok(ToolOutput {
-                text: format!("read {}", self.label),
+                content: ToolOutputContent::Text(format!("read {}", self.label)),
                 images: vec![ImageBlock {
                     source: ImageSource::Url {
                         url: format!("https://example.test/{}.png", self.label),

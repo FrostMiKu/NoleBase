@@ -281,8 +281,11 @@ under `~/.nole`:
 config/         # private application configuration
   ai.toml       # LLM provider and optional Tavily configuration
   settings.toml # theme, default export directory, editor, and terminal shell
-  agent-session.json # current Agent conversation; absent when empty
   AGENTS.md      # user-authored Agent instructions
+agent-session/  # current Agent conversation and its temporary tool results
+  session.json  # conversation; the whole directory is absent when empty
+  results/      # oversized UTF-8 tool results, readable as nole://result/<id>
+    <id>
 themes/         # Agent-editable application and MBDown themes
   default.toml   # generated current default colors
   <name>.toml    # additional custom themes
@@ -502,11 +505,16 @@ retains its single shell session; exiting the shell closes and discards it.
 Set `shell` in `config/settings.toml` to an executable name or path; when it is
 unset or blank, Nole uses the system login shell.
 The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
-Agent conversations and their visible panel history persist in the single
-`config/agent-session.json` file across prompts and application restarts. Each
+Agent conversations and their visible panel history persist in
+`agent-session/session.json` across prompts and application restarts. Each
 completed conversation update atomically replaces that file; the application
-maintains one session. Continue in the compose box with `Ctrl+Enter`; the
-Agent receives the completed conversation history.
+maintains one session. Oversized UTF-8 tool-result bodies are stored under the
+same directory and returned to the Agent as `nole://result/<id>` references;
+status and other compact metadata remain inline, while the `read` tool pages
+the stored body by line range. References report character and line counts,
+not storage byte counts. Clearing the Agent session removes the conversation
+and all of its stored results together. Continue in the compose box with
+`Ctrl+Enter`; the Agent receives the completed conversation history.
 One Agent worker lives for the lifetime of the application. It reuses its HTTP
 connection pool, tool instances, precomputed tool definitions, and unchanged
 file-read snapshots across prompts. Before each task it checks the actual
@@ -719,7 +727,11 @@ directly while the hard safety check still runs. The initial
 Brush input backend checks each complete line assembled through `terminal_input`
 immediately before submission. Text sent through `terminal_input` presses Enter by default;
 `submit=false` types the text while leaving submission to a later key, and named keys include
-`ctrl-a` through `ctrl-z`. An exited PTY keeps its
+`ctrl-a` through `ctrl-z`. Terminal reads default to the current 24-row screen;
+output mode instead returns everything after a previously returned cursor,
+including text that has scrolled away. Cursors are passed back unchanged, and
+long output uses the same pageable `nole://result/<id>` representation as other
+tool-result bodies. An exited PTY keeps its
 final screen until `terminal_close` removes it. Denying an approval blocks that
 action while preserving an existing PTY. Cancelling the Agent interrupts its
 model request, active tool call, or wait while the PTY process and terminal
@@ -763,7 +775,8 @@ inside paired replacement lines in both unified and side-by-side views. Every
 mode retains path, symlink, identity,
 read-before-update, and non-overwrite validation.
 Adding a new card proceeds directly. Note listings return at
-most 2,000 entries per call; file and web responses are capped at 1 MB.
+most 2,000 entries per call; textual file and web responses are capped at
+8,192 characters.
 Filesystem mutation tools reject symlink targets. The API configuration itself
 remains outside the tool surface.
 

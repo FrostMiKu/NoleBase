@@ -44,6 +44,7 @@ pub(crate) mod hashline;
 pub(crate) mod images;
 pub(crate) mod jobs;
 mod prompts;
+mod results;
 mod shell_helper;
 mod shell_policy;
 mod snapshots;
@@ -61,6 +62,7 @@ pub(crate) use self::context::*;
 pub(crate) use self::hashline::*;
 pub(crate) use self::jobs::*;
 pub(crate) use self::prompts::*;
+pub(crate) use self::results::*;
 pub(crate) use self::shell_helper::*;
 pub(crate) use self::shell_policy::*;
 pub(crate) use self::snapshots::*;
@@ -76,6 +78,7 @@ use self::images::{
 
 const MAX_PROVIDER_REQUEST_ATTEMPTS: usize = 3;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_INLINE_TOOL_RESULT_CHARACTERS: usize = 8_192;
 
 pub(crate) async fn wait_while_active(cancelled: &AtomicBool, duration: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + duration;
@@ -327,15 +330,83 @@ async fn recv_while_active<T>(
 /// so the caller can place them protocol-safe in outgoing messages.
 #[derive(Clone, Debug)]
 pub struct ToolOutput {
-    pub text: String,
+    pub content: ToolOutputContent,
     pub images: Vec<crate::provider::ImageBlock>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ToolOutputContent {
+    Text(String),
+    Structured {
+        metadata: serde_json::Map<String, Value>,
+        bodies: Vec<ToolTextBody>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolTextBody {
+    pub field: String,
+    pub content: String,
 }
 
 impl ToolOutput {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            text: text.into(),
+            content: ToolOutputContent::Text(text.into()),
             images: Vec::new(),
+        }
+    }
+
+    pub fn structured(metadata: Value, bodies: Vec<ToolTextBody>) -> Result<Self> {
+        let Value::Object(metadata) = metadata else {
+            bail!("structured tool output metadata must be a JSON object");
+        };
+        Ok(Self {
+            content: ToolOutputContent::Structured { metadata, bodies },
+            images: Vec::new(),
+        })
+    }
+
+    pub fn structured_json(text: &str, body_fields: &[&str]) -> Result<Self> {
+        let Value::Object(mut metadata) = serde_json::from_str::<Value>(text)
+            .context("decoding structured tool output")?
+        else {
+            bail!("structured tool output must be a JSON object");
+        };
+        let mut bodies = Vec::new();
+        for field in body_fields {
+            if let Some(value) = metadata.remove(*field) {
+                let content = value
+                    .as_str()
+                    .with_context(|| format!("structured tool output field {field} is not text"))?
+                    .to_string();
+                bodies.push(ToolTextBody {
+                    field: (*field).to_string(),
+                    content,
+                });
+            }
+        }
+        Self::structured(Value::Object(metadata), bodies)
+    }
+
+    pub(crate) fn into_inline_text(self) -> Result<String> {
+        match self.content {
+            ToolOutputContent::Text(text) => Ok(text),
+            ToolOutputContent::Structured {
+                mut metadata,
+                bodies,
+            } => {
+                for body in bodies {
+                    if metadata
+                        .insert(body.field.clone(), Value::String(body.content))
+                        .is_some()
+                    {
+                        bail!("structured tool output field {} is duplicated", body.field);
+                    }
+                }
+                serde_json::to_string_pretty(&Value::Object(metadata))
+                    .context("encoding structured tool output")
+            }
         }
     }
 }
@@ -410,6 +481,7 @@ pub struct Agent {
     /// Shared task-plan state behind the `todo` tool; the conversation
     /// snapshot re-arms it at every run start.
     todos: TodoHandle,
+    results: SessionResultStore,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -709,6 +781,7 @@ impl Agent {
         let agent_client = client.clone();
         let attachments = AttachmentStore::new(nole_root.join(ATTACHMENTS_DIR));
         let todos = TodoHandle::default();
+        let results = SessionResultStore::new(nole_root)?;
         let mut agent = Self {
             config,
             provider,
@@ -723,6 +796,7 @@ impl Agent {
             attachments,
             client: agent_client,
             todos: todos.clone(),
+            results,
         };
         let gate = ApprovalGate::new(
             permission_mode,
@@ -1510,19 +1584,10 @@ impl Agent {
     ) -> Result<Vec<Message>> {
         outputs.sort_by_key(|(offset, _)| *offset);
         let mut messages = Vec::with_capacity(outputs.len() + 1);
-        // A turn's tool results must stay small enough that compaction can
-        // always cut at the turn's opening user message: cap each result and
-        // the batch's combined cost at shares of the input budget.
-        let mut batch_remaining =
-            self.input_token_budget() * CONTEXT_COMPACTION_TARGET_PERCENT / 100;
+        // Pageable bodies were already materialized before activity reporting,
+        // so this layer only assembles the compact rendered results.
         for (_, output) in &outputs {
-            let cost = estimate_text_tokens(&output.result.content);
-            let cap = self.tool_result_token_cap().min(batch_remaining);
-            let mut result = output.result.clone();
-            if let Some(content) = truncate_tool_result(&result.content, cap) {
-                result.content = content;
-            }
-            batch_remaining = batch_remaining.saturating_sub(cost.min(cap));
+            let result = output.result.clone();
             messages.push(Message::tool(result));
         }
         let mut trailing = Vec::new();
@@ -1676,7 +1741,7 @@ impl Agent {
             Err(error) => Err(error),
         };
         match result {
-            Ok(output) => {
+            Ok(mut output) => {
                 if !output.images.is_empty() && !self.config.supports_images {
                     ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
                         tool_use_id: id.to_string(),
@@ -1684,14 +1749,26 @@ impl Agent {
                         is_error: true,
                     }))
                 } else {
-                    ToolCallExecution::Completed(ToolCallOutput::with_images(
-                        ToolResult {
-                            tool_use_id: id.to_string(),
-                            content: output.text,
-                            is_error: false,
-                        },
-                        output.images,
-                    ))
+                    let images = std::mem::take(&mut output.images);
+                    match self.materialize_tool_output(output) {
+                        Ok(content) => ToolCallExecution::Completed(
+                            ToolCallOutput::with_images(
+                                ToolResult {
+                                    tool_use_id: id.to_string(),
+                                    content,
+                                    is_error: false,
+                                },
+                                images,
+                            ),
+                        ),
+                        Err(error) => ToolCallExecution::Completed(ToolCallOutput::text(
+                            ToolResult {
+                                tool_use_id: id.to_string(),
+                                content: tool_error_message(&error),
+                                is_error: true,
+                            },
+                        )),
+                    }
                 }
             }
             Err(error) => {
@@ -1709,6 +1786,80 @@ impl Agent {
             }
         }
     }
+
+    fn materialize_tool_output(&self, output: ToolOutput) -> Result<String> {
+        match output.content {
+            ToolOutputContent::Text(text) => {
+                if should_externalize_text(&text, self.tool_result_token_cap()) {
+                    let uri = self.results.store(&text)?;
+                    Ok(result_reference_message(&uri, &text))
+                } else {
+                    Ok(text)
+                }
+            }
+            ToolOutputContent::Structured {
+                mut metadata,
+                bodies,
+            } => {
+                for body in bodies {
+                    let result_field = format!("{}_result", body.field);
+                    let characters_field = format!("{}_characters", body.field);
+                    let lines_field = format!("{}_lines", body.field);
+                    if [
+                        body.field.as_str(),
+                        result_field.as_str(),
+                        characters_field.as_str(),
+                        lines_field.as_str(),
+                    ]
+                    .iter()
+                    .any(|field| metadata.contains_key(*field))
+                    {
+                        bail!("structured tool output field {} is duplicated", body.field);
+                    }
+                    let mut inline_candidate = metadata.clone();
+                    inline_candidate.insert(
+                        body.field.clone(),
+                        Value::String(body.content.clone()),
+                    );
+                    let inline_rendered =
+                        serde_json::to_string_pretty(&Value::Object(inline_candidate))
+                            .context("encoding structured tool output")?;
+                    if should_externalize_text(
+                        &inline_rendered,
+                        self.tool_result_token_cap(),
+                    ) {
+                        let uri = self.results.store(&body.content)?;
+                        metadata.insert(result_field, Value::String(uri));
+                        metadata.insert(
+                            characters_field,
+                            Value::from(body.content.chars().count() as u64),
+                        );
+                        metadata.insert(
+                            lines_field,
+                            Value::from(text_line_count(&body.content) as u64),
+                        );
+                    } else {
+                        metadata.insert(body.field, Value::String(body.content));
+                    }
+                }
+                serde_json::to_string_pretty(&Value::Object(metadata))
+                    .context("encoding structured tool output")
+            }
+        }
+    }
+}
+
+fn should_externalize_text(text: &str, token_cap: u64) -> bool {
+    text.chars().count() > MAX_INLINE_TOOL_RESULT_CHARACTERS
+        || estimate_text_tokens(text) > token_cap
+}
+
+fn result_reference_message(uri: &str, text: &str) -> String {
+    format!(
+        "Tool result stored at {uri} ({} characters, {} lines). Use read with this URI and a line range to inspect it.",
+        text.chars().count(),
+        text_line_count(text),
+    )
 }
 
 fn canonical_root(root: &Path) -> Result<PathBuf> {
