@@ -894,6 +894,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_status_and_cursor_position_are_answered_immediately() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg(
+            r#"stty raw -echo; printf '\033[5n\033[6n'; \
+             response=$(dd bs=1 count=10 2>/dev/null | od -An -tx1 | tr -d ' \n'); \
+             stty sane; printf 'RESPONSE:%s\n' "$response""#,
+        );
+        let mut terminal = EmbeddedTerminal::spawn_command(directory.path(), command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let contents = terminal.snapshot().contents();
+            if contents.contains("RESPONSE:1b5b306e1b5b313b3152") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "PTY output was {contents:?}");
+            let _ = terminal.try_wait();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn configured_shell_is_spawned_and_exported() {
         let directory = tempfile::tempdir().unwrap();
         let mut terminal = EmbeddedTerminal::spawn(directory.path(), Some("/bin/sh")).unwrap();

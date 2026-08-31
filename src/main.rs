@@ -524,6 +524,24 @@ where
     matches!(args.next().as_deref(), Some("--version" | "-V"))
 }
 
+fn should_query_image_capabilities(term_program: Option<&str>) -> bool {
+    term_program != Some("nole")
+}
+
+fn image_picker() -> ratatui_image::picker::Picker {
+    // Nole's embedded terminal identifies itself through TERM_PROGRAM and does
+    // not implement any of the pixel-image protocols probed by ratatui-image.
+    // Avoid querying stdin there: a PTY implementation that does not answer the
+    // terminating status report would leave the query thread blocked on stdin.
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    if !should_query_image_capabilities(term_program.as_deref()) {
+        return ratatui_image::picker::Picker::halfblocks();
+    }
+
+    ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+}
+
 fn main() -> Result<()> {
     if let Some(mode) = agent::shell_helper_mode(std::env::args()) {
         let code = agent::run_shell_helper(mode).unwrap_or_else(|error| {
@@ -544,10 +562,7 @@ fn main() -> Result<()> {
 
     enter_tui()?;
     let _guard = TerminalGuard;
-    app.images.set_picker(
-        ratatui_image::picker::Picker::from_query_stdio()
-            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
-    );
+    app.images.set_picker(image_picker());
     let backend = FrameBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -568,6 +583,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn embedded_nole_terminal_skips_image_capability_queries() {
+        assert!(!should_query_image_capabilities(Some("nole")));
+        assert!(should_query_image_capabilities(Some("iTerm.app")));
+        assert!(should_query_image_capabilities(None));
+    }
     use crate::app::{CenterView, Document, DocumentKind, DocumentReturn};
     use notify::event::ModifyKind;
     use ratatui::backend::TestBackend;
