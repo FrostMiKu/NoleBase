@@ -77,33 +77,38 @@ impl Tool for Grep {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let pattern = required_string(input, "pattern")?;
-        if pattern.is_empty() {
-            bail!("pattern must not be empty");
-        }
-        let requested = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        let case_sensitive = optional_bool(input, "case_sensitive", true)?;
-        let fixed_strings = optional_bool(input, "fixed_strings", false)?;
-        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
-        let includes = include_patterns(input)?;
-        let root = self.root.clone();
-        let requested = requested.to_string();
-        let pattern = pattern.to_string();
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let pattern = required_string(input, "pattern")?;
+            if pattern.is_empty() {
+                bail!("pattern must not be empty");
+            }
+            let requested = input.get("path").and_then(Value::as_str).unwrap_or(".");
+            let case_sensitive = optional_bool(input, "case_sensitive", true)?;
+            let fixed_strings = optional_bool(input, "fixed_strings", false)?;
+            let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
+            let includes = include_patterns(input)?;
+            let root = self.root.clone();
+            let requested = requested.to_string();
+            let pattern = pattern.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            execute_search(
-                &root,
-                &requested,
-                &pattern,
-                case_sensitive,
-                fixed_strings,
-                &includes,
-                selector,
-            )
-        })
-        .await
-        .context("joining grep search")?
+            tokio::task::spawn_blocking(move || {
+                execute_search(
+                    &root,
+                    &requested,
+                    &pattern,
+                    case_sensitive,
+                    fixed_strings,
+                    &includes,
+                    selector,
+                )
+            })
+            .await
+            .context("joining grep search")?
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -205,24 +210,23 @@ fn execute_search(
     }
 
     let page = selector.window(state.total);
-    let mut result = json!({
-        "pattern": pattern,
-        "path": display_path(root, &search_path),
-        "case_sensitive": case_sensitive,
-        "fixed_strings": fixed_strings,
-        "range": selector.as_string(),
-        "returned": state.items.len(),
-        "total": state.total,
-        "has_more": page.has_more(),
-        "items": state.items,
-    });
+    let mut result = format!(
+        "Pattern: {pattern}\nPath: {}\nCase sensitive: {case_sensitive}\nFixed strings: {fixed_strings}\nMatches: {} of {}\nRange: {}",
+        display_path(root, &search_path), state.items.len(), state.total, selector.as_string(),
+    );
     if !includes.is_empty() {
-        result["include"] = json!(includes);
+        result.push_str(&format!("\nInclude: {}", includes.join(", ")));
     }
     if let Some(next) = page.next() {
-        result["next"] = json!(next);
+        result.push_str(&format!("\nNext range: {next}"));
     }
-    serde_json::to_string_pretty(&result).context("encoding grep results")
+    if state.items.is_empty() {
+        result.push_str("\n\nNo matches.");
+    } else {
+        result.push_str("\n\n");
+        result.push_str(&state.items.join("\n"));
+    }
+    Ok(result)
 }
 
 fn build_include_set(patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -247,7 +251,7 @@ struct SearchState<'a> {
     include_set: Option<&'a GlobSet>,
     selector: RangeSelector,
     total: usize,
-    items: Vec<Value>,
+    items: Vec<String>,
 }
 
 impl SearchState<'_> {
@@ -284,12 +288,12 @@ impl SearchState<'_> {
                 continue;
             }
             let text = String::from_utf8_lossy(&bytes);
-            self.items.push(json!({
-                "path": display_path(self.root, path),
-                "line": line,
-                "column": found.start() + 1,
-                "snippet": truncate_chars(&text, MAX_SEARCH_SNIPPET_CHARS),
-            }));
+            self.items.push(format!(
+                "{}:{line}:{}: {}",
+                display_path(self.root, path),
+                found.start() + 1,
+                truncate_chars(&text, MAX_SEARCH_SNIPPET_CHARS),
+            ));
         }
         Ok(())
     }
@@ -299,7 +303,6 @@ impl SearchState<'_> {
 mod tests {
     use std::fs;
 
-    use serde_json::Value;
     use tempfile::tempdir;
 
     use super::*;
@@ -312,21 +315,18 @@ mod tests {
         source.extend_from_slice(b"\nNeedle at the end\n");
         fs::write(&path, source).unwrap();
 
-        let result: Value = serde_json::from_str(
-            &execute_search(
-                directory.path(),
-                path.to_str().unwrap(),
-                "Needle",
-                true,
-                false,
-                &[],
-                RangeSelector::parse("1-10", MAX_SEARCH_RESULTS).unwrap(),
-            )
-            .unwrap(),
+        let result = execute_search(
+            directory.path(),
+            path.to_str().unwrap(),
+            "Needle",
+            true,
+            false,
+            &[],
+            RangeSelector::parse("1-10", MAX_SEARCH_RESULTS).unwrap(),
         )
         .unwrap();
-        assert_eq!(result["total"], 1);
-        assert_eq!(result["items"][0]["line"], 2);
+        assert!(result.contains("Matches: 1 of 1"));
+        assert!(result.contains(":2:1: Needle"));
     }
 
     #[test]
@@ -336,25 +336,19 @@ mod tests {
         fs::write(directory.path().join("two.md"), "Alpha 99\n").unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
 
-        let result: Value = serde_json::from_str(
-            &execute_search(
-                &root,
-                ".",
-                r"alpha \d+",
-                false,
-                false,
-                &["*.rs".to_string()],
-                RangeSelector::parse("1-1", MAX_SEARCH_RESULTS).unwrap(),
-            )
-            .unwrap(),
+        let result = execute_search(
+            &root,
+            ".",
+            r"alpha \d+",
+            false,
+            false,
+            &["*.rs".to_string()],
+            RangeSelector::parse("1-1", MAX_SEARCH_RESULTS).unwrap(),
         )
         .unwrap();
-        assert_eq!(result["returned"], 1);
-        assert_eq!(result["total"], 2);
-        assert_eq!(result["has_more"], true);
-        assert_eq!(result["next"], "2-2");
-        assert_eq!(result["items"][0]["path"], "one.rs");
-        assert_eq!(result["items"][0]["column"], 1);
+        assert!(result.contains("Matches: 1 of 2"));
+        assert!(result.contains("Next range: 2-2"));
+        assert!(result.contains("one.rs:1:1:"));
     }
 
     #[cfg(unix)]
@@ -367,19 +361,16 @@ mod tests {
         fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
         symlink(outside.path(), directory.path().join("linked")).unwrap();
 
-        let result: Value = serde_json::from_str(
-            &execute_search(
-                directory.path(),
-                ".",
-                "needle",
-                true,
-                true,
-                &[],
-                RangeSelector::parse("1-10", MAX_SEARCH_RESULTS).unwrap(),
-            )
-            .unwrap(),
+        let result = execute_search(
+            directory.path(),
+            ".",
+            "needle",
+            true,
+            true,
+            &[],
+            RangeSelector::parse("1-10", MAX_SEARCH_RESULTS).unwrap(),
         )
         .unwrap();
-        assert_eq!(result["total"], 0);
+        assert!(result.contains("Matches: 0 of 0"));
     }
 }

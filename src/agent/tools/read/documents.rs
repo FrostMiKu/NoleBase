@@ -71,7 +71,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     use super::super::test_support::{simple_pdf, simple_rtf};
     use super::super::Read;
@@ -95,14 +95,9 @@ mod tests {
             .execute(&json!({"path": "report.pdf", "range": "1-20"}))
             .await
             .unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["kind"], "file");
-        assert_eq!(parsed["format"], "pdf");
-        assert!(parsed["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|line| line.as_str().unwrap().contains("PDF marker")));
+        assert!(output.content.contains("kind: file"));
+        assert!(output.content.contains("format: pdf"));
+        assert!(output.content.contains("PDF marker"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -117,32 +112,23 @@ mod tests {
         )
         .unwrap();
 
-        let first: Value = serde_json::from_str(
-            &read
-                .execute(&json!({"path": "report.rtf", "range": "1-1"}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let second: Value = serde_json::from_str(
-            &read
-                .execute(&json!({"path": "report.rtf", "range": "3-3"}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first["format"], "rtf");
-        assert_eq!(first["items"], json!(["first"]));
-        assert_eq!(second["items"], json!(["second"]));
+        let first = read
+            .execute(&json!({"path": "report.rtf", "range": "1-1"}))
+            .await
+            .unwrap();
+        let second = read
+            .execute(&json!({"path": "report.rtf", "range": "3-3"}))
+            .await
+            .unwrap();
+        assert!(first.content.contains("format: rtf"));
+        assert!(first.content.contains("items[1]: first"));
+        assert!(second.content.contains("items[1]: second"));
 
         fs::write(&path, simple_rtf(&["replacement line", "new tail"])).unwrap();
-        let changed: Value = serde_json::from_str(
-            &read
-                .execute(&json!({"path": "report.rtf", "range": "1-1"}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(changed["items"], json!(["replacement line"]));
+        let changed = read
+            .execute(&json!({"path": "report.rtf", "range": "1-1"}))
+            .await
+            .unwrap();
+        assert!(changed.content.contains("items[1]: replacement line"));
     }
 }

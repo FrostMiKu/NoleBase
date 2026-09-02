@@ -47,16 +47,21 @@ impl Tool for Wait {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let seconds = input
-            .get("seconds")
-            .and_then(Value::as_u64)
-            .context("field seconds must be a positive integer")?;
-        if !(1..=MAX_WAIT_SECONDS).contains(&seconds) {
-            bail!("field seconds must be between 1 and {MAX_WAIT_SECONDS}");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let seconds = input
+                .get("seconds")
+                .and_then(Value::as_u64)
+                .context("field seconds must be a positive integer")?;
+            if !(1..=MAX_WAIT_SECONDS).contains(&seconds) {
+                bail!("field seconds must be between 1 and {MAX_WAIT_SECONDS}");
+            }
+            wait_while_active(&self.cancelled, Duration::from_secs(seconds)).await?;
+            Ok(format!("waited {seconds} seconds"))
         }
-        wait_while_active(&self.cancelled, Duration::from_secs(seconds)).await?;
-        Ok(format!("waited {seconds} seconds"))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 

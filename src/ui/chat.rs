@@ -825,8 +825,10 @@ mod tests {
             .agent_jobs
             .start_background(JobKind::Shell, "npm test")
             .unwrap();
-        app.agent_jobs
-            .settle(&test_run.id, Ok("all passed".to_string()));
+        app.agent_jobs.settle(
+            &test_run.id,
+            Ok(crate::agent::ToolOutput::text("all passed".to_string())),
+        );
 
         // A tall terminal keeps the whole panel, including the trailing job
         // section, inside the statistics viewport.

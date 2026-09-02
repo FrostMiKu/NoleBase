@@ -166,7 +166,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     use super::super::test_support::{large_text, simple_pdf};
     use super::super::{Read, ATTACHMENTS_DIR};
@@ -194,13 +194,8 @@ mod tests {
             .execute(&json!({"path": uri, "range": "1-20"}))
             .await
             .unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["format"], "pdf");
-        assert!(parsed["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|line| line.as_str().unwrap().contains("Attachment PDF marker")));
+        assert!(output.content.contains("format: pdf"));
+        assert!(output.content.contains("Attachment PDF marker"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -228,22 +223,19 @@ mod tests {
             .execute(&json!({ "path": uri, "range": "3-4" }))
             .await
             .unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["kind"], "attachment");
-        assert_eq!(parsed["target"], uri);
-        assert_eq!(parsed["name"], "notes.txt");
-        assert_eq!(parsed["mime_type"], "text/plain");
-        assert_eq!(parsed["size"], content.len() as u64);
-        assert_eq!(parsed["range"], "3-4");
-        assert_eq!(parsed["returned"], 2);
-        assert_eq!(parsed["total"], 5);
-        assert_eq!(parsed["has_more"], true);
-        assert_eq!(parsed["items"], json!(["line 3", "line 4"]));
-        assert!(parsed.get("next").is_none());
+        assert!(output.content.contains("kind: attachment"));
+        assert!(output.content.contains(&format!("target: {uri}")));
+        assert!(output.content.contains("name: notes.txt"));
+        assert!(output.content.contains("mime_type: text/plain"));
+        assert!(output.content.contains("range: 3-4"));
+        assert!(output.content.contains("returned: 2"));
+        assert!(output.content.contains("total: 5"));
+        assert!(output.content.contains("items[1]: line 3"));
+        assert!(output.content.contains("items[2]: line 4"));
         // Structured attachment content uses metadata pagination. Hashline
         // snapshots and edit-gating tags belong to editable text files.
-        assert!(parsed.get("tag").is_none());
-        assert!(!output.contains("[notes.txt#"));
+        assert!(!output.content.contains("tag:"));
+        assert!(!output.content.contains("[notes.txt#"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -268,12 +260,12 @@ mod tests {
             .execute(&json!({"path": uri, "range": "49991-49995"}))
             .await
             .unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["range"], "49991-49995");
-        assert_eq!(parsed["returned"], 5);
-        assert!(parsed.get("next").is_none());
-        assert_eq!(parsed["total"], 50_000);
-        assert_eq!(parsed["items"][0], "line 49990 xxxxxxxxxxxxxxxxxxxx");
+        assert!(output.content.contains("range: 49991-49995"));
+        assert!(output.content.contains("returned: 5"));
+        assert!(output.content.contains("total: 50000"));
+        assert!(output
+            .content
+            .contains("items[1]: line 49990 xxxxxxxxxxxxxxxxxxxx"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -296,11 +288,10 @@ mod tests {
         )
         .unwrap();
 
-        let output = read.execute_output(&json!({ "path": uri })).await.unwrap();
+        let output = read.execute(&json!({ "path": uri })).await.unwrap();
         assert!(output
             .clone()
             .into_inline_text()
-            .unwrap()
             .starts_with(&format!("Read image {uri} (8x4, image/png, ")));
         assert_eq!(output.images.len(), 1);
         let block = &output.images[0];
@@ -328,15 +319,12 @@ mod tests {
         )
         .unwrap();
 
-        let parsed: Value =
-            serde_json::from_str(&read.execute(&json!({ "path": uri })).await.unwrap()).unwrap();
-        assert_eq!(parsed["kind"], "attachment");
-        assert_eq!(parsed["name"], "blob.bin");
-        assert_eq!(parsed["size"], 5);
-        assert_eq!(parsed["mime_type"], Value::Null);
-        assert!(parsed.get("lines").is_none());
-        assert!(parsed.get("width").is_none());
-        assert!(parsed.get("content").is_none());
+        let output = read.execute(&json!({ "path": uri })).await.unwrap();
+        assert!(output.content.contains("kind: attachment"));
+        assert!(output.content.contains("name: blob.bin"));
+        assert!(output.content.contains("size: 5"));
+        assert!(output.content.contains("mime_type: null"));
+        assert!(!output.content.contains("lines:"));
     }
 
     #[tokio::test(flavor = "current_thread")]

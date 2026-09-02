@@ -11,24 +11,21 @@
 //! the suppression and re-enqueues a result that settled while suppressed.
 
 use std::collections::VecDeque;
-use std::fs;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::provider::ImageSource;
 use anyhow::{bail, Result};
-use serde_json::json;
 
 use super::types::{AgentEvent, AgentEventSender};
-
-/// Result text delivered inline with a completion frame.
-pub(crate) const INLINE_RESULT_LIMIT: usize = 16 * 1024;
+use super::{externalize_tool_output_with, render_tool_output, SessionResultStore, ToolOutput};
 /// How long settled job rows stay listed after settlement.
 const SETTLED_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JobKind {
+    Tool,
     Shell,
     Download,
     TerminalWatch,
@@ -37,6 +34,7 @@ pub(crate) enum JobKind {
 impl JobKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Tool => "tool",
             Self::Shell => "shell",
             Self::Download => "download",
             Self::TerminalWatch => "terminal-watch",
@@ -85,9 +83,7 @@ pub(crate) struct JobDelivery {
     pub(crate) label: String,
     pub(crate) status: JobStatus,
     pub(crate) duration: Duration,
-    /// Inline result text (already truncated to [`INLINE_RESULT_LIMIT`] with a
-    /// spill pointer when the full output was larger).
-    pub(crate) result: String,
+    pub(crate) output: ToolOutput,
 }
 
 struct JobEntry {
@@ -97,13 +93,10 @@ struct JobEntry {
     status: JobStatus,
     started: Instant,
     settled: Option<Instant>,
-    /// Rendered result text; present once settled.
-    result: Option<String>,
-    /// Path holding the full output when it exceeded the inline limit.
-    spill: Option<PathBuf>,
+    output: Option<ToolOutput>,
     /// Foreground waiter for the auto-background race. The waiter holds the
     /// receiving half; settling sends once and drops the sender.
-    waiter: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    waiter: Option<tokio::sync::oneshot::Sender<Result<ToolOutput, String>>>,
     /// Delivery suppressed: the foreground race acknowledged this job, or a
     /// `job_wait` is watching it.
     suppressed: bool,
@@ -125,7 +118,7 @@ struct JobState {
     /// Bumped on every state mutation so the UI can cheaply poll for changes.
     revision: u64,
     seen_revision: u64,
-    workspace: Option<PathBuf>,
+    result_store: Option<(SessionResultStore, u64)>,
     max_running: usize,
 }
 
@@ -145,11 +138,6 @@ impl JobState {
                 || entry
                     .settled
                     .is_none_or(|settled| now.duration_since(settled) < SETTLED_RETENTION);
-            if !keep {
-                if let Some(spill) = &entry.spill {
-                    let _ = fs::remove_file(spill);
-                }
-            }
             keep
         });
         if self.entries.len() != before {
@@ -172,7 +160,7 @@ pub(crate) struct AgentJobsHandle {
 pub(crate) struct StartedJob {
     pub(crate) id: String,
     pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) completion: tokio::sync::oneshot::Receiver<Result<String, String>>,
+    _completion: tokio::sync::oneshot::Receiver<Result<ToolOutput, String>>,
 }
 
 impl AgentJobsHandle {
@@ -186,9 +174,9 @@ impl AgentJobsHandle {
         }
     }
 
-    pub(crate) fn with_workspace(self, workspace: PathBuf) -> Self {
+    pub(crate) fn with_result_store(self, results: SessionResultStore, token_cap: u64) -> Self {
         if let Ok(mut state) = self.inner.lock() {
-            state.workspace = Some(workspace);
+            state.result_store = Some((results, token_cap));
         }
         self
     }
@@ -200,17 +188,16 @@ impl AgentJobsHandle {
         }
     }
 
-    pub(crate) fn at_capacity(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|state| state.running_count() >= state.max_running)
-            .unwrap_or(true)
-    }
-
     /// Start a job. `suppress` marks a foreground-raced start: delivery is
     /// acknowledged up front and the job stays hidden until `resume`
     /// backgrounds it; a background-only start passes `false`.
-    fn start(&self, kind: JobKind, label: &str, suppress: bool) -> Result<StartedJob> {
+    fn start(
+        &self,
+        kind: JobKind,
+        label: &str,
+        suppress: bool,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<StartedJob> {
         let (sender, completion) = tokio::sync::oneshot::channel();
         let mut state = self
             .inner
@@ -232,13 +219,12 @@ impl AgentJobsHandle {
             status: JobStatus::Running,
             started: Instant::now(),
             settled: None,
-            result: None,
-            spill: None,
+            output: None,
             waiter: Some(sender),
             suppressed: suppress,
             delivered: false,
             backgrounded: !suppress,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         });
         state.revision += 1;
         let cancel = state
@@ -259,29 +245,46 @@ impl AgentJobsHandle {
         Ok(StartedJob {
             id,
             cancel,
-            completion,
+            _completion: completion,
         })
     }
 
     /// Start a job that runs purely in the background; its result is delivered
     /// as a completion frame when it settles.
     pub(crate) fn start_background(&self, kind: JobKind, label: &str) -> Result<StartedJob> {
-        self.start(kind, label, false)
+        self.start(kind, label, false, None)
     }
 
+    /// Register work that began as a foreground operation only after it
+    /// actually crosses the backgrounding boundary. The adopted job shares
+    /// the running operation's cancellation token, so promotion neither
+    /// restarts nor detaches the underlying process.
     /// Start a job for the foreground auto-background race. The job is
     /// invisible (no rows, no events) while the tool foreground-waits; if the
     /// wait converts to a background job, call [`AgentJobsHandle::resume`] to
     /// list it. If the outcome is consumed inline instead, call
     /// [`AgentJobsHandle::remove`].
+    #[cfg(test)]
     pub(crate) fn start_raced(&self, kind: JobKind, label: &str) -> Result<StartedJob> {
-        self.start(kind, label, true)
+        self.start(kind, label, true, None)
     }
 
     /// Settle a job from its body thread: record the outcome, notify the
     /// foreground waiter if one is still listening, and enqueue the delivery
     /// frame unless suppressed.
-    pub(crate) fn settle(&self, id: &str, outcome: Result<String, String>) {
+    pub(crate) fn settle(&self, id: &str, outcome: Result<ToolOutput, String>) {
+        let result_store = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.result_store.clone());
+        let outcome = match (outcome, result_store) {
+            (Ok(output), Some((results, token_cap))) => {
+                externalize_tool_output_with(&results, token_cap, output)
+                    .map_err(|error| format!("storing background job result: {error:#}"))
+            }
+            (outcome, _) => outcome,
+        };
         let delivery = {
             let Ok(mut state) = self.inner.lock() else {
                 return;
@@ -297,21 +300,18 @@ impl AgentJobsHandle {
                 Err(_) => JobStatus::Failed,
             };
             let duration = state.entries[index].started.elapsed();
-            let text = match outcome {
-                Ok(text) => text,
-                Err(error) => error,
+            let (output, error) = match outcome {
+                Ok(output) => (output, None),
+                Err(error) => (ToolOutput::text(&error), Some(error)),
             };
-            let (inline, spill) = truncate_result(&mut state, id, &text);
-            let rendered = render_result(&inline, spill.as_deref());
             let entry = &mut state.entries[index];
             entry.status = status;
             entry.settled = Some(Instant::now());
-            entry.result = Some(inline.clone());
-            entry.spill = spill;
+            entry.output = Some(output.clone());
             if let Some(waiter) = entry.waiter.take() {
-                let forwarded = match status {
-                    JobStatus::Done => Ok(rendered),
-                    _ => Err(rendered),
+                let forwarded = match error {
+                    None => Ok(output.clone()),
+                    Some(error) => Err(error),
                 };
                 let _ = waiter.send(forwarded);
             }
@@ -329,7 +329,7 @@ impl AgentJobsHandle {
                     label: entry.label.clone(),
                     status,
                     duration,
-                    result: inline,
+                    output: entry.output.clone().unwrap_or_else(|| ToolOutput::text("")),
                 })
             } else {
                 None
@@ -378,7 +378,7 @@ impl AgentJobsHandle {
                         .settled
                         .map(|settled| settled.duration_since(entry.started))
                         .unwrap_or_default(),
-                    result: entry.result.clone().unwrap_or_default(),
+                    output: entry.output.clone().unwrap_or_else(|| ToolOutput::text("")),
                 })
                 .filter(|_| reenqueue)
             } else {
@@ -418,26 +418,22 @@ impl AgentJobsHandle {
     /// before it ever backgrounded: the entry must not linger as a settled
     /// row for the retention window. A late `settle` from the body thread
     /// finds no entry and stays silent.
+    #[cfg(test)]
     pub(crate) fn remove(&self, id: &str) {
         if let Ok(mut state) = self.inner.lock() {
             if let Some(index) = state.entries.iter().position(|entry| entry.id == id) {
-                if let Some(spill) = state.entries.remove(index).spill {
-                    let _ = fs::remove_file(spill);
-                }
+                state.entries.remove(index);
                 state.revision += 1;
             }
         }
     }
 
     /// Take the rendered result of a settled job (used by `job_wait`).
-    pub(crate) fn take_result(&self, id: &str) -> Option<String> {
+    pub(crate) fn take_result(&self, id: &str) -> Option<ToolOutput> {
         let mut state = self.inner.lock().ok()?;
         let index = state.entries.iter().position(|entry| entry.id == id)?;
         state.entries[index].delivered = true;
-        state.entries[index]
-            .result
-            .clone()
-            .map(|truncated| render_result(&truncated, state.entries[index].spill.as_deref()))
+        state.entries[index].output.clone()
     }
 
     /// Cancel one running job; its body observes the flag and settles as
@@ -535,9 +531,6 @@ impl AgentJobsHandle {
                 if entry.status == JobStatus::Running {
                     entry.cancel.store(true, Ordering::Relaxed);
                 }
-                if let Some(spill) = &entry.spill {
-                    let _ = fs::remove_file(spill);
-                }
             }
             state.entries.clear();
             state.deliveries.clear();
@@ -576,49 +569,6 @@ fn row_of(entry: &JobEntry) -> JobRow {
     }
 }
 
-/// Truncate `text` to the inline limit, spilling the full text to
-/// `workspace/jobs/<id>.out` when it exceeds it.
-fn truncate_result(state: &mut JobState, id: &str, text: &str) -> (String, Option<PathBuf>) {
-    if text.len() <= INLINE_RESULT_LIMIT {
-        return (text.to_string(), None);
-    }
-    let spill = state
-        .workspace
-        .as_ref()
-        .and_then(|workspace| write_spill(workspace, id, text));
-    let mut limit = INLINE_RESULT_LIMIT;
-    while !text.is_char_boundary(limit) {
-        limit -= 1;
-    }
-    let inline = format!(
-        "{}\n\n[Output truncated; showing the first {} characters.{}]",
-        &text[..limit],
-        limit,
-        spill
-            .as_ref()
-            .map(|path| format!(" Full output: {}", path.display()))
-            .unwrap_or_default()
-    );
-    (inline, spill)
-}
-
-fn write_spill(workspace: &std::path::Path, id: &str, text: &str) -> Option<PathBuf> {
-    let dir = workspace.join("jobs");
-    fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("{id}.out"));
-    fs::write(&path, text).ok()?;
-    Some(path)
-}
-
-/// Render a stored (possibly truncated) result for a foreground waiter or a
-/// `job_wait` consumer.
-fn render_result(truncated: &str, spill: Option<&std::path::Path>) -> String {
-    match spill {
-        Some(path) => format!("{truncated}\nFull output: {}", path.display()),
-        None => truncated.to_string(),
-    }
-}
-
 /// Format settled-job deliveries as one framed block of user text. The frame
 /// tells the model these are tool-delivered results, not human input.
 pub(crate) fn format_job_deliveries(deliveries: &[JobDelivery]) -> String {
@@ -640,7 +590,27 @@ pub(crate) fn format_job_deliveries(deliveries: &[JobDelivery]) -> String {
                     format_duration(delivery.duration)
                 ),
             };
-            format!("{heading}\n{}", delivery.result)
+            let images = delivery
+                .output
+                .images
+                .iter()
+                .map(|image| match &image.source {
+                    ImageSource::Attachment { uri } => format!("![{}]({uri})", image.label),
+                    ImageSource::LocalFile { path } => {
+                        format!("![{}]({})", image.label, path.display())
+                    }
+                    ImageSource::Url { url } => format!("![{}]({url})", image.label),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if images.is_empty() {
+                format!("{heading}\n{}", render_tool_output(&delivery.output))
+            } else {
+                format!(
+                    "{heading}\n{}\n{images}",
+                    render_tool_output(&delivery.output)
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -655,20 +625,6 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     } else {
         format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
-}
-
-/// Serialize job rows for the `jobs` tool.
-pub(crate) fn rows_value(rows: &[JobRow]) -> serde_json::Value {
-    json!(rows
-        .iter()
-        .map(|row| json!({
-            "id": row.id,
-            "kind": row.kind.as_str(),
-            "label": row.label,
-            "status": row.status.as_str(),
-            "elapsed_seconds": row.elapsed.as_secs(),
-        }))
-        .collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -687,12 +643,15 @@ mod tests {
         let started = jobs.start_background(JobKind::Shell, "echo hi").unwrap();
         assert!(jobs.has_running());
         assert!(!jobs.has_pending_deliveries());
-        jobs.settle(&started.id, Ok("done".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("done".to_string())),
+        );
         assert!(!jobs.has_running());
         let deliveries = jobs.take_deliveries();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].id, started.id);
-        assert_eq!(deliveries[0].result, "done");
+        assert_eq!(deliveries[0].output.content, "done");
         assert_eq!(deliveries[0].status, JobStatus::Done);
         assert!(jobs.take_deliveries().is_empty());
     }
@@ -703,12 +662,18 @@ mod tests {
         let started = jobs.start_raced(JobKind::Shell, "build").unwrap();
         // The foreground race consumed the outcome inline, so the raced job
         // is removed instead of lingering as a settled row.
-        jobs.settle(&started.id, Ok("inline".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("inline".to_string())),
+        );
         jobs.remove(&started.id);
         assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
         // A late settle from the body thread finds no entry and stays silent.
-        jobs.settle(&started.id, Ok("late".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("late".to_string())),
+        );
         assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
     }
@@ -721,7 +686,10 @@ mod tests {
         // The foreground race consumed the outcome inline and never resumes
         // the job, so settling while suppressed must neither deliver a frame
         // nor emit JobSettled.
-        jobs.settle(&started.id, Ok("inline".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("inline".to_string())),
+        );
         assert!(!jobs.has_pending_deliveries());
         while let Ok(event) = receiver.try_recv() {
             assert!(
@@ -763,7 +731,10 @@ mod tests {
     fn resume_after_settle_delivers_once() {
         let jobs = handle();
         let started = jobs.start_raced(JobKind::Shell, "build").unwrap();
-        jobs.settle(&started.id, Ok("result".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("result".to_string())),
+        );
         // Settled while suppressed: no delivery yet.
         assert!(!jobs.has_pending_deliveries());
         jobs.resume(&started.id);
@@ -779,10 +750,10 @@ mod tests {
         jobs.set_max_running(1);
         let first = jobs.start_background(JobKind::Shell, "one").unwrap();
         assert!(jobs.start_background(JobKind::Shell, "two").is_err());
-        assert!(jobs.at_capacity());
+        assert_eq!(jobs.rows().len(), 1);
         jobs.cancel(&first.id);
         jobs.settle(&first.id, Err("cancelled".to_string()));
-        assert!(!jobs.at_capacity());
+        assert!(jobs.start_background(JobKind::Shell, "two").is_ok());
     }
 
     #[test]
@@ -796,29 +767,49 @@ mod tests {
     }
 
     #[test]
-    fn large_results_spill_and_inline_truncate() {
+    fn large_results_use_the_session_result_store_and_preserve_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let (events, _receiver) = event_channel();
-        let jobs = AgentJobsHandle::new(events).with_workspace(directory.path().to_path_buf());
+        let results = crate::agent::SessionResultStore::new(directory.path()).unwrap();
+        let jobs = AgentJobsHandle::new(events).with_result_store(results, 1);
         let started = jobs.start_background(JobKind::Shell, "big").unwrap();
-        let big = "x".repeat(INLINE_RESULT_LIMIT + 100);
-        jobs.settle(&started.id, Ok(big));
+        let big = "x".repeat(100);
+        let output = crate::agent::ToolOutput {
+            exit_code: Some(7),
+            content: big,
+            images: vec![crate::provider::ImageBlock {
+                label: "chart".to_string(),
+                source: crate::provider::ImageSource::Url {
+                    url: "https://example.com/chart.png".to_string(),
+                },
+                media_type: crate::provider::ImageMediaType::Png,
+                width: 8,
+                height: 4,
+                bytes: None,
+            }],
+        };
+        jobs.settle(&started.id, Ok(output));
         let deliveries = jobs.take_deliveries();
-        assert!(deliveries[0].result.contains("Output truncated"));
-        assert!(deliveries[0].result.contains("jobs"));
+        assert!(deliveries[0].output.content.contains("nole://result/1"));
+        assert_eq!(deliveries[0].output.exit_code, Some(7));
+        assert_eq!(deliveries[0].output.images.len(), 1);
     }
 
     #[test]
-    fn truncation_respects_char_boundaries() {
-        let jobs = handle();
+    fn externalized_unicode_content_is_stored_losslessly() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _receiver) = event_channel();
+        let results = crate::agent::SessionResultStore::new(directory.path()).unwrap();
+        let jobs = AgentJobsHandle::new(events).with_result_store(results.clone(), 1);
         let started = jobs.start_background(JobKind::Shell, "utf8").unwrap();
-        let big = "意".repeat(INLINE_RESULT_LIMIT / 3 + 10);
-        assert!(big.len() > INLINE_RESULT_LIMIT);
-        jobs.settle(&started.id, Ok(big));
+        let big = "意".repeat(100);
+        jobs.settle(&started.id, Ok(crate::agent::ToolOutput::text(&big)));
         let deliveries = jobs.take_deliveries();
-        let result = &deliveries[0].result;
-        assert!(result.contains("Output truncated"));
-        assert!(result.is_char_boundary(result.find("[Output truncated").unwrap()));
+        assert!(deliveries[0].output.content.contains("nole://result/1"));
+        assert_eq!(
+            std::fs::read_to_string(results.root.join("1")).unwrap(),
+            big
+        );
     }
 
     #[test]
@@ -826,9 +817,12 @@ mod tests {
         let jobs = handle();
         let started = jobs.start_background(JobKind::Shell, "job").unwrap();
         jobs.suppress(&started.id);
-        jobs.settle(&started.id, Ok("payload".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("payload".to_string())),
+        );
         let result = jobs.take_result(&started.id).unwrap();
-        assert_eq!(result, "payload");
+        assert_eq!(result.content, "payload");
         assert!(!jobs.has_pending_deliveries());
     }
 
@@ -838,7 +832,10 @@ mod tests {
         let started = jobs
             .start_background(JobKind::Shell, "cargo build")
             .unwrap();
-        jobs.settle(&started.id, Ok("ok".to_string()));
+        jobs.settle(
+            &started.id,
+            Ok(crate::agent::ToolOutput::text("ok".to_string())),
+        );
         let deliveries = jobs.take_deliveries();
         let frame = format_job_deliveries(&deliveries);
         assert!(frame.contains("[background job completed] job-1 · cargo build · shell"));

@@ -179,10 +179,9 @@
             .unwrap();
         assert!(oversized.contains("Tool result stored at nole://result/1"));
         assert!(estimate_text_tokens(&oversized) <= agent.tool_result_token_cap());
-        assert_eq!(
-            fs::read_to_string(agent.results.root.join("1")).unwrap(),
-            "x".repeat(40_000)
-        );
+        let stored = fs::read_to_string(agent.results.root.join("1")).unwrap();
+        assert_eq!(stored.replace('\n', ""), "x".repeat(40_000));
+        assert!(stored.lines().all(|line| line.chars().count() <= 4_096));
         assert_eq!(
             agent
                 .materialize_tool_output(ToolOutput::text("small"))
@@ -192,29 +191,15 @@
     }
 
     #[test]
-    fn structured_tool_results_store_only_the_declared_body() {
+    fn oversized_process_output_stores_only_content() {
         let agent = small_budget_agent();
-        let output = ToolOutput::structured(
-            json!({"status": 200, "url": "https://example.test"}),
-            vec![ToolTextBody {
-                field: "body".to_string(),
-                content: "你".repeat(10_000),
-            }],
-        )
-        .unwrap();
-        let rendered: Value = serde_json::from_str(
-            &agent.materialize_tool_output(output).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(rendered["status"], 200);
-        assert_eq!(rendered["body_result"], "nole://result/1");
-        assert_eq!(rendered["body_characters"], 10_000);
-        assert_eq!(rendered["body_lines"], 1);
-        assert!(rendered.get("body").is_none());
-        assert_eq!(
-            fs::read_to_string(agent.results.root.join("1")).unwrap(),
-            "你".repeat(10_000)
-        );
+        let output = ToolOutput::process(23, "你".repeat(10_000));
+        let rendered = agent.materialize_tool_output(output).unwrap();
+        assert!(rendered.contains("Exit code: 23"));
+        assert!(rendered.contains("nole://result/1"));
+        let stored = fs::read_to_string(agent.results.root.join("1")).unwrap();
+        assert_eq!(stored.replace('\n', ""), "你".repeat(10_000));
+        assert!(stored.lines().all(|line| line.chars().count() <= 4_096));
     }
 
     #[test]
@@ -226,26 +211,40 @@
     }
 
     #[test]
-    fn structured_output_budget_includes_metadata_and_all_inline_bodies() {
+    fn every_tool_kind_uses_the_shared_auto_background_boundary() {
+        let mut agent = small_budget_agent();
+        agent.config.auto_background = true;
+        agent.config.auto_background_threshold_seconds = 1;
+        let calls = [ToolCall {
+            id: "slow-wait".to_string(),
+            name: "wait".to_string(),
+            input: json!({"seconds": 2}),
+        }];
+        let started = std::time::Instant::now();
+        let messages = completed_tool_results(
+            test_runtime()
+                .block_on(agent.execute_tool_batch(&calls, &HashMap::new()))
+                .unwrap(),
+        );
+        assert!(started.elapsed() < Duration::from_millis(1_800));
+        let result = match &messages[0].parts[0] {
+            MessagePart::ToolResult(result) => result,
+            _ => panic!("expected tool result"),
+        };
+        assert!(result.content.contains("Background job: job-1"));
+        let rows = agent.jobs.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, JobKind::Tool);
+        assert!(agent.jobs.cancel(&rows[0].id));
+    }
+
+    #[test]
+    fn output_budget_applies_to_the_single_content_field() {
         let agent = small_budget_agent();
-        let output = ToolOutput::structured(
-            json!({"status": "ok"}),
-            vec![
-                ToolTextBody {
-                    field: "stdout".to_string(),
-                    content: "a".repeat(3_000),
-                },
-                ToolTextBody {
-                    field: "stderr".to_string(),
-                    content: "b".repeat(3_000),
-                },
-            ],
-        )
-        .unwrap();
+        let output = ToolOutput::text(format!("{}\n{}", "a".repeat(5_000), "b".repeat(5_000)));
         let rendered = agent.materialize_tool_output(output).unwrap();
         assert!(rendered.chars().count() <= MAX_INLINE_TOOL_RESULT_CHARACTERS);
-        let value: Value = serde_json::from_str(&rendered).unwrap();
-        assert!(value.get("stdout_result").is_some() || value.get("stderr_result").is_some());
+        assert!(rendered.contains("nole://result/1"));
     }
 
     #[test]
@@ -559,7 +558,7 @@
             .execute(&json!({"path": "data/test.md"}))
             .unwrap();
         assert_eq!(
-            result,
+            result.content,
             format!(
                 "[data/test.md#{}]\n1:hello\n2:world\n\n[Showing lines 1-2 of 2]",
                 snapshot_tag("hello\nworld\n")
@@ -569,9 +568,9 @@
         let outside = outside_directory.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
         let result = read.execute(&json!({"path": outside})).unwrap();
-        let header = result.lines().next().unwrap();
+        let header = result.content.lines().next().unwrap();
         assert!(header.starts_with("[/") && header.contains("outside.txt#") && header.ends_with(']'));
-        assert!(result.contains("\n1:outside\n"));
+        assert!(result.content.contains("\n1:outside\n"));
     }
 
     #[test]
@@ -597,9 +596,9 @@
         let first = read
             .execute(&json!({"path": "data/large.md", "range": "1-100"}))
             .unwrap();
-        assert!(first.starts_with("[data/large.md#"));
-        assert!(first.contains("\n1:line 0\n"));
-        assert!(first.ends_with("[Showing lines 1-100 of 450]"));
+        assert!(first.content.starts_with("[data/large.md#"));
+        assert!(first.content.contains("\n1:line 0\n"));
+        assert!(first.content.ends_with("[Showing lines 1-100 of 450]"));
         assert!(edit
             .execute(&json!({
                 "patch": format!(
@@ -612,8 +611,8 @@
         let last = read
             .execute(&json!({"path": "data/large.md", "range": "401-450"}))
             .unwrap();
-        assert_eq!(first.lines().next(), last.lines().next());
-        assert!(last.ends_with("[Showing lines 401-450 of 450]"));
+        assert_eq!(first.content.lines().next(), last.content.lines().next());
+        assert!(last.content.ends_with("[Showing lines 401-450 of 450]"));
         edit.execute(&json!({
             "patch": format!(
                 "[data/large.md#{}]\nPUT >450:\n+done\n",
@@ -652,7 +651,7 @@
                 "range": format!("{line_count}-{line_count}")
             }))
             .unwrap();
-        assert!(page.contains(&format!("{line_count}:large line {line_count}")));
+        assert!(page.content.contains(&format!("{line_count}:large line {line_count}")));
         edit.execute(&json!({
             "patch": format!(
                 "[data/huge.md#{}]\nPUT {line_count}.={line_count}:\n+edited final line\n",
@@ -683,14 +682,11 @@
             build_http_client().unwrap(),
         )
         .unwrap();
-        let listing: Value = serde_json::from_str(
-            &read
+        let listing = read
                 .execute(&json!({"path": "data", "depth": 1}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(listing["items"][0]["size"], 1_100_000);
-        assert_eq!(listing["items"][0]["line_count"], 1);
+                .unwrap();
+        assert!(listing.content.contains("items[1].size: 1100000"));
+        assert!(listing.content.contains("items[1].line_count: 1"));
     }
 
     #[test]
@@ -736,8 +732,7 @@
         .unwrap();
 
         let grep = Grep::new(directory.path()).unwrap();
-        let result: Value = serde_json::from_str(
-            &grep
+        let result = grep
                 .execute(&json!({
                     "pattern": "rust",
                     "case_sensitive": false,
@@ -745,18 +740,12 @@
                     "include": ["*.md"],
                     "range": "1-1"
                 }))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["range"], "1-1");
-        assert_eq!(result["returned"], 1);
-        assert_eq!(result["total"], 3);
-        assert_eq!(result["has_more"], true);
-        assert_eq!(result["next"], "2-2");
-        assert_eq!(result["items"][0]["line"], 1);
+                .unwrap();
+        assert!(result.content.contains("Range: 1-1"));
+        assert!(result.content.contains("Matches: 1 of 3"));
+        assert!(result.content.contains("Next range: 2-2"));
 
-        let remaining: Value = serde_json::from_str(
-            &grep
+        let remaining = grep
                 .execute(&json!({
                     "pattern": "rust",
                     "case_sensitive": false,
@@ -764,39 +753,23 @@
                     "include": ["*.md"],
                     "range": "2-3"
                 }))
-                .unwrap(),
-        )
-        .unwrap();
-        let mut paths = remaining["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["path"].as_str().unwrap())
-            .chain(std::iter::once(result["items"][0]["path"].as_str().unwrap()))
-            .collect::<Vec<_>>();
-        paths.sort_unstable();
-        assert_eq!(paths.len(), 3);
-        assert!(paths.iter().any(|path| path.starts_with("daily/")));
-        assert!(paths.contains(&"data/RustProject.md"));
-        assert!(paths.contains(&"archives/RustHistory.md"));
+                .unwrap();
+        let combined = format!("{}\n{}", result.content, remaining.content);
+        assert!(combined.contains("daily/"));
+        assert!(combined.contains("data/RustProject.md"));
+        assert!(combined.contains("archives/RustHistory.md"));
 
         let files = SearchNotes::new(directory.path()).unwrap();
-        let result: Value = serde_json::from_str(
-            &files
+        let result = files
                 .execute(&json!({"query": "rsprj", "range": "1-10"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["total"], 1);
-        assert_eq!(result["items"][0]["path"], "data/RustProject.md");
-        let archived: Value = serde_json::from_str(
-            &files
+                .unwrap();
+        assert!(result.content.contains("Matches: 1 of 1"));
+        assert!(result.content.contains("data/RustProject.md"));
+        let archived = files
                 .execute(&json!({"query": "history", "range": "1-10"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(archived["total"], 1);
-        assert_eq!(archived["items"][0]["path"], "archives/RustHistory.md");
+                .unwrap();
+        assert!(archived.content.contains("Matches: 1 of 1"));
+        assert!(archived.content.contains("archives/RustHistory.md"));
     }
 
     #[test]
@@ -813,8 +786,8 @@
         let daily = read
             .execute(&json!({"path": "daily/2026-07-27.md"}))
             .unwrap();
-        assert!(daily.starts_with("[daily/2026-07-27.md#"));
-        assert!(daily.contains("\n1:daily entry\n"));
+        assert!(daily.content.starts_with("[daily/2026-07-27.md#"));
+        assert!(daily.content.contains("\n1:daily entry\n"));
     }
 
     #[test]
@@ -906,53 +879,32 @@
         )
         .unwrap();
 
-        let direct: Value = serde_json::from_str(
-            &list
+        let direct = list
                 .execute(&json!({"path": "data", "depth": 1, "sort_by": "name"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(direct["total"], 2);
-        assert_eq!(direct["items"][0]["path"], "data/Alpha.md");
-        assert_eq!(direct["items"][0]["type"], "file");
-        assert_eq!(direct["items"][0]["depth"], 1);
-        assert_eq!(direct["items"][0]["extension"], "md");
-        assert_eq!(direct["items"][0]["line_count"], 2);
-        assert_eq!(direct["items"][0]["size"], 8);
-        assert!(direct["items"][0].get("created_at").is_some());
-        assert!(direct["items"][0]["modified_at"].is_string());
-        assert_eq!(direct["items"][1]["type"], "directory");
-        assert!(direct["items"][1]["line_count"].is_null());
+                .unwrap();
+        assert!(direct.content.contains("total: 2"));
+        assert!(direct.content.contains("items[1].path: data/Alpha.md"));
+        assert!(direct.content.contains("items[1].line_count: 2"));
+        assert!(direct.content.contains("items[2].type: directory"));
 
-        let nested: Value = serde_json::from_str(
-            &list
+        let nested = list
                 .execute(&json!({
                     "path": "data", "depth": 2, "sort_by": "depth",
                     "order": "desc", "range": "1-1"
                 }))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(nested["total"], 3);
-        assert_eq!(nested["returned"], 1);
-        assert_eq!(nested["has_more"], true);
-        assert!(nested.get("next").is_none());
-        assert_eq!(nested["items"][0]["path"], "data/Nested/Beta.txt");
-        assert_eq!(nested["items"][0]["depth"], 2);
+                .unwrap();
+        assert!(nested.content.contains("total: 3"));
+        assert!(nested.content.contains("returned: 1"));
+        assert!(nested.content.contains("items[1].path: data/Nested/Beta.txt"));
+        assert!(nested.content.contains("items[1].depth: 2"));
 
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("External.md"), "outside\n").unwrap();
-        let external: Value = serde_json::from_str(
-            &list
+        let external = list
                 .execute(&json!({"path": outside.path(), "depth": 1}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(external["total"], 1);
-        assert!(external["items"][0]["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("External.md"));
+                .unwrap();
+        assert!(external.content.contains("total: 1"));
+        assert!(external.content.contains("External.md"));
     }
 
     #[test]
@@ -965,32 +917,21 @@
         fs::write(directory.path().join("data/ignored.txt"), "ignored").unwrap();
         let list = Notes::new(directory.path()).unwrap();
 
-        let result: Value = serde_json::from_str(
-            &list
+        let result = list
                 .execute(&json!({
                     "sort_by": "line_count", "order": "desc", "range": "1-1"
                 }))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["total"], 2);
-        assert_eq!(result["returned"], 1);
-        assert_eq!(result["has_more"], true);
-        assert_eq!(result["next"], "2-2");
-        assert_eq!(result["items"][0]["name"], "Alpha.md");
-        assert_eq!(result["items"][0]["line_count"], 3);
-        assert!(result["items"][0].get("created_at").is_some());
-        assert!(result["items"][0]["modified_at"].is_string());
-        assert_eq!(result["items"][0]["size"], 14);
+                .unwrap();
+        assert!(result.content.contains("Notes: 1 of 2"));
+        assert!(result.content.contains("Next range: 2-2"));
+        assert!(result.content.contains("Name: Alpha.md"));
+        assert!(result.content.contains("Lines: 3"));
+        assert!(result.content.contains("Size: 14 bytes"));
 
-        let by_name: Value = serde_json::from_str(
-            &list
+        let by_name = list
                 .execute(&json!({"sort_by": "name", "order": "asc"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(by_name["items"][0]["name"], "Alpha.md");
-        assert_eq!(by_name["items"][1]["name"], "Beta.mb");
+                .unwrap();
+        assert!(by_name.content.find("Name: Alpha.md") < by_name.content.find("Name: Beta.mb"));
     }
 
     #[test]
@@ -1070,8 +1011,7 @@
                 "destination_directory": "data/collected"
             }))
             .unwrap();
-        let result: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["count"], 2);
+        assert!(result.content.contains("Moved: 2"));
         assert!(!alpha.exists());
         assert!(!beta.exists());
         assert_eq!(
@@ -1492,13 +1432,16 @@
             ToolExecutionPolicy::Subagent
         }
 
-        async fn execute(&self, input: &Value) -> Result<String> {
+        async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.maximum.fetch_max(active, Ordering::SeqCst);
             self.barrier.wait().await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(input["label"].as_str().unwrap().to_string())
-        }
+        }.await;
+        Ok(crate::agent::ToolOutput::text(content?))
+    }
     }
 
     struct ExclusiveProbe {
@@ -1520,11 +1463,14 @@
             json!({"type": "object"})
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
             assert_eq!(self.concurrent_active.load(Ordering::SeqCst), 0);
             self.executed.store(true, Ordering::SeqCst);
             Ok("exclusive".to_string())
-        }
+        }.await;
+        Ok(crate::agent::ToolOutput::text(content?))
+    }
     }
 
     #[test]
@@ -2322,11 +2268,7 @@
             ToolExecutionPolicy::Subagent
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
-            Ok("unused".to_string())
-        }
-
-        async fn execute_output(&self, _input: &Value) -> Result<ToolOutput> {
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
             // Take the receiver out of the mutex and drop the guard before
             // the await, so the future stays Send.
             let receiver = self
@@ -2341,7 +2283,8 @@
                 let _ = sender.send(()).await;
             }
             Ok(ToolOutput {
-                content: ToolOutputContent::Text(format!("read {}", self.label)),
+                exit_code: None,
+                content: format!("read {}", self.label),
                 images: vec![ImageBlock {
                     source: ImageSource::LocalFile {
                         path: PathBuf::from(format!("{}.png", self.label)),
@@ -2376,9 +2319,12 @@
             ToolExecutionPolicy::Subagent
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
             Ok("plain text result".to_string())
-        }
+        }.await;
+        Ok(crate::agent::ToolOutput::text(content?))
+    }
     }
 
     #[test]
@@ -2593,9 +2539,12 @@
             ToolExecutionPolicy::Subagent
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
             Err(ApprovalDenied.into())
-        }
+        }.await;
+        Ok(crate::agent::ToolOutput::text(content?))
+    }
     }
 
     #[test]
@@ -2713,16 +2662,13 @@
             ToolExecutionPolicy::Subagent
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
-            Ok("unused".to_string())
-        }
-
-        async fn execute_output(&self, _input: &Value) -> Result<ToolOutput> {
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
             if self.push {
                 self.buffer.lock().unwrap().push("Squeeze extra".to_string());
             }
             Ok(ToolOutput {
-                content: ToolOutputContent::Text(format!("read {}", self.label)),
+                exit_code: None,
+                content: format!("read {}", self.label),
                 images: vec![ImageBlock {
                     source: ImageSource::Url {
                         url: format!("https://example.test/{}.png", self.label),

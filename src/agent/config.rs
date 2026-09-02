@@ -87,13 +87,11 @@ pub struct AgentConfig {
     pub max_concurrent_network_tools: usize,
     #[serde(default = "default_max_concurrent_subagents")]
     pub max_concurrent_subagents: usize,
-    /// Automatically convert long-running foreground `shell` commands into
-    /// background jobs once the foreground wait is exceeded. Mirrors omp's
-    /// `bash.autoBackground.enabled`.
+    /// Automatically convert any long-running foreground tool call into a
+    /// background job once the foreground wait is exceeded.
     #[serde(default = "default_auto_background")]
     pub auto_background: bool,
-    /// How long an automatically backgrounded `shell` command is foreground-
-    /// waited before it converts into a background job.
+    /// How long any tool call is foreground-waited before it becomes a job.
     #[serde(default = "default_auto_background_threshold_seconds")]
     pub auto_background_threshold_seconds: u64,
     /// Maximum concurrently running background jobs.

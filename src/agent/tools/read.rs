@@ -235,11 +235,7 @@ impl Tool for Read {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        self.read_output(input).await?.into_inline_text()
-    }
-
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
         self.read_output(input).await
     }
 }
@@ -263,16 +259,12 @@ impl Read {
                             block.height,
                             block.media_type.mime(),
                         );
-                        Ok(ToolOutput {
-                            content: crate::agent::ToolOutputContent::Text(summary),
-                            images: vec![block],
-                        })
+                        Ok(ToolOutput::with_images(summary, vec![block]))
                     }
                     ReadPayload::Structured(Value::Object(mut payload)) => {
                         payload.insert("kind".into(), json!(target.kind()));
                         payload.insert("target".into(), json!(target.display(&self.ctx.root)));
-                        let text = serde_json::to_string_pretty(&Value::Object(payload))
-                            .context("encoding read result")?;
+                        let text = render_read_fields(&payload);
                         Ok(ToolOutput::text(text))
                     }
                     ReadPayload::Structured(_) => {
@@ -287,6 +279,35 @@ impl Read {
             target.display(&self.ctx.root)
         )
     }
+}
+
+fn render_read_fields(fields: &serde_json::Map<String, Value>) -> String {
+    fn append(prefix: &str, value: &Value, output: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    append(&format!("{prefix}[{}]", index + 1), item, output);
+                }
+            }
+            Value::Object(fields) => {
+                for (name, value) in fields {
+                    let key = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    append(&key, value, output);
+                }
+            }
+            Value::String(text) => output.push(format!("{prefix}: {text}")),
+            other => output.push(format!("{prefix}: {other}")),
+        }
+    }
+    let mut output = Vec::new();
+    for (name, value) in fields {
+        append(name, value, &mut output);
+    }
+    output.join("\n")
 }
 
 /// Resolves the `path` argument into a concrete target, rejecting the private
@@ -411,9 +432,8 @@ mod tests {
             .execute(&json!({ "path": "sample.pdf" }))
             .await
             .unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["kind"], "file");
-        assert_eq!(parsed["parsed_by"], "fake");
+        assert!(output.content.contains("kind: file"));
+        assert!(output.content.contains("parsed_by: fake"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -447,8 +467,8 @@ mod tests {
             .execute(&json!({"path": uri, "range": "2-3"}))
             .await
             .unwrap();
-        assert!(output.contains("2:two\n3:three"));
-        assert!(output.contains("[Showing lines 2-3 of 4]"));
+        assert!(output.content.contains("2:two\n3:three"));
+        assert!(output.content.contains("[Showing lines 2-3 of 4]"));
 
         let restored = crate::agent::SessionResultStore::new(directory.path()).unwrap();
         assert_eq!(restored.store("next").unwrap(), "nole://result/2");
@@ -470,9 +490,31 @@ mod tests {
         )
         .unwrap();
         let output = read.execute(&json!({"path": uri})).await.unwrap();
-        assert!(output.chars().count() <= MAX_READ_RESPONSE_CHARACTERS);
-        assert!(output.contains("[Showing lines 1-"));
-        assert!(!output.contains("[Showing lines 1-200"));
+        assert!(output.content.chars().count() <= MAX_READ_RESPONSE_CHARACTERS);
+        assert!(output.content.contains("[Showing lines 1-"));
+        assert!(!output.content.contains("[Showing lines 1-200"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn normalized_long_single_line_result_uses_normal_line_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::agent::SessionResultStore::new(directory.path()).unwrap();
+        let content = crate::agent::normalize_stored_result(&"界".repeat(10_000));
+        let uri = store.store(&content).unwrap();
+        let read = Read::new(
+            directory.path(),
+            Arc::new(SnapshotStore::default()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let first = read.execute(&json!({"path": uri})).await.unwrap();
+        assert!(first.content.chars().count() <= MAX_READ_RESPONSE_CHARACTERS);
+        assert!(first.content.contains("[Showing lines 1-1 of 3]"));
+        let rest = read
+            .execute(&json!({"path": uri, "range": "2-3"}))
+            .await
+            .unwrap();
+        assert!(rest.content.contains("[Showing lines 2-3 of 3]"));
     }
 
     #[cfg(unix)]
@@ -577,20 +619,19 @@ mod tests {
 
         // Absolute local path.
         let output = read
-            .execute_output(&json!({ "path": path.to_str().unwrap() }))
+            .execute(&json!({ "path": path.to_str().unwrap() }))
             .await
             .unwrap();
         assert!(output
             .clone()
             .into_inline_text()
-            .unwrap()
             .starts_with("Read image diagram.png (8x4, image/png, "));
         assert_eq!(output.images.len(), 1);
         assert!(output.images[0].bytes.is_some());
 
         // Relative local path resolves against the nole root.
         let output = read
-            .execute_output(&json!({ "path": "diagram.png" }))
+            .execute(&json!({ "path": "diagram.png" }))
             .await
             .unwrap();
         assert_eq!(output.images.len(), 1);
@@ -600,7 +641,7 @@ mod tests {
         ));
 
         // Attachment URI.
-        let output = read.execute_output(&json!({ "path": uri })).await.unwrap();
+        let output = read.execute(&json!({ "path": uri })).await.unwrap();
         assert_eq!(output.images.len(), 1);
         assert!(matches!(
             &output.images[0].source,
@@ -609,7 +650,7 @@ mod tests {
 
         // Line ranges are rejected for image targets.
         let error = read
-            .execute_output(&json!({ "path": uri, "range": "1-2" }))
+            .execute(&json!({ "path": uri, "range": "1-2" }))
             .await
             .unwrap_err();
         assert_eq!(
@@ -621,7 +662,7 @@ mod tests {
         let bad = directory.path().join("broken.png");
         fs::write(&bad, b"\x89PNG\r\n\x1a\nnot-a-real-png").unwrap();
         let error = read
-            .execute_output(&json!({ "path": bad.to_str().unwrap() }))
+            .execute(&json!({ "path": bad.to_str().unwrap() }))
             .await
             .unwrap_err();
         assert!(!format!("{error:#}").contains("not valid UTF-8"));

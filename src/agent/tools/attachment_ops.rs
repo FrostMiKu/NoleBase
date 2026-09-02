@@ -76,16 +76,20 @@ fn resolve_import_source(root: &Path, unresolved: &Path) -> Result<PathBuf> {
 
 /// Metadata shaped for Agent output. It contains stable identifiers and
 /// presentation metadata while keeping storage locations private.
-fn attachment_metadata_json(metadata: &AttachmentMetadata) -> Value {
-    json!({
-        "id": metadata.id.to_string(),
-        "uri": metadata.uri().to_string(),
-        "display_name": metadata.display_name,
-        "source": metadata.source,
-        "size": metadata.size,
-        "mime_type": metadata.mime_type,
-        "imported_at": metadata.imported_at.to_rfc3339(),
-    })
+fn attachment_metadata_text(metadata: &AttachmentMetadata) -> String {
+    let mut output = format!(
+        "ID: {}\nURI: {}\nName: {}\nSource: {}\nBytes: {}\nImported: {}",
+        metadata.id,
+        metadata.uri(),
+        metadata.display_name,
+        metadata.source,
+        metadata.size,
+        metadata.imported_at.to_rfc3339(),
+    );
+    if let Some(mime_type) = &metadata.mime_type {
+        output.push_str(&format!("\nMedia type: {mime_type}"));
+    }
+    output
 }
 
 /// Resolve an update source under `workspace`: an existing regular file
@@ -186,7 +190,8 @@ impl Tool for ImportAttachment {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
         let source_text = required_string(input, "source")?;
         let unresolved = if Path::new(source_text).is_absolute() {
             PathBuf::from(source_text)
@@ -211,9 +216,10 @@ impl Tool for ImportAttachment {
                 );
             }
         }
-        let mut result = attachment_metadata_json(&metadata);
-        result["markdown"] = json!(markdown_embed(&metadata));
-        serde_json::to_string_pretty(&result).context("encoding attachment metadata")
+        Ok(format!("{}\nMarkdown: {}", attachment_metadata_text(&metadata), markdown_embed(&metadata)))
+    }.await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -266,33 +272,41 @@ impl Tool for ListAttachments {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let selector = RangeSelector::from_input(input, MAX_LIST_LIMIT)?;
-        let mut query_input = input.clone();
-        let object = query_input
-            .as_object_mut()
-            .context("list_attachments input must be an object")?;
-        object.remove("range");
-        object.insert("offset".to_string(), json!(selector.start - 1));
-        object.insert(
-            "limit".to_string(),
-            json!(selector.end - selector.start + 1),
-        );
-        let query: AttachmentQuery =
-            serde_json::from_value(query_input).context("invalid list_attachments parameters")?;
-        let store_page = self.store.list(&query)?;
-        let page = selector.window(usize::try_from(store_page.total).unwrap_or(usize::MAX));
-        let mut result = json!({
-            "range": selector.as_string(),
-            "returned": store_page.items.len(),
-            "total": store_page.total,
-            "has_more": store_page.has_more,
-            "items": store_page.items.iter().map(attachment_metadata_json).collect::<Vec<_>>(),
-        });
-        if let Some(next) = page.next() {
-            result["next"] = json!(next);
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let selector = RangeSelector::from_input(input, MAX_LIST_LIMIT)?;
+            let mut query_input = input.clone();
+            let object = query_input
+                .as_object_mut()
+                .context("list_attachments input must be an object")?;
+            object.remove("range");
+            object.insert("offset".to_string(), json!(selector.start - 1));
+            object.insert(
+                "limit".to_string(),
+                json!(selector.end - selector.start + 1),
+            );
+            let query: AttachmentQuery = serde_json::from_value(query_input)
+                .context("invalid list_attachments parameters")?;
+            let store_page = self.store.list(&query)?;
+            let page = selector.window(usize::try_from(store_page.total).unwrap_or(usize::MAX));
+            let mut result = format!(
+                "Attachments: {} of {}\nRange: {}",
+                store_page.items.len(),
+                store_page.total,
+                selector.as_string()
+            );
+            if let Some(next) = page.next() {
+                result.push_str(&format!("\nNext range: {next}"));
+            }
+            for metadata in &store_page.items {
+                result.push_str("\n\n");
+                result.push_str(&attachment_metadata_text(metadata));
+            }
+            Ok(result)
         }
-        serde_json::to_string_pretty(&result).context("encoding attachment list")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -332,12 +346,16 @@ impl Tool for AttachmentInfo {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let reference = required_string(input, "uri")?;
-        let uri = resolve_attachment_uri(reference)?;
-        let metadata = self.store.metadata(uri.id())?;
-        serde_json::to_string_pretty(&attachment_metadata_json(&metadata))
-            .context("encoding attachment metadata")
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let reference = required_string(input, "uri")?;
+            let uri = resolve_attachment_uri(reference)?;
+            let metadata = self.store.metadata(uri.id())?;
+            Ok(attachment_metadata_text(&metadata))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -383,38 +401,40 @@ impl Tool for CheckoutAttachment {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let reference = required_string(input, "uri")?;
-        let destination_text = required_string(input, "destination")?;
-        let uri = resolve_attachment_uri(reference)?;
-        let metadata = self.store.metadata(uri.id())?;
-        let destination = workspace_destination(&self.root, destination_text)?;
-        check_workspace_write(&self.root, &destination, metadata.size)?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-            .with_context(|| format!("creating destination {}", destination.display()))?;
-        let (copied, token) = match self.store.copy_to_with_token_limited(
-            uri.id(),
-            &mut output,
-            MAX_WORKSPACE_FILE_BYTES,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                drop(output);
-                let _ = fs::remove_file(&destination);
-                return Err(error)
-                    .with_context(|| format!("writing destination {}", destination.display()));
-            }
-        };
-        serde_json::to_string_pretty(&json!({
-            "path": display_path(&self.root, &destination),
-            "bytes": copied,
-            "uri": uri.to_string(),
-            "content_token": token,
-        }))
-        .context("encoding checkout result")
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let reference = required_string(input, "uri")?;
+            let destination_text = required_string(input, "destination")?;
+            let uri = resolve_attachment_uri(reference)?;
+            let metadata = self.store.metadata(uri.id())?;
+            let destination = workspace_destination(&self.root, destination_text)?;
+            check_workspace_write(&self.root, &destination, metadata.size)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .with_context(|| format!("creating destination {}", destination.display()))?;
+            let (copied, token) = match self.store.copy_to_with_token_limited(
+                uri.id(),
+                &mut output,
+                MAX_WORKSPACE_FILE_BYTES,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(output);
+                    let _ = fs::remove_file(&destination);
+                    return Err(error)
+                        .with_context(|| format!("writing destination {}", destination.display()));
+                }
+            };
+            Ok(format!(
+                "Path: {}\nBytes: {copied}\nURI: {uri}\nContent token: {token}",
+                display_path(&self.root, &destination)
+            ))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -466,54 +486,60 @@ impl Tool for UpdateAttachment {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let reference = required_string(input, "uri")?;
-        let source_text = required_string(input, "source")?;
-        let expected_token = required_string(input, "expected_content_token")?;
-        let uri = resolve_attachment_uri(reference)?;
-        // Source safety and workspace/attachment limits are validated before
-        // any approval request; a refusal never asks the user.
-        let source = workspace_source(&self.root, source_text)?;
-        let source_len = fs::metadata(&source)
-            .with_context(|| format!("reading metadata for {}", source.display()))?
-            .len();
-        if source_len > MAX_WORKSPACE_FILE_BYTES {
-            bail!(
-                "source {} exceeds the 64 MiB workspace per-file limit",
-                source.display()
-            );
-        }
-        if source_len > MAX_ATTACHMENT_SIZE {
-            bail!(
-                "source {} exceeds the attachment {} byte limit",
-                source.display(),
-                MAX_ATTACHMENT_SIZE
-            );
-        }
-        let metadata = self.store.metadata(uri.id())?;
-        self.gate
-            .request(ApprovalRequest {
-                title: "Update attachment content".to_string(),
-                message: format!(
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let reference = required_string(input, "uri")?;
+            let source_text = required_string(input, "source")?;
+            let expected_token = required_string(input, "expected_content_token")?;
+            let uri = resolve_attachment_uri(reference)?;
+            // Source safety and workspace/attachment limits are validated before
+            // any approval request; a refusal never asks the user.
+            let source = workspace_source(&self.root, source_text)?;
+            let source_len = fs::metadata(&source)
+                .with_context(|| format!("reading metadata for {}", source.display()))?
+                .len();
+            if source_len > MAX_WORKSPACE_FILE_BYTES {
+                bail!(
+                    "source {} exceeds the 64 MiB workspace per-file limit",
+                    source.display()
+                );
+            }
+            if source_len > MAX_ATTACHMENT_SIZE {
+                bail!(
+                    "source {} exceeds the attachment {} byte limit",
+                    source.display(),
+                    MAX_ATTACHMENT_SIZE
+                );
+            }
+            let metadata = self.store.metadata(uri.id())?;
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Update attachment content".to_string(),
+                    message: format!(
                     "Replace the content of attachment {uri} ({}), {} bytes, with the {} bytes \
                      from workspace/{source_text}? The attachment keeps its URI and identity, \
                      so every existing note reference observes the updated content.",
                     metadata.display_name, metadata.size, source_len
                 ),
-                kind: ApprovalKind::Confirm,
-            })
-            .await?;
-        let reader =
-            File::open(&source).with_context(|| format!("opening source {}", source.display()))?;
-        let (updated, token) = self.store.replace_content(
-            uri.id(),
-            expected_token,
-            reader,
-            MAX_WORKSPACE_FILE_BYTES,
-        )?;
-        let mut result = attachment_metadata_json(&updated);
-        result["content_token"] = json!(token);
-        serde_json::to_string_pretty(&result).context("encoding attachment metadata")
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
+            let reader = File::open(&source)
+                .with_context(|| format!("opening source {}", source.display()))?;
+            let (updated, token) = self.store.replace_content(
+                uri.id(),
+                expected_token,
+                reader,
+                MAX_WORKSPACE_FILE_BYTES,
+            )?;
+            Ok(format!(
+                "{}\nContent token: {token}",
+                attachment_metadata_text(&updated)
+            ))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -586,35 +612,40 @@ impl Tool for DeleteAttachment {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let reference = required_string(input, "uri")?;
-        let uri = resolve_attachment_uri(reference)?;
-        let metadata = self.store.metadata(uri.id())?;
-        let usage_snapshot = self.usage.snapshot();
-        if !usage_snapshot.ready {
-            bail!("{}", TrashError::NotReady);
-        }
-        let expected_revision = usage_snapshot.revision;
-        self.gate
-            .request(ApprovalRequest {
-                title: "Delete attachment".to_string(),
-                message: format!(
-                    "Delete attachment {uri} ({}), {} bytes? It is moved to trash and \
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let reference = required_string(input, "uri")?;
+            let uri = resolve_attachment_uri(reference)?;
+            let metadata = self.store.metadata(uri.id())?;
+            let usage_snapshot = self.usage.snapshot();
+            if !usage_snapshot.ready {
+                bail!("{}", TrashError::NotReady);
+            }
+            let expected_revision = usage_snapshot.revision;
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Delete attachment".to_string(),
+                    message: format!(
+                        "Delete attachment {uri} ({}), {} bytes? It is moved to trash and \
                      refused while any note still references it.",
-                    metadata.display_name, metadata.size
-                ),
-                kind: ApprovalKind::DestructiveConfirm,
-            })
-            .await?;
-        let storage = Storage::new(&self.root)?;
-        let result = self
-            .usage
-            .trash(&self.store, &storage, uri.id(), expected_revision)
-            .map_err(|error| trash_error_message(&uri, error))?;
-        match result {
-            TrashResult::Trashed => Ok(format!("deleted attachment {uri} (moved to trash)")),
-            TrashResult::NotFound => bail!("attachment no longer exists"),
+                        metadata.display_name, metadata.size
+                    ),
+                    kind: ApprovalKind::DestructiveConfirm,
+                })
+                .await?;
+            let storage = Storage::new(&self.root)?;
+            let result = self
+                .usage
+                .trash(&self.store, &storage, uri.id(), expected_revision)
+                .map_err(|error| trash_error_message(&uri, error))?;
+            match result {
+                TrashResult::Trashed => Ok(format!("deleted attachment {uri} (moved to trash)")),
+                TrashResult::NotFound => bail!("attachment no longer exists"),
+            }
         }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -656,9 +687,22 @@ mod tests {
     }
 
     fn import_source(import: &ImportAttachment, source: &Path) -> String {
-        let result: Value =
-            serde_json::from_str(&import.execute(&json!({"source": source})).unwrap()).unwrap();
-        result["uri"].as_str().unwrap().to_string()
+        import
+            .execute(&json!({"source": source}))
+            .unwrap()
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("URI: "))
+            .unwrap()
+            .to_string()
+    }
+
+    fn field<'a>(output: &'a crate::agent::ToolOutput, name: &str) -> &'a str {
+        output
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+            .unwrap_or_else(|| panic!("missing {name} in {}", output.content))
     }
 
     /// A usage handle whose snapshot is ready at revision 0 against the
@@ -676,37 +720,24 @@ mod tests {
         let (_outside, source) = outside_file("photo.png", TINY_PNG);
         let import = ImportAttachment::new(&root).unwrap();
 
-        let first: Value =
-            serde_json::from_str(&import.execute(&json!({"source": source})).unwrap()).unwrap();
+        let first = import.execute(&json!({"source": source})).unwrap();
         assert!(source.exists(), "import must preserve the source file");
-        let uri = first["uri"].as_str().unwrap().to_string();
+        let uri = field(&first, "URI").to_string();
         assert!(uri.starts_with("nole://attachment/"));
         assert_eq!(uri.len(), "nole://attachment/".len() + 36);
-        assert_eq!(first["display_name"], "photo.png");
-        assert_eq!(first["mime_type"], "image/png");
-        assert_eq!(first["size"], TINY_PNG.len() as u64);
-        assert!(first["markdown"].as_str().unwrap().contains(&uri));
-        assert!(first["markdown"]
-            .as_str()
-            .unwrap()
-            .starts_with("![photo.png]("));
+        assert_eq!(field(&first, "Name"), "photo.png");
+        assert_eq!(field(&first, "Media type"), "image/png");
+        assert_eq!(field(&first, "Bytes"), TINY_PNG.len().to_string());
+        assert!(field(&first, "Markdown").contains(&uri));
 
         // Duplicate bytes import to a NEW attachment with its own identity.
-        let second: Value =
-            serde_json::from_str(&import.execute(&json!({"source": source})).unwrap()).unwrap();
-        assert_ne!(
-            second["uri"], first["uri"],
-            "duplicate import must create a distinct attachment"
-        );
+        let second = import.execute(&json!({"source": source})).unwrap();
+        assert_ne!(field(&second, "URI"), field(&first, "URI"));
         assert!(source.exists());
 
         let list = ListAttachments::new(&root).unwrap();
-        let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(
-            listed["returned"], 2,
-            "each import stores its own attachment"
-        );
-        assert_eq!(listed["total"], 2);
+        let listed = list.execute(&json!({})).unwrap();
+        assert!(listed.content.contains("Attachments: 2 of 2"));
     }
 
     #[test]
@@ -715,53 +746,36 @@ mod tests {
         fs::write(root.join("data/note.md"), "# imported\n").unwrap();
         let import = ImportAttachment::new(&root).unwrap();
 
-        let result: Value =
-            serde_json::from_str(&import.execute(&json!({"source": "data/note.md"})).unwrap())
-                .unwrap();
-        assert_eq!(result["display_name"], "note.md");
-        assert_eq!(result["mime_type"], "text/markdown");
-        assert!(result["markdown"]
-            .as_str()
-            .unwrap()
-            .starts_with("[note.md]("));
+        let result = import.execute(&json!({"source": "data/note.md"})).unwrap();
+        assert_eq!(field(&result, "Name"), "note.md");
+        assert_eq!(field(&result, "Media type"), "text/markdown");
+        assert!(field(&result, "Markdown").starts_with("[note.md]("));
 
         // Re-importing identical bytes with a new name produces a distinct
         // attachment carrying that name (display name belongs to the import).
-        let renamed: Value = serde_json::from_str(
-            &import
-                .execute(&json!({
-                    "source": "data/note.md",
-                    "display_name": "renamed.png"
-                }))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_ne!(renamed["uri"], result["uri"]);
-        assert_eq!(renamed["display_name"], "renamed.png");
-        assert_eq!(
-            renamed["mime_type"], "text/markdown",
-            "content detection still sees markdown text despite the .png name"
-        );
+        let renamed = import
+            .execute(&json!({
+                "source": "data/note.md",
+                "display_name": "renamed.png"
+            }))
+            .unwrap();
+        assert_ne!(field(&renamed, "URI"), field(&result, "URI"));
+        assert_eq!(field(&renamed, "Name"), "renamed.png");
+        assert_eq!(field(&renamed, "Media type"), "text/markdown");
 
         // Explicit display name and matching media type are accepted when the
         // bytes really are an image.
         fs::write(root.join("data/art.png"), TINY_PNG).unwrap();
-        let custom: Value = serde_json::from_str(
-            &import
-                .execute(&json!({
-                    "source": "data/art.png",
-                    "display_name": "renamed.png",
-                    "media_type": "image/png"
-                }))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(custom["display_name"], "renamed.png");
-        assert_eq!(custom["mime_type"], "image/png");
-        assert!(custom["markdown"]
-            .as_str()
-            .unwrap()
-            .starts_with("![renamed.png]("));
+        let custom = import
+            .execute(&json!({
+                "source": "data/art.png",
+                "display_name": "renamed.png",
+                "media_type": "image/png"
+            }))
+            .unwrap();
+        assert_eq!(field(&custom, "Name"), "renamed.png");
+        assert_eq!(field(&custom, "Media type"), "image/png");
+        assert!(field(&custom, "Markdown").starts_with("![renamed.png]("));
 
         // Unsafe display names and non-matching media types are refused.
         assert!(import
@@ -817,19 +831,19 @@ mod tests {
         let root_text = root.to_string_lossy().to_string();
         let info = AttachmentInfo::new(&root).unwrap();
         let info_text = info.execute(&json!({"uri": uri})).unwrap();
-        assert!(info_text.contains("\"display_name\": \"report.pdf\""));
-        assert!(!info_text.contains(&root_text));
-        assert!(!info_text.contains("objects"));
-        assert!(!info_text.contains("metadata"));
-        assert!(!info_text.contains("attachments"));
+        assert!(info_text.content.contains("Name: report.pdf"));
+        assert!(!info_text.content.contains(&root_text));
+        assert!(!info_text.content.contains("objects"));
+        assert!(!info_text.content.contains("metadata"));
+        assert!(!info_text.content.contains("attachments"));
 
         let list = ListAttachments::new(&root).unwrap();
         let list_text = list.execute(&json!({})).unwrap();
-        assert!(!list_text.contains(&root_text));
-        assert!(!list_text.contains("objects"));
-        assert!(!list_text.contains("metadata"));
-        assert!(!list_text.contains("attachments"));
-        assert!(list_text.contains(&uri));
+        assert!(!list_text.content.contains(&root_text));
+        assert!(!list_text.content.contains("objects"));
+        assert!(!list_text.content.contains("metadata"));
+        assert!(!list_text.content.contains("attachments"));
+        assert!(list_text.content.contains(&uri));
 
         // Bare lowercase hyphenated UUIDs are accepted as references.
         let bare = uri.trim_start_matches("nole://attachment/");
@@ -857,14 +871,11 @@ mod tests {
         let uri = import_source(&import, &source);
         let copy = CheckoutAttachment::new(&root).unwrap();
 
-        let result: Value = serde_json::from_str(
-            &copy
-                .execute(&json!({"uri": uri, "destination": "docs/plan.pdf"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["path"], "workspace/docs/plan.pdf");
-        assert_eq!(result["bytes"], 19);
+        let result = copy
+            .execute(&json!({"uri": uri, "destination": "docs/plan.pdf"}))
+            .unwrap();
+        assert!(result.content.contains("Path: workspace/docs/plan.pdf"));
+        assert!(result.content.contains("Bytes: 19"));
         let written = root.join("workspace/docs/plan.pdf");
         assert_eq!(fs::read(&written).unwrap(), b"%PDF-1.4 plan bytes");
 
@@ -897,13 +908,10 @@ mod tests {
                 .returns_err());
         }
         // A different new destination still works after the first copy.
-        let again: Value = serde_json::from_str(
-            &copy
-                .execute(&json!({"uri": uri, "destination": "plan-copy.pdf"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(again["path"], "workspace/plan-copy.pdf");
+        let again = copy
+            .execute(&json!({"uri": uri, "destination": "plan-copy.pdf"}))
+            .unwrap();
+        assert!(again.content.contains("Path: workspace/plan-copy.pdf"));
         assert_eq!(
             fs::read(root.join("workspace/plan-copy.pdf")).unwrap(),
             b"%PDF-1.4 plan bytes"
@@ -928,13 +936,10 @@ mod tests {
         let original = store.metadata(id).unwrap();
 
         let checkout = CheckoutAttachment::new(&root).unwrap();
-        let checked_out: Value = serde_json::from_str(
-            &checkout
-                .execute(&json!({"uri": uri, "destination": "draft.txt"}))
-                .unwrap(),
-        )
-        .unwrap();
-        let token = checked_out["content_token"].as_str().unwrap();
+        let checked_out = checkout
+            .execute(&json!({"uri": uri, "destination": "draft.txt"}))
+            .unwrap();
+        let token = field(&checked_out, "Content token");
         assert_eq!(
             token,
             "sha256:0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5"
@@ -942,26 +947,23 @@ mod tests {
         fs::write(root.join("workspace/draft.txt"), b"agent edit").unwrap();
 
         let update = UpdateAttachment::new(&root, bypass_gate()).unwrap();
-        let updated: Value = serde_json::from_str(
-            &update
-                .execute(&json!({
-                    "uri": uri,
-                    "source": "draft.txt",
-                    "expected_content_token": token,
-                }))
-                .unwrap(),
-        )
-        .unwrap();
+        let updated = update
+            .execute(&json!({
+                "uri": uri,
+                "source": "draft.txt",
+                "expected_content_token": token,
+            }))
+            .unwrap();
         let after = store.metadata(id).unwrap();
-        assert_eq!(updated["uri"], uri);
+        assert_eq!(field(&updated, "URI"), uri);
         assert_eq!(after.id, original.id);
         assert_eq!(after.display_name, original.display_name);
         assert_eq!(after.source, original.source);
         assert_eq!(after.imported_at, original.imported_at);
         assert_eq!(fs::read(store.open(id).unwrap()).unwrap(), b"agent edit");
-        assert_ne!(updated["content_token"], token);
+        assert_ne!(field(&updated, "Content token"), token);
 
-        let current_token = updated["content_token"].as_str().unwrap();
+        let current_token = field(&updated, "Content token");
         fs::write(root.join("workspace/draft.txt"), b"stale overwrite").unwrap();
         fs::write(store.open(id).unwrap(), b"concurrent user edit").unwrap();
         let error = update
@@ -1045,39 +1047,27 @@ mod tests {
         let list = ListAttachments::new(&root).unwrap();
 
         // Defaults: range 1-50, imported_at desc.
-        let all: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(all["range"], "1-50");
-        assert_eq!(all["returned"], 3);
-        assert_eq!(all["total"], 3);
-        assert_eq!(all["has_more"], false);
+        let all = list.execute(&json!({})).unwrap();
+        assert!(all.content.contains("Attachments: 3 of 3"));
+        assert!(all.content.contains("Range: 1-50"));
 
         // Case-insensitive substring filter on display name.
-        let filtered: Value =
-            serde_json::from_str(&list.execute(&json!({"query": "ALP"})).unwrap()).unwrap();
-        assert_eq!(filtered["returned"], 1);
-        assert_eq!(filtered["items"][0]["display_name"], "alpha.md");
+        let filtered = list.execute(&json!({"query": "ALP"})).unwrap();
+        assert!(filtered.content.contains("Attachments: 1 of 1"));
+        assert!(filtered.content.contains("Name: alpha.md"));
 
         // Inclusive ranges paginate and return the next selector.
-        let first_page: Value =
-            serde_json::from_str(&list.execute(&json!({"range": "1-2"})).unwrap()).unwrap();
-        assert_eq!(first_page["returned"], 2);
-        assert_eq!(first_page["total"], 3);
-        assert_eq!(first_page["has_more"], true);
-        assert_eq!(first_page["next"], "3-4");
-        let second_page: Value =
-            serde_json::from_str(&list.execute(&json!({"range": "3-4"})).unwrap()).unwrap();
-        assert_eq!(second_page["returned"], 1);
-        assert_eq!(second_page["has_more"], false);
+        let first_page = list.execute(&json!({"range": "1-2"})).unwrap();
+        assert!(first_page.content.contains("Attachments: 2 of 3"));
+        assert!(first_page.content.contains("Next range: 3-4"));
+        let second_page = list.execute(&json!({"range": "3-4"})).unwrap();
+        assert!(second_page.content.contains("Attachments: 1 of 3"));
 
         // Sort by name ascending.
-        let sorted: Value = serde_json::from_str(
-            &list
-                .execute(&json!({"sort_by": "name", "order": "asc"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(sorted["items"][0]["display_name"], "alpha.md");
-        assert_eq!(sorted["items"][2]["display_name"], "gamma.md");
+        let sorted = list
+            .execute(&json!({"sort_by": "name", "order": "asc"}))
+            .unwrap();
+        assert!(sorted.content.find("Name: alpha.md") < sorted.content.find("Name: gamma.md"));
 
         // Invalid sort keys are refused.
         assert!(list.execute(&json!({"sort_by": "bogus"})).returns_err());
@@ -1156,14 +1146,11 @@ mod tests {
         };
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         let message = worker.join().unwrap().unwrap();
-        assert!(message.contains("moved to trash"));
+        assert!(message.content.contains("moved to trash"));
 
         let list = ListAttachments::new(&root).unwrap();
-        let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(
-            listed["returned"], 0,
-            "deleted attachment must leave the store"
-        );
+        let listed = list.execute(&json!({})).unwrap();
+        assert!(listed.content.contains("Attachments: 0 of 0"));
         let trash = root.join("attachments/trash");
         assert!(
             fs::read_dir(&trash).unwrap().next().is_some(),
@@ -1190,8 +1177,8 @@ mod tests {
 
         // The attachment is untouched and still listed.
         let list = ListAttachments::new(&root).unwrap();
-        let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(listed["returned"], 1);
+        let listed = list.execute(&json!({})).unwrap();
+        assert!(listed.content.contains("Attachments: 1 of 1"));
     }
 
     #[test]
@@ -1202,9 +1189,9 @@ mod tests {
         let uri = import_source(&import, &source);
         let delete = DeleteAttachment::new(&root, bypass_gate(), ready_usage(&root)).unwrap();
         let message = delete.execute(&json!({"uri": uri})).unwrap();
-        assert!(message.contains("moved to trash"));
+        assert!(message.content.contains("moved to trash"));
         let list = ListAttachments::new(&root).unwrap();
-        let listed: Value = serde_json::from_str(&list.execute(&json!({})).unwrap()).unwrap();
-        assert_eq!(listed["returned"], 0);
+        let listed = list.execute(&json!({})).unwrap();
+        assert!(listed.content.contains("Attachments: 0 of 0"));
     }
 }

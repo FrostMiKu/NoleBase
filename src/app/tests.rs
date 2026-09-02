@@ -356,7 +356,10 @@ fn settled_background_job_wakes_the_idle_agent() {
     // Settles while idle: with no active run there is no observable to poll,
     // so only the permanent subscription can observe the settlement and
     // start the delivery run.
-    app.agent_jobs.settle(&started.id, Ok("done".to_string()));
+    app.agent_jobs.settle(
+        &started.id,
+        Ok(crate::agent::ToolOutput::text("done".to_string())),
+    );
     app.poll_agent();
 
     assert!(app.ai_running, "a settled job must wake the idle agent");
@@ -378,7 +381,10 @@ fn settled_job_during_a_run_does_not_start_a_second_run() {
         .agent_jobs
         .start_background(crate::agent::JobKind::Shell, "sleep 1")
         .unwrap();
-    app.agent_jobs.settle(&started.id, Ok("done".to_string()));
+    app.agent_jobs.settle(
+        &started.id,
+        Ok(crate::agent::ToolOutput::text("done".to_string())),
+    );
     // The run's own stream reports the settlement; its loop drains the
     // delivery at the next round boundary.
     sender
@@ -410,7 +416,10 @@ fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
     // The job settles while the model streams its final answer: the run's
     // loop has already passed its last delivery drain, so only the Finished
     // handler can start the wake-up run for the queued delivery.
-    app.agent_jobs.settle(&started.id, Ok("done".to_string()));
+    app.agent_jobs.settle(
+        &started.id,
+        Ok(crate::agent::ToolOutput::text("done".to_string())),
+    );
     sender
         .send(AgentEvent::Finished(Ok("final answer".to_string())))
         .unwrap();

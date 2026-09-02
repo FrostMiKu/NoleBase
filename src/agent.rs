@@ -1,5 +1,3 @@
-//! Provider-neutral agent with a registry of local tools.
-
 use std::collections::HashMap;
 use std::fs;
 #[cfg(test)]
@@ -330,84 +328,41 @@ async fn recv_while_active<T>(
 /// so the caller can place them protocol-safe in outgoing messages.
 #[derive(Clone, Debug)]
 pub struct ToolOutput {
-    pub content: ToolOutputContent,
-    pub images: Vec<crate::provider::ImageBlock>,
-}
-
-#[derive(Clone, Debug)]
-pub enum ToolOutputContent {
-    Text(String),
-    Structured {
-        metadata: serde_json::Map<String, Value>,
-        bodies: Vec<ToolTextBody>,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub struct ToolTextBody {
-    pub field: String,
+    pub exit_code: Option<i32>,
     pub content: String,
+    pub images: Vec<crate::provider::ImageBlock>,
 }
 
 impl ToolOutput {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            content: ToolOutputContent::Text(text.into()),
+            exit_code: None,
+            content: text.into(),
             images: Vec::new(),
         }
     }
 
-    pub fn structured(metadata: Value, bodies: Vec<ToolTextBody>) -> Result<Self> {
-        let Value::Object(metadata) = metadata else {
-            bail!("structured tool output metadata must be a JSON object");
-        };
-        Ok(Self {
-            content: ToolOutputContent::Structured { metadata, bodies },
+    pub fn process(exit_code: i32, content: impl Into<String>) -> Self {
+        Self {
+            exit_code: Some(exit_code),
+            content: content.into(),
             images: Vec::new(),
-        })
+        }
     }
 
-    pub fn structured_json(text: &str, body_fields: &[&str]) -> Result<Self> {
-        let Value::Object(mut metadata) =
-            serde_json::from_str::<Value>(text).context("decoding structured tool output")?
-        else {
-            bail!("structured tool output must be a JSON object");
-        };
-        let mut bodies = Vec::new();
-        for field in body_fields {
-            if let Some(value) = metadata.remove(*field) {
-                let content = value
-                    .as_str()
-                    .with_context(|| format!("structured tool output field {field} is not text"))?
-                    .to_string();
-                bodies.push(ToolTextBody {
-                    field: (*field).to_string(),
-                    content,
-                });
-            }
+    pub fn with_images(
+        content: impl Into<String>,
+        images: Vec<crate::provider::ImageBlock>,
+    ) -> Self {
+        Self {
+            exit_code: None,
+            content: content.into(),
+            images,
         }
-        Self::structured(Value::Object(metadata), bodies)
     }
 
-    pub(crate) fn into_inline_text(self) -> Result<String> {
-        match self.content {
-            ToolOutputContent::Text(text) => Ok(text),
-            ToolOutputContent::Structured {
-                mut metadata,
-                bodies,
-            } => {
-                for body in bodies {
-                    if metadata
-                        .insert(body.field.clone(), Value::String(body.content))
-                        .is_some()
-                    {
-                        bail!("structured tool output field {} is duplicated", body.field);
-                    }
-                }
-                serde_json::to_string_pretty(&Value::Object(metadata))
-                    .context("encoding structured tool output")
-            }
-        }
+    pub(crate) fn into_inline_text(self) -> String {
+        self.content
     }
 }
 
@@ -420,13 +375,7 @@ pub trait Tool: Send + Sync {
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::Exclusive
     }
-    async fn execute(&self, input: &Value) -> Result<String>;
-    /// Execute returning text plus any native image blocks. The default wraps
-    /// [`Tool::execute`], so pure-text tools need no changes; only tools that
-    /// produce images override it.
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
-        Ok(ToolOutput::text(self.execute(input).await?))
-    }
+    async fn execute(&self, input: &Value) -> Result<ToolOutput>;
 }
 pub(crate) fn tool_error_message(error: &anyhow::Error) -> String {
     format!("{error:#}")
@@ -457,7 +406,7 @@ impl RegisteredTool {
         self.validator.validate(input).map_err(|error| {
             anyhow::anyhow!("invalid input for tool {}: {error}", self.tool.name())
         })?;
-        self.tool.execute_output(input).await
+        self.tool.execute(input).await
     }
 }
 
@@ -782,6 +731,7 @@ impl Agent {
         let attachments = AttachmentStore::new(nole_root.join(ATTACHMENTS_DIR));
         let todos = TodoHandle::default();
         let results = SessionResultStore::new(nole_root)?;
+        let tool_result_token_cap = tool_result_token_cap_for(&config);
         let mut agent = Self {
             config,
             provider,
@@ -791,7 +741,9 @@ impl Agent {
             events: events.clone(),
             input_buffer,
             cancelled: cancelled.clone(),
-            jobs: jobs_handle.clone(),
+            jobs: jobs_handle
+                .clone()
+                .with_result_store(results.clone(), tool_result_token_cap),
             concurrency,
             attachments,
             client: agent_client,
@@ -817,11 +769,9 @@ impl Agent {
             nole_root,
             gate.clone(),
             cancelled.clone(),
-            jobs_handle
-                .clone()
-                .with_workspace(nole_root.join(crate::storage::WORKSPACE_DIR)),
+            agent.jobs.clone(),
             agent.input_buffer.clone(),
-            agent.config.auto_background,
+            false,
             agent.config.auto_background_threshold_seconds,
         ));
         agent.jobs.set_max_running(agent.config.max_background_jobs);
@@ -846,7 +796,6 @@ impl Agent {
             terminal.clone(),
             cancelled.clone(),
             agent.jobs.clone(),
-            agent.input_buffer.clone(),
         ));
         agent.register(AskPrivate {
             events: agent.events.clone(),
@@ -1006,6 +955,24 @@ impl Agent {
                 if !delivered.is_empty() {
                     let frame = format_job_deliveries(&delivered);
                     append_user_parts(&mut conversation.messages, Message::user(frame).parts);
+                    let image_parts = delivered
+                        .iter()
+                        .flat_map(|job| job.output.images.iter())
+                        .flat_map(|image| {
+                            [
+                                MessagePart::Text {
+                                    text: format!(
+                                        "Image returned by background job: {}",
+                                        image.label
+                                    ),
+                                },
+                                MessagePart::Image(image.clone()),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    if !image_parts.is_empty() {
+                        append_user_parts(&mut conversation.messages, image_parts);
+                    }
                     let _ = self.events.send(AgentEvent::JobDelivered(
                         delivered.iter().map(|job| job.id.clone()).collect(),
                     ));
@@ -1662,7 +1629,7 @@ impl Agent {
         call: &ToolCall,
         input_error: Option<&String>,
     ) -> ToolCallExecution {
-        let _permit = self
+        let permit = self
             .concurrency
             .acquire(self.tool_execution_policy(call))
             .await;
@@ -1674,7 +1641,19 @@ impl Agent {
             Some(error) => {
                 ToolCallExecution::Completed(ToolCallOutput::text(failed_tool_result(call, error)))
             }
-            None => self.execute_tool_call_with_wait_progress(call).await,
+            None => {
+                if self.config.auto_background
+                    && self.config.auto_background_threshold_seconds > 0
+                    && call.name != "job_wait"
+                    && call.name != "jobs"
+                {
+                    self.execute_tool_call_with_auto_background(call, permit)
+                        .await
+                } else {
+                    let _permit = permit;
+                    self.execute_tool_call_with_wait_progress(call).await
+                }
+            }
         };
         let output = match &execution {
             ToolCallExecution::Completed(output) | ToolCallExecution::Denied(output) => output,
@@ -1692,6 +1671,116 @@ impl Agent {
             preview,
         });
         execution
+    }
+
+    async fn execute_tool_call_with_auto_background(
+        &self,
+        call: &ToolCall,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> ToolCallExecution {
+        let Some(tool) = self.tools.get(&call.name).cloned() else {
+            return self.execute_tool_call(call).await;
+        };
+        let input = call.input.clone();
+        let mut task = tokio::spawn(async move {
+            let _permit = permit;
+            tool.execute(&input).await
+        });
+        let threshold = Duration::from_secs(self.config.auto_background_threshold_seconds);
+        tokio::select! {
+            joined = &mut task => self.tool_output_execution(call, joined),
+            _ = tokio::time::sleep(threshold) => {
+                let started = match self.jobs.start_background(JobKind::Tool, &call.name) {
+                    Ok(started) => started,
+                    Err(error) => {
+                        let _ = error;
+                        return self.tool_output_execution(call, task.await);
+                    }
+                };
+                let jobs = self.jobs.clone();
+                let job_id = started.id.clone();
+                let job_cancel = Arc::clone(&started.cancel);
+                tokio::spawn(async move {
+                    let mut task = task;
+                    tokio::select! {
+                        joined = &mut task => {
+                            let outcome = match joined {
+                                Ok(Ok(output)) => Ok(output),
+                                Ok(Err(error)) => Err(tool_error_message(&error)),
+                                Err(error) => Err(format!("tool task failed: {error}")),
+                            };
+                            jobs.settle(&job_id, outcome);
+                        }
+                        _ = async {
+                            while !job_cancel.load(Ordering::Relaxed) {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        } => task.abort()
+                    }
+                });
+                let content = format!(
+                    "Background job: {}\nThe tool is still running. Its result will be delivered automatically.",
+                    started.id
+                );
+                ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content,
+                    is_error: false,
+                }))
+            }
+        }
+    }
+
+    fn tool_output_execution(
+        &self,
+        call: &ToolCall,
+        joined: Result<Result<ToolOutput>, tokio::task::JoinError>,
+    ) -> ToolCallExecution {
+        match joined {
+            Ok(Ok(mut output)) => {
+                if !output.images.is_empty() && !self.config.supports_images {
+                    return ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: DISABLED_IMAGE_ERROR.to_string(),
+                        is_error: true,
+                    }));
+                }
+                let images = std::mem::take(&mut output.images);
+                match self.materialize_tool_output(output) {
+                    Ok(content) => ToolCallExecution::Completed(ToolCallOutput::with_images(
+                        ToolResult {
+                            tool_use_id: call.id.clone(),
+                            content,
+                            is_error: false,
+                        },
+                        images,
+                    )),
+                    Err(error) => ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: tool_error_message(&error),
+                        is_error: true,
+                    })),
+                }
+            }
+            Ok(Err(error)) => {
+                let denied = error.downcast_ref::<ApprovalDenied>().is_some();
+                let output = ToolCallOutput::text(ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: tool_error_message(&error),
+                    is_error: true,
+                });
+                if denied {
+                    ToolCallExecution::Denied(output)
+                } else {
+                    ToolCallExecution::Completed(output)
+                }
+            }
+            Err(error) => ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                tool_use_id: call.id.clone(),
+                content: format!("tool task failed: {error}"),
+                is_error: true,
+            })),
+        }
     }
 
     async fn execute_tool_call_with_wait_progress(&self, call: &ToolCall) -> ToolCallExecution {
@@ -1789,77 +1878,39 @@ impl Agent {
     }
 
     fn materialize_tool_output(&self, output: ToolOutput) -> Result<String> {
-        match output.content {
-            ToolOutputContent::Text(text) => {
-                if should_externalize_text(&text, self.tool_result_token_cap()) {
-                    let uri = self.results.store(&text)?;
-                    Ok(result_reference_message(&uri, &text))
-                } else {
-                    Ok(text)
-                }
-            }
-            ToolOutputContent::Structured {
-                mut metadata,
-                bodies,
-            } => {
-                for body in bodies {
-                    let result_field = format!("{}_result", body.field);
-                    let characters_field = format!("{}_characters", body.field);
-                    let lines_field = format!("{}_lines", body.field);
-                    if [
-                        body.field.as_str(),
-                        result_field.as_str(),
-                        characters_field.as_str(),
-                        lines_field.as_str(),
-                    ]
-                    .iter()
-                    .any(|field| metadata.contains_key(*field))
-                    {
-                        bail!("structured tool output field {} is duplicated", body.field);
-                    }
-                    let mut inline_candidate = metadata.clone();
-                    inline_candidate
-                        .insert(body.field.clone(), Value::String(body.content.clone()));
-                    let inline_rendered =
-                        serde_json::to_string_pretty(&Value::Object(inline_candidate))
-                            .context("encoding structured tool output")?;
-                    if should_externalize_text(&inline_rendered, self.tool_result_token_cap()) {
-                        let uri = self.results.store(&body.content)?;
-                        metadata.insert(result_field, Value::String(uri));
-                        metadata.insert(
-                            characters_field,
-                            Value::from(body.content.chars().count() as u64),
-                        );
-                        metadata.insert(
-                            lines_field,
-                            Value::from(text_line_count(&body.content) as u64),
-                        );
-                    } else {
-                        metadata.insert(body.field, Value::String(body.content));
-                    }
-                }
-                serde_json::to_string_pretty(&Value::Object(metadata))
-                    .context("encoding structured tool output")
-            }
-        }
+        externalize_tool_output_with(&self.results, self.tool_result_token_cap(), output)
+            .map(|output| render_tool_output(&output))
     }
 }
 
-fn should_externalize_text(text: &str, token_cap: u64) -> bool {
-    text.chars().count() > MAX_INLINE_TOOL_RESULT_CHARACTERS
-        || estimate_text_tokens(text) > token_cap
+fn externalize_tool_output_with(
+    results: &SessionResultStore,
+    token_cap: u64,
+    mut output: ToolOutput,
+) -> Result<ToolOutput> {
+    let text = &output.content;
+    if should_externalize_text(&text, token_cap) {
+        let stored = normalize_stored_result(&text);
+        let uri = results.store(&stored)?;
+        let reference = result_reference_message(&uri, &text, &stored);
+        output.content = reference;
+    }
+    Ok(output)
 }
 
-fn result_reference_message(uri: &str, text: &str) -> String {
-    format!(
-        "Tool result stored at {uri} ({} characters, {} lines). Use read with this URI and a line range to inspect it.",
-        text.chars().count(),
-        text_line_count(text),
-    )
+fn render_tool_output(output: &ToolOutput) -> String {
+    match output.exit_code {
+        Some(code) => format!("Exit code: {code}\n{}", output.content),
+        None => output.content.clone(),
+    }
 }
 
-fn canonical_root(root: &Path) -> Result<PathBuf> {
-    fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))
+fn tool_result_token_cap_for(config: &AgentConfig) -> u64 {
+    config
+        .context_window_tokens
+        .saturating_sub(u64::from(config.max_tokens))
+        * TOOL_RESULT_BUDGET_PERCENT
+        / 100
 }
 
 #[cfg(test)]

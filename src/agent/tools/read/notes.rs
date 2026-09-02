@@ -72,69 +72,77 @@ impl Tool for Notes {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let sort_by = input
-            .get("sort_by")
-            .and_then(Value::as_str)
-            .unwrap_or("modified_at");
-        let descending = match input.get("order").and_then(Value::as_str).unwrap_or("desc") {
-            "asc" => false,
-            "desc" => true,
-            other => bail!("unsupported order: {other}"),
-        };
-        if !matches!(
-            sort_by,
-            "name" | "line_count" | "created_at" | "modified_at" | "size"
-        ) {
-            bail!("unsupported sort_by: {sort_by}");
-        }
-        let selector = RangeSelector::from_input(input, MAX_NOTE_RESULTS)?;
-        let listed = list_note_files_in(&self.data_dir).await?;
-        let mut notes = Vec::with_capacity(listed.len());
-        for note in listed {
-            notes.push(note_metadata(note.path).await?);
-        }
-        notes.sort_by(|a, b| {
-            let ordering = match sort_by {
-                "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                "line_count" => a.line_count.cmp(&b.line_count),
-                "created_at" => a.created.cmp(&b.created),
-                "modified_at" => a.modified.cmp(&b.modified),
-                "size" => a.size.cmp(&b.size),
-                _ => unreachable!(),
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let sort_by = input
+                .get("sort_by")
+                .and_then(Value::as_str)
+                .unwrap_or("modified_at");
+            let descending = match input.get("order").and_then(Value::as_str).unwrap_or("desc") {
+                "asc" => false,
+                "desc" => true,
+                other => bail!("unsupported order: {other}"),
             };
-            let ordering = if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            };
-            ordering.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        let page = selector.window(notes.len());
-        let items = notes[page.start_index..page.end_index]
-            .iter()
-            .map(|note| json!({
-                "path": display_path(&self.root, &note.path),
-                "name": note.name,
-                "line_count": note.line_count,
-                "created_at": note.created.map(|time| DateTime::<Local>::from(time).to_rfc3339()),
-                "modified_at": DateTime::<Local>::from(note.modified).to_rfc3339(),
-                "size": note.size,
-            }))
-            .collect::<Vec<_>>();
-        let mut result = json!({
-            "sort_by": sort_by,
-            "order": if descending { "desc" } else { "asc" },
-            "range": selector.as_string(),
-            "returned": page.returned(),
-            "total": page.total,
-            "has_more": page.has_more(),
-            "items": items,
-        });
-        if let Some(next) = page.next() {
-            result["next"] = json!(next);
+            if !matches!(
+                sort_by,
+                "name" | "line_count" | "created_at" | "modified_at" | "size"
+            ) {
+                bail!("unsupported sort_by: {sort_by}");
+            }
+            let selector = RangeSelector::from_input(input, MAX_NOTE_RESULTS)?;
+            let listed = list_note_files_in(&self.data_dir).await?;
+            let mut notes = Vec::with_capacity(listed.len());
+            for note in listed {
+                notes.push(note_metadata(note.path).await?);
+            }
+            notes.sort_by(|a, b| {
+                let ordering = match sort_by {
+                    "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    "line_count" => a.line_count.cmp(&b.line_count),
+                    "created_at" => a.created.cmp(&b.created),
+                    "modified_at" => a.modified.cmp(&b.modified),
+                    "size" => a.size.cmp(&b.size),
+                    _ => unreachable!(),
+                };
+                let ordering = if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+                ordering.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            let page = selector.window(notes.len());
+            let mut result = format!(
+                "Sort: {sort_by} {}\nNotes: {} of {}\nRange: {}",
+                if descending { "desc" } else { "asc" },
+                page.returned(),
+                page.total,
+                selector.as_string()
+            );
+            if let Some(next) = page.next() {
+                result.push_str(&format!("\nNext range: {next}"));
+            }
+            for note in &notes[page.start_index..page.end_index] {
+                result.push_str(&format!(
+                    "\n\nPath: {}\nName: {}\nLines: {}\nSize: {} bytes\nModified: {}",
+                    display_path(&self.root, &note.path),
+                    note.name,
+                    note.line_count,
+                    note.size,
+                    DateTime::<Local>::from(note.modified).to_rfc3339()
+                ));
+                if let Some(created) = note.created {
+                    result.push_str(&format!(
+                        "\nCreated: {}",
+                        DateTime::<Local>::from(created).to_rfc3339()
+                    ));
+                }
+            }
+            Ok(result)
         }
-        serde_json::to_string_pretty(&result).context("encoding note listing")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -189,32 +197,37 @@ impl Tool for SearchNotes {
         search_schema("Fuzzy filename query; the extension is not required")
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let query = required_string(input, "query")?.trim();
-        if query.is_empty() {
-            bail!("query must not be empty");
-        }
-        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
-        let mut listed = Vec::new();
-        for directory in &self.directories {
-            listed.extend(list_note_files_in(directory).await?);
-        }
-        let matches = listed
-            .into_iter()
-            .filter(|file| {
-                file.path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| fuzzy_match(name, query))
-            })
-            .map(|file| {
-                json!({
-                    "path": display_path(&self.root, &file.path),
-                    "name": file.path.file_name().unwrap_or_default().to_string_lossy(),
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let query = required_string(input, "query")?.trim();
+            if query.is_empty() {
+                bail!("query must not be empty");
+            }
+            let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
+            let mut listed = Vec::new();
+            for directory in &self.directories {
+                listed.extend(list_note_files_in(directory).await?);
+            }
+            let matches = listed
+                .into_iter()
+                .filter(|file| {
+                    file.path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| fuzzy_match(name, query))
                 })
-            })
-            .collect();
-        paginated_search_result(query, selector, matches)
+                .map(|file| {
+                    json!({
+                        "path": display_path(&self.root, &file.path),
+                        "name": file.path.file_name().unwrap_or_default().to_string_lossy(),
+                    })
+                })
+                .collect();
+            paginated_search_result(query, selector, matches)
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -280,16 +293,26 @@ fn paginated_search_result(
     matches: Vec<Value>,
 ) -> Result<String> {
     let page = selector.window(matches.len());
-    let mut result = json!({
-        "query": query,
-        "range": selector.as_string(),
-        "returned": page.returned(),
-        "total": page.total,
-        "has_more": page.has_more(),
-        "items": &matches[page.start_index..page.end_index],
-    });
+    let mut result = format!(
+        "Query: {query}\nMatches: {} of {}\nRange: {}",
+        page.returned(),
+        page.total,
+        selector.as_string()
+    );
     if let Some(next) = page.next() {
-        result["next"] = json!(next);
+        result.push_str(&format!("\nNext range: {next}"));
     }
-    serde_json::to_string_pretty(&result).context("encoding search results")
+    for item in &matches[page.start_index..page.end_index] {
+        let path = item.get("path").and_then(Value::as_str).unwrap_or_default();
+        let line = item.get("line").and_then(Value::as_u64);
+        let snippet = item
+            .get("snippet")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match line {
+            Some(line) => result.push_str(&format!("\n\n{path}:{line}: {snippet}")),
+            None => result.push_str(&format!("\n\n{path}: {snippet}")),
+        }
+    }
+    Ok(result)
 }

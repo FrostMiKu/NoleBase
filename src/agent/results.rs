@@ -8,6 +8,46 @@ use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 
 pub(crate) const RESULT_URI_PREFIX: &str = "nole://result/";
+/// Leaves room for the read tool's URI and line-number framing while ensuring
+/// every stored line is reachable through ordinary line pagination.
+const MAX_STORED_RESULT_LINE_CHARACTERS: usize = 4_096;
+
+pub(crate) fn normalize_stored_result(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, false), |line| (line, true));
+        let mut characters = line.chars().peekable();
+        while characters.peek().is_some() {
+            output.extend(characters.by_ref().take(MAX_STORED_RESULT_LINE_CHARACTERS));
+            if characters.peek().is_some() {
+                output.push('\n');
+            }
+        }
+        if newline {
+            output.push('\n');
+        }
+    }
+    output
+}
+
+pub(crate) fn should_externalize_text(text: &str, token_cap: u64) -> bool {
+    text.chars().count() > super::MAX_INLINE_TOOL_RESULT_CHARACTERS
+        || super::estimate_text_tokens(text) > token_cap
+}
+
+pub(crate) fn result_reference_message(uri: &str, original: &str, stored: &str) -> String {
+    format!(
+        "Tool result stored at {uri} ({} characters, {} lines). Use read with this URI and a line range to inspect it.",
+        original.chars().count(),
+        text_line_count(stored),
+    )
+}
+
+pub(crate) fn canonical_root(root: &Path) -> Result<PathBuf> {
+    fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))
+}
 
 #[derive(Clone)]
 pub(crate) struct SessionResultStore {
@@ -128,4 +168,19 @@ fn next_result_id(root: &Path) -> Result<u64> {
     maximum
         .checked_add(1)
         .context("session result id exhausted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_results_bound_every_line_without_splitting_unicode() {
+        let text = format!("header\n{}\ntail", "界".repeat(9_000));
+        let normalized = normalize_stored_result(&text);
+        assert_eq!(normalized.replace('\n', ""), text.replace('\n', ""));
+        assert!(normalized
+            .lines()
+            .all(|line| line.chars().count() <= MAX_STORED_RESULT_LINE_CHARACTERS));
+    }
 }

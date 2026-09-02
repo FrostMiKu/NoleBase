@@ -171,9 +171,9 @@ mod tests {
             .execute(&json!({"path": "large.txt", "range": "49991-49995"}))
             .await
             .unwrap();
-        assert!(output.contains("49991:line 49990"));
-        assert!(output.contains("[Showing lines 49991-49995"));
-        assert!(!output.contains("Continue with"));
+        assert!(output.content.contains("49991:line 49990"));
+        assert!(output.content.contains("[Showing lines 49991-49995"));
+        assert!(!output.content.contains("Continue with"));
         assert!(tracker
             .head(&fs::canonicalize(path).unwrap())
             .unwrap()
@@ -182,7 +182,9 @@ mod tests {
             .execute(&json!({"path": "large.txt", "range": "49999-50003"}))
             .await
             .unwrap();
-        assert!(final_page.contains("[Showing lines 49999-50000 of 50000"));
-        assert!(!final_page.contains("Continue with"));
+        assert!(final_page
+            .content
+            .contains("[Showing lines 49999-50000 of 50000"));
+        assert!(!final_page.content.contains("Continue with"));
     }
 }

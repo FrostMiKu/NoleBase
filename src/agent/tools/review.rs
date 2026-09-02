@@ -75,14 +75,19 @@ impl Tool for Review {
         ToolExecutionPolicy::Subagent
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let task = input
-            .get("task")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|task| !task.is_empty())
-            .context("field task must be a non-empty string")?;
-        self.runner.run(task).await
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let task = input
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|task| !task.is_empty())
+                .context("field task must be a non-empty string")?;
+            self.runner.run(task).await
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -220,7 +225,10 @@ mod tests {
         let output = crate::agent::test_support::test_runtime()
             .block_on(review.execute(&json!({"task": "Review the draft note"})))
             .unwrap();
-        assert_eq!(output, "Review: the draft is solid with two minor gaps.");
+        assert_eq!(
+            output.content,
+            "Review: the draft is solid with two minor gaps."
+        );
 
         let requests = provider.requests.lock();
         assert_eq!(requests.len(), 2);
@@ -272,7 +280,7 @@ mod tests {
         let output = crate::agent::test_support::test_runtime()
             .block_on(review.execute(&json!({"task": "Keep reviewing"})))
             .unwrap();
-        assert_eq!(output, "Budget-limited review.");
+        assert_eq!(output.content, "Budget-limited review.");
 
         let requests = provider.requests.lock();
         assert_eq!(requests.len(), 2);
@@ -329,7 +337,7 @@ mod tests {
             .block_on(review.execute(&json!({"task": "Review the migration plan"})))
             .unwrap();
         assert_eq!(
-            output,
+            output.content,
             "Assessment: the plan covers the stated requirements."
         );
 

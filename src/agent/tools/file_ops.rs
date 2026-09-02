@@ -252,31 +252,36 @@ impl Tool for Copy {
         transfer_schema()
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
-        let destination_text = required_string(input, "destination")?;
-        let destination = resolve_new_destination(&self.root, destination_text)?;
-        validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Copy file".to_string(),
-                    message: format!(
-                        "Copy {} to {}?",
-                        display_path(&self.root, &source),
-                        display_path(&self.root, &destination)
-                    ),
-                    kind: ApprovalKind::Confirm,
-                },
-                &[&source, &destination],
-            )
-            .await?;
-        let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
-        Ok(post_write_result(
-            format!("copied {bytes} bytes to {destination_text}"),
-            destination_text,
-            &destination,
-        ))
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
+            let destination_text = required_string(input, "destination")?;
+            let destination = resolve_new_destination(&self.root, destination_text)?;
+            validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Copy file".to_string(),
+                        message: format!(
+                            "Copy {} to {}?",
+                            display_path(&self.root, &source),
+                            display_path(&self.root, &destination)
+                        ),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &[&source, &destination],
+                )
+                .await?;
+            let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
+            Ok(post_write_result(
+                format!("copied {bytes} bytes to {destination_text}"),
+                destination_text,
+                &destination,
+            ))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -321,42 +326,47 @@ impl Tool for Export {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let source = required_string(input, "source")?.to_string();
-        let destination = required_string(input, "destination")?.to_string();
-        let format = ExportFormat::Html;
-        let storage = self.storage.clone();
-        let prepared = tokio::task::spawn_blocking(move || {
-            storage.prepare_export(
-                source,
-                destination,
-                format,
-                ExportDestinationPolicy::CreateNew,
-            )
-        })
-        .await
-        .context("joining export preparation")??;
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Export file".to_string(),
-                    message: format!(
-                        "Export {} as {} to {}?",
-                        prepared.source().display(),
-                        format.label(),
-                        prepared.destination().display()
-                    ),
-                    kind: ApprovalKind::Confirm,
-                },
-                &[prepared.source(), prepared.destination()],
-            )
-            .await?;
-        // Rendering HTML is CPU-bound, so publish on the blocking pool.
-        let storage = self.storage.clone();
-        let outcome = tokio::task::spawn_blocking(move || storage.publish_export(&prepared))
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let source = required_string(input, "source")?.to_string();
+            let destination = required_string(input, "destination")?.to_string();
+            let format = ExportFormat::Html;
+            let storage = self.storage.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                storage.prepare_export(
+                    source,
+                    destination,
+                    format,
+                    ExportDestinationPolicy::CreateNew,
+                )
+            })
             .await
-            .context("joining export publication")??;
-        Ok(describe_export_outcome(&outcome, format))
+            .context("joining export preparation")??;
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Export file".to_string(),
+                        message: format!(
+                            "Export {} as {} to {}?",
+                            prepared.source().display(),
+                            format.label(),
+                            prepared.destination().display()
+                        ),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &[prepared.source(), prepared.destination()],
+                )
+                .await?;
+            // Rendering HTML is CPU-bound, so publish on the blocking pool.
+            let storage = self.storage.clone();
+            let outcome = tokio::task::spawn_blocking(move || storage.publish_export(&prepared))
+                .await
+                .context("joining export publication")??;
+            Ok(describe_export_outcome(&outcome, format))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -414,35 +424,40 @@ impl Tool for Move {
         transfer_schema()
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
-        let identity = capture_source_identity(&source)?;
-        let destination_text = required_string(input, "destination")?;
-        let destination = resolve_new_destination(&self.root, destination_text)?;
-        validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
-        check_workspace_write(&self.root, &destination, identity.len)?;
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Move file".to_string(),
-                    message: format!(
-                        "Move {} to {}?",
-                        display_path(&self.root, &source),
-                        display_path(&self.root, &destination)
-                    ),
-                    kind: ApprovalKind::Confirm,
-                },
-                &[&source, &destination],
-            )
-            .await?;
-        revalidate_source(&identity)?;
-        let bytes = move_to_new_file(&source, &destination)?;
-        send_file_moved(&self.events, &self.root, &source, &destination);
-        Ok(post_write_result(
-            format!("moved {bytes} bytes to {destination_text}"),
-            destination_text,
-            &destination,
-        ))
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let source = resolve_transfer_source(&self.root, required_string(input, "source")?)?;
+            let identity = capture_source_identity(&source)?;
+            let destination_text = required_string(input, "destination")?;
+            let destination = resolve_new_destination(&self.root, destination_text)?;
+            validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
+            check_workspace_write(&self.root, &destination, identity.len)?;
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Move file".to_string(),
+                        message: format!(
+                            "Move {} to {}?",
+                            display_path(&self.root, &source),
+                            display_path(&self.root, &destination)
+                        ),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &[&source, &destination],
+                )
+                .await?;
+            revalidate_source(&identity)?;
+            let bytes = move_to_new_file(&source, &destination)?;
+            send_file_moved(&self.events, &self.root, &source, &destination);
+            Ok(post_write_result(
+                format!("moved {bytes} bytes to {destination_text}"),
+                destination_text,
+                &destination,
+            ))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -490,123 +505,117 @@ impl Tool for MoveMany {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let source_values = input
-            .get("sources")
-            .and_then(Value::as_array)
-            .context("field sources must be an array")?;
-        if source_values.is_empty() || source_values.len() > 200 {
-            bail!("sources must contain between 1 and 200 paths");
-        }
-        let directory_text = required_string(input, "destination_directory")?;
-        let destination_directory = resolve_destination_directory(&self.root, directory_text)?;
-        let mut transfers = Vec::with_capacity(source_values.len());
-        let mut sources = std::collections::HashSet::new();
-        let mut destinations = std::collections::HashSet::new();
-        for value in source_values {
-            let source_text = value.as_str().context("each source must be a string")?;
-            let source = resolve_transfer_source(&self.root, source_text)?;
-            let identity = capture_source_identity(&source)?;
-            if !sources.insert(source.clone()) {
-                bail!("duplicate source: {source_text}");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let source_values = input
+                .get("sources")
+                .and_then(Value::as_array)
+                .context("field sources must be an array")?;
+            if source_values.is_empty() || source_values.len() > 200 {
+                bail!("sources must contain between 1 and 200 paths");
             }
-            let name = source.file_name().context("source must have a file name")?;
-            let destination = destination_directory.join(name);
-            ensure_not_special(&self.root, &destination)?;
-            if !destinations.insert(destination.clone()) {
-                bail!(
-                    "multiple sources have the same basename: {}",
-                    name.to_string_lossy()
-                );
-            }
-            match fs::symlink_metadata(&destination) {
-                Ok(_) => bail!("destination already exists: {}", destination.display()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("checking batch destination"),
-            }
-            validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
-            transfers.push((source, destination, identity));
-        }
-        check_workspace_writes(
-            &self.root,
-            transfers
-                .iter()
-                .map(|(_, destination, identity)| (destination.as_path(), identity.len)),
-        )?;
-
-        let approval_paths = transfers
-            .iter()
-            .map(|(source, _, _)| source.as_path())
-            .chain(std::iter::once(destination_directory.as_path()))
-            .collect::<Vec<_>>();
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Move files".to_string(),
-                    message: format!(
-                        "Move {} file{} into {}?",
-                        transfers.len(),
-                        if transfers.len() == 1 { "" } else { "s" },
-                        display_path(&self.root, &destination_directory)
-                    ),
-                    kind: ApprovalKind::Confirm,
-                },
-                &approval_paths,
-            )
-            .await?;
-
-        for (_, _, identity) in &transfers {
-            revalidate_source(identity)?;
-        }
-
-        let mut completed = Vec::with_capacity(transfers.len());
-        for (source, destination, _) in &transfers {
-            match move_to_new_file(source, destination) {
-                Ok(bytes) => completed.push((source.clone(), destination.clone(), bytes)),
-                Err(error) => {
-                    let rollback_errors = rollback_moves(&completed);
-                    if rollback_errors.is_empty() {
-                        bail!("batch move failed and was rolled back: {error}");
-                    }
+            let directory_text = required_string(input, "destination_directory")?;
+            let destination_directory = resolve_destination_directory(&self.root, directory_text)?;
+            let mut transfers = Vec::with_capacity(source_values.len());
+            let mut sources = std::collections::HashSet::new();
+            let mut destinations = std::collections::HashSet::new();
+            for value in source_values {
+                let source_text = value.as_str().context("each source must be a string")?;
+                let source = resolve_transfer_source(&self.root, source_text)?;
+                let identity = capture_source_identity(&source)?;
+                if !sources.insert(source.clone()) {
+                    bail!("duplicate source: {source_text}");
+                }
+                let name = source.file_name().context("source must have a file name")?;
+                let destination = destination_directory.join(name);
+                ensure_not_special(&self.root, &destination)?;
+                if !destinations.insert(destination.clone()) {
                     bail!(
-                        "batch move failed: {error}; rollback failures: {}",
-                        rollback_errors.join("; ")
+                        "multiple sources have the same basename: {}",
+                        name.to_string_lossy()
                     );
                 }
+                match fs::symlink_metadata(&destination) {
+                    Ok(_) => bail!("destination already exists: {}", destination.display()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("checking batch destination"),
+                }
+                validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
+                transfers.push((source, destination, identity));
             }
-        }
-        let moved = completed
-            .iter()
-            .map(|(source, destination, bytes)| {
-                json!({
-                    "source": display_path(&self.root, source),
-                    "destination": display_path(&self.root, destination),
-                    "bytes": bytes,
+            check_workspace_writes(
+                &self.root,
+                transfers
+                    .iter()
+                    .map(|(_, destination, identity)| (destination.as_path(), identity.len)),
+            )?;
+
+            let approval_paths = transfers
+                .iter()
+                .map(|(source, _, _)| source.as_path())
+                .chain(std::iter::once(destination_directory.as_path()))
+                .collect::<Vec<_>>();
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Move files".to_string(),
+                        message: format!(
+                            "Move {} file{} into {}?",
+                            transfers.len(),
+                            if transfers.len() == 1 { "" } else { "s" },
+                            display_path(&self.root, &destination_directory)
+                        ),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &approval_paths,
+                )
+                .await?;
+
+            for (_, _, identity) in &transfers {
+                revalidate_source(identity)?;
+            }
+
+            let mut completed = Vec::with_capacity(transfers.len());
+            for (source, destination, _) in &transfers {
+                match move_to_new_file(source, destination) {
+                    Ok(bytes) => completed.push((source.clone(), destination.clone(), bytes)),
+                    Err(error) => {
+                        let rollback_errors = rollback_moves(&completed);
+                        if rollback_errors.is_empty() {
+                            bail!("batch move failed and was rolled back: {error}");
+                        }
+                        bail!(
+                            "batch move failed: {error}; rollback failures: {}",
+                            rollback_errors.join("; ")
+                        );
+                    }
+                }
+            }
+            for (source, destination, _) in &completed {
+                send_file_moved(&self.events, &self.root, source, destination);
+            }
+            let warnings = completed
+                .iter()
+                .filter_map(|(_, destination, _)| {
+                    let display = display_path(&self.root, destination);
+                    mbdown_warning(&display, destination)
                 })
-            })
-            .collect::<Vec<_>>();
-        for (source, destination, _) in &completed {
-            send_file_moved(&self.events, &self.root, source, destination);
+                .collect::<Vec<_>>();
+            let mut result = format!("Destination: {directory_text}\nMoved: {}", completed.len());
+            for (source, destination, bytes) in &completed {
+                result.push_str(&format!("\n\nSource: {}\nDestination: {}\nBytes: {bytes}", display_path(&self.root, source), display_path(&self.root, destination)));
+            }
+            if !warnings.is_empty() {
+                for warning in warnings {
+                    result.push_str(&format!("\nMBDown warning: {warning}"));
+                }
+                result.push_str(&format!("\nRepair: Files were moved. Read each affected file and {REPAIR_REQUIRED_MARKER}."));
+            }
+            Ok(result)
         }
-        let warnings = completed
-            .iter()
-            .filter_map(|(_, destination, _)| {
-                let display = display_path(&self.root, destination);
-                mbdown_warning(&display, destination)
-            })
-            .collect::<Vec<_>>();
-        let mut result = json!({
-            "destination_directory": directory_text,
-            "count": moved.len(),
-            "moved": moved,
-        });
-        if !warnings.is_empty() {
-            result["mbdown_warnings"] = json!(warnings);
-            result["repair"] = json!(format!(
-                "Files were moved. Read each affected file and {REPAIR_REQUIRED_MARKER}."
-            ));
-        }
-        serde_json::to_string_pretty(&result).context("encoding batch move result")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -693,54 +702,59 @@ impl Tool for Rename {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let path_text = required_string(input, "path")?;
-        let source = resolve_transfer_source(&self.root, path_text)?;
-        let identity = capture_source_identity(&source)?;
-        let new_name = required_string(input, "new_name")?;
-        let candidate = Path::new(new_name);
-        if candidate.file_name().is_none()
-            || candidate.components().count() != 1
-            || candidate == Path::new(".")
-            || candidate == Path::new("..")
-        {
-            bail!("new_name must be a file basename without directory components");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let path_text = required_string(input, "path")?;
+            let source = resolve_transfer_source(&self.root, path_text)?;
+            let identity = capture_source_identity(&source)?;
+            let new_name = required_string(input, "new_name")?;
+            let candidate = Path::new(new_name);
+            if candidate.file_name().is_none()
+                || candidate.components().count() != 1
+                || candidate == Path::new(".")
+                || candidate == Path::new("..")
+            {
+                bail!("new_name must be a file basename without directory components");
+            }
+            let destination = source
+                .parent()
+                .context("source must have a parent directory")?
+                .join(candidate);
+            ensure_not_special(&self.root, &destination)?;
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => bail!("destination already exists: {}", destination.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("checking rename destination"),
+            }
+            validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
+            check_workspace_write(&self.root, &destination, identity.len)?;
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Rename file".to_string(),
+                        message: format!(
+                            "Rename {} to {}?",
+                            display_path(&self.root, &source),
+                            display_path(&self.root, &destination)
+                        ),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &[&source, &destination],
+                )
+                .await?;
+            revalidate_source(&identity)?;
+            let bytes = move_to_new_file(&source, &destination)?;
+            send_file_moved(&self.events, &self.root, &source, &destination);
+            let destination_text = display_path(&self.root, &destination);
+            Ok(post_write_result(
+                format!("renamed {path_text} to {destination_text} ({bytes} bytes)"),
+                &destination_text,
+                &destination,
+            ))
         }
-        let destination = source
-            .parent()
-            .context("source must have a parent directory")?
-            .join(candidate);
-        ensure_not_special(&self.root, &destination)?;
-        match fs::symlink_metadata(&destination) {
-            Ok(_) => bail!("destination already exists: {}", destination.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("checking rename destination"),
-        }
-        validate_write_preconditions(&self.root, &destination, WriteSource::File(&source))?;
-        check_workspace_write(&self.root, &destination, identity.len)?;
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Rename file".to_string(),
-                    message: format!(
-                        "Rename {} to {}?",
-                        display_path(&self.root, &source),
-                        display_path(&self.root, &destination)
-                    ),
-                    kind: ApprovalKind::Confirm,
-                },
-                &[&source, &destination],
-            )
-            .await?;
-        revalidate_source(&identity)?;
-        let bytes = move_to_new_file(&source, &destination)?;
-        send_file_moved(&self.events, &self.root, &source, &destination);
-        let destination_text = display_path(&self.root, &destination);
-        Ok(post_write_result(
-            format!("renamed {path_text} to {destination_text} ({bytes} bytes)"),
-            &destination_text,
-            &destination,
-        ))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -800,46 +814,51 @@ impl Tool for Delete {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let path_text = required_string(input, "path")?;
-        let unresolved = resolve_mutation_path(&self.root, path_text)?;
-        let metadata = fs::symlink_metadata(&unresolved)
-            .with_context(|| format!("checking {}", unresolved.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            bail!("delete only accepts regular files, not symlinks or directories");
-        }
-        let path = fs::canonicalize(&unresolved)?;
-        match path_zone(&self.root, &path) {
-            PathZone::Config => bail!("delete cannot operate inside config/"),
-            PathZone::Attachments => {
-                bail!("generic file tools cannot operate inside attachments/")
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let path_text = required_string(input, "path")?;
+            let unresolved = resolve_mutation_path(&self.root, path_text)?;
+            let metadata = fs::symlink_metadata(&unresolved)
+                .with_context(|| format!("checking {}", unresolved.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                bail!("delete only accepts regular files, not symlinks or directories");
             }
-            _ => {}
-        }
-        let modified = metadata.modified().ok();
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Delete file".to_string(),
-                    message: format!("Delete {path_text}?"),
-                    kind: ApprovalKind::DestructiveConfirm,
-                },
-                &[&path],
-            )
-            .await?;
+            let path = fs::canonicalize(&unresolved)?;
+            match path_zone(&self.root, &path) {
+                PathZone::Config => bail!("delete cannot operate inside config/"),
+                PathZone::Attachments => {
+                    bail!("generic file tools cannot operate inside attachments/")
+                }
+                _ => {}
+            }
+            let modified = metadata.modified().ok();
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Delete file".to_string(),
+                        message: format!("Delete {path_text}?"),
+                        kind: ApprovalKind::DestructiveConfirm,
+                    },
+                    &[&path],
+                )
+                .await?;
 
-        let current = fs::symlink_metadata(&unresolved)
-            .with_context(|| format!("rechecking {}", unresolved.display()))?;
-        if current.file_type().is_symlink()
-            || !current.file_type().is_file()
-            || current.len() != metadata.len()
-            || current.modified().ok() != modified
-            || fs::canonicalize(&unresolved)? != path
-        {
-            bail!("file changed before deletion; inspect it again and retry");
+            let current = fs::symlink_metadata(&unresolved)
+                .with_context(|| format!("rechecking {}", unresolved.display()))?;
+            if current.file_type().is_symlink()
+                || !current.file_type().is_file()
+                || current.len() != metadata.len()
+                || current.modified().ok() != modified
+                || fs::canonicalize(&unresolved)? != path
+            {
+                bail!("file changed before deletion; inspect it again and retry");
+            }
+            fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
+            Ok(format!("deleted {path_text}"))
         }
-        fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
-        Ok(format!("deleted {path_text}"))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -875,51 +894,58 @@ impl Tool for Write {
             "required": ["path", "content"], "additionalProperties": false
         })
     }
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let path_text = required_string(input, "path")?;
-        let content = required_string(input, "content")?;
-        let path = resolve_mutation_path(&self.root, path_text)?;
-        match path_zone(&self.root, &path) {
-            PathZone::Config | PathZone::Daily => {
-                bail!("generic file tools cannot operate on this special file");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let path_text = required_string(input, "path")?;
+            let content = required_string(input, "content")?;
+            let path = resolve_mutation_path(&self.root, path_text)?;
+            match path_zone(&self.root, &path) {
+                PathZone::Config | PathZone::Daily => {
+                    bail!("generic file tools cannot operate on this special file");
+                }
+                PathZone::Attachments => {
+                    bail!("generic file tools cannot operate inside attachments/")
+                }
+                _ => {}
             }
-            PathZone::Attachments => {
-                bail!("generic file tools cannot operate inside attachments/")
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    bail!("write only creates new files; use read and edit for existing files")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("checking {path_text}")),
             }
-            _ => {}
+            validate_write_preconditions(&self.root, &path, WriteSource::Text(content))?;
+            check_workspace_write(&self.root, &path, content.len() as u64)?;
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Write file".to_string(),
+                        message: format!(
+                            "Write {} bytes to {}?",
+                            content.len(),
+                            display_path(&self.root, &path)
+                        ),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &[&path],
+                )
+                .await?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options
+                .open(&path)
+                .with_context(|| format!("writing file {}", path.display()))?;
+            file.write_all(content.as_bytes())?;
+            Ok(post_write_result(
+                format!("wrote {} bytes to {path_text}", content.len()),
+                path_text,
+                &path,
+            ))
         }
-        match fs::symlink_metadata(&path) {
-            Ok(_) => bail!("write only creates new files; use read and edit for existing files"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("checking {path_text}")),
-        }
-        validate_write_preconditions(&self.root, &path, WriteSource::Text(content))?;
-        check_workspace_write(&self.root, &path, content.len() as u64)?;
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Write file".to_string(),
-                    message: format!(
-                        "Write {} bytes to {}?",
-                        content.len(),
-                        display_path(&self.root, &path)
-                    ),
-                    kind: ApprovalKind::Confirm,
-                },
-                &[&path],
-            )
-            .await?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = options
-            .open(&path)
-            .with_context(|| format!("writing file {}", path.display()))?;
-        file.write_all(content.as_bytes())?;
-        Ok(post_write_result(
-            format!("wrote {} bytes to {path_text}", content.len()),
-            path_text,
-            &path,
-        ))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -1013,28 +1039,33 @@ impl Tool for Mkdir {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let path_text = required_string(input, "path")?;
-        let path = resolve_new_directory(&self.root, path_text)?;
-        match path_zone(&self.root, &path) {
-            PathZone::Config | PathZone::Daily | PathZone::Attachments => {
-                bail!("generic file tools cannot operate on this special file");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let path_text = required_string(input, "path")?;
+            let path = resolve_new_directory(&self.root, path_text)?;
+            match path_zone(&self.root, &path) {
+                PathZone::Config | PathZone::Daily | PathZone::Attachments => {
+                    bail!("generic file tools cannot operate on this special file");
+                }
+                _ => {}
             }
-            _ => {}
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Create directory".to_string(),
+                        message: format!("Create directory {}?", display_path(&self.root, &path)),
+                        kind: ApprovalKind::Confirm,
+                    },
+                    &[&path],
+                )
+                .await?;
+            fs::create_dir_all(&path)
+                .with_context(|| format!("creating directory {}", path.display()))?;
+            Ok(format!("created directory {path_text}"))
         }
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Create directory".to_string(),
-                    message: format!("Create directory {}?", display_path(&self.root, &path)),
-                    kind: ApprovalKind::Confirm,
-                },
-                &[&path],
-            )
-            .await?;
-        fs::create_dir_all(&path)
-            .with_context(|| format!("creating directory {}", path.display()))?;
-        Ok(format!("created directory {path_text}"))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -1072,38 +1103,43 @@ impl Tool for Rmdir {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let path_text = required_string(input, "path")?;
-        let unresolved = resolve_mutation_path(&self.root, path_text)?;
-        let metadata = fs::symlink_metadata(&unresolved)
-            .with_context(|| format!("checking {}", unresolved.display()))?;
-        if metadata.file_type().is_symlink() {
-            bail!("refusing to remove a directory through a symlink");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let path_text = required_string(input, "path")?;
+            let unresolved = resolve_mutation_path(&self.root, path_text)?;
+            let metadata = fs::symlink_metadata(&unresolved)
+                .with_context(|| format!("checking {}", unresolved.display()))?;
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to remove a directory through a symlink");
+            }
+            if !metadata.is_dir() {
+                bail!("rmdir only removes directories; use delete for regular files");
+            }
+            let path = fs::canonicalize(&unresolved)
+                .with_context(|| format!("resolving {}", unresolved.display()))?;
+            // Inside Nole, recursive removal stays confined to the Agent workspace;
+            // an external absolute directory is a plain external path and allowed.
+            if path.starts_with(&self.root)
+                && !matches!(path_zone(&self.root, &path), PathZone::Workspace)
+            {
+                bail!("recursive removal is only allowed inside workspace");
+            }
+            self.gate
+                .request_for_paths(
+                    ApprovalRequest {
+                        title: "Remove directory".to_string(),
+                        message: format!("Remove directory {}?", display_path(&self.root, &path)),
+                        kind: ApprovalKind::DestructiveConfirm,
+                    },
+                    &[&path],
+                )
+                .await?;
+            fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+            Ok(format!("removed directory {path_text}"))
         }
-        if !metadata.is_dir() {
-            bail!("rmdir only removes directories; use delete for regular files");
-        }
-        let path = fs::canonicalize(&unresolved)
-            .with_context(|| format!("resolving {}", unresolved.display()))?;
-        // Inside Nole, recursive removal stays confined to the Agent workspace;
-        // an external absolute directory is a plain external path and allowed.
-        if path.starts_with(&self.root)
-            && !matches!(path_zone(&self.root, &path), PathZone::Workspace)
-        {
-            bail!("recursive removal is only allowed inside workspace");
-        }
-        self.gate
-            .request_for_paths(
-                ApprovalRequest {
-                    title: "Remove directory".to_string(),
-                    message: format!("Remove directory {}?", display_path(&self.root, &path)),
-                    kind: ApprovalKind::DestructiveConfirm,
-                },
-                &[&path],
-            )
-            .await?;
-        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
-        Ok(format!("removed directory {path_text}"))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -1136,7 +1172,7 @@ mod tests {
     /// approval would block forever; the timeout turns that hang into a failure.
     fn execute_unapproved<F>(run: F) -> String
     where
-        F: FnOnce() -> Result<String> + Send + 'static,
+        F: FnOnce() -> Result<crate::agent::ToolOutput> + Send + 'static,
     {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1146,6 +1182,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("tool must complete without waiting for approval")
             .expect("tool must succeed without approval")
+            .content
     }
 
     fn assert_no_approval_requested(events: Vec<AgentEvent>) {
@@ -1175,7 +1212,7 @@ mod tests {
         let input = json!({"path": "Old.md"});
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         let output = test_runtime().block_on(tool.execute(&input)).unwrap();
-        assert!(output.contains("deleted Old.md"));
+        assert!(output.content.contains("deleted Old.md"));
         assert!(!root.join("Old.md").exists());
         let events = drain_events(&mut event_receiver);
         let request = events
@@ -1378,7 +1415,7 @@ mod tests {
         };
         decision_sender.send(ApprovalDecision::Approve).unwrap();
         let output = worker.join().unwrap().unwrap();
-        assert!(output.contains("moved"));
+        assert!(output.content.contains("moved"));
         assert!(!move_source.exists());
         assert_eq!(
             fs::read_to_string(root.join("data/moved.md")).unwrap(),
@@ -1743,8 +1780,8 @@ mod tests {
                 "destination": destination
             })))
             .unwrap();
-        assert!(result.starts_with("exported "));
-        assert!(result.contains(" bytes as html to "));
+        assert!(result.content.starts_with("exported "));
+        assert!(result.content.contains(" bytes as html to "));
         assert!(fs::read_to_string(&destination)
             .unwrap()
             .starts_with("<!doctype html>"));

@@ -103,7 +103,7 @@ mod tests {
             .execute(&json!({"path": "skill://beta"}))
             .await
             .unwrap();
-        assert_eq!(output, "Skill directory: skills/beta\n\nBeta body");
+        assert_eq!(output.content, "Skill directory: skills/beta\n\nBeta body");
 
         let error = read
             .execute(&json!({"path": "skill://missing"}))
@@ -125,6 +125,6 @@ mod tests {
             .execute(&json!({"path": "skill://shared"}))
             .await
             .unwrap();
-        assert!(output.contains("Workspace body"));
+        assert!(output.content.contains("Workspace body"));
     }
 }

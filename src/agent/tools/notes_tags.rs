@@ -61,73 +61,71 @@ impl Tool for Tags {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let query = input
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        let scope = tag_scope(input)?;
-        let sort_by = input
-            .get("sort_by")
-            .and_then(Value::as_str)
-            .unwrap_or("documents");
-        if !matches!(sort_by, "documents" | "mentions" | "name") {
-            bail!("unsupported sort_by: {sort_by}");
-        }
-        let descending = match input.get("order").and_then(Value::as_str).unwrap_or("desc") {
-            "asc" => false,
-            "desc" => true,
-            other => bail!("unsupported order: {other}"),
-        };
-        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
-        let mut tags = self
-            .index
-            .with_index(|index| index.tags_scoped(scope))
-            .context("workspace tag index is still building")?;
-        if !query.is_empty() {
-            tags.retain(|tag| fuzzy_match(&tag.name, query));
-        }
-        tags.sort_by(|left, right| {
-            let ordering = match sort_by {
-                "documents" => left.documents.cmp(&right.documents),
-                "mentions" => left.mentions.cmp(&right.mentions),
-                "name" => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-                _ => unreachable!(),
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let scope = tag_scope(input)?;
+            let sort_by = input
+                .get("sort_by")
+                .and_then(Value::as_str)
+                .unwrap_or("documents");
+            if !matches!(sort_by, "documents" | "mentions" | "name") {
+                bail!("unsupported sort_by: {sort_by}");
+            }
+            let descending = match input.get("order").and_then(Value::as_str).unwrap_or("desc") {
+                "asc" => false,
+                "desc" => true,
+                other => bail!("unsupported order: {other}"),
             };
-            let ordering = if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            };
-            ordering.then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        });
-        let page = selector.window(tags.len());
-        let items = tags[page.start_index..page.end_index]
-            .iter()
-            .map(|tag| {
-                json!({
-                    "tag": tag.name,
-                    "documents": tag.documents,
-                    "mentions": tag.mentions,
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut result = json!({
-            "query": query,
-            "scope": tag_scope_label(scope),
-            "sort_by": sort_by,
-            "order": if descending { "desc" } else { "asc" },
-            "range": selector.as_string(),
-            "returned": page.returned(),
-            "total": page.total,
-            "has_more": page.has_more(),
-            "items": items,
-        });
-        if let Some(next) = page.next() {
-            result["next"] = json!(next);
+            let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
+            let mut tags = self
+                .index
+                .with_index(|index| index.tags_scoped(scope))
+                .context("workspace tag index is still building")?;
+            if !query.is_empty() {
+                tags.retain(|tag| fuzzy_match(&tag.name, query));
+            }
+            tags.sort_by(|left, right| {
+                let ordering = match sort_by {
+                    "documents" => left.documents.cmp(&right.documents),
+                    "mentions" => left.mentions.cmp(&right.mentions),
+                    "name" => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+                    _ => unreachable!(),
+                };
+                let ordering = if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+                ordering.then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+            let page = selector.window(tags.len());
+            let mut result = format!(
+                "Query: {query}\nScope: {}\nSort: {sort_by} {}\nTags: {} of {}\nRange: {}",
+                tag_scope_label(scope),
+                if descending { "desc" } else { "asc" },
+                page.returned(),
+                page.total,
+                selector.as_string()
+            );
+            if let Some(next) = page.next() {
+                result.push_str(&format!("\nNext range: {next}"));
+            }
+            for tag in &tags[page.start_index..page.end_index] {
+                result.push_str(&format!(
+                    "\n\n#{}\nDocuments: {}\nMentions: {}",
+                    tag.name, tag.documents, tag.mentions
+                ));
+            }
+            Ok(result)
         }
-        serde_json::to_string_pretty(&result).context("encoding tag list")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -174,46 +172,54 @@ impl Tool for SearchTag {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let tag = required_string(input, "tag")?.trim();
-        if tag.is_empty() {
-            bail!("tag must not be empty");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let tag = required_string(input, "tag")?.trim();
+            if tag.is_empty() {
+                bail!("tag must not be empty");
+            }
+            let scope = tag_scope(input)?;
+            let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
+            let hits = self
+                .index
+                .with_index(|index| index.exact_tag_hits(tag, scope))
+                .context("workspace tag index is still building")?;
+            let items = hits
+                .iter()
+                .filter_map(|hit| match hit {
+                    SearchHit::FileLine {
+                        path,
+                        line_no,
+                        text,
+                    } => Some(format!(
+                        "{}:{line_no}: {}",
+                        display_path(&self.root, path),
+                        truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS)
+                    )),
+                    SearchHit::DocumentLine { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let page = selector.window(items.len());
+            let mut result = format!(
+                "Tag: #{}\nScope: {}\nMatches: {} of {}\nRange: {}",
+                tag.trim_start_matches('#'),
+                tag_scope_label(scope),
+                page.returned(),
+                page.total,
+                selector.as_string()
+            );
+            if let Some(next) = page.next() {
+                result.push_str(&format!("\nNext range: {next}"));
+            }
+            if page.returned() > 0 {
+                result.push_str("\n\n");
+                result.push_str(&items[page.start_index..page.end_index].join("\n"));
+            }
+            Ok(result)
         }
-        let scope = tag_scope(input)?;
-        let selector = RangeSelector::from_input(input, MAX_SEARCH_RESULTS)?;
-        let hits = self
-            .index
-            .with_index(|index| index.exact_tag_hits(tag, scope))
-            .context("workspace tag index is still building")?;
-        let items = hits
-            .iter()
-            .filter_map(|hit| match hit {
-                SearchHit::FileLine {
-                    path,
-                    line_no,
-                    text,
-                } => Some(json!({
-                    "path": display_path(&self.root, path),
-                    "line": line_no,
-                    "snippet": truncate_chars(text, MAX_SEARCH_SNIPPET_CHARS),
-                })),
-                SearchHit::DocumentLine { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        let page = selector.window(items.len());
-        let mut result = json!({
-            "tag": tag.trim_start_matches('#'),
-            "scope": tag_scope_label(scope),
-            "range": selector.as_string(),
-            "returned": page.returned(),
-            "total": page.total,
-            "has_more": page.has_more(),
-            "items": &items[page.start_index..page.end_index],
-        });
-        if let Some(next) = page.next() {
-            result["next"] = json!(next);
-        }
-        serde_json::to_string_pretty(&result).context("encoding tag search")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -257,52 +263,53 @@ impl Tool for RenameTag {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let from = required_string(input, "from")?.trim();
-        let to = required_string(input, "to")?.trim();
-        let paths = self
-            .index
-            .with_index(|index| index.tag_paths(from))
-            .context("workspace tag index is still building")?;
-        let plan = TagRenamePlan::prepare(&self.storage, paths, from, to)?;
-        let mut diff = format!(
-            "Rename #{} to #{} in {} documents ({} mentions)\n\n",
-            plan.from,
-            plan.to,
-            plan.documents(),
-            plan.mentions()
-        );
-        for (path, before, after, _) in plan.changes() {
-            let label = display_path(&self.root, path);
-            diff.push_str(&limited_diff(before, after, &label, &label));
-            diff.push('\n');
-            if diff.len() > MAX_DIFF_BYTES {
-                diff = truncate_with_marker(&diff, MAX_DIFF_BYTES);
-                break;
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let from = required_string(input, "from")?.trim();
+            let to = required_string(input, "to")?.trim();
+            let paths = self
+                .index
+                .with_index(|index| index.tag_paths(from))
+                .context("workspace tag index is still building")?;
+            let plan = TagRenamePlan::prepare(&self.storage, paths, from, to)?;
+            let mut diff = format!(
+                "Rename #{} to #{} in {} documents ({} mentions)\n\n",
+                plan.from,
+                plan.to,
+                plan.documents(),
+                plan.mentions()
+            );
+            for (path, before, after, _) in plan.changes() {
+                let label = display_path(&self.root, path);
+                diff.push_str(&limited_diff(before, after, &label, &label));
+                diff.push('\n');
+                if diff.len() > MAX_DIFF_BYTES {
+                    diff = truncate_with_marker(&diff, MAX_DIFF_BYTES);
+                    break;
+                }
             }
+            self.gate
+                .request(ApprovalRequest {
+                    title: format!("Rename #{} to #{}", plan.from, plan.to),
+                    message: diff,
+                    kind: ApprovalKind::Diff,
+                })
+                .await?;
+            let outcome = plan.apply()?;
+            self.index
+                .refresh_paths(&self.storage, outcome.paths.clone());
+            let mut result = format!(
+                "Renamed: #{} -> #{}\nDocuments: {}\nMentions: {}",
+                outcome.from, outcome.to, outcome.documents, outcome.mentions
+            );
+            for path in &outcome.paths {
+                result.push_str(&format!("\nPath: {}", display_path(&self.root, path)));
+            }
+            Ok::<String, anyhow::Error>(result)
         }
-        self.gate
-            .request(ApprovalRequest {
-                title: format!("Rename #{} to #{}", plan.from, plan.to),
-                message: diff,
-                kind: ApprovalKind::Diff,
-            })
-            .await?;
-        let outcome = plan.apply()?;
-        self.index
-            .refresh_paths(&self.storage, outcome.paths.clone());
-        serde_json::to_string_pretty(&json!({
-            "from": outcome.from,
-            "to": outcome.to,
-            "documents": outcome.documents,
-            "mentions": outcome.mentions,
-            "paths": outcome
-                .paths
-                .iter()
-                .map(|path| display_path(&self.root, path))
-                .collect::<Vec<_>>(),
-        }))
-        .context("encoding tag rename result")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -341,33 +348,35 @@ impl Tool for Daily {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let content = required_string(input, "content")?;
-        let requested_date = input
-            .get("date")
-            .map(|date| {
-                date.as_str()
-                    .context("field date must be a string")
-                    .map(str::to_owned)
-            })
-            .transpose()?;
-        let date = requested_date
-            .clone()
-            .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
-        let path = self.storage.daily_file_path(&date)?;
-        let note = match requested_date {
-            Some(date) => self.storage.append_daily(&date, content)?,
-            None => self.storage.append_to_today(content)?,
-        };
-        let display_path = format!("daily/{}.md", note.date);
-        let mut result = json!({ "date": note.date.to_string() });
-        if let Some(warning) = mbdown_warning(&display_path, &path) {
-            result["mbdown_warning"] = json!(warning);
-            result["repair"] = json!(format!(
-                "The entry was added. Read the daily note and {REPAIR_REQUIRED_MARKER}."
-            ));
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let content = required_string(input, "content")?;
+            let requested_date = input
+                .get("date")
+                .map(|date| {
+                    date.as_str()
+                        .context("field date must be a string")
+                        .map(str::to_owned)
+                })
+                .transpose()?;
+            let date = requested_date
+                .clone()
+                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+            let path = self.storage.daily_file_path(&date)?;
+            let note = match requested_date {
+                Some(date) => self.storage.append_daily(&date, content)?,
+                None => self.storage.append_to_today(content)?,
+            };
+            let display_path = format!("daily/{}.md", note.date);
+            let mut result = format!("Added daily entry\nDate: {}", note.date);
+            if let Some(warning) = mbdown_warning(&display_path, &path) {
+                result.push_str(&format!("\nMBDown warning: {warning}\nRepair: The entry was added. Read the daily note and {REPAIR_REQUIRED_MARKER}."));
+            }
+            Ok(result)
         }
-        serde_json::to_string(&result).context("encoding daily result")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 

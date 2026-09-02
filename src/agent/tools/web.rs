@@ -90,34 +90,39 @@ impl Tool for SearchWeb {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let (query, request) = tavily_search_request(&self.api_key, input)?;
-        let response = self
-            .client
-            .post(TAVILY_SEARCH_URL)
-            .json(&request)
-            .send()
-            .await
-            .context("calling Tavily Search API")?;
-        let status = response.status();
-        let bytes = read_limited_http_body(response, "Tavily response").await?;
-        let body = String::from_utf8(bytes).context("Tavily response is not UTF-8")?;
-        if !status.is_success() {
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("detail")
-                        .and_then(Value::as_str)
-                        .or_else(|| value.get("error").and_then(Value::as_str))
-                        .map(str::to_owned)
-                })
-                .unwrap_or(body);
-            bail!("Tavily API returned {status}: {message}");
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
+        let content: Result<String> = async {
+            let (query, request) = tavily_search_request(&self.api_key, input)?;
+            let response = self
+                .client
+                .post(TAVILY_SEARCH_URL)
+                .json(&request)
+                .send()
+                .await
+                .context("calling Tavily Search API")?;
+            let status = response.status();
+            let bytes = read_limited_http_body(response, "Tavily response").await?;
+            let body = String::from_utf8(bytes).context("Tavily response is not UTF-8")?;
+            if !status.is_success() {
+                let message = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .or_else(|| value.get("error").and_then(Value::as_str))
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or(body);
+                bail!("Tavily API returned {status}: {message}");
+            }
+            let response: Value =
+                serde_json::from_str(&body).context("decoding Tavily search response")?;
+            render_tavily_response(&query, &response)
         }
-        let response: Value =
-            serde_json::from_str(&body).context("decoding Tavily search response")?;
-        compact_tavily_response(&query, &response)
+        .await;
+        let content = content?;
+        Ok(ToolOutput::text(content))
     }
 }
 
@@ -165,21 +170,35 @@ impl Http {
                 "base64",
             ),
         };
-        let mut payload = json!({
-            "status": status.as_u16(),
-            "reason": status.canonical_reason().unwrap_or_default(),
-            "version": version,
-            "url": final_url,
-            "headers": headers,
-            "body": body,
-            "body_encoding": body_encoding,
-            "received_bytes": received_bytes,
-            "truncated": truncated,
-        });
+        let mut output = format!(
+            "HTTP {} {} ({version})\nURL: {final_url}\nReceived: {received_bytes} bytes\nBody encoding: {body_encoding}\nTruncated: {truncated}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or_default(),
+        );
         if let Some(length) = content_length {
-            payload["content_length"] = json!(length);
+            output.push_str(&format!("\nContent length: {length}"));
         }
-        serde_json::to_string_pretty(&payload).context("encoding HTTP response")
+        if let Some(headers) = headers.as_object() {
+            output.push_str("\nHeaders:");
+            for (name, value) in headers {
+                let value = value.as_str().map(str::to_owned).unwrap_or_else(|| {
+                    value
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default()
+                });
+                output.push_str(&format!("\n{name}: {value}"));
+            }
+        }
+        output.push_str("\n\nBody:\n");
+        output.push_str(&body);
+        Ok(output)
     }
 
     async fn save_response(
@@ -267,16 +286,14 @@ impl Http {
         guard.committed = true;
 
         let token = format!("sha256:{}", hex_lower(&hasher.finalize()));
-        let mut result = json!({
-            "path": display_path(&root, &destination),
-            "bytes": written,
-            "url": final_url,
-            "sha256": token,
-        });
+        let mut result = format!(
+            "Saved {}\nBytes: {written}\nURL: {final_url}\nSHA-256: {token}",
+            display_path(&root, &destination),
+        );
         if let Some(media_type) = media_type {
-            result["media_type"] = json!(media_type);
+            result.push_str(&format!("\nMedia type: {media_type}"));
         }
-        serde_json::to_string(&result).context("encoding download result")
+        Ok(result)
     }
 }
 
@@ -353,7 +370,8 @@ impl Tool for Http {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
+        let content: Result<String> = async {
         let url = reqwest::Url::parse(required_string(input, "url")?)
             .context("parsing HTTP request URL")?;
         if !matches!(url.scheme(), "http" | "https") {
@@ -431,7 +449,7 @@ impl Tool for Http {
                     }
                     .await
                     .map_err(|error| format!("{error:#}"));
-                    jobs.settle(&id, outcome);
+                    jobs.settle(&id, outcome.map(ToolOutput::text));
                 });
                 return backgrounded_job_result(
                     &started.id,
@@ -450,11 +468,9 @@ impl Tool for Http {
         }
         let response = request.send().await.context("sending HTTP request")?;
         self.render_response(response).await
-    }
-
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
-        let text = self.execute(input).await?;
-        ToolOutput::structured_json(&text, &["body"])
+    }.await;
+        let content = content?;
+        Ok(ToolOutput::text(content))
     }
 }
 
@@ -639,27 +655,48 @@ pub fn tavily_search_request(api_key: &str, input: &Value) -> Result<(String, Va
     Ok((query.to_string(), request))
 }
 
-pub fn compact_tavily_response(query: &str, response: &Value) -> Result<String> {
+pub fn render_tavily_response(query: &str, response: &Value) -> Result<String> {
     let results = response
         .get("results")
         .and_then(Value::as_array)
-        .context("Tavily response has no results array")?
-        .iter()
-        .map(|result| {
-            let mut compact = serde_json::Map::new();
-            for field in ["title", "url", "content", "score", "published_date"] {
-                if let Some(value) = result.get(field).filter(|value| !value.is_null()) {
-                    compact.insert(field.to_string(), value.clone());
-                }
-            }
-            Value::Object(compact)
-        })
-        .collect::<Vec<_>>();
-    let mut compact = json!({ "query": query, "results": results });
+        .context("Tavily response has no results array")?;
+    let mut output = format!("Search results for: {query}");
     if let Some(answer) = response.get("answer").and_then(Value::as_str) {
-        compact["answer"] = Value::String(answer.to_string());
+        output.push_str("\n\nAnswer:\n");
+        output.push_str(answer.trim());
     }
-    serde_json::to_string(&compact).context("encoding Tavily search results")
+    if results.is_empty() {
+        output.push_str("\n\nNo results.");
+        return Ok(output);
+    }
+    output.push_str("\n\nSources:");
+    for (index, result) in results.iter().enumerate() {
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled result");
+        let url = result.get("url").and_then(Value::as_str).unwrap_or("");
+        output.push_str(&format!("\n\n{}. {}", index + 1, title.trim()));
+        if !url.is_empty() {
+            output.push('\n');
+            output.push_str(url.trim());
+        }
+        if let Some(published) = result.get("published_date").and_then(Value::as_str) {
+            output.push_str("\nPublished: ");
+            output.push_str(published.trim());
+        }
+        if let Some(score) = result.get("score").and_then(Value::as_f64) {
+            output.push_str(&format!("\nRelevance: {score:.3}"));
+        }
+        if let Some(content) = result.get("content").and_then(Value::as_str) {
+            let content = content.trim();
+            if !content.is_empty() {
+                output.push_str("\n\n");
+                output.push_str(content);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn optional_choice<'a>(
@@ -777,6 +814,28 @@ mod tests {
     use base64::Engine as _;
 
     use super::*;
+
+    #[test]
+    fn tavily_response_becomes_readable_text_instead_of_raw_json() {
+        let response = json!({
+            "answer": "Layer clothing.\nBring a shell.",
+            "results": [{
+                "title": "Travel guide",
+                "url": "https://example.com/guide",
+                "content": "First paragraph.\n\nSecond paragraph.",
+                "score": 0.875,
+                "published_date": "2026-09-01",
+                "raw_content": "must not leak"
+            }]
+        });
+        let output = render_tavily_response("what to wear", &response).unwrap();
+        assert!(output.starts_with("Search results for: what to wear\n\nAnswer:\n"));
+        assert!(output.contains("\n\n1. Travel guide\nhttps://example.com/guide"));
+        assert!(output.contains("First paragraph.\n\nSecond paragraph."));
+        assert!(!output.starts_with('{'));
+        assert!(!output.contains("raw_content"));
+        assert!(!output.contains("must not leak"));
+    }
     use crate::agent::test_support::TestFutureResultExt;
     use crate::storage::Storage;
 
@@ -941,17 +1000,15 @@ mod tests {
 
         let output = tool.execute(&json!({ "url": url })).await.unwrap();
         server.join().unwrap();
-        let response: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(response["status"], 422);
-        assert_eq!(response["reason"], "Unprocessable Entity");
-        assert_eq!(response["version"], "HTTP/1.1");
-        assert_eq!(response["body"], String::from_utf8(body).unwrap());
-        assert_eq!(response["body_encoding"], "utf8");
-        assert_eq!(
-            response["headers"]["content-type"],
-            json!(["application/json"])
-        );
-        assert_eq!(response["headers"]["x-trace"], json!(["first", "second"]));
+        assert!(output
+            .content
+            .contains("HTTP 422 Unprocessable Entity (HTTP/1.1)"));
+        assert!(output.content.contains("Body encoding: utf8"));
+        assert!(output.content.contains(&String::from_utf8(body).unwrap()));
+        assert!(output.content.contains("content-type:"));
+        assert!(output.content.contains("x-trace:"));
+        assert!(output.content.contains("first"));
+        assert!(output.content.contains("second"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -967,13 +1024,11 @@ mod tests {
 
         let output = tool.execute(&json!({ "url": url })).await.unwrap();
         server.join().unwrap();
-        let response: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(response["status"], 200);
-        assert_eq!(response["body_encoding"], "base64");
-        assert_eq!(
-            response["body"],
-            base64::engine::general_purpose::STANDARD.encode(body)
-        );
+        assert!(output.content.contains("HTTP 200 OK"));
+        assert!(output.content.contains("Body encoding: base64"));
+        assert!(output
+            .content
+            .contains(&base64::engine::general_purpose::STANDARD.encode(body)));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -992,9 +1047,8 @@ mod tests {
             .await
             .unwrap();
         server.join().unwrap();
-        let response: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(response["status"], 200);
-        let echoed = response["body"].as_str().unwrap();
+        assert!(output.content.contains("HTTP 200 OK"));
+        let echoed = output.content.split_once("Body:\n").unwrap().1;
         assert!(
             echoed.starts_with("POST /echo"),
             "echoed request line: {echoed}"
@@ -1052,23 +1106,22 @@ mod tests {
             body.clone(),
             Some("application/octet-stream; charset=binary"),
         )]);
-        let result: Value = serde_json::from_str(
-            &http_tool(&root)
-                .execute(&json!({"url": url, "save_to": "binaries/blob.bin"}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let result = http_tool(&root)
+            .execute(&json!({"url": url, "save_to": "binaries/blob.bin"}))
+            .await
+            .unwrap();
         handle.join().unwrap();
 
-        assert_eq!(result["path"], "workspace/binaries/blob.bin");
-        assert_eq!(result["bytes"], body.len() as u64);
-        assert_eq!(result["media_type"], "application/octet-stream");
-        assert!(result["url"].as_str().unwrap().starts_with("http://"));
-        assert_eq!(
-            result["sha256"],
-            format!("sha256:{}", hex_lower(&Sha256::digest(&body)))
-        );
+        assert!(result.content.contains("Saved workspace/binaries/blob.bin"));
+        assert!(result.content.contains(&format!("Bytes: {}", body.len())));
+        assert!(result
+            .content
+            .contains("Media type: application/octet-stream"));
+        assert!(result.content.contains("URL: http://"));
+        assert!(result.content.contains(&format!(
+            "SHA-256: sha256:{}",
+            hex_lower(&Sha256::digest(&body))
+        )));
         assert_eq!(
             fs::read(workspace(&root).join("binaries/blob.bin")).unwrap(),
             body
@@ -1098,9 +1151,7 @@ mod tests {
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
-        let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["backgrounded"], json!(true));
-        let job = value["job"].as_str().unwrap().to_string();
+        let job = output.content.lines().next().unwrap()["Background job: ".len()..].to_string();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1121,8 +1172,10 @@ mod tests {
         let deliveries = jobs.take_deliveries();
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].status, JobStatus::Done);
-        let result: Value = serde_json::from_str(&deliveries[0].result).unwrap();
-        assert_eq!(result["bytes"], body.len() as u64);
+        assert!(deliveries[0]
+            .output
+            .content
+            .contains(&format!("Bytes: {}", body.len())));
         assert_eq!(
             fs::read(workspace(&root).join("binaries/async.bin")).unwrap(),
             body
@@ -1151,16 +1204,13 @@ mod tests {
             },
             ok_response(b"redirected".to_vec(), None),
         ]);
-        let result: Value = serde_json::from_str(
-            &http_tool(&root)
-                .execute(&json!({"url": url, "save_to": "redirected.bin"}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let result = http_tool(&root)
+            .execute(&json!({"url": url, "save_to": "redirected.bin"}))
+            .await
+            .unwrap();
         handle.join().unwrap();
-        assert_eq!(result["bytes"], 10);
-        assert!(result["url"].as_str().unwrap().ends_with("/final.bin"));
+        assert!(result.content.contains("Bytes: 10"));
+        assert!(result.content.contains("/final.bin"));
         assert_eq!(
             fs::read(workspace(&root).join("redirected.bin")).unwrap(),
             b"redirected"
@@ -1380,14 +1430,14 @@ mod tests {
             .await
             .unwrap();
         handle.join().unwrap();
-        let response: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(response["status"], 200);
-        assert_eq!(response["truncated"], true);
-        assert_eq!(response["received_bytes"], MAX_HTTP_RESPONSE_BYTES);
-        assert_eq!(response["content_length"], total);
-        assert_eq!(response["body_encoding"], "utf8");
+        assert!(output.content.contains("HTTP 200 OK"));
+        assert!(output.content.contains("Truncated: true"));
+        assert!(output
+            .content
+            .contains(&format!("Received: {MAX_HTTP_RESPONSE_BYTES} bytes")));
+        assert!(output.content.contains(&format!("Content length: {total}")));
         assert_eq!(
-            response["body"].as_str().unwrap().len(),
+            output.content.split_once("Body:\n").unwrap().1.len(),
             MAX_HTTP_RESPONSE_BYTES as usize
         );
     }
@@ -1423,10 +1473,9 @@ mod tests {
             .await
             .unwrap();
         handle.join().unwrap();
-        let response: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(response["status"], 206);
-        assert_eq!(response["truncated"], false);
-        assert_eq!(response["received_bytes"], 100);
-        assert_eq!(response["content_length"], 5000);
+        assert!(output.content.contains("HTTP 206 Partial Content"));
+        assert!(output.content.contains("Truncated: false"));
+        assert!(output.content.contains("Received: 100 bytes"));
+        assert!(output.content.contains("Content length: 5000"));
     }
 }

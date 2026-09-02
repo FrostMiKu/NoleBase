@@ -221,7 +221,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
 
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     use super::super::test_support::{serve_once, simple_pdf};
     use super::super::Read;
@@ -243,9 +243,7 @@ mod tests {
             .await
             .unwrap();
         server.join().unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["items"], json!(["second"]));
-        assert!(parsed.get("next").is_none());
+        assert!(output.content.contains("items[1]: second"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -260,9 +258,8 @@ mod tests {
         .unwrap();
         let output = read.execute(&json!({"path": url})).await.unwrap();
         server.join().unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["format"], "text");
-        assert_eq!(parsed["items"], json!(["# Reader heading"]));
+        assert!(output.content.contains("format: text"));
+        assert!(output.content.contains("items[1]: # Reader heading"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -342,13 +339,11 @@ mod tests {
             .await
             .unwrap();
         server.join().unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["format"], "pdf");
-        assert!(parsed["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|line| line.as_str().unwrap().contains("Remote PDF marker")));
+        assert!(output.content.contains("format: pdf"));
+        assert!(output
+            .content
+            .lines()
+            .any(|line| line.contains("Remote PDF marker")));
     }
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -368,10 +363,7 @@ mod tests {
             reqwest::Client::new(),
         )
         .unwrap();
-        let output = read
-            .execute_output(&json!({"path": url.clone()}))
-            .await
-            .unwrap();
+        let output = read.execute(&json!({"path": url.clone()})).await.unwrap();
         server.join().unwrap();
         assert_eq!(output.images.len(), 1);
         let block = &output.images[0];
@@ -380,17 +372,16 @@ mod tests {
         assert!(
             matches!(&block.source, ImageSource::Url { url: resolved } if resolved == &final_url)
         );
-        let summary = output.clone().into_inline_text().unwrap();
+        let summary = output.clone().into_inline_text();
         assert!(!summary.contains("base64"));
         assert!(output
             .into_inline_text()
-            .unwrap()
             .starts_with(&format!("Read image {url} (4x2, image/png, ")));
 
         // A real image served with a non-image content type is still detected
         // by magic bytes and returned natively.
         let (url, server) = serve_once("text/plain", png_bytes(4, 2));
-        let output = read.execute_output(&json!({"path": url})).await.unwrap();
+        let output = read.execute(&json!({"path": url})).await.unwrap();
         server.join().unwrap();
         assert_eq!(output.images.len(), 1);
         assert!(output.images[0].bytes.is_some());
@@ -446,20 +437,17 @@ mod tests {
             stream.flush().unwrap();
         });
         let output = read
-            .execute_output(&json!({"path": format!("http://{address}/start")}))
+            .execute(&json!({"path": format!("http://{address}/start")}))
             .await
             .unwrap();
         server.join().unwrap();
         assert_eq!(output.images.len(), 1);
         let final_url = format!("http://{address}/real.png");
-        assert!(matches!(&output.images[0].source, ImageSource::Url { url } if url == &final_url));
+        assert!(matches!(&output.images[0].source, ImageSource::Url { url } if *url == final_url));
 
         // Fake image content type (no real image bytes) errors explicitly.
         let (url, server) = serve_once("image/png", b"this is not an image".to_vec());
-        let error = read
-            .execute_output(&json!({"path": url}))
-            .await
-            .unwrap_err();
+        let error = read.execute(&json!({"path": url})).await.unwrap_err();
         server.join().unwrap();
         assert!(error
             .to_string()
@@ -485,7 +473,7 @@ mod tests {
             .unwrap();
         });
         let error = read
-            .execute_output(&json!({"path": format!("http://{address}/missing.png")}))
+            .execute(&json!({"path": format!("http://{address}/missing.png")}))
             .await
             .unwrap_err();
         server.join().unwrap();
@@ -516,7 +504,7 @@ mod tests {
             stream.flush().unwrap();
         });
         let error = read
-            .execute_output(&json!({"path": format!("http://{address}/big.png")}))
+            .execute(&json!({"path": format!("http://{address}/big.png")}))
             .await
             .unwrap_err();
         server.join().unwrap();

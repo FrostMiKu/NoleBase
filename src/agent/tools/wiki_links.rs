@@ -127,20 +127,29 @@ impl Tool for Wikilink {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let target = required_string(input, "target")?.trim();
-        let candidates = resolve_paths(&self.index, target)?;
-        let resolved = candidates
-            .iter()
-            .map(|path| json!({ "path": display_path(&self.root, path) }))
-            .collect::<Vec<_>>();
-        serde_json::to_string_pretty(&json!({
-            "target": target,
-            "status": if resolved.is_empty() { "missing" } else if resolved.len() == 1 { "unique" } else { "ambiguous" },
-            "matches": resolved.len(),
-            "candidates": resolved,
-        }))
-        .context("encoding wiki-link resolution")
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let target = required_string(input, "target")?.trim();
+            let candidates = resolve_paths(&self.index, target)?;
+            let status = if candidates.is_empty() {
+                "missing"
+            } else if candidates.len() == 1 {
+                "unique"
+            } else {
+                "ambiguous"
+            };
+            let mut output = format!(
+                "Target: {target}\nStatus: {status}\nMatches: {}",
+                candidates.len()
+            );
+            for path in &candidates {
+                output.push_str(&format!("\nCandidate: {}", display_path(&self.root, path)));
+            }
+            Ok(output)
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -183,36 +192,42 @@ impl Tool for Backlinks {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let target = required_string(input, "target")?.trim();
-        let resolved = resolve_paths(&self.index, target)?;
-        if resolved.len() != 1 {
-            return serde_json::to_string_pretty(&json!({
-                "target": target,
-                "status": if resolved.is_empty() { "missing" } else { "ambiguous" },
-                "matches": resolved.len(),
-                "candidates": resolved
-                    .iter()
-                    .map(|path| display_path(&self.root, path))
-                    .collect::<Vec<_>>(),
-            }))
-            .context("encoding backlink resolution");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let target = required_string(input, "target")?.trim();
+            let resolved = resolve_paths(&self.index, target)?;
+            if resolved.len() != 1 {
+                let status = if resolved.is_empty() {
+                    "missing"
+                } else {
+                    "ambiguous"
+                };
+                let mut output = format!(
+                    "Target: {target}\nStatus: {status}\nMatches: {}",
+                    resolved.len()
+                );
+                for path in &resolved {
+                    output.push_str(&format!("\nCandidate: {}", display_path(&self.root, path)));
+                }
+                return Ok(output);
+            }
+            let backlinks = self
+                .index
+                .with_index(|index| index.backlinks(&resolved[0]))
+                .context("wiki-link index is still building")?;
+            let mut output = format!(
+                "Target: {target}\nNote: {}\nStatus: ok\nBacklinks: {}",
+                display_path(&self.root, &resolved[0]),
+                backlinks.len()
+            );
+            for path in &backlinks {
+                output.push_str(&format!("\nBacklink: {}", display_path(&self.root, path)));
+            }
+            Ok(output)
         }
-        let backlinks = self
-            .index
-            .with_index(|index| index.backlinks(&resolved[0]))
-            .context("wiki-link index is still building")?;
-        serde_json::to_string_pretty(&json!({
-            "target": target,
-            "note": display_path(&self.root, &resolved[0]),
-            "status": "ok",
-            "count": backlinks.len(),
-            "backlinks": backlinks
-                .iter()
-                .map(|path| display_path(&self.root, path))
-                .collect::<Vec<_>>(),
-        }))
-        .context("encoding backlink list")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -256,51 +271,53 @@ impl Tool for RenameWikilink {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let from = required_string(input, "from")?;
-        let to = required_string(input, "to")?;
-        validate_wiki_target(from)?;
-        validate_wiki_target(to)?;
-        if from.eq_ignore_ascii_case(to) {
-            bail!("source and destination wiki targets are the same");
-        }
-        let plan = WikiRenamePlan::prepare(&self.storage, &self.index, from, to)?;
-        let mentions = plan.mentions;
-        let mut diff = format!(
-            "Rename [[{}]] to [[{}]] in {} documents ({} mentions)\n\n",
-            plan.from,
-            plan.to,
-            plan.changes.len(),
-            mentions
-        );
-        for change in &plan.changes {
-            let label = display_path(&self.root, &change.path);
-            diff.push_str(&limited_diff(&change.before, &change.after, &label, &label));
-            diff.push('\n');
-            if diff.len() > MAX_DIFF_BYTES {
-                diff = truncate_with_marker(&diff, MAX_DIFF_BYTES);
-                break;
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let from = required_string(input, "from")?;
+            let to = required_string(input, "to")?;
+            validate_wiki_target(from)?;
+            validate_wiki_target(to)?;
+            if from.eq_ignore_ascii_case(to) {
+                bail!("source and destination wiki targets are the same");
             }
+            let plan = WikiRenamePlan::prepare(&self.storage, &self.index, from, to)?;
+            let mentions = plan.mentions;
+            let mut diff = format!(
+                "Rename [[{}]] to [[{}]] in {} documents ({} mentions)\n\n",
+                plan.from,
+                plan.to,
+                plan.changes.len(),
+                mentions
+            );
+            for change in &plan.changes {
+                let label = display_path(&self.root, &change.path);
+                diff.push_str(&limited_diff(&change.before, &change.after, &label, &label));
+                diff.push('\n');
+                if diff.len() > MAX_DIFF_BYTES {
+                    diff = truncate_with_marker(&diff, MAX_DIFF_BYTES);
+                    break;
+                }
+            }
+            self.gate
+                .request(ApprovalRequest {
+                    title: format!("Rename [[{}]] to [[{}]]", plan.from, plan.to),
+                    message: diff,
+                    kind: ApprovalKind::Diff,
+                })
+                .await?;
+            let paths = plan.apply(&self.storage)?;
+            let mut output = format!(
+                "Renamed: [[{from}]] -> [[{to}]]\nDocuments: {}\nMentions: {mentions}",
+                paths.len()
+            );
+            for path in &paths {
+                output.push_str(&format!("\nPath: {}", display_path(&self.root, path)));
+            }
+            Ok::<String, anyhow::Error>(output)
         }
-        self.gate
-            .request(ApprovalRequest {
-                title: format!("Rename [[{}]] to [[{}]]", plan.from, plan.to),
-                message: diff,
-                kind: ApprovalKind::Diff,
-            })
-            .await?;
-        let paths = plan.apply(&self.storage)?;
-        serde_json::to_string_pretty(&json!({
-            "from": from,
-            "to": to,
-            "documents": paths.len(),
-            "mentions": mentions,
-            "paths": paths
-                .iter()
-                .map(|path| display_path(&self.root, path))
-                .collect::<Vec<_>>(),
-        }))
-        .context("encoding wiki rename result")
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 

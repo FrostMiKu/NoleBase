@@ -29,7 +29,24 @@ async fn run_terminal_operation(
     let output = tokio::task::spawn_blocking(operation)
         .await
         .context(join_context)??;
-    serde_json::to_string_pretty(&output).context("encoding terminal operation result")
+    Ok(render_terminal_value(&output))
+}
+
+fn render_terminal_value(value: &Value) -> String {
+    let Some(fields) = value.as_object() else {
+        return value.to_string();
+    };
+    fields
+        .iter()
+        .map(|(name, value)| {
+            let label = name.replace('_', " ");
+            match value {
+                Value::String(text) => format!("{label}: {text}"),
+                _ => format!("{label}: {value}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn optional_string<'a>(input: &'a Value, key: &str) -> Result<Option<&'a str>> {
@@ -91,9 +108,6 @@ pub struct Shell {
     gate: ApprovalGate,
     cancelled: Arc<AtomicBool>,
     jobs: AgentJobsHandle,
-    input_buffer: Arc<Mutex<Vec<String>>>,
-    auto_background: bool,
-    auto_background_threshold_seconds: u64,
 }
 
 impl Shell {
@@ -102,26 +116,16 @@ impl Shell {
         gate: ApprovalGate,
         cancelled: Arc<AtomicBool>,
         jobs: AgentJobsHandle,
-        input_buffer: Arc<Mutex<Vec<String>>>,
-        auto_background: bool,
-        auto_background_threshold_seconds: u64,
+        _input_buffer: Arc<Mutex<Vec<String>>>,
+        _auto_background: bool,
+        _auto_background_threshold_seconds: u64,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
             gate,
             cancelled,
             jobs,
-            input_buffer,
-            auto_background,
-            auto_background_threshold_seconds,
         }
-    }
-
-    fn has_buffered_prompts(&self) -> bool {
-        self.input_buffer
-            .lock()
-            .map(|buffer| !buffer.is_empty())
-            .unwrap_or(false)
     }
 }
 
@@ -163,7 +167,7 @@ impl Tool for Shell {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
         let purpose = required_purpose(input)?;
         let command = required_string(input, "command")?;
         let cwd = resolve_shell_cwd(&self.root, optional_string(input, "cwd")?)?;
@@ -192,68 +196,18 @@ impl Tool for Shell {
             .await?;
 
         let timeout = Duration::from_secs(timeout_seconds);
-        // Branch 1: explicit background — register and return immediately.
-        // Branch 2: auto-background race — register suppressed, foreground-wait
-        // bounded by the threshold, convert on threshold or steering input.
-        // Branch 3: plain foreground execution (config off or at capacity).
-        let raced = !background
-            && self.auto_background
-            && !self.jobs.at_capacity()
-            && self.auto_background_threshold_seconds > 0;
-        if background || raced {
-            let mut started = if background {
-                self.jobs.start_background(JobKind::Shell, command)?
-            } else {
-                self.jobs.start_raced(JobKind::Shell, command)?
-            };
+        if background {
+            let started = self.jobs.start_background(JobKind::Shell, command)?;
             // A backgrounded command has no timeout: only `jobs cancel` or
             // clearing the session stops it, exactly as the tool docs state.
             // `timeout_seconds` bounds foreground execution (and the race's
             // foreground wait) only.
-            let job_timeout = if background { None } else { Some(timeout) };
-            self.spawn_shell_job_body(&started, &cwd, command, job_timeout);
-            if background {
-                return backgrounded_job_result(
-                    &started.id,
-                    "The command keeps running; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it.",
-                );
-            }
-            let wait = Duration::from_secs(self.auto_background_threshold_seconds)
-                .min(timeout.saturating_sub(Duration::from_secs(1)));
-            let deadline = std::time::Instant::now() + wait;
-            loop {
-                if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    self.jobs.cancel(&started.id);
-                    self.jobs.remove(&started.id);
-                    anyhow::bail!("agent task cancelled");
-                }
-                if self.has_buffered_prompts() {
-                    self.jobs.resume(&started.id);
-                    return backgrounded_job_result(
-                        &started.id,
-                        "Backgrounded early to handle an incoming message; the command keeps running and its result will be delivered automatically.",
-                    );
-                }
-                if let Ok(outcome) = started.completion.try_recv() {
-                    // Consumed inline: the raced job was never backgrounded,
-                    // so it must not linger in the registry or the UI.
-                    self.jobs.remove(&started.id);
-                    return match outcome {
-                        Ok(text) => Ok(text),
-                        Err(error) => Err(anyhow::anyhow!(error)),
-                    };
-                }
-                if std::time::Instant::now() >= deadline {
-                    self.jobs.resume(&started.id);
-                    return backgrounded_job_result(
-                        &started.id,
-                        "Still running after the foreground wait; backgrounded and its result will be delivered automatically.",
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            self.spawn_shell_job_body(&started, &cwd, command, None);
+            return Ok(ToolOutput::text(backgrounded_job_result(
+                &started.id,
+                "The command keeps running; its result will be delivered automatically as a [background job] frame. Continue with other work or end your turn—do not wait for it.",
+            )?));
         }
-
         let cwd = cwd.clone();
         let command = command.to_string();
         let cancelled = Arc::clone(&self.cancelled);
@@ -262,12 +216,7 @@ impl Tool for Shell {
         })
         .await
         .context("joining shell command")??;
-        Ok(serde_json::to_string_pretty(&result)?)
-    }
-
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
-        let text = self.execute(input).await?;
-        ToolOutput::structured_json(&text, &["stdout", "stderr"])
+        Ok(shell_tool_output(&result))
     }
 }
 
@@ -294,11 +243,38 @@ impl Shell {
                 Some(timeout) => run_noninteractive_shell(&cwd, &command, timeout, &cancel),
                 None => run_noninteractive_shell_untimed(&cwd, &command, &cancel),
             }
-            .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
+            .map(|value| shell_tool_output(&value))
             .map_err(|error| format!("{error:#}"));
             jobs.settle(&id, outcome);
         });
     }
+}
+
+fn shell_tool_output(value: &Value) -> ToolOutput {
+    let exit_code = value.get("exit_code").and_then(Value::as_i64).unwrap_or(1) as i32;
+    let stdout = value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = value
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut content = stdout.to_string();
+    if !stderr.is_empty() {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str("[stderr]\n");
+        content.push_str(stderr);
+    }
+    if let Some(warning) = value.get("warning").and_then(Value::as_str) {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(warning);
+    }
+    ToolOutput::process(exit_code, content)
 }
 
 pub struct TerminalOpen {
@@ -351,39 +327,39 @@ impl Tool for TerminalOpen {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let purpose = required_purpose(input)?;
-        let command = required_string(input, "command")?;
-        let cwd = resolve_shell_cwd(&self.root, optional_string(input, "cwd")?)?;
-        validate_shell_command(command, &cwd, &self.root)?;
-        self.gate
-            .request_host_action(command_approval(
-                "Open interactive terminal",
-                purpose,
-                "Cmd",
-                command,
-            ))
-            .await?;
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
+        let content: Result<String> = async {
+            let purpose = required_purpose(input)?;
+            let command = required_string(input, "command")?;
+            let cwd = resolve_shell_cwd(&self.root, optional_string(input, "cwd")?)?;
+            validate_shell_command(command, &cwd, &self.root)?;
+            self.gate
+                .request_host_action(command_approval(
+                    "Open interactive terminal",
+                    purpose,
+                    "Cmd",
+                    command,
+                ))
+                .await?;
 
-        let terminal = self.terminal.clone();
-        let nole_root = self.root.clone();
-        let command = command.to_string();
-        let session_id =
-            tokio::task::spawn_blocking(move || terminal.open(&cwd, &nole_root, &command))
-                .await
-                .context("joining terminal startup")??;
-        let terminal = self.terminal.clone();
-        let cancelled = Arc::clone(&self.cancelled);
-        let settled_id = session_id.clone();
-        run_terminal_operation("joining terminal observation", move || {
-            terminal.wait_until_settled(&settled_id, &cancelled)
-        })
-        .await
-    }
-
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
-        let text = self.execute(input).await?;
-        ToolOutput::structured_json(&text, &["screen"])
+            let terminal = self.terminal.clone();
+            let nole_root = self.root.clone();
+            let command = command.to_string();
+            let session_id =
+                tokio::task::spawn_blocking(move || terminal.open(&cwd, &nole_root, &command))
+                    .await
+                    .context("joining terminal startup")??;
+            let terminal = self.terminal.clone();
+            let cancelled = Arc::clone(&self.cancelled);
+            let settled_id = session_id.clone();
+            run_terminal_operation("joining terminal observation", move || {
+                terminal.wait_until_settled(&settled_id, &cancelled)
+            })
+            .await
+        }
+        .await;
+        let content = content?;
+        Ok(ToolOutput::text(content))
     }
 }
 
@@ -451,42 +427,41 @@ impl Tool for TerminalInput {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let session_id = required_string(input, "session_id")?;
-        let purpose = required_purpose(input)?;
-        let text = optional_string(input, "text")?;
-        let key = optional_string(input, "key")?;
-        let submit = should_submit(input, text.is_some());
-        let bytes = terminal_input_bytes(text, submit, key)?;
-        let display = terminal_input_display(text, submit, key)?;
-        self.gate
-            .request_host_action(command_approval(
-                "Send terminal input",
-                purpose,
-                "Input",
-                &display,
-            ))
-            .await?;
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
+        let content: Result<String> = async {
+            let session_id = required_string(input, "session_id")?;
+            let purpose = required_purpose(input)?;
+            let text = optional_string(input, "text")?;
+            let key = optional_string(input, "key")?;
+            let submit = should_submit(input, text.is_some());
+            let bytes = terminal_input_bytes(text, submit, key)?;
+            let display = terminal_input_display(text, submit, key)?;
+            self.gate
+                .request_host_action(command_approval(
+                    "Send terminal input",
+                    purpose,
+                    "Input",
+                    &display,
+                ))
+                .await?;
 
-        self.terminal.write(session_id, &bytes)?;
-        let terminal = self.terminal.clone();
-        let cancelled = Arc::clone(&self.cancelled);
-        let session_id = session_id.to_string();
-        run_terminal_operation("joining terminal observation", move || {
-            terminal.wait_until_settled(&session_id, &cancelled)
-        })
-        .await
-    }
-
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
-        let text = self.execute(input).await?;
-        ToolOutput::structured_json(&text, &["screen"])
+            self.terminal.write(session_id, &bytes)?;
+            let terminal = self.terminal.clone();
+            let cancelled = Arc::clone(&self.cancelled);
+            let session_id = session_id.to_string();
+            run_terminal_operation("joining terminal observation", move || {
+                terminal.wait_until_settled(&session_id, &cancelled)
+            })
+            .await
+        }
+        .await;
+        let content = content?;
+        Ok(ToolOutput::text(content))
     }
 }
 
 /// How long a foreground terminal watch waits before converting into a
 /// background TerminalWatch job (or when steering arrives).
-const TERMINAL_WATCH_FOREGROUND_BUDGET_MS: u64 = 10_000;
 const TERMINAL_WATCH_MAX_MS: u64 = 600_000;
 /// Bytes of prior raw stream kept in front of each new chunk so patterns that
 /// span poll boundaries still match.
@@ -495,7 +470,6 @@ pub struct TerminalRead {
     terminal: AgentTerminalHandle,
     cancelled: Arc<AtomicBool>,
     jobs: AgentJobsHandle,
-    input_buffer: Arc<Mutex<Vec<String>>>,
 }
 
 impl TerminalRead {
@@ -503,21 +477,12 @@ impl TerminalRead {
         terminal: AgentTerminalHandle,
         cancelled: Arc<AtomicBool>,
         jobs: AgentJobsHandle,
-        input_buffer: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         Self {
             terminal,
             cancelled,
             jobs,
-            input_buffer,
         }
-    }
-
-    fn has_buffered_prompts(&self) -> bool {
-        self.input_buffer
-            .lock()
-            .map(|buffer| !buffer.is_empty())
-            .unwrap_or(false)
     }
 }
 
@@ -584,7 +549,8 @@ impl Tool for TerminalRead {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
+        let content: Result<String> = async {
         let session_id = required_string(input, "session_id")?.to_string();
         let mode = input
             .get("mode")
@@ -630,40 +596,31 @@ impl Tool for TerminalRead {
             .get("background")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // An explicit background watch is a background job from the start;
-        // only the foreground race needs the suppressed, hidden start.
-        let started = if background {
-            self.jobs
-                .start_background(JobKind::TerminalWatch, &session_id)?
-        } else {
-            self.jobs.start_raced(JobKind::TerminalWatch, &session_id)?
-        };
-        spawn_terminal_watch(
-            self.jobs.clone(),
-            self.terminal.clone(),
-            started.id.clone(),
-            session_id.clone(),
-            pattern.clone(),
-            Duration::from_millis(timeout_ms),
-            Arc::clone(&started.cancel),
-        );
-        // Explicit background: deliver via the job only.
         if background {
+            let started = self
+                .jobs
+                .start_background(JobKind::TerminalWatch, &session_id)?;
+            spawn_terminal_watch(
+                self.jobs.clone(),
+                self.terminal.clone(),
+                started.id.clone(),
+                session_id.clone(),
+                pattern.clone(),
+                Duration::from_millis(timeout_ms),
+                Arc::clone(&started.cancel),
+            );
             return backgrounded_job_result(
                 &started.id,
                 "Watching the terminal; the result will be delivered automatically on match, exit, or timeout.",
             );
         }
-        // Foreground race: inline hit, else convert at the budget (or steering).
-        let budget = Duration::from_millis(TERMINAL_WATCH_FOREGROUND_BUDGET_MS)
-            .min(Duration::from_millis(timeout_ms));
-        let deadline = std::time::Instant::now() + budget;
+        // Ordinary foreground watch. The shared tool executor owns automatic
+        // promotion if this call outlives the global foreground threshold.
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         let mut offset = 0;
         let mut carry: Vec<u8> = Vec::new();
         loop {
             if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                self.jobs.cancel(&started.id);
-                self.jobs.remove(&started.id);
                 anyhow::bail!("agent task cancelled");
             }
             if let Some(sample) = self.terminal.sample_watch(&session_id, offset) {
@@ -680,24 +637,26 @@ impl Tool for TerminalRead {
                     sample.exit_code,
                     &sample.screen,
                 ) {
-                    self.jobs.remove(&started.id);
-                    return Ok(serde_json::to_string_pretty(&payload)?);
+                    return Ok(render_watch_payload(&payload));
                 }
             }
-            if self.has_buffered_prompts() || std::time::Instant::now() >= deadline {
-                self.jobs.resume(&started.id);
-                return backgrounded_job_result(
-                    &started.id,
-                    "Watch converted to a background job; the result will be delivered automatically on match, exit, or timeout. Continue with other work or end your turn—do not wait for it.",
-                );
+            if std::time::Instant::now() >= deadline {
+                let screen = self
+                    .terminal
+                    .sample_watch(&session_id, offset)
+                    .map(|sample| sample.screen)
+                    .unwrap_or_default();
+                return Ok(render_watch_payload(&json!({
+                    "matched": false,
+                    "timed_out": true,
+                    "screen": screen,
+                })));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    }
-
-    async fn execute_output(&self, input: &Value) -> Result<ToolOutput> {
-        let text = self.execute(input).await?;
-        ToolOutput::structured_json(&text, &["screen", "output"])
+    }.await;
+        let content = content?;
+        Ok(ToolOutput::text(content))
     }
 }
 
@@ -775,10 +734,15 @@ impl Tool for TerminalClose {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let session_id = required_string(input, "session_id")?;
-        self.terminal.close_exited(session_id)?;
-        Ok(format!("closed terminal session {session_id}"))
+    async fn execute(&self, input: &Value) -> Result<ToolOutput> {
+        let content: Result<String> = async {
+            let session_id = required_string(input, "session_id")?;
+            self.terminal.close_exited(session_id)?;
+            Ok(format!("closed terminal session {session_id}"))
+        }
+        .await;
+        let content = content?;
+        Ok(ToolOutput::text(content))
     }
 }
 
@@ -815,6 +779,27 @@ fn watch_payload(
         }));
     }
     None
+}
+
+fn render_watch_payload(payload: &Value) -> String {
+    let mut lines = Vec::new();
+    if payload.get("matched").and_then(Value::as_bool) == Some(true) {
+        lines.push("Matched terminal output".to_string());
+        if let Some(line) = payload.get("match_line").and_then(Value::as_str) {
+            lines.push(format!("Match: {line}"));
+        }
+    } else if payload.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        lines.push("Terminal wait timed out".to_string());
+    } else if payload.get("exited").and_then(Value::as_bool) == Some(true) {
+        lines.push("Terminal process exited".to_string());
+        if let Some(code) = payload.get("exit_code").and_then(Value::as_u64) {
+            lines.push(format!("Exit code: {code}"));
+        }
+    }
+    if let Some(screen) = payload.get("screen").and_then(Value::as_str) {
+        lines.push(format!("Screen:\n{screen}"));
+    }
+    lines.join("\n")
 }
 
 /// Background watcher body: polls the raw stream until the pattern matches,
@@ -859,10 +844,7 @@ fn spawn_terminal_watch(
                         sample.exit_code,
                         &sample.screen,
                     ) {
-                        match serde_json::to_string_pretty(&payload) {
-                            Ok(text) => jobs.settle(&id, Ok(text)),
-                            Err(error) => jobs.settle(&id, Err(format!("{error:#}"))),
-                        }
+                        jobs.settle(&id, Ok(ToolOutput::text(render_watch_payload(&payload))));
                         return;
                     }
                 }
@@ -877,10 +859,7 @@ fn spawn_terminal_watch(
                     "timed_out": true,
                     "screen": screen,
                 });
-                match serde_json::to_string_pretty(&payload) {
-                    Ok(text) => jobs.settle(&id, Ok(text)),
-                    Err(error) => jobs.settle(&id, Err(format!("{error:#}"))),
-                }
+                jobs.settle(&id, Ok(ToolOutput::text(render_watch_payload(&payload))));
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1061,9 +1040,8 @@ mod tests {
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
-        let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["backgrounded"], json!(true));
-        let job = value["job"].as_str().unwrap().to_string();
+        assert!(output.content.starts_with("Background job: "));
+        let job = output.content.lines().next().unwrap()["Background job: ".len()..].to_string();
         // The real helper process finishes; the job settles and delivers.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1133,8 +1111,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        let value: Value = serde_json::from_str(&output).unwrap();
-        assert!(value.get("backgrounded").is_none());
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.content, "raced\n");
         // Inline consumption removes the raced job entirely: no delivery,
         // and no lingering row in the registry or the statistics panel.
         assert!(!jobs.has_pending_deliveries());
@@ -1143,7 +1121,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn race_backgrounds_when_threshold_expires() {
+    async fn foreground_shell_is_not_registered_as_a_job_before_the_threshold() {
         let directory = tempfile::tempdir().unwrap();
         let (events, _) = tokio::sync::broadcast::channel::<AgentEvent>(8);
         let jobs = AgentJobsHandle::new(events);
@@ -1154,65 +1132,23 @@ mod tests {
             jobs.clone(),
             Arc::new(Mutex::new(Vec::new())),
             true,
-            1,
-        );
-        let started = std::time::Instant::now();
-        let output = shell
-            .execute(&json!({
-                "purpose": "Sleep long",
-                "command": "sleep 30",
-                "timeout_seconds": 60
-            }))
-            .await
-            .unwrap();
-        assert!(started.elapsed() >= Duration::from_secs(1));
-        let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["backgrounded"], json!(true));
-        let job = value["job"].as_str().unwrap();
-        // Converted to background: the job is now listed and running.
-        assert!(jobs.rows().iter().any(|row| row.id == job));
-        assert!(jobs.has_running());
-        assert!(jobs.cancel(job));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn race_backgrounds_early_on_buffered_prompt() {
-        let directory = tempfile::tempdir().unwrap();
-        let (events, _) = tokio::sync::broadcast::channel::<AgentEvent>(8);
-        let jobs = AgentJobsHandle::new(events);
-        let input_buffer = Arc::new(Mutex::new(Vec::new()));
-        let shell = Shell::new(
-            directory.path(),
-            yolo_gate(directory.path()),
-            Arc::new(AtomicBool::new(false)),
-            jobs.clone(),
-            input_buffer.clone(),
-            true,
             60,
         );
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            input_buffer
-                .lock()
-                .unwrap()
-                .push("new user message".to_string());
+        let execution = tokio::spawn(async move {
+            shell
+                .execute(&json!({
+                    "purpose": "Remain foreground briefly",
+                    "command": "sleep 1; echo done"
+                }))
+                .await
         });
-        let started = std::time::Instant::now();
-        let output = shell
-            .execute(&json!({
-                "purpose": "Sleep",
-                "command": "sleep 30",
-                "timeout_seconds": 60
-            }))
-            .await
-            .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["backgrounded"], json!(true));
-        assert!(value["note"].as_str().unwrap().contains("incoming message"));
-        let job = value["job"].as_str().unwrap();
-        assert!(jobs.cancel(job));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(jobs.rows().is_empty());
+        assert!(!jobs.has_running());
+        let output = execution.await.unwrap().unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.content, "done\n");
+        assert!(jobs.rows().is_empty());
     }
 }
 
@@ -1251,38 +1187,35 @@ mod terminal_watch_tests {
             terminal,
             Arc::new(AtomicBool::new(false)),
             AgentJobsHandle::new(events),
-            Arc::new(Mutex::new(Vec::new())),
         );
-        let first: Value = serde_json::from_str(
-            &read
-                .execute(&json!({
-                    "session_id": session,
-                    "mode": "output",
-                    "cursor": "0"
-                }))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let output = first["output"].as_str().unwrap();
+        let first = read
+            .execute(&json!({
+                "session_id": session,
+                "mode": "output",
+                "cursor": "0"
+            }))
+            .await
+            .unwrap();
+        let output = first.content.split_once("output: ").unwrap().1;
         assert!(output.len() > 256 * 1024);
         assert!(output.contains("line-00000"));
         assert!(output.contains("line-39999"));
-        let cursor = first["cursor"].as_str().unwrap();
+        let cursor = first
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("cursor: "))
+            .unwrap();
 
-        let second: Value = serde_json::from_str(
-            &read
-                .execute(&json!({
-                    "session_id": session,
-                    "mode": "output",
-                    "cursor": cursor
-                }))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(second["output"], "");
-        assert_eq!(second["cursor"], cursor);
+        let second = read
+            .execute(&json!({
+                "session_id": session,
+                "mode": "output",
+                "cursor": cursor
+            }))
+            .await
+            .unwrap();
+        assert!(second.content.contains("output: "));
+        assert!(second.content.contains(&format!("cursor: {cursor}")));
     }
 
     #[test]
@@ -1310,8 +1243,8 @@ mod terminal_watch_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn terminal_read_wait_for_converts_to_background_job() {
-        use crate::agent::{AgentTerminalHandle, JobStatus};
+    async fn terminal_read_wait_for_times_out_inline_without_registering_a_job() {
+        use crate::agent::AgentTerminalHandle;
         let directory = tempfile::tempdir().unwrap();
         let (events, _receiver) = event_channel();
         let jobs = AgentJobsHandle::new(events);
@@ -1323,7 +1256,6 @@ mod terminal_watch_tests {
             terminal.clone(),
             Arc::new(AtomicBool::new(false)),
             jobs.clone(),
-            Arc::new(Mutex::new(Vec::new())),
         );
         let output = read_tool
             .execute(&json!({
@@ -1333,29 +1265,8 @@ mod terminal_watch_tests {
             }))
             .await
             .unwrap();
-        let value: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(value["backgrounded"], json!(true));
-        let job = value["job"].as_str().unwrap().to_string();
-        // The foreground budget elapsed, so the job keeps watching. Cancel it
-        // and confirm the watcher settles it as failed/cancelled without
-        // delivering a frame.
-        assert!(jobs.cancel(&job));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let rows = jobs.rows();
-            if rows
-                .iter()
-                .any(|row| row.id == job && row.status != JobStatus::Running)
-            {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "watcher never settled after cancel"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(!jobs.has_pending_deliveries());
+        assert!(output.content.contains("Terminal wait timed out"));
+        assert!(jobs.rows().is_empty());
     }
 
     #[cfg(unix)]
@@ -1373,7 +1284,6 @@ mod terminal_watch_tests {
             terminal.clone(),
             Arc::new(AtomicBool::new(false)),
             jobs.clone(),
-            Arc::new(Mutex::new(Vec::new())),
         );
         let output = read_tool
             .execute(&json!({
@@ -1383,11 +1293,10 @@ mod terminal_watch_tests {
             }))
             .await
             .unwrap();
-        let value: Value = serde_json::from_str(&output).unwrap();
         // The pattern hits inside the foreground budget, so the payload comes
         // back inline and the raced job is removed instead of lingering as a
         // settled row in the statistics panel.
-        assert!(value.get("backgrounded").is_none());
+        assert!(output.content.contains("Matched terminal output"));
         assert!(jobs.rows().is_empty());
         assert!(!jobs.has_pending_deliveries());
     }
@@ -1410,7 +1319,6 @@ mod terminal_watch_tests {
             terminal.clone(),
             Arc::new(AtomicBool::new(false)),
             jobs.clone(),
-            Arc::new(Mutex::new(Vec::new())),
         );
         let output = read_tool
             .execute(&json!({
@@ -1421,8 +1329,7 @@ mod terminal_watch_tests {
             }))
             .await
             .unwrap();
-        let value: Value = serde_json::from_str(&output).unwrap();
-        let job = value["job"].as_str().unwrap().to_string();
+        let job = output.content.lines().next().unwrap()["Background job: ".len()..].to_string();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1430,9 +1337,8 @@ mod terminal_watch_tests {
             if let Some(delivery) = deliveries.first() {
                 assert_eq!(delivery.id, job);
                 assert_eq!(delivery.status, JobStatus::Done);
-                let payload: Value = serde_json::from_str(&delivery.result).unwrap();
-                assert_eq!(payload["exited"], json!(true));
-                assert_eq!(payload["exit_code"], json!(0));
+                assert!(delivery.output.content.contains("Terminal process exited"));
+                assert!(delivery.output.content.contains("Exit code: 0"));
                 break;
             }
             assert!(

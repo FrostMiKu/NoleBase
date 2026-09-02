@@ -3600,7 +3600,10 @@ fn agent_sidebar_lists_running_background_jobs() {
     assert!(screen.contains("cargo build"));
 
     // Once settled and drained, the section disappears.
-    app.agent_jobs.settle("job-1", Ok("done".to_string()));
+    app.agent_jobs.settle(
+        "job-1",
+        Ok(crate::agent::ToolOutput::text("done".to_string())),
+    );
     let _ = app.agent_jobs.take_deliveries();
     let terminal = render(&mut app, 220, 32);
     let screen = buffer_string(&terminal);

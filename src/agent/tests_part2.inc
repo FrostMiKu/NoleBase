@@ -379,13 +379,16 @@
                 json!({"type": "object", "additionalProperties": false})
             }
 
-            async fn execute(&self, _input: &Value) -> Result<String> {
+            async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
                 self.0
                     .lock()
                     .unwrap()
                     .push("New user turn".to_string());
                 Ok("buffered".to_string())
-            }
+            }.await;
+        Ok(crate::agent::ToolOutput::text(content?))
+    }
         }
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -700,7 +703,7 @@
     }
 
     #[test]
-    fn tavily_response_is_reduced_to_agent_relevant_fields() {
+    fn tavily_response_is_rendered_as_agent_relevant_text() {
         let response = json!({
             "answer": "A concise answer",
             "request_id": "private-noise",
@@ -713,13 +716,12 @@
                 "raw_content": "large omitted content"
             }]
         });
-        let compact: Value =
-            serde_json::from_str(&compact_tavily_response("query", &response).unwrap()).unwrap();
-        assert_eq!(compact["query"], "query");
-        assert_eq!(compact["answer"], "A concise answer");
-        assert_eq!(compact["results"][0]["title"], "Result");
-        assert!(compact.get("request_id").is_none());
-        assert!(compact["results"][0].get("raw_content").is_none());
+        let rendered = render_tavily_response("query", &response).unwrap();
+        assert!(rendered.starts_with("Search results for: query\n\nAnswer:\nA concise answer"));
+        assert!(rendered.contains("\n\n1. Result\nhttps://example.test"));
+        assert!(rendered.contains("Useful snippet"));
+        assert!(!rendered.contains("private-noise"));
+        assert!(!rendered.contains("large omitted content"));
     }
 
     #[test]
@@ -843,10 +845,9 @@
             .unwrap();
 
         server.join().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["kind"], "web");
-        assert_eq!(parsed["format"], "text");
-        assert_eq!(parsed["items"], json!(["runtime-safe response"]));
+        assert!(output.content.contains("kind: web"));
+        assert!(output.content.contains("format: text"));
+        assert!(output.content.contains("items[1]: runtime-safe response"));
     }
 
     #[test]
@@ -930,7 +931,7 @@
         let output = read
             .execute(&json!({"path": "data/note.md"}))
             .unwrap();
-        assert!(output.starts_with(&format!("[data/note.md#{}]", snapshot_tag("old\n"))));
+        assert!(output.content.starts_with(&format!("[data/note.md#{}]", snapshot_tag("old\n"))));
 
         // The external change rewrote the very line the patch targets, so the
         // rebase must fail: the retained snapshot can no longer prove that
@@ -974,7 +975,7 @@
             )
         }))
         .unwrap();
-        assert!(result.contains("edited data/note.md"));
+        assert!(result.content.contains("edited data/note.md"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "agent change\nnew unrelated line\nappended externally\n"
@@ -992,11 +993,11 @@
         let result = write
             .execute(&json!({"path": "data/invalid.md", "content": invalid}))
             .unwrap();
-        assert!(result.contains("wrote"));
-        assert!(result.contains("MBDown validation warning"));
-        assert!(result.contains("box border must be single or none"));
-        assert!(result.contains("file change succeeded"));
-        assert!(result.contains("Read it and use edit"));
+        assert!(result.content.contains("wrote"));
+        assert!(result.content.contains("MBDown validation warning"));
+        assert!(result.content.contains("box border must be single or none"));
+        assert!(result.content.contains("file change succeeded"));
+        assert!(result.content.contains("Read it and use edit"));
         assert_eq!(
             fs::read_to_string(storage.data_dir.join("invalid.md")).unwrap(),
             invalid
@@ -1008,14 +1009,14 @@
                 "content": "# Diagram\n\n```mermaid\nclassDiagram\nclass Agent~T~ {}\n```\n"
             }))
             .unwrap();
-        assert!(mermaid_result.contains("Mermaid validation failed at line 3"));
-        assert!(mermaid_result.contains("generics not yet supported"));
+        assert!(mermaid_result.content.contains("Mermaid validation failed at line 3"));
+        assert!(mermaid_result.content.contains("generics not yet supported"));
         assert!(storage.data_dir.join("invalid-mermaid.md").exists());
 
         let plain_result = write
             .execute(&json!({"path": "data/plain.txt", "content": invalid}))
             .unwrap();
-        assert!(!plain_result.contains("MBDown validation warning"));
+        assert!(!plain_result.content.contains("MBDown validation warning"));
         assert_eq!(fs::read_to_string(storage.data_dir.join("plain.txt")).unwrap(), invalid);
 
         let path = storage.data_dir.join("note.md");
@@ -1050,8 +1051,8 @@
                 )
             })))
             .unwrap();
-        assert!(result.contains("edited data/note.md"));
-        assert!(result.contains("box border must be single or none"));
+        assert!(result.content.contains("edited data/note.md"));
+        assert!(result.content.contains("box border must be single or none"));
         assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
 
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
@@ -1066,7 +1067,7 @@
                 )
             })))
             .unwrap();
-        assert!(repaired.contains("edited data/note.md"));
+        assert!(repaired.content.contains("edited data/note.md"));
         assert!(mbdown::validate(&fs::read_to_string(&path).unwrap()).is_ok());
     }
 
@@ -1469,8 +1470,8 @@
                 "content": "[box border=double]\ninvalid\n[/box]"
             }))
             .unwrap();
-        assert!(result.contains("MBDown validation warning"));
-        assert!(result.contains("box border must be single or none"));
+        assert!(result.content.contains("MBDown validation warning"));
+        assert!(result.content.contains("box border must be single or none"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "existing\n\n[box border=double]\ninvalid\n[/box]\n"
@@ -1545,7 +1546,7 @@
         let tool = Open::new(directory.path(), sender).unwrap();
 
         let result = tool.execute(&json!({"path": "data/Guide.md"})).unwrap();
-        assert!(result.contains("Guide.md"));
+        assert!(result.content.contains("Guide.md"));
         let AgentEvent::OpenFile(opened) = receiver.blocking_recv().unwrap() else {
             panic!("expected open-file event");
         };
@@ -1589,7 +1590,7 @@
         response_sender
             .send(AskUserResponse::Answer("MBDown".to_string()))
             .unwrap();
-        assert_eq!(worker.join().unwrap().unwrap(), "MBDown");
+        assert_eq!(worker.join().unwrap().unwrap().content, "MBDown");
     }
 
     #[test]
@@ -1601,29 +1602,19 @@
         let handle = WorkspaceIndexHandle::default();
         handle.replace(crate::workspace_index::WorkspaceIndex::build(&storage));
 
-        let listed: Value = serde_json::from_str(
-            &Tags::new(handle.clone())
+        let listed = Tags::new(handle.clone())
                 .execute(&json!({"query": "rust"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(listed["total"], 2);
-        assert_eq!(listed["items"][0]["tag"], "rust");
-        assert_eq!(listed["items"][0]["mentions"], 2);
+                .unwrap();
+        assert!(listed.content.contains("Tags: 2 of 2"));
+        assert!(listed.content.contains("#rust"));
+        assert!(listed.content.contains("Mentions: 2"));
 
-        let searched: Value = serde_json::from_str(
-            &SearchTag::new(directory.path(), handle)
+        let searched = SearchTag::new(directory.path(), handle)
                 .unwrap()
                 .execute(&json!({"tag": "#rust"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(searched["total"], 1);
-        assert_eq!(searched["items"][0]["line"], 1);
-        assert!(searched["items"][0]["snippet"]
-            .as_str()
-            .unwrap()
-            .contains("#rust #rust"));
+                .unwrap();
+        assert!(searched.content.contains("Matches: 1 of 1"));
+        assert!(searched.content.contains(":1: #rust #rust"));
     }
 
     #[test]
@@ -1649,8 +1640,8 @@
         assert!(request.message.contains("-#old"));
         assert!(request.message.contains("+#new"));
         decision_sender.send(ApprovalDecision::Approve).unwrap();
-        let result: Value = serde_json::from_str(&worker.join().unwrap().unwrap()).unwrap();
-        assert_eq!(result["documents"], 1);
+        let result = worker.join().unwrap().unwrap();
+        assert!(result.content.contains("Documents: 1"));
         assert_eq!(fs::read_to_string(path).unwrap(), "#new\n");
         assert!(handle
             .with_index(|index| index.exact_tag_hits("old", None).is_empty())
@@ -1687,38 +1678,24 @@
         let handle = WikiLinkIndexHandle::default();
         handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
 
-        let resolved: Value = serde_json::from_str(
-            &Wikilink::new(directory.path(), handle.clone())
+        let resolved = Wikilink::new(directory.path(), handle.clone())
                 .unwrap()
                 .execute(&json!({"target": "Project"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resolved["status"], "unique");
-        assert_eq!(resolved["candidates"].as_array().unwrap().len(), 1);
-        assert!(resolved["candidates"][0]["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("data/Project.md"));
+                .unwrap();
+        assert!(resolved.content.contains("Status: unique"));
+        assert!(resolved.content.contains("Candidate: data/Project.md"));
 
-        let missing: Value = serde_json::from_str(
-            &Wikilink::new(directory.path(), handle.clone())
+        let missing = Wikilink::new(directory.path(), handle.clone())
                 .unwrap()
                 .execute(&json!({"target": "Nope"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(missing["status"], "missing");
+                .unwrap();
+        assert!(missing.content.contains("Status: missing"));
 
-        let backlinks: Value = serde_json::from_str(
-            &Backlinks::new(directory.path(), handle.clone())
+        let backlinks = Backlinks::new(directory.path(), handle.clone())
                 .unwrap()
                 .execute(&json!({"target": "Project.md"}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(backlinks["count"], 2, "one note per distinct referrer");
-        assert_eq!(backlinks["backlinks"].as_array().unwrap().len(), 2);
+                .unwrap();
+        assert!(backlinks.content.contains("Backlinks: 2"));
     }
 
     #[test]
@@ -1747,9 +1724,9 @@
         };
         assert!(request.message.contains("Rename [[Old]] to [[New]]"));
         decision_sender.send(ApprovalDecision::Approve).unwrap();
-        let result: Value = serde_json::from_str(&worker.join().unwrap().unwrap()).unwrap();
-        assert_eq!(result["documents"], 1);
-        assert_eq!(result["mentions"], 2);
+        let result = worker.join().unwrap().unwrap();
+        assert!(result.content.contains("Documents: 1"));
+        assert!(result.content.contains("Mentions: 2"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "[[New]] and [[New]] and ```[[Old]]``` and <!-- [[Old]] -->\n",
@@ -1810,14 +1787,11 @@
         let handle = WikiLinkIndexHandle::default();
         handle.replace(crate::wiki_link_index::WikiLinkIndex::build(&storage));
         let tool = RenameWikilink::new(directory.path(), handle, bypass_gate()).unwrap();
-        let result: Value = serde_json::from_str(
-            &test_runtime()
+        let result = test_runtime()
                 .block_on(tool.execute(&json!({"from": "Old", "to": "New"})))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["documents"], 1);
-        assert_eq!(result["mentions"], 1);
+                .unwrap();
+        assert!(result.content.contains("Documents: 1"));
+        assert!(result.content.contains("Mentions: 1"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "see [[New]] here\n",
@@ -1953,7 +1927,7 @@
                 .block_on(registered.execute(&json!({"message": "valid"})))
                 .unwrap()
                 .into_inline_text()
-                .unwrap(),
+                ,
             "notification shown"
         );
         assert!(matches!(

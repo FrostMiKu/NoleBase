@@ -328,20 +328,16 @@ impl SubagentRunner {
                     })
                 } else {
                     let images = std::mem::take(&mut output.images);
-                    match output.into_inline_text() {
-                        Ok(content) => ToolCallOutput::with_images(
+                    {
+                        let content = output.into_inline_text();
+                        ToolCallOutput::with_images(
                             ToolResult {
                                 tool_use_id: call.id.clone(),
                                 content,
                                 is_error: false,
                             },
                             images,
-                        ),
-                        Err(error) => ToolCallOutput::text(ToolResult {
-                            tool_use_id: call.id.clone(),
-                            content: super::tool_error_message(&error),
-                            is_error: true,
-                        }),
+                        )
                     }
                 }
             }
@@ -583,8 +579,10 @@ mod tests {
             ToolExecutionPolicy::LocalRead
         }
 
-        async fn execute(&self, input: &Value) -> Result<String> {
-            Ok(input["value"].as_str().unwrap().to_string())
+        async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+            let content: Result<String> =
+                async { Ok(input["value"].as_str().unwrap().to_string()) }.await;
+            Ok(crate::agent::ToolOutput::text(content?))
         }
     }
 
@@ -779,12 +777,16 @@ mod tests {
             ToolExecutionPolicy::Network
         }
 
-        async fn execute(&self, input: &Value) -> Result<String> {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.maximum.fetch_max(active, Ordering::SeqCst);
-            self.barrier.wait().await;
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(input["label"].as_str().unwrap().to_string())
+        async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+            let content: Result<String> = async {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.maximum.fetch_max(active, Ordering::SeqCst);
+                self.barrier.wait().await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(input["label"].as_str().unwrap().to_string())
+            }
+            .await;
+            Ok(crate::agent::ToolOutput::text(content?))
         }
     }
 
@@ -875,11 +877,7 @@ mod tests {
             ToolExecutionPolicy::Network
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
-            Ok("unused".to_string())
-        }
-
-        async fn execute_output(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
             // Take the receiver out of the mutex and drop the guard before
             // the await, so the future stays Send.
             let receiver = self.receiver.as_ref().and_then(|slot| slot.lock().take());
@@ -891,7 +889,8 @@ mod tests {
                 let _ = sender.send(()).await;
             }
             Ok(crate::agent::ToolOutput {
-                content: crate::agent::ToolOutputContent::Text(format!("read {}", self.label)),
+                exit_code: None,
+                content: format!("read {}", self.label),
                 images: vec![crate::provider::ImageBlock {
                     source: crate::provider::ImageSource::Url {
                         url: format!("https://example.test/{}.png", self.label),
@@ -1025,19 +1024,23 @@ mod tests {
             self.policy
         }
 
-        async fn execute(&self, _input: &Value) -> Result<String> {
-            if self.yield_before_complete {
-                tokio::task::yield_now().await;
+        async fn execute(&self, _input: &Value) -> Result<crate::agent::ToolOutput> {
+            let content: Result<String> = async {
+                if self.yield_before_complete {
+                    tokio::task::yield_now().await;
+                }
+                if self
+                    .prerequisite
+                    .as_ref()
+                    .is_some_and(|ready| !ready.load(Ordering::SeqCst))
+                {
+                    bail!("tool phase started before its prerequisite completed");
+                }
+                self.complete.store(true, Ordering::SeqCst);
+                Ok(self.name.to_string())
             }
-            if self
-                .prerequisite
-                .as_ref()
-                .is_some_and(|ready| !ready.load(Ordering::SeqCst))
-            {
-                bail!("tool phase started before its prerequisite completed");
-            }
-            self.complete.store(true, Ordering::SeqCst);
-            Ok(self.name.to_string())
+            .await;
+            Ok(crate::agent::ToolOutput::text(content?))
         }
     }
 

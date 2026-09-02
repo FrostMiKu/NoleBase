@@ -101,23 +101,28 @@ impl Tool for Calculate {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let expression = input
-            .get("expression")
-            .and_then(Value::as_str)
-            .context("field expression must be a string")?
-            .trim();
-        if expression.is_empty() {
-            anyhow::bail!("expression must not be empty");
-        }
-        if expression.chars().count() > 1000 {
-            anyhow::bail!("expression must not exceed 1000 characters");
-        }
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let expression = input
+                .get("expression")
+                .and_then(Value::as_str)
+                .context("field expression must be a string")?
+                .trim();
+            if expression.is_empty() {
+                anyhow::bail!("expression must not be empty");
+            }
+            if expression.chars().count() > 1000 {
+                anyhow::bail!("expression must not exceed 1000 characters");
+            }
 
-        let expression = normalize_leading_decimal(expression);
-        evaluate(expression.as_ref())
-            .map(format_result)
-            .map_err(|error| anyhow::anyhow!("invalid expression: {error}"))
+            let expression = normalize_leading_decimal(expression);
+            evaluate(expression.as_ref())
+                .map(format_result)
+                .map_err(|error| anyhow::anyhow!("invalid expression: {error}"))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -128,6 +133,7 @@ mod tests {
     fn calculate(expression: &str) -> Result<String> {
         crate::agent::test_support::test_runtime()
             .block_on(Calculate.execute(&json!({"expression": expression})))
+            .map(|output| output.content)
     }
 
     #[test]

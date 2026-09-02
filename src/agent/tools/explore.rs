@@ -75,14 +75,19 @@ impl Tool for Explore {
         ToolExecutionPolicy::Subagent
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let task = input
-            .get("task")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|task| !task.is_empty())
-            .context("field task must be a non-empty string")?;
-        self.runner.run(task).await
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let task = input
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|task| !task.is_empty())
+                .context("field task must be a non-empty string")?;
+            self.runner.run(task).await
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -222,7 +227,7 @@ mod tests {
         let output = crate::agent::test_support::test_runtime()
             .block_on(explore.execute(&json!({"task": "Find the answer note"})))
             .unwrap();
-        assert_eq!(output, "Found data/answer.md.");
+        assert_eq!(output.content, "Found data/answer.md.");
 
         let requests = provider.requests.lock();
         assert_eq!(requests.len(), 2);
@@ -288,7 +293,7 @@ mod tests {
         let output = crate::agent::test_support::test_runtime()
             .block_on(explore.execute(&json!({"task": "Keep searching"})))
             .unwrap();
-        assert_eq!(output, "Budget-limited report.");
+        assert_eq!(output.content, "Budget-limited report.");
 
         let requests = provider.requests.lock();
         assert_eq!(requests.len(), 2);

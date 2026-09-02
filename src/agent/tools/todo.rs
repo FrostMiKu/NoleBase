@@ -108,38 +108,45 @@ impl Tool for Todo {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let raw = input
-            .get("todos")
-            .and_then(Value::as_array)
-            .context("field todos must be an array")?;
-        if raw.len() > MAX_TODO_ITEMS {
-            anyhow::bail!("todos must not exceed {MAX_TODO_ITEMS} items");
-        }
-        let mut todos = Vec::with_capacity(raw.len());
-        for item in raw {
-            let content = item
-                .get("content")
-                .and_then(Value::as_str)
-                .context("every todo needs a string content")?
-                .trim()
-                .to_string();
-            if content.is_empty() {
-                anyhow::bail!("todo content must not be empty");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let raw = input
+                .get("todos")
+                .and_then(Value::as_array)
+                .context("field todos must be an array")?;
+            if raw.len() > MAX_TODO_ITEMS {
+                anyhow::bail!("todos must not exceed {MAX_TODO_ITEMS} items");
             }
-            if content.chars().count() > MAX_TODO_CONTENT_CHARS {
-                anyhow::bail!("todo content must not exceed {MAX_TODO_CONTENT_CHARS} characters");
+            let mut todos = Vec::with_capacity(raw.len());
+            for item in raw {
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .context("every todo needs a string content")?
+                    .trim()
+                    .to_string();
+                if content.is_empty() {
+                    anyhow::bail!("todo content must not be empty");
+                }
+                if content.chars().count() > MAX_TODO_CONTENT_CHARS {
+                    anyhow::bail!(
+                        "todo content must not exceed {MAX_TODO_CONTENT_CHARS} characters"
+                    );
+                }
+                let status = match item.get("status").and_then(Value::as_str) {
+                    Some("pending") => TodoStatus::Pending,
+                    Some("in_progress") => TodoStatus::InProgress,
+                    Some("completed") => TodoStatus::Completed,
+                    _ => anyhow::bail!("todo status must be pending, in_progress, or completed"),
+                };
+                todos.push(TodoItem { content, status });
             }
-            let status = match item.get("status").and_then(Value::as_str) {
-                Some("pending") => TodoStatus::Pending,
-                Some("in_progress") => TodoStatus::InProgress,
-                Some("completed") => TodoStatus::Completed,
-                _ => anyhow::bail!("todo status must be pending, in_progress, or completed"),
-            };
-            todos.push(TodoItem { content, status });
+            self.todos.replace(todos.clone());
+            Ok(render_todos(&todos))
         }
-        self.todos.replace(todos.clone());
-        Ok(render_todos(&todos))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -150,6 +157,7 @@ mod tests {
     fn write(handle: &TodoHandle, todos: Value) -> Result<String> {
         crate::agent::test_support::test_runtime()
             .block_on(Todo::new(handle.clone()).execute(&json!({ "todos": todos })))
+            .map(|output| output.content)
     }
 
     #[test]

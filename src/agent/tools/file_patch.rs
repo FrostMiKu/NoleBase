@@ -582,20 +582,28 @@ impl Tool for Append {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let path = required_string(input, "path")?;
-        let tag = required_string(input, "tag")?;
-        let content = required_string(input, "content")?;
-        if content.is_empty() {
-            bail!("append content must not be empty");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let path = required_string(input, "path")?;
+            let tag = required_string(input, "tag")?;
+            let content = required_string(input, "content")?;
+            if content.is_empty() {
+                bail!("append content must not be empty");
+            }
+            let mut patch = format!("[{path}#{tag}]\nPUT >$:\n");
+            for line in content.lines() {
+                patch.push('+');
+                patch.push_str(line);
+                patch.push('\n');
+            }
+            self.edit
+                .execute(&json!({"patch": patch}))
+                .await
+                .map(|output| output.content)
         }
-        let mut patch = format!("[{path}#{tag}]\nPUT >$:\n");
-        for line in content.lines() {
-            patch.push('+');
-            patch.push_str(line);
-            patch.push('\n');
-        }
-        self.edit.execute(&json!({"patch": patch})).await
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -634,29 +642,34 @@ file's NEW [path#TAG], new line count, and numbered windows of the changed regio
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let patch_text = required_string(input, "patch")?;
-        let patch = parse_patch(patch_text)?;
-        if patch.sections.is_empty() {
-            bail!("patch must contain at least one section");
-        }
-        let mut plans = Vec::with_capacity(patch.sections.len());
-        let mut seen_paths = HashSet::new();
-        for section in &patch.sections {
-            let relative = section.path.trim().to_string();
-            if relative.is_empty() {
-                bail!("patch section must name a path");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let patch_text = required_string(input, "patch")?;
+            let patch = parse_patch(patch_text)?;
+            if patch.sections.is_empty() {
+                bail!("patch must contain at least one section");
             }
-            let path = self.resolve_path(&relative)?;
-            if !seen_paths.insert(path.clone()) {
-                bail!("patch contains multiple sections for the same path: {relative}");
+            let mut plans = Vec::with_capacity(patch.sections.len());
+            let mut seen_paths = HashSet::new();
+            for section in &patch.sections {
+                let relative = section.path.trim().to_string();
+                if relative.is_empty() {
+                    bail!("patch section must name a path");
+                }
+                let path = self.resolve_path(&relative)?;
+                if !seen_paths.insert(path.clone()) {
+                    bail!("patch contains multiple sections for the same path: {relative}");
+                }
+                plans.push(self.preflight(section, &relative, path)?);
             }
-            plans.push(self.preflight(section, &relative, path)?);
+            self.approve(&plans).await?;
+            self.publish(&mut plans)?;
+            self.anchor(&mut plans)?;
+            Ok(self.render_result(&plans))
         }
-        self.approve(&plans).await?;
-        self.publish(&mut plans)?;
-        self.anchor(&mut plans)?;
-        Ok(self.render_result(&plans))
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -729,7 +742,7 @@ mod tests {
             })))
             .unwrap();
 
-        assert!(result.contains("edited data/note.md"));
+        assert!(result.content.contains("edited data/note.md"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "before\nfirst appended line\n\nlast appended line\n"
@@ -761,9 +774,9 @@ mod tests {
                 "patch": format!("[data/note.md#{tag}]\nPUT 2.=2:\n+REPLACED\n")
             })))
             .unwrap();
-        assert!(result.contains("edited data/note.md"));
-        assert!(result.contains("[data/note.md#"));
-        assert!(result.contains("2:REPLACED"));
+        assert!(result.content.contains("edited data/note.md"));
+        assert!(result.content.contains("[data/note.md#"));
+        assert!(result.content.contains("2:REPLACED"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "line one\nREPLACED\nline three\n"
@@ -771,7 +784,7 @@ mod tests {
 
         // The published file is re-anchored with the whole file seen, so the
         // delayed watcher event for that write must not discard the NEW tag.
-        let new_tag = extract_tag(&result, "data/note.md");
+        let new_tag = extract_tag(&result.content, "data/note.md");
         assert_ne!(new_tag, tag);
         reads.mark_dirty(&path).unwrap();
         let second = test_runtime()
@@ -779,7 +792,7 @@ mod tests {
                 "patch": format!("[data/note.md#{new_tag}]\nPUT 1.=1:\n+first!\n")
             })))
             .unwrap();
-        assert!(second.contains("edited data/note.md"));
+        assert!(second.content.contains("edited data/note.md"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "first!\nREPLACED\nline three\n"
@@ -833,8 +846,8 @@ mod tests {
                 )
             })))
             .unwrap();
-        assert!(result.contains("edited data/a.md"));
-        assert!(result.contains("edited data/b.md"));
+        assert!(result.content.contains("edited data/a.md"));
+        assert!(result.content.contains("edited data/b.md"));
         assert_eq!(fs::read_to_string(&a).unwrap(), "A-new\nA2\n");
         assert_eq!(fs::read_to_string(&b).unwrap(), "B1\n");
     }
@@ -901,7 +914,7 @@ mod tests {
                 "patch": format!("[workspace/note.md#{tag}]\nREM\n")
             })))
             .unwrap();
-        assert!(result.contains("removed workspace/note.md"));
+        assert!(result.content.contains("removed workspace/note.md"));
         assert!(!path.exists());
         assert!(reads.head(&path).unwrap().is_none());
     }
@@ -923,7 +936,9 @@ mod tests {
                 )
             })))
             .unwrap();
-        assert!(result.contains("moved workspace/from.md -> workspace/to.md"));
+        assert!(result
+            .content
+            .contains("moved workspace/from.md -> workspace/to.md"));
         assert!(!from.exists());
         let to = fs::canonicalize(root.join("workspace/to.md")).unwrap();
         assert_eq!(fs::read_to_string(&to).unwrap(), "MOVED\nsecond\n");
@@ -932,7 +947,10 @@ mod tests {
             .head(&to)
             .unwrap()
             .expect("moved snapshot is anchored");
-        assert_eq!(anchored.tag, extract_tag(&result, "workspace/to.md"));
+        assert_eq!(
+            anchored.tag,
+            extract_tag(&result.content, "workspace/to.md")
+        );
     }
 
     #[test]
@@ -962,7 +980,7 @@ mod tests {
                 "patch": format!("[workspace/note.md#{tag}]\nPUT 2.=2:\n+BETA\n")
             })))
             .unwrap();
-        assert!(result.contains("edited workspace/note.md"));
+        assert!(result.content.contains("edited workspace/note.md"));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "alpha\nBETA\nchanged-externally\ngamma\n"

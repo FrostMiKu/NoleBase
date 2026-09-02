@@ -195,11 +195,7 @@ pub(super) fn required_string<'a>(input: &'a Value, key: &str) -> Result<&'a str
 /// The immediate reply of a tool that handed its work to a background job:
 /// the job id plus the note telling the model how the result arrives.
 pub(super) fn backgrounded_job_result(id: &str, note: &str) -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "backgrounded": true,
-        "job": id,
-        "note": note,
-    }))?)
+    Ok(format!("Background job: {id}\n{note}"))
 }
 
 pub(super) fn limited_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {

@@ -51,20 +51,25 @@ impl Tool for Open {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let requested = required_string(input, "path")?;
-        let path = if Path::new(requested).is_absolute() {
-            PathBuf::from(requested)
-        } else {
-            self.root.join(requested)
-        };
-        let path = fs::canonicalize(&path)
-            .with_context(|| format!("resolving document {}", path.display()))?;
-        self.storage.read_document_file(&path)?;
-        self.events
-            .send(AgentEvent::OpenFile(path.clone()))
-            .context("requesting document open")?;
-        Ok(format!("opened {}", display_path(&self.root, &path)))
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let requested = required_string(input, "path")?;
+            let path = if Path::new(requested).is_absolute() {
+                PathBuf::from(requested)
+            } else {
+                self.root.join(requested)
+            };
+            let path = fs::canonicalize(&path)
+                .with_context(|| format!("resolving document {}", path.display()))?;
+            self.storage.read_document_file(&path)?;
+            self.events
+                .send(AgentEvent::OpenFile(path.clone()))
+                .context("requesting document open")?;
+            Ok(format!("opened {}", display_path(&self.root, &path)))
+        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -91,18 +96,23 @@ impl Tool for Notify {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let message = required_string(input, "message")?;
-        if message.trim().is_empty() {
-            bail!("notification message is empty");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let message = required_string(input, "message")?;
+            if message.trim().is_empty() {
+                bail!("notification message is empty");
+            }
+            if message.chars().count() > 500 {
+                bail!("notification message exceeds 500 characters");
+            }
+            self.events
+                .send(AgentEvent::Notification(message.to_string()))
+                .context("sending notification")?;
+            Ok("notification shown".to_string())
         }
-        if message.chars().count() > 500 {
-            bail!("notification message exceeds 500 characters");
-        }
-        self.events
-            .send(AgentEvent::Notification(message.to_string()))
-            .context("sending notification")?;
-        Ok("notification shown".to_string())
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -136,57 +146,62 @@ impl Tool for Ask {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let question = required_string(input, "question")?.trim();
-        if question.is_empty() {
-            bail!("question must not be empty");
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let question = required_string(input, "question")?.trim();
+            if question.is_empty() {
+                bail!("question must not be empty");
+            }
+            if question.chars().count() > 2_000 {
+                bail!("question exceeds 2000 characters");
+            }
+            let options = input
+                .get("options")
+                .map(|value| {
+                    value
+                        .as_array()
+                        .context("field options must be an array")?
+                        .iter()
+                        .map(|option| {
+                            let option = option
+                                .as_str()
+                                .context("each option must be a string")?
+                                .trim();
+                            if option.is_empty() {
+                                bail!("options must not be empty");
+                            }
+                            if option.chars().count() > 200 {
+                                bail!("option exceeds 200 characters");
+                            }
+                            Ok(option.to_string())
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if options.len() > 10 {
+                bail!("at most 10 options are allowed");
+            }
+            self.events
+                .send(AgentEvent::AskUser(AskUserRequest {
+                    question: question.to_string(),
+                    options,
+                }))
+                .context("sending question to user")?;
+            match recv_while_active(
+                &self.responses,
+                &self.cancelled,
+                "waiting for user response",
+            )
+            .await?
+            {
+                AskUserResponse::Answer(answer) => Ok(answer),
+                AskUserResponse::Cancelled => bail!("user cancelled the question"),
+            }
         }
-        if question.chars().count() > 2_000 {
-            bail!("question exceeds 2000 characters");
-        }
-        let options = input
-            .get("options")
-            .map(|value| {
-                value
-                    .as_array()
-                    .context("field options must be an array")?
-                    .iter()
-                    .map(|option| {
-                        let option = option
-                            .as_str()
-                            .context("each option must be a string")?
-                            .trim();
-                        if option.is_empty() {
-                            bail!("options must not be empty");
-                        }
-                        if option.chars().count() > 200 {
-                            bail!("option exceeds 200 characters");
-                        }
-                        Ok(option.to_string())
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        if options.len() > 10 {
-            bail!("at most 10 options are allowed");
-        }
-        self.events
-            .send(AgentEvent::AskUser(AskUserRequest {
-                question: question.to_string(),
-                options,
-            }))
-            .context("sending question to user")?;
-        match recv_while_active(
-            &self.responses,
-            &self.cancelled,
-            "waiting for user response",
-        )
-        .await?
-        {
-            AskUserResponse::Answer(answer) => Ok(answer),
-            AskUserResponse::Cancelled => bail!("user cancelled the question"),
-        }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -233,47 +248,52 @@ impl Tool for AskPrivate {
         })
     }
 
-    async fn execute(&self, input: &Value) -> Result<String> {
-        let session_id = required_string(input, "session_id")?.trim();
-        let purpose = required_string(input, "purpose")?.trim();
-        let prompt = required_string(input, "prompt")?.trim();
-        if session_id.is_empty() {
-            bail!("session_id must not be empty");
-        }
-        if purpose.is_empty() || prompt.is_empty() {
-            bail!("purpose and prompt must not be empty");
-        }
-        if purpose.chars().count() > 500 || prompt.chars().count() > 500 {
-            bail!("purpose and prompt must not exceed 500 characters");
-        }
-        self.terminal.ensure_running_session(session_id)?;
-        self.events
-            .send(AgentEvent::PrivateTerminalInput(
-                PrivateTerminalInputRequest {
-                    session_id: session_id.to_string(),
-                    purpose: purpose.to_string(),
-                    prompt: prompt.to_string(),
-                },
-            ))
-            .context("requesting private terminal input")?;
+    async fn execute(&self, input: &Value) -> Result<crate::agent::ToolOutput> {
+        let content: Result<String> = async {
+            let session_id = required_string(input, "session_id")?.trim();
+            let purpose = required_string(input, "purpose")?.trim();
+            let prompt = required_string(input, "prompt")?.trim();
+            if session_id.is_empty() {
+                bail!("session_id must not be empty");
+            }
+            if purpose.is_empty() || prompt.is_empty() {
+                bail!("purpose and prompt must not be empty");
+            }
+            if purpose.chars().count() > 500 || prompt.chars().count() > 500 {
+                bail!("purpose and prompt must not exceed 500 characters");
+            }
+            self.terminal.ensure_running_session(session_id)?;
+            self.events
+                .send(AgentEvent::PrivateTerminalInput(
+                    PrivateTerminalInputRequest {
+                        session_id: session_id.to_string(),
+                        purpose: purpose.to_string(),
+                        prompt: prompt.to_string(),
+                    },
+                ))
+                .context("requesting private terminal input")?;
 
-        match recv_while_active(
-            &self.responses,
-            &self.cancelled,
-            "waiting for private terminal input",
-        )
-        .await?
-        {
-            PrivateTerminalInputDecision::Submit(mut private_value) => {
-                self.terminal.ensure_running_session(session_id)?;
-                private_value.push('\r');
-                self.terminal.write(session_id, private_value.as_bytes())?;
-                Ok(json!({"status": "submitted"}).to_string())
-            }
-            PrivateTerminalInputDecision::Cancelled => {
-                Ok(json!({"status": "cancelled"}).to_string())
+            match recv_while_active(
+                &self.responses,
+                &self.cancelled,
+                "waiting for private terminal input",
+            )
+            .await?
+            {
+                PrivateTerminalInputDecision::Submit(mut private_value) => {
+                    self.terminal.ensure_running_session(session_id)?;
+                    private_value.push('\r');
+                    self.terminal.write(session_id, private_value.as_bytes())?;
+                    Ok(json!({"status": "submitted"}).to_string())
+                }
+                PrivateTerminalInputDecision::Cancelled => {
+                    Ok(json!({"status": "cancelled"}).to_string())
+                }
             }
         }
+        .await;
+        let content = content?;
+        Ok(crate::agent::ToolOutput::text(content))
     }
 }
 
@@ -366,10 +386,10 @@ mod tests {
             )))
             .unwrap_or_else(|_| panic!("private-input response channel closed"));
         let result = execution.await.unwrap().unwrap();
-        assert_eq!(result, r#"{"status":"submitted"}"#);
-        assert!(!result.contains("s3cret-value"));
-        assert!(!result.contains("screen"));
-        assert!(!result.contains("length"));
+        assert_eq!(result.content, r#"{"status":"submitted"}"#);
+        assert!(!result.content.contains("s3cret-value"));
+        assert!(!result.content.contains("screen"));
+        assert!(!result.content.contains("length"));
 
         let cancelled = AtomicBool::new(false);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -415,7 +435,7 @@ mod tests {
             .send(PrivateTerminalInputDecision::Cancelled)
             .unwrap_or_else(|_| panic!("private-input response channel closed"));
         assert_eq!(
-            execution.await.unwrap().unwrap(),
+            execution.await.unwrap().unwrap().content,
             r#"{"status":"cancelled"}"#
         );
         assert!(terminal.is_running());
