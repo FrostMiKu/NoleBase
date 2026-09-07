@@ -32,12 +32,12 @@ anydoc = "0.2.3"
 async-trait = "0.1"
 cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "7"
 fastrand = "2"
 globset = "0.4"
 ignore = "0.4"
 fasteval = "0.2.4"
-jsonschema = { version = "0.51", default-features = false }
+jsonschema = { version = "0.55", default-features = false }
 htmd = "0.5.5"
 notify = "8"
 open = "5"
