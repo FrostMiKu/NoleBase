@@ -143,10 +143,14 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
         "terminal_read" | "terminal_close" => text("session_id"),
         "ask_private" => Some(format!("{}: {}", text("session_id")?, text("purpose")?)),
         "read" => text("path").map(|path| {
-            if is_url(&path) {
+            let path = if is_url(&path) {
                 web_base_url(&path)
             } else {
                 path
+            };
+            match text("range") {
+                Some(range) => format!("{path} · lines {range}"),
+                None => path,
             }
         }),
         "http" => text("url").map(|url| {
@@ -238,4 +242,54 @@ pub(crate) fn tool_display_name(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{tool_activity_target, tool_finish_activity, tool_start_activity};
+
+    #[test]
+    fn read_activity_includes_the_requested_line_range() {
+        let first = json!({
+            "name": "read",
+            "input": {"path": "src/agent.rs", "range": "1-200"}
+        });
+        let second = json!({
+            "name": "read",
+            "input": {"path": "src/agent.rs", "range": "201-400"}
+        });
+
+        assert_eq!(
+            tool_activity_target(&first).as_deref(),
+            Some("src/agent.rs · lines 1-200")
+        );
+        assert_eq!(
+            tool_start_activity(&second),
+            "Calling Read...\nsrc/agent.rs · lines 201-400"
+        );
+        assert_eq!(
+            tool_finish_activity(&second, None),
+            "Completed Read.\nsrc/agent.rs · lines 201-400"
+        );
+    }
+
+    #[test]
+    fn read_activity_without_a_range_keeps_the_plain_target() {
+        let local = json!({"name": "read", "input": {"path": "src/agent.rs"}});
+        let web = json!({
+            "name": "read",
+            "input": {"path": "https://example.com/article", "range": "21-40"}
+        });
+
+        assert_eq!(
+            tool_activity_target(&local).as_deref(),
+            Some("src/agent.rs")
+        );
+        assert_eq!(
+            tool_start_activity(&web),
+            "Fetching Web...\nhttps://example.com · lines 21-40"
+        );
+    }
 }
