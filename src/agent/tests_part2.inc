@@ -1574,6 +1574,7 @@
             events: event_sender,
             responses: Arc::new(tokio::sync::Mutex::new(response_receiver)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            interactions: UserInteractionWaits::default(),
         };
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(tool.execute(&json!({

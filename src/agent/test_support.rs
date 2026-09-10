@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::{
     AgentEvent, AgentEventSender, AgentRunCompletion, ApprovalDecision, ApprovalGate,
-    PermissionMode, ToolBatchExecution, AGENT_STREAM_BUFFER,
+    PermissionMode, ToolBatchExecution, UserInteractionWaits, AGENT_STREAM_BUFFER,
 };
 use crate::agent::{Agent, AgentConversation};
 use crate::provider::Message;
@@ -96,6 +96,7 @@ pub(crate) fn bypass_gate() -> ApprovalGate {
         Arc::new(AtomicBool::new(false)),
         event_sender,
         Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+        UserInteractionWaits::default(),
     )
 }
 
@@ -113,5 +114,6 @@ pub(crate) fn gate(
         Arc::new(AtomicBool::new(false)),
         events,
         Arc::new(tokio::sync::Mutex::new(decisions)),
+        UserInteractionWaits::default(),
     )
 }

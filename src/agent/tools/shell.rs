@@ -872,7 +872,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU8};
 
     use super::*;
-    use crate::agent::{AgentEvent, AgentJobsHandle, PermissionMode};
+    use crate::agent::{AgentEvent, AgentJobsHandle, PermissionMode, UserInteractionWaits};
 
     pub(crate) fn test_gate(root: &Path) -> ApprovalGate {
         let (events, _) = tokio::sync::broadcast::channel::<AgentEvent>(8);
@@ -883,6 +883,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             events,
             Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+            UserInteractionWaits::default(),
         )
     }
 
@@ -895,6 +896,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             events,
             Arc::new(tokio::sync::Mutex::new(decision_receiver)),
+            UserInteractionWaits::default(),
         )
     }
 

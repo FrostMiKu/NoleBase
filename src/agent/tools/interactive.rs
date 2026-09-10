@@ -12,7 +12,7 @@ use super::util::{display_path, required_string};
 use crate::agent::{
     canonical_root, recv_while_active, AgentEvent, AgentEventSender, AgentTerminalHandle,
     AskUserRequest, AskUserResponse, PrivateTerminalInputDecision, PrivateTerminalInputRequest,
-    Tool,
+    Tool, UserInteractionWaits,
 };
 use crate::storage::Storage;
 
@@ -120,6 +120,7 @@ pub struct Ask {
     pub events: AgentEventSender,
     pub responses: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AskUserResponse>>>,
     pub cancelled: Arc<AtomicBool>,
+    pub interactions: UserInteractionWaits,
 }
 
 #[async_trait::async_trait]
@@ -130,6 +131,10 @@ impl Tool for Ask {
 
     fn description(&self) -> &'static str {
         "Ask the user an interactive clarification question in the TUI. Optional choices may be provided, and the user can always enter a different free-text answer."
+    }
+
+    fn allows_auto_background(&self) -> bool {
+        false
     }
 
     fn input_schema(&self) -> Value {
@@ -188,6 +193,7 @@ impl Tool for Ask {
                     options,
                 }))
                 .context("sending question to user")?;
+            let _interaction = self.interactions.begin();
             match recv_while_active(
                 &self.responses,
                 &self.cancelled,
@@ -211,6 +217,7 @@ pub struct AskPrivate {
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<PrivateTerminalInputDecision>>>,
     pub terminal: AgentTerminalHandle,
     pub cancelled: Arc<AtomicBool>,
+    pub interactions: UserInteractionWaits,
 }
 
 #[async_trait::async_trait]
@@ -221,6 +228,10 @@ impl Tool for AskPrivate {
 
     fn description(&self) -> &'static str {
         "Ask the user for one masked private value and submit it with Enter directly to the active Agent PTY. Use for passwords, passphrases, and MFA codes. The value is never returned to the Agent; the result is only submitted or cancelled. Call terminal_read afterward to observe the outcome."
+    }
+
+    fn allows_auto_background(&self) -> bool {
+        false
     }
 
     fn input_schema(&self) -> Value {
@@ -272,6 +283,7 @@ impl Tool for AskPrivate {
                     },
                 ))
                 .context("requesting private terminal input")?;
+            let _interaction = self.interactions.begin();
 
             match recv_while_active(
                 &self.responses,
@@ -319,6 +331,7 @@ mod tests {
                 responses: Arc::new(tokio::sync::Mutex::new(responses)),
                 terminal,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                interactions: UserInteractionWaits::default(),
             },
             event_receiver,
             response_sender,

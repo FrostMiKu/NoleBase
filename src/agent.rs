@@ -3,7 +3,7 @@ use std::fs;
 #[cfg(test)]
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -210,6 +210,7 @@ struct ApprovalGate {
     cancelled: Arc<AtomicBool>,
     events: AgentEventSender,
     decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
+    interactions: UserInteractionWaits,
 }
 
 impl ApprovalGate {
@@ -219,6 +220,7 @@ impl ApprovalGate {
         cancelled: Arc<AtomicBool>,
         events: AgentEventSender,
         decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
+        interactions: UserInteractionWaits,
     ) -> Self {
         Self {
             mode,
@@ -226,6 +228,7 @@ impl ApprovalGate {
             cancelled,
             events,
             decisions,
+            interactions,
         }
     }
 
@@ -278,6 +281,7 @@ impl ApprovalGate {
         self.events
             .send(AgentEvent::Approval(request))
             .context("sending approval request")?;
+        let _interaction = self.interactions.begin();
         let decision = recv_while_active(
             &self.decisions,
             &self.cancelled,
@@ -288,6 +292,52 @@ impl ApprovalGate {
             ApprovalDecision::Approve => Ok(()),
             ApprovalDecision::Deny => Err(ApprovalDenied.into()),
         }
+    }
+}
+
+/// Tracks waits that require a response from the person using the TUI.
+/// Automatic backgrounding must never let the Agent advance past one of these
+/// waits: doing so can finish the foreground run and dismiss its dialog.
+#[derive(Clone)]
+pub(crate) struct UserInteractionWaits(Arc<UserInteractionState>);
+
+struct UserInteractionState {
+    count: AtomicUsize,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for UserInteractionWaits {
+    fn default() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(());
+        Self(Arc::new(UserInteractionState {
+            count: AtomicUsize::new(0),
+            changed,
+        }))
+    }
+}
+
+impl UserInteractionWaits {
+    pub(crate) fn begin(&self) -> UserInteractionGuard {
+        self.0.count.fetch_add(1, Ordering::Relaxed);
+        self.0.changed.send_replace(());
+        UserInteractionGuard(self.0.clone())
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.count.load(Ordering::Relaxed) > 0
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.0.changed.subscribe()
+    }
+}
+
+pub(crate) struct UserInteractionGuard(Arc<UserInteractionState>);
+
+impl Drop for UserInteractionGuard {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::Relaxed);
+        self.0.changed.send_replace(());
     }
 }
 
@@ -375,6 +425,12 @@ pub trait Tool: Send + Sync {
     fn execution_policy(&self) -> ToolExecutionPolicy {
         ToolExecutionPolicy::Exclusive
     }
+    /// Whether this tool may be automatically continued as a background job.
+    /// Interactive tools must stay foreground so their response is delivered
+    /// to the same Agent turn that requested it.
+    fn allows_auto_background(&self) -> bool {
+        true
+    }
     async fn execute(&self, input: &Value) -> Result<ToolOutput>;
 }
 pub(crate) fn tool_error_message(error: &anyhow::Error) -> String {
@@ -400,6 +456,10 @@ impl RegisteredTool {
 
     pub(crate) fn execution_policy(&self) -> ToolExecutionPolicy {
         self.tool.execution_policy()
+    }
+
+    fn allows_auto_background(&self) -> bool {
+        self.tool.allows_auto_background()
     }
 
     pub(crate) async fn execute(&self, input: &Value) -> Result<ToolOutput> {
@@ -431,6 +491,7 @@ pub struct Agent {
     /// snapshot re-arms it at every run start.
     todos: TodoHandle,
     results: SessionResultStore,
+    interactions: UserInteractionWaits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -706,6 +767,7 @@ impl Agent {
             workspace_index,
             wiki_links,
         } = runtime;
+        let interactions = UserInteractionWaits::default();
         let AgentSource {
             config,
             agents_instructions,
@@ -749,6 +811,7 @@ impl Agent {
             client: agent_client,
             todos: todos.clone(),
             results,
+            interactions: interactions.clone(),
         };
         let gate = ApprovalGate::new(
             permission_mode,
@@ -756,6 +819,7 @@ impl Agent {
             cancelled.clone(),
             events,
             decisions,
+            interactions.clone(),
         );
         for warning in warnings {
             let _ = agent.events.send(AgentEvent::Notification(format!(
@@ -802,6 +866,7 @@ impl Agent {
             responses: private_terminal_input,
             terminal: terminal.clone(),
             cancelled: cancelled.clone(),
+            interactions: interactions.clone(),
         });
         agent.register(TerminalClose::new(terminal));
         let mut read = Read::new(nole_root, reads.clone(), client.clone())?;
@@ -851,6 +916,7 @@ impl Agent {
             events: agent.events.clone(),
             responses: user_responses,
             cancelled,
+            interactions,
         });
         if has_web_search {
             agent.register(SearchWeb {
@@ -1646,6 +1712,10 @@ impl Agent {
                     && self.config.auto_background_threshold_seconds > 0
                     && call.name != "job_wait"
                     && call.name != "jobs"
+                    && self
+                        .tools
+                        .get(&call.name)
+                        .is_some_and(|tool| tool.allows_auto_background())
                 {
                     self.execute_tool_call_with_auto_background(call, permit)
                         .await
@@ -1682,51 +1752,77 @@ impl Agent {
             return self.execute_tool_call(call).await;
         };
         let input = call.input.clone();
+        let mut interaction_changes = self.interactions.subscribe();
         let mut task = tokio::spawn(async move {
             let _permit = permit;
             tool.execute(&input).await
         });
         let threshold = Duration::from_secs(self.config.auto_background_threshold_seconds);
-        tokio::select! {
-            joined = &mut task => self.tool_output_execution(call, joined),
-            _ = tokio::time::sleep(threshold) => {
-                let started = match self.jobs.start_background(JobKind::Tool, &call.name) {
-                    Ok(started) => started,
-                    Err(error) => {
-                        let _ = error;
+        loop {
+            tokio::select! {
+                joined = &mut task => return self.tool_output_execution(call, joined),
+                changed = interaction_changes.changed() => {
+                    // A newly opened or resolved user-interaction dialog starts
+                    // a fresh execution window. Time spent awaiting a person
+                    // must never count toward automatic backgrounding.
+                    if changed.is_err() {
                         return self.tool_output_execution(call, task.await);
                     }
-                };
-                let jobs = self.jobs.clone();
-                let job_id = started.id.clone();
-                let job_cancel = Arc::clone(&started.cancel);
-                tokio::spawn(async move {
-                    let mut task = task;
-                    tokio::select! {
-                        joined = &mut task => {
-                            let outcome = match joined {
-                                Ok(Ok(output)) => Ok(output),
-                                Ok(Err(error)) => Err(tool_error_message(&error)),
-                                Err(error) => Err(format!("tool task failed: {error}")),
-                            };
-                            jobs.settle(&job_id, outcome);
-                        }
-                        _ = async {
-                            while !job_cancel.load(Ordering::Relaxed) {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                },
+                _ = tokio::time::sleep(threshold) => {
+                    // A permission prompt may originate inside any mutating tool,
+                    // so this is a runtime-wide state rather than a tool-name
+                    // allowlist. Wait for the answer, then restart the full
+                    // backgrounding window for the approved execution.
+                    if self.interactions.is_active() {
+                        tokio::select! {
+                            joined = &mut task => return self.tool_output_execution(call, joined),
+                            changed = interaction_changes.changed() => {
+                                if changed.is_err() {
+                                    return self.tool_output_execution(call, task.await);
+                                }
                             }
-                        } => task.abort()
+                        }
+                        continue;
                     }
-                });
-                let content = format!(
-                    "Background job: {}\nThe tool is still running. Its result will be delivered automatically.",
-                    started.id
-                );
-                ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
-                    tool_use_id: call.id.clone(),
-                    content,
-                    is_error: false,
-                }))
+                    let started = match self.jobs.start_background(JobKind::Tool, &call.name) {
+                        Ok(started) => started,
+                        Err(error) => {
+                            let _ = error;
+                            return self.tool_output_execution(call, task.await);
+                        }
+                    };
+                    let jobs = self.jobs.clone();
+                    let job_id = started.id.clone();
+                    let job_cancel = Arc::clone(&started.cancel);
+                    tokio::spawn(async move {
+                        let mut task = task;
+                        tokio::select! {
+                            joined = &mut task => {
+                                let outcome = match joined {
+                                    Ok(Ok(output)) => Ok(output),
+                                    Ok(Err(error)) => Err(tool_error_message(&error)),
+                                    Err(error) => Err(format!("tool task failed: {error}")),
+                                };
+                                jobs.settle(&job_id, outcome);
+                            }
+                            _ = async {
+                                while !job_cancel.load(Ordering::Relaxed) {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            } => task.abort()
+                        }
+                    });
+                    let content = format!(
+                        "Background job: {}\nThe tool is still running. Its result will be delivered automatically.",
+                        started.id
+                    );
+                    return ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content,
+                        is_error: false,
+                    }));
+                }
             }
         }
     }

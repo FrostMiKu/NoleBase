@@ -239,6 +239,46 @@
     }
 
     #[test]
+    fn user_interaction_wait_keeps_a_tool_foreground_past_the_auto_background_threshold() {
+        let mut agent = small_budget_agent();
+        agent.config.auto_background = true;
+        agent.config.auto_background_threshold_seconds = 1;
+        let interaction = agent.interactions.begin();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            drop(interaction);
+        });
+        let calls = [ToolCall {
+            id: "approval-wait".to_string(),
+            name: "wait".to_string(),
+            input: json!({"seconds": 2}),
+        }];
+
+        let started = std::time::Instant::now();
+        let messages = completed_tool_results(
+            test_runtime()
+                .block_on(agent.execute_tool_batch(&calls, &HashMap::new()))
+                .unwrap(),
+        );
+
+        assert!(started.elapsed() >= Duration::from_millis(1_800));
+        assert!(!stored_tool_result(&messages[0]).contains("Background job:"));
+        assert!(agent.jobs.rows().is_empty());
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn ask_tools_are_never_automatically_backgrounded() {
+        let agent = small_budget_agent();
+        assert!(!agent.tools.get("ask").unwrap().allows_auto_background());
+        assert!(!agent
+            .tools
+            .get("ask_private")
+            .unwrap()
+            .allows_auto_background());
+    }
+
+    #[test]
     fn output_budget_applies_to_the_single_content_field() {
         let agent = small_budget_agent();
         let output = ToolOutput::text(format!("{}\n{}", "a".repeat(5_000), "b".repeat(5_000)));
@@ -1229,11 +1269,11 @@
         });
         assert_eq!(
             tool_start_activity(&read),
-            "Calling Read...\ndata/project notes.md"
+            "Calling Read...\ndata/project notes.md · lines 101-300"
         );
         assert_eq!(
             tool_finish_activity(&read, None),
-            "Completed Read.\ndata/project notes.md"
+            "Completed Read.\ndata/project notes.md · lines 101-300"
         );
         assert_eq!(tool_display_name("daily"), "Add Daily Entry");
 
@@ -1308,7 +1348,7 @@
 
         assert_eq!(
             tool_finish_activity(&read, Some("file not found")),
-            "Failed Read: file not found\ndata/project notes.md"
+            "Failed Read: file not found\ndata/project notes.md · lines 101-300"
         );
 
         let download = json!({
