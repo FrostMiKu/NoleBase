@@ -190,7 +190,7 @@ fn append_todo_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
 fn append_job_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
     use crate::core::agent::JobStatus;
 
-    let mut job_rows = app.agent_jobs.rows();
+    let mut job_rows = app.agent.jobs().rows();
     if job_rows.is_empty() {
         return;
     }
@@ -269,7 +269,7 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
         inner.y = inner.y.saturating_add(1);
         inner.height = inner.height.saturating_sub(1);
     }
-    let job_rows = app.agent_jobs.rows();
+    let job_rows = app.agent.jobs().rows();
     if !job_rows.is_empty() && inner.height > AGENT_JOBS_RESERVED_ROWS {
         let jobs_height = (job_rows.len() as u16 + AGENT_JOBS_RESERVED_ROWS).min(inner.height);
         draw_agent_jobs(

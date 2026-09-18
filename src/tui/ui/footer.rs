@@ -22,7 +22,7 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         _ => "DAILY",
     };
     let surface_segment = format!(" {surface} ");
-    let permission_segment = format!(" {} ", app.permission_mode.label());
+    let permission_segment = format!(" {} ", app.agent.permission_mode().label());
     let mouse_status = Span::styled(
         " ",
         Style::default().bg(if app.mouse_captured {
@@ -34,7 +34,7 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let surface_style = Style::default()
         .bg(app.theme.surface_status_context)
         .fg(app.theme.text_on_accent);
-    let mode_line = if app.permission_mode == PermissionMode::Yolo {
+    let mode_line = if app.agent.permission_mode() == PermissionMode::Yolo {
         let mut spans = vec![
             mouse_status,
             Span::styled(surface_segment.clone(), surface_style),

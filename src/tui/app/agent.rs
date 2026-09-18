@@ -1,7 +1,6 @@
 //! Agent coordination: the event loop, prompt dispatch, session lifecycle,
 //! and approval / ask-user / permission handling.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::*;
@@ -78,9 +77,7 @@ impl App {
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                         observable.cancel.cancel();
-                        self.agent_worker
-                            .cancellation_token()
-                            .store(true, Ordering::Relaxed);
+                        self.agent.cancel();
                         events.push(AgentEvent::Finished(Err(
                             "Agent event stream lagged; task cancelled".to_string(),
                         )));
@@ -351,7 +348,8 @@ impl App {
                     // at the next round boundary and injects them as a framed
                     // user message. Idle: start a delivery run now.
                     let label = self
-                        .agent_jobs
+                        .agent
+                        .jobs()
                         .rows()
                         .into_iter()
                         .find(|row| row.id == id)
@@ -466,11 +464,9 @@ impl App {
                     self.deactivate_agent_tools();
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
-                        self.ai_cancel = None;
                         continue;
                     }
                     self.ai_running = false;
-                    self.ai_cancel = None;
                     let (notification, status) = match reason {
                         AgentStopReason::ToolApprovalDenied => (
                             "Agent stopped after tool approval was denied",
@@ -485,11 +481,7 @@ impl App {
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
                     }
-                    let pending = self
-                        .agent_input_buffer
-                        .lock()
-                        .map(|mut buffer| std::mem::take(&mut *buffer))
-                        .unwrap_or_default();
+                    let pending = self.agent.take_buffered_prompts();
                     if !pending.is_empty() {
                         self.mark_buffered_prompts_consumed(pending.len());
                         self.start_agent_worker(pending.join("\n\n"));
@@ -510,12 +502,10 @@ impl App {
                         .retain(|entry| !Self::is_unclaimed_preparation(entry));
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
-                        self.ai_cancel = None;
                         continue;
                     }
                     let completed_successfully = result.is_ok();
                     self.ai_running = false;
-                    self.ai_cancel = None;
                     match result {
                         Ok(_) => {
                             self.notifications.notify("Agent finished");
@@ -544,11 +534,7 @@ impl App {
                         self.set_error(format!("Agent session save error: {error}"));
                     }
                     if completed_successfully {
-                        let pending = self
-                            .agent_input_buffer
-                            .lock()
-                            .map(|mut buffer| std::mem::take(&mut *buffer))
-                            .unwrap_or_default();
+                        let pending = self.agent.take_buffered_prompts();
                         if !pending.is_empty() {
                             self.mark_buffered_prompts_consumed(pending.len());
                             self.start_agent_worker(pending.join("\n\n"));
@@ -567,7 +553,6 @@ impl App {
         }
         if disconnected && self.ai_running {
             self.ai_running = false;
-            self.ai_cancel = None;
             self.agent_panel.push(Arc::new(AgentPanelEntry::Error(
                 "Agent worker stopped unexpectedly".to_string(),
             )));
@@ -616,7 +601,7 @@ impl App {
     }
 
     pub fn mark_agent_reads_dirty(&mut self, paths: &[PathBuf]) {
-        if let Err(error) = self.agent_worker.mark_reads_dirty(paths) {
+        if let Err(error) = self.agent.mark_reads_dirty(paths) {
             self.set_error(format!("Agent read-state error: {error:#}"));
         }
     }
@@ -736,15 +721,7 @@ impl App {
     }
 
     pub(super) fn buffer_agent_prompt(&mut self, prompt: String, display_prompt: String) -> bool {
-        let queued = {
-            match self.agent_input_buffer.lock() {
-                Ok(mut buffer) => {
-                    buffer.push(prompt);
-                    true
-                }
-                Err(_) => false,
-            }
-        };
+        let queued = self.agent.buffer_prompt(prompt);
         if !queued {
             self.set_error("Agent input buffer is unavailable");
             return false;
@@ -823,26 +800,17 @@ impl App {
         }
         self.reload_thinking_display_config();
         self.reload_agent_effort();
-        if let Ok(mut buffer) = self.agent_input_buffer.lock() {
-            buffer.clear();
-        }
+        self.agent.clear_buffered_prompts();
         self.ai_running = true;
         self.agent_round = 0;
         self.set_status("AI is working...");
-        let cancelled = self.agent_worker.cancellation_token();
-        cancelled.store(false, Ordering::Relaxed);
-        self.ai_cancel = Some(cancelled.clone());
-        match self
-            .agent_worker
-            .run(prompt, self.agent_conversation.clone())
-        {
+        match self.agent.run(prompt, self.agent_conversation.clone()) {
             Ok(observable) => {
                 self.active_agent = Some(observable);
                 true
             }
             Err(error) => {
                 self.ai_running = false;
-                self.ai_cancel = None;
                 if agent_debug_logging_enabled() {
                     eprintln!("[nole debug] Agent error: {error:#}");
                 }
@@ -858,7 +826,7 @@ impl App {
     /// run was already finishing its last answer. A delivery left queued
     /// here would strand its job's result until an unrelated future run.
     pub(super) fn start_job_delivery_run(&mut self) -> bool {
-        let deliveries = self.agent_jobs.take_deliveries();
+        let deliveries = self.agent.jobs().take_deliveries();
         if deliveries.is_empty() {
             return false;
         }
@@ -898,17 +866,13 @@ impl App {
             self.set_status("Agent is not running");
             return;
         }
-        if let Some(cancelled) = self.ai_cancel.take() {
-            cancelled.store(true, Ordering::Relaxed);
-        }
+        self.agent.cancel();
         if let Some(observable) = &self.active_agent {
             observable.cancel.cancel();
         }
         self.ai_running = false;
         self.ai_cancelling = true;
-        if let Ok(mut buffer) = self.agent_input_buffer.lock() {
-            buffer.clear();
-        }
+        self.agent.clear_buffered_prompts();
         self.approval_request = None;
         self.clear_ask_user();
         self.clear_private_terminal_input();
@@ -970,10 +934,10 @@ impl App {
         if was_running {
             self.cancel_agent();
         }
-        self.agent_terminal.terminate();
-        // Cancel jobs that belong to the session being cleared; the Agent
-        // workspace itself persists and keeps its files.
-        self.agent_jobs.terminate();
+        // Terminate the agent terminal sessions and cancel jobs that belong
+        // to the session being cleared; the Agent workspace itself persists
+        // and keeps its files.
+        self.agent.terminate_session();
         let had_saved_session = match self.storage().clear_agent_session() {
             Ok(had_saved_session) => had_saved_session,
             Err(error) => {
@@ -982,16 +946,14 @@ impl App {
             }
         };
         let had_history = self.agent_conversation.clear();
-        if let Err(error) = self.agent_worker.clear_read_state() {
+        if let Err(error) = self.agent.clear_read_state() {
             self.set_error(format!("Agent state clear error: {error:#}"));
         }
         let had_panel_content = !self.agent_panel.is_empty();
         self.agent_panel.clear();
         self.preparing_agent_tools.clear();
         self.active_agent_tools.clear();
-        if let Ok(mut buffer) = self.agent_input_buffer.lock() {
-            buffer.clear();
-        }
+        self.agent.clear_buffered_prompts();
         self.agent_scroll = 0;
         self.agent_stats_scroll = 0;
         self.agent_follow_tail = false;
@@ -1025,13 +987,7 @@ impl App {
     }
 
     pub(super) fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {
-        let sender = self
-            .ai_user_sender
-            .as_ref()
-            .context("Agent user-response channel is unavailable")?;
-        sender
-            .send(response.clone())
-            .context("sending response to Agent")?;
+        self.agent.respond_user(response.clone())?;
         if let AskUserResponse::Answer(answer) = &response {
             let answer = answer.split_whitespace().collect::<Vec<_>>().join(" ");
             if !answer.is_empty() {
@@ -1080,11 +1036,6 @@ impl App {
     }
 
     pub(super) fn send_private_terminal_input(&mut self, submit: bool) -> anyhow::Result<()> {
-        let sender = self
-            .ai_private_terminal_input_sender
-            .as_ref()
-            .context("Agent private-input channel is unavailable")?
-            .clone();
         let decision = if submit {
             let private_value = std::mem::replace(
                 &mut self.private_terminal_input,
@@ -1095,9 +1046,9 @@ impl App {
             self.private_terminal_input.zeroize();
             PrivateTerminalInputDecision::Cancelled
         };
-        if sender.send(decision).is_err() {
+        if let Err(error) = self.agent.submit_private_terminal_input(decision) {
             self.clear_private_terminal_input();
-            anyhow::bail!("sending private input to Agent");
+            return Err(error.context("sending private input to Agent"));
         }
         self.set_status(if submit {
             "Private input submitted to Agent terminal"
@@ -1125,13 +1076,7 @@ impl App {
     }
 
     pub(super) fn send_approval(&mut self, decision: ApprovalDecision) -> anyhow::Result<()> {
-        let sender = self
-            .ai_approval_sender
-            .as_ref()
-            .context("Agent approval channel is unavailable")?;
-        sender
-            .send(decision)
-            .context("sending Agent approval decision")?;
+        self.agent.respond_approval(decision)?;
         self.set_status(match decision {
             ApprovalDecision::Approve => "Change approved",
             ApprovalDecision::Deny => "Change denied",
@@ -1152,15 +1097,14 @@ impl App {
     }
 
     pub(super) fn toggle_permission_mode(&mut self) {
-        self.permission_mode = self.permission_mode.cycled();
-        self.permission_mode_atomic
-            .store(self.permission_mode.code(), Ordering::Relaxed);
+        let mode = self.agent.permission_mode().cycled();
+        self.agent.set_permission_mode(mode);
         // Entering YOLO approves whatever approval is currently waiting.
         // AUTO and APPROVE leave a pending request at the gate for its user
         // decision; YOLO approves the request currently shown by the overlay.
-        if self.permission_mode == PermissionMode::Yolo && self.overlay == Some(Overlay::Approval) {
+        if mode == PermissionMode::Yolo && self.overlay == Some(Overlay::Approval) {
             let _ = self.send_approval(ApprovalDecision::Approve);
         }
-        self.set_status(format!("Permission mode: {}", self.permission_mode.label()));
+        self.set_status(format!("Permission mode: {}", mode.label()));
     }
 }

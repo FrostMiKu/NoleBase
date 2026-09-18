@@ -817,17 +817,20 @@ mod tests {
     fn chat_statistics_lists_background_jobs_below_the_stat_rows() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
-        app.agent_jobs
+        app.agent
+            .jobs()
             .start_background(JobKind::Shell, "cargo build --release")
             .unwrap();
-        app.agent_jobs
+        app.agent
+            .jobs()
             .start_background(JobKind::Download, "model.bin")
             .unwrap();
         let test_run = app
-            .agent_jobs
+            .agent
+            .jobs()
             .start_background(JobKind::Shell, "npm test")
             .unwrap();
-        app.agent_jobs.settle(
+        app.agent.jobs().settle(
             &test_run.id,
             Ok(crate::core::agent::ToolOutput::text(
                 "all passed".to_string(),
@@ -855,16 +858,17 @@ mod tests {
         assert_eq!(first_y, jobs_y + 1);
         let (_, cargo_y) = find_text(&terminal, "shell · cargo build --release");
         assert_eq!(cargo_y, first_y + 1);
-        assert!(app.agent_jobs.has_running());
+        assert!(app.agent.jobs().has_running());
     }
 
     #[test]
     fn chat_statistics_job_list_scrolls_when_content_overflows() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
-        app.agent_jobs.set_max_running(64);
+        app.agent.jobs().set_max_running(64);
         for index in 0..40 {
-            app.agent_jobs
+            app.agent
+                .jobs()
                 .start_background(JobKind::Shell, &format!("job-{index:02}"))
                 .unwrap();
         }

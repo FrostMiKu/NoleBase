@@ -12,7 +12,8 @@ pub(super) fn draw_agent_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let rows: Vec<JobRow> = app
-        .agent_jobs
+        .agent
+        .jobs()
         .rows()
         .into_iter()
         .filter(|row| row.status == JobStatus::Running)

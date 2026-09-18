@@ -1,7 +1,6 @@
-use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
-use crate::core::agent::CommandApproval;
+use crate::core::agent::{CommandApproval, AGENT_STREAM_BUFFER};
 use crate::core::attachment::AttachmentStore;
 use crate::core::workspace_index::WorkspaceIndex;
 
@@ -27,7 +26,8 @@ fn install_agent_observable(app: &mut App) -> tokio::sync::broadcast::Sender<Age
 }
 
 fn install_agent_terminal_snapshot(app: &mut App) {
-    app.agent_terminal
+    app.agent
+        .terminal()
         .set_monitor_snapshot_for_test(crate::core::agent::AgentTerminalSnapshot {
             title: "ssh build-host".to_string(),
             status: crate::core::agent::AgentTerminalStatus::Running,
@@ -98,7 +98,7 @@ fn starts_with_daily_center_focused() {
     assert_eq!(app.center_view, CenterView::Daily);
     assert_eq!(app.files_context, FilesContext::Browse);
     assert_eq!(app.overlay, None);
-    assert_eq!(app.permission_mode, PermissionMode::Approve);
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Approve);
 }
 
 #[test]
@@ -365,13 +365,14 @@ fn settled_background_job_wakes_the_idle_agent() {
     let (mut app, _directory) = make_app();
     assert!(!app.ai_running);
     let started = app
-        .agent_jobs
+        .agent
+        .jobs()
         .start_background(crate::core::agent::JobKind::Shell, "sleep 1 && echo done")
         .unwrap();
     // Settles while idle: with no active run there is no observable to poll,
     // so only the permanent subscription can observe the settlement and
     // start the delivery run.
-    app.agent_jobs.settle(
+    app.agent.jobs().settle(
         &started.id,
         Ok(crate::core::agent::ToolOutput::text("done".to_string())),
     );
@@ -384,7 +385,7 @@ fn settled_background_job_wakes_the_idle_agent() {
             AgentPanelEntry::Prompt { text, muted: true, .. } if text.starts_with("Job completed")
         )
     }));
-    assert!(app.agent_jobs.take_deliveries().is_empty());
+    assert!(app.agent.jobs().take_deliveries().is_empty());
 }
 
 #[test]
@@ -393,10 +394,11 @@ fn settled_job_during_a_run_does_not_start_a_second_run() {
     app.ai_running = true;
     let sender = install_agent_observable(&mut app);
     let started = app
-        .agent_jobs
+        .agent
+        .jobs()
         .start_background(crate::core::agent::JobKind::Shell, "sleep 1")
         .unwrap();
-    app.agent_jobs.settle(
+    app.agent.jobs().settle(
         &started.id,
         Ok(crate::core::agent::ToolOutput::text("done".to_string())),
     );
@@ -412,7 +414,7 @@ fn settled_job_during_a_run_does_not_start_a_second_run() {
 
     // The delivery stays queued for the run loop and the permanent
     // subscription must not have started a duplicate delivery run.
-    assert!(!app.agent_jobs.take_deliveries().is_empty());
+    assert!(!app.agent.jobs().take_deliveries().is_empty());
     assert!(app
         .agent_panel
         .iter()
@@ -425,13 +427,14 @@ fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
     app.ai_running = true;
     let sender = install_agent_observable(&mut app);
     let started = app
-        .agent_jobs
+        .agent
+        .jobs()
         .start_background(crate::core::agent::JobKind::Shell, "sleep 1 && echo done")
         .unwrap();
     // The job settles while the model streams its final answer: the run's
     // loop has already passed its last delivery drain, so only the Finished
     // handler can start the wake-up run for the queued delivery.
-    app.agent_jobs.settle(
+    app.agent.jobs().settle(
         &started.id,
         Ok(crate::core::agent::ToolOutput::text("done".to_string())),
     );
@@ -450,7 +453,7 @@ fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
             AgentPanelEntry::Prompt { text, muted: true, .. } if text.starts_with("Job completed")
         )
     }));
-    assert!(app.agent_jobs.take_deliveries().is_empty());
+    assert!(app.agent.jobs().take_deliveries().is_empty());
 }
 
 #[test]
@@ -467,7 +470,7 @@ fn failed_session_delete_keeps_the_in_memory_session() {
     app.clear_agent_session();
 
     assert!(app.agent_conversation.clear());
-    assert!(!app.agent_terminal.is_running());
+    assert!(!app.agent.terminal().is_running());
     assert!(app.status.starts_with("Agent session clear error:"));
     assert!(app.notifications.visible().is_some());
 }
@@ -475,8 +478,6 @@ fn failed_session_delete_keeps_the_in_memory_session() {
 #[test]
 fn command_palette_interrupts_the_running_agent() {
     let (mut app, _directory) = make_app();
-    let cancelled = Arc::new(AtomicBool::new(false));
-    app.ai_cancel = Some(cancelled.clone());
     app.ai_running = true;
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
@@ -487,7 +488,7 @@ fn command_palette_interrupts_the_running_agent() {
     );
     app.handle_key(key(KeyCode::Enter));
 
-    assert!(cancelled.load(Ordering::Relaxed));
+    assert!(app.agent.is_cancel_requested());
     assert!(!app.ai_running);
     assert_eq!(app.status, "Agent task cancelled");
 }
@@ -1397,24 +1398,15 @@ fn tab_cycles_permission_mode_approve_auto_yolo_without_changing_focus() {
     let (mut app, _directory) = make_app();
     assert_eq!(app.focus, Focus::Center);
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.permission_mode, PermissionMode::Auto);
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Auto);
     assert_eq!(app.focus, Focus::Center);
-    assert_eq!(
-        app.permission_mode_atomic.load(Ordering::Relaxed),
-        PermissionMode::Auto.code()
-    );
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Auto);
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.permission_mode, PermissionMode::Yolo);
-    assert_eq!(
-        app.permission_mode_atomic.load(Ordering::Relaxed),
-        PermissionMode::Yolo.code()
-    );
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Yolo);
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Yolo);
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.permission_mode, PermissionMode::Approve);
-    assert_eq!(
-        app.permission_mode_atomic.load(Ordering::Relaxed),
-        PermissionMode::Approve.code()
-    );
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Approve);
+    assert_eq!(app.agent.permission_mode(), PermissionMode::Approve);
 }
 
 #[test]
@@ -1448,7 +1440,7 @@ fn daily_ai_custom_prompt_includes_the_daily_file_path() {
     app.handle_paste("Extract the action items");
     app.handle_key(key(KeyCode::Enter));
 
-    let prompts = app.agent_input_buffer.lock().unwrap();
+    let prompts = app.agent.take_buffered_prompts();
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains(&display_path));
     assert!(prompts[0].contains("Extract the action items"));
@@ -1476,7 +1468,7 @@ fn empty_daily_ai_prompt_requests_in_place_markdown_formatting() {
     app.dispatch_action(date, Action::Ai);
     app.handle_key(key(KeyCode::Enter));
 
-    let prompts = app.agent_input_buffer.lock().unwrap();
+    let prompts = app.agent.take_buffered_prompts();
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains(&display_path));
     assert!(prompts[0].contains(FORMAT_DAILY_NOTE_PROMPT));
@@ -1492,7 +1484,7 @@ fn empty_daily_ai_prompt_requests_in_place_markdown_formatting() {
 fn approval_overlay_sends_the_user_decision() {
     let (mut app, _directory) = make_app();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    app.ai_approval_sender = Some(sender);
+    app.agent.set_approval_sender_for_test(sender);
     app.approval_request = Some(ApprovalRequest {
         title: "Update note".to_string(),
         message: "--- old\n+++ new\n-old\n+new\n".to_string(),
@@ -1517,7 +1509,7 @@ fn approval_overlay_sends_the_user_decision() {
     app.set_overlay(Overlay::Approval);
     app.handle_key(key(KeyCode::Char('n')));
     assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Deny);
-    assert!(app.agent_terminal.is_running());
+    assert!(app.agent.terminal().is_running());
 }
 
 #[test]
@@ -1525,7 +1517,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     let (mut app, _directory) = make_app();
     let event_sender = install_agent_observable(&mut app);
     let (answer_sender, mut answer_receiver) = tokio::sync::mpsc::unbounded_channel();
-    app.ai_user_sender = Some(answer_sender);
+    app.agent.set_user_sender_for_test(answer_sender);
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Calling Ask...\nChoose a format".to_string(),
         active: true,
@@ -1588,7 +1580,7 @@ fn private_terminal_input_is_masked_and_sent_only_on_its_private_channel() {
     let (mut app, _directory) = make_app();
     let event_sender = install_agent_observable(&mut app);
     let (response_sender, mut response_receiver) = tokio::sync::mpsc::unbounded_channel();
-    app.ai_private_terminal_input_sender = Some(response_sender);
+    app.agent.set_private_input_sender_for_test(response_sender);
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Calling Ask Private...\nterminal-1: Authenticate".to_string(),
         active: true,
@@ -1640,7 +1632,7 @@ fn private_terminal_input_is_masked_and_sent_only_on_its_private_channel() {
 fn private_terminal_input_escape_cancels_without_touching_agent_activity() {
     let (mut app, _directory) = make_app();
     let (response_sender, mut response_receiver) = tokio::sync::mpsc::unbounded_channel();
-    app.ai_private_terminal_input_sender = Some(response_sender);
+    app.agent.set_private_input_sender_for_test(response_sender);
     app.private_terminal_input_request = Some(PrivateTerminalInputRequest {
         session_id: "terminal-1".to_string(),
         purpose: "Authenticate".to_string(),
@@ -2289,7 +2281,7 @@ fn cancelling_agent_finishes_streaming_thinking_and_preserves_terminal() {
     app.cancel_agent();
 
     assert!(!app.ai_running);
-    assert!(app.agent_terminal.is_running());
+    assert!(app.agent.terminal().is_running());
     assert!(app.agent_panel.iter().all(|entry| !matches!(
         entry.as_ref(),
         AgentPanelEntry::Thinking {
@@ -2314,7 +2306,7 @@ fn disconnected_agent_worker_preserves_terminal() {
     app.poll_agent();
 
     assert!(!app.ai_running);
-    assert!(app.agent_terminal.is_running());
+    assert!(app.agent.terminal().is_running());
     assert_eq!(app.status, "AI error: worker stopped unexpectedly");
 }
 
@@ -2458,7 +2450,7 @@ fn agent_terminal_outcomes_send_distinct_notifications() {
         Some("Agent stopped after tool approval was denied")
     );
     assert_eq!(app.notifications.take_bells(), 1);
-    assert!(app.agent_terminal.is_running());
+    assert!(app.agent.terminal().is_running());
 
     let sender = install_agent_observable(&mut app);
     app.ai_running = true;
@@ -2575,8 +2567,6 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
         events,
         cancel: observable_cancel.clone(),
     });
-    let cancelled = Arc::new(AtomicBool::new(false));
-    app.ai_cancel = Some(cancelled.clone());
     app.ai_running = true;
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
@@ -2587,13 +2577,13 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
 
     app.handle_key(key(KeyCode::Char('c')));
     assert!(app.ai_running);
-    assert!(!cancelled.load(Ordering::Relaxed));
+    assert!(!app.agent.is_cancel_requested());
     assert!(!observable_cancel.is_cancelled());
 
     app.focus = Focus::Agent;
     app.handle_key(key(KeyCode::Char('c')));
     assert!(!app.ai_running);
-    assert!(cancelled.load(Ordering::Relaxed));
+    assert!(app.agent.is_cancel_requested());
     assert!(observable_cancel.is_cancelled());
     assert!(
         matches!(app.agent_panel.last().map(|entry| entry.as_ref()), Some(AgentPanelEntry::Error(text)) if text == "Cancelled")
@@ -2602,8 +2592,6 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
         app.agent_panel[0].as_ref(),
         AgentPanelEntry::Tool { active: false, .. }
     ));
-    assert!(app.ai_approval_sender.is_some());
-    assert!(app.ai_user_sender.is_some());
     assert_eq!(app.status, "Agent task cancelled");
     assert_eq!(
         app.notifications.visible().as_deref(),
@@ -2648,8 +2636,6 @@ fn agent_statistics_panel_keys_scroll_the_job_list() {
 #[test]
 fn uppercase_c_cancels_work_and_clears_the_agent_session() {
     let (mut app, _directory) = make_app();
-    let cancelled = Arc::new(AtomicBool::new(false));
-    app.ai_cancel = Some(cancelled.clone());
     app.ai_running = true;
     app.agent_panel = vec![
         Arc::new(AgentPanelEntry::Prompt {
@@ -2673,11 +2659,11 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
 
     app.handle_key(key(KeyCode::Char('C')));
 
-    assert!(cancelled.load(Ordering::Relaxed));
+    assert!(app.agent.is_cancel_requested());
     assert!(!app.ai_running);
     assert!(!app.agent_conversation.clear());
     assert!(app.agent_panel.is_empty());
-    assert!(!app.agent_terminal.is_running());
+    assert!(!app.agent.terminal().is_running());
     assert_eq!(app.status, "Agent session cleared");
 }
 
@@ -2948,8 +2934,11 @@ fn ctrl_enter_buffers_and_clears_compose_while_agent_is_busy() {
         ]
     );
     assert_eq!(
-        *app.agent_input_buffer.lock().unwrap(),
-        ["Additional prompt", "One more detail"]
+        app.agent.take_buffered_prompts(),
+        vec![
+            "Additional prompt".to_string(),
+            "One more detail".to_string()
+        ]
     );
     assert_eq!(app.status, "Prompt buffered for Agent");
 }
@@ -4393,7 +4382,7 @@ fn app_index_publish_reaches_the_agent_delete_handles_shared_state() {
     // the moment the app publishes its first attachment index. This fails if
     // App::new stores a separate handle instead of the one it cloned into
     // AgentWorker::spawn.
-    let worker_usage = app.agent_worker.attachment_usage().clone();
+    let worker_usage = app.agent.attachment_usage_handle().clone();
     assert!(!worker_usage.is_ready());
     refresh_attachment_refs(&mut app);
     assert!(
@@ -4411,7 +4400,7 @@ fn app_wiki_index_publish_reaches_the_agent_wiki_tools_shared_state() {
     // app publishes to: it starts empty and sees the note the moment the app
     // publishes its first wiki index. This fails if App::new stores a
     // separate handle instead of the one it cloned into AgentWorker::spawn.
-    let worker_wiki = app.agent_worker.wiki_links().clone();
+    let worker_wiki = app.agent.wiki_links_handle().clone();
     assert!(worker_wiki
         .with_index(|index| index.backlinks(&app.storage().data_dir.join("B.md")).len())
         .is_none());

@@ -854,7 +854,7 @@ fn yolo_mode_animates_in_the_footer_and_daily_advertises_commands() {
         ctp::SAPPHIRE
     );
 
-    app.permission_mode = PermissionMode::Yolo;
+    app.agent.set_permission_mode(PermissionMode::Yolo);
     app.animation_tick = 0;
     let first = render(&mut app, 170, 24);
     let footer_y = 23;
@@ -1935,7 +1935,7 @@ fn approval_panel_with_empty_diff_keeps_body_and_footer() {
 fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Chat;
-    app.agent_terminal
+    app.agent.terminal()
         .set_monitor_snapshot_for_test(AgentTerminalSnapshot {
             title: "ssh build-host".to_string(),
             status: AgentTerminalStatus::Running,
@@ -2013,7 +2013,8 @@ fn command_approval_keeps_the_chat_width_pty_monitor_above_it() {
     assert_eq!(command_cell.fg, app.theme.markdown_link);
     assert_eq!(command_cell.bg, app.theme.markdown_code_block_background);
     assert_eq!(
-        app.agent_terminal
+        app.agent
+            .terminal()
             .monitor_snapshot(80)
             .expect("monitor snapshot")
             .terminal
@@ -2033,7 +2034,8 @@ fn exited_agent_terminal_retains_its_screen_without_reserving_monitor_rows() {
 
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Chat;
-    app.agent_terminal
+    app.agent
+        .terminal()
         .set_monitor_snapshot_for_test(AgentTerminalSnapshot {
             title: "ssh build-host".to_string(),
             status: AgentTerminalStatus::Exited(0),
@@ -2042,8 +2044,8 @@ fn exited_agent_terminal_retains_its_screen_without_reserving_monitor_rows() {
 
     let terminal = render(&mut app, 120, 30);
 
-    assert!(!app.agent_terminal.is_running());
-    assert!(app.agent_terminal.monitor_snapshot(80).is_none());
+    assert!(!app.agent.terminal().is_running());
+    assert!(app.agent.terminal().monitor_snapshot(80).is_none());
     assert_eq!(app.layout.compose, baseline_compose);
     assert!(!buffer_string(&terminal).contains("PTY · ssh build-host"));
 }
@@ -3613,7 +3615,8 @@ fn agent_sidebar_lists_running_background_jobs() {
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Daily;
     let started = app
-        .agent_jobs
+        .agent
+        .jobs()
         .start_background(crate::core::agent::JobKind::Shell, "cargo build --release")
         .unwrap();
     assert_eq!(started.id, "job-1");
@@ -3626,11 +3629,11 @@ fn agent_sidebar_lists_running_background_jobs() {
     assert!(screen.contains("cargo build"));
 
     // Once settled and drained, the section disappears.
-    app.agent_jobs.settle(
+    app.agent.jobs().settle(
         "job-1",
         Ok(crate::core::agent::ToolOutput::text("done".to_string())),
     );
-    let _ = app.agent_jobs.take_deliveries();
+    let _ = app.agent.jobs().take_deliveries();
     let terminal = render(&mut app, 220, 32);
     let screen = buffer_string(&terminal);
     assert!(!screen.contains("cargo build"));
@@ -3656,7 +3659,8 @@ fn agent_sidebar_renders_the_todo_plan_above_jobs() {
             status: TodoStatus::Completed,
         },
     ];
-    app.agent_jobs
+    app.agent
+        .jobs()
         .start_background(crate::core::agent::JobKind::Shell, "cargo build --release")
         .unwrap();
 

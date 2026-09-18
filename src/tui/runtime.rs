@@ -373,8 +373,8 @@ fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Res
         app.poll_terminal();
         app.poll_export();
         needs_draw |= was_ai_running != app.ai_running || was_overlay != app.overlay;
-        needs_draw |= app.agent_terminal.poll_monitor_change();
-        needs_draw |= app.agent_jobs.poll_change();
+        needs_draw |= app.agent.terminal().poll_monitor_change();
+        needs_draw |= app.agent.jobs().poll_change();
         let pending_bells = app.notifications.take_bells();
         if pending_bells > 0 {
             let mut output = io::stdout();
@@ -528,9 +528,9 @@ pub fn run_app() -> Result<()> {
     let storage = resolve_storage()?;
     storage.ensure_files()?;
     let (_watcher, workspace_events) = watch_workspace(&storage)?;
-    let mut app = App::new(std::sync::Arc::new(
-        crate::core::workspace::Workspace::open(storage)?,
-    ))?;
+    let workspace = std::sync::Arc::new(crate::core::workspace::Workspace::open(storage)?);
+    let agent = std::sync::Arc::new(crate::core::agent_service::AgentService::new(&workspace));
+    let mut app = App::new(workspace, agent)?;
 
     enter_tui()?;
     let _guard = TerminalGuard;

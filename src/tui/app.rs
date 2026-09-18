@@ -2,21 +2,21 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::core::agent::{
-    AgentConfig, AgentEvent, AgentRuntime, AgentStopReason, AgentWorker, ApprovalDecision,
-    ApprovalKind, ApprovalRequest, AskUserRequest, AskUserResponse, PermissionMode,
-    PrivateTerminalInputDecision, PrivateTerminalInputRequest, AGENT_STREAM_BUFFER,
+    AgentConfig, AgentEvent, AgentStopReason, ApprovalDecision, ApprovalKind, ApprovalRequest,
+    AskUserRequest, AskUserResponse, PermissionMode, PrivateTerminalInputDecision,
+    PrivateTerminalInputRequest,
 };
+use crate::core::agent_service::AgentService;
 use crate::core::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
 use crate::core::attachment::AttachmentId;
 use crate::core::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
@@ -228,6 +228,10 @@ pub struct App {
     /// The workspace application service: storage, shared indexes, and
     /// attachments. The TUI is a consumer; it does not assemble these.
     pub workspace: Arc<Workspace>,
+    /// The agent application service: worker, event stream, approval /
+    /// ask-user / private-input channels, permission mode, and buffered
+    /// prompts. The TUI is a consumer; it does not wire these channels.
+    pub agent: Arc<AgentService>,
     pub theme: crate::tui::theme::Theme,
     pub theme_selection: String,
     pub active_theme: String,
@@ -363,18 +367,8 @@ pub struct App {
     terminal: Option<EmbeddedTerminal>,
     terminal_return_overlay: Option<Overlay>,
     terminal_return_dialog: Option<DialogState>,
-    pub(crate) agent_terminal: crate::core::agent::AgentTerminalHandle,
-    pub(crate) agent_jobs: crate::core::agent::AgentJobsHandle,
     active_agent: Option<Observable<crate::core::agent::AgentRunOutput, AgentEvent>>,
-    ai_approval_sender: Option<tokio::sync::mpsc::UnboundedSender<ApprovalDecision>>,
-    ai_user_sender: Option<tokio::sync::mpsc::UnboundedSender<AskUserResponse>>,
-    ai_private_terminal_input_sender:
-        Option<tokio::sync::mpsc::UnboundedSender<PrivateTerminalInputDecision>>,
-    agent_worker: AgentWorker,
-    agent_input_buffer: Arc<Mutex<Vec<String>>>,
     pub ai_running: bool,
-    pub permission_mode: PermissionMode,
-    permission_mode_atomic: Arc<AtomicU8>,
     pub agent_panel: Vec<Arc<AgentPanelEntry>>,
     preparing_agent_tools: HashMap<usize, usize>,
     active_agent_tools: HashMap<String, usize>,
@@ -417,7 +411,6 @@ pub struct App {
     pub wiki_link_candidates: Vec<WikiLinkCandidate>,
     pub wiki_link_index: usize,
 
-    ai_cancel: Option<Arc<AtomicBool>>,
     ai_cancelling: bool,
 
     undo_stack: Vec<UndoOp>,
@@ -443,7 +436,7 @@ struct CodeCopyFeedback {
 }
 
 impl App {
-    pub fn new(workspace: Arc<Workspace>) -> anyhow::Result<Self> {
+    pub fn new(workspace: Arc<Workspace>, agent: Arc<AgentService>) -> anyhow::Result<Self> {
         let storage = workspace.storage();
         let loaded_theme = crate::tui::theme::load_theme(storage, None)?;
         let (
@@ -469,34 +462,7 @@ impl App {
         let file_row = usize::from(first_note.is_some());
         let todo_items = workspace.todos()?;
         let images = crate::tui::media::ImageService::new(&storage.root);
-        let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
-        let permission_mode_atomic = Arc::new(AtomicU8::new(PermissionMode::Approve.code()));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let agent_terminal = crate::core::agent::AgentTerminalHandle::default();
-        let (event_sender, agent_events_rx) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
-        let agent_jobs = crate::core::agent::AgentJobsHandle::new(event_sender.clone());
-        let (approval_sender, approval_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (user_sender, user_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (private_terminal_input_sender, private_terminal_input_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
-        let agent_worker = AgentWorker::spawn(
-            storage.ai_config_path.clone(),
-            storage.root.clone(),
-            AgentRuntime::new(
-                event_sender,
-                approval_receiver,
-                user_receiver,
-                private_terminal_input_receiver,
-                agent_input_buffer.clone(),
-                permission_mode_atomic.clone(),
-                cancelled.clone(),
-            )
-            .with_terminal(agent_terminal.clone())
-            .with_jobs(agent_jobs.clone())
-            .with_workspace_index(workspace.workspace_index().clone())
-            .with_wiki_link_index(workspace.wiki_links().clone()),
-            workspace.attachment_usage().clone(),
-        );
+        let agent_events_rx = agent.subscribe();
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
         let mut agent_effort = None;
         if let Ok(effort) = AgentConfig::load_effort(&storage.ai_config_path) {
@@ -506,6 +472,7 @@ impl App {
         }
         Ok(Self {
             workspace,
+            agent,
             theme: loaded_theme.theme,
             theme_selection: loaded_theme.requested,
             active_theme: loaded_theme.active,
@@ -609,17 +576,8 @@ impl App {
             terminal: None,
             terminal_return_overlay: None,
             terminal_return_dialog: None,
-            agent_terminal,
-            agent_jobs,
             active_agent: None,
-            ai_approval_sender: Some(approval_sender),
-            ai_user_sender: Some(user_sender),
-            ai_private_terminal_input_sender: Some(private_terminal_input_sender),
-            agent_worker,
-            agent_input_buffer,
             ai_running: false,
-            permission_mode: PermissionMode::Approve,
-            permission_mode_atomic,
             agent_panel,
             preparing_agent_tools: HashMap::new(),
             active_agent_tools: HashMap::new(),
@@ -654,7 +612,6 @@ impl App {
             wiki_link_target: None,
             wiki_link_candidates: Vec::new(),
             wiki_link_index: 0,
-            ai_cancel: None,
             ai_cancelling: false,
             undo_stack: Vec::new(),
         })
@@ -715,7 +672,9 @@ impl App {
     /// the application bootstrap does.
     #[cfg(test)]
     pub(crate) fn new_for_tests(storage: Storage) -> anyhow::Result<Self> {
-        Self::new(Arc::new(Workspace::open(storage)?))
+        let workspace = Arc::new(Workspace::open(storage)?);
+        let agent = Arc::new(crate::core::agent_service::AgentService::new(&workspace));
+        Self::new(workspace, agent)
     }
 
     pub(super) fn reload_thinking_display_config(&mut self) {

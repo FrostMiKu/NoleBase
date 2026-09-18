@@ -12,7 +12,7 @@ pub(super) fn draw_agent_terminal_monitor(frame: &mut Frame, app: &mut App, area
         .borders(Borders::ALL)
         .style(Style::default().bg(app.theme.surface_panel));
     let inner = block.inner(area);
-    let Some(snapshot) = app.agent_terminal.monitor_snapshot(inner.width) else {
+    let Some(snapshot) = app.agent.terminal().monitor_snapshot(inner.width) else {
         return;
     };
     let status = snapshot.status.label();
