@@ -1,6 +1,6 @@
 //! Pure MBDown AST traversal and extraction shared by indexing, the agent,
 //! and the TUI renderer. Depends on mbdown and core types only; rendering
-//! lives in [`crate::tui::markdown`].
+//! lives in the TUI markdown renderer module.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::path::Path;
 use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
 use unicode_width::UnicodeWidthChar;
 
-use crate::attachment::AttachmentUri;
+use crate::core::attachment::AttachmentUri;
 use crate::core::model::LinkTarget;
 
 /// Visit every Markdown leaf in document order, hiding MBDown's structural

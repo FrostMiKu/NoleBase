@@ -12,7 +12,7 @@ use crate::core::markup::{
     code_block_specs, embed_link_target, expand_tabs, link_specs, CodeBlockSpec, LinkSpec,
 };
 use crate::core::model::LinkTarget;
-use crate::theme::Theme;
+use crate::tui::theme::Theme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedMarkup {
@@ -396,7 +396,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
-    use crate::theme::catppuccin as ctp;
+    use crate::tui::theme::catppuccin as ctp;
 
     fn to_lines_at_width(source: &str, width: usize) -> Vec<Line<'static>> {
         super::to_lines_at_width(source, width, Theme::default())
