@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 
 use super::fuzzy_match;
 use crate::attachment::AttachmentId;
-use crate::model::DailyNote;
+use crate::core::model::DailyNote;
 use crate::storage::AppendReceipt;
 
 /// A request for the terminal owner, which controls suspension and process exit.

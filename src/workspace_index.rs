@@ -12,7 +12,7 @@ use crate::document_index::{
     self, DocumentGroup as FileGroup, DocumentIndex, IndexedDocument, IndexedLine,
 };
 use crate::markdown::visit_markdown;
-use crate::model::SearchHit;
+use crate::core::model::SearchHit;
 use crate::storage::Storage;
 
 const SEARCH_RESULT_CAP: usize = 200;

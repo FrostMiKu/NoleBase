@@ -49,13 +49,15 @@ use crate::app::{
     human_size, App, CenterView, DialogMode, DialogPurpose, DialogState, FilesContext, Focus,
     LayoutSnapshot, Overlay, SidebarSelection, WorkspaceView,
 };
-use crate::embedded_terminal::{TerminalColor, TerminalSnapshot};
-use crate::model::{
-    Action, AttachmentHitbox, BacklinkHitbox, ButtonHitbox, FileGroup, FileGroupHitbox, FileHitbox,
-    FileListRow, LinkHitbox, LinkTarget, SearchHit, SearchHitbox, TagHitbox, TodoHitbox,
-    WorkspaceViewHitbox,
+use crate::core::model::{
+    Action, FileGroup, FileListRow, LinkTarget, SearchHit,
 };
+use crate::embedded_terminal::{TerminalColor, TerminalSnapshot};
 use crate::theme::Theme;
+use crate::tui::model::{
+    AttachmentHitbox, BacklinkHitbox, ButtonHitbox, FileGroupHitbox, FileHitbox, LinkHitbox,
+    SearchHitbox, TagHitbox, TodoHitbox, WorkspaceViewHitbox,
+};
 
 pub(in crate::ui) const DATE_FMT: &str = "%Y-%m-%d";
 pub(in crate::ui) const DAILY_DATE_LABEL_WIDTH: usize = 10;

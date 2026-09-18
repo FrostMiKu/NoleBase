@@ -6,7 +6,7 @@
 //! helpers here are pure, the App state only carries the filtered candidates
 //! and the user's selection.
 
-use crate::model::{WikiLinkCandidate, WikiLinkLocation};
+use crate::core::model::{WikiLinkCandidate, WikiLinkLocation};
 
 use super::{move_index, App};
 
@@ -144,7 +144,7 @@ pub(crate) fn apply_wiki_completion(
 /// Build every completable candidate from the cached daily and note lists.
 pub(in crate::app) fn all_wiki_candidates(
     daily_dates: &[chrono::NaiveDate],
-    note_files: &[crate::model::NoteFile],
+    note_files: &[crate::core::model::NoteFile],
 ) -> Vec<WikiLinkCandidate> {
     let mut candidates: Vec<WikiLinkCandidate> = note_files
         .iter()

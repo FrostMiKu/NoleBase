@@ -412,7 +412,7 @@ pub(super) fn render_note_card_content(
 }
 
 pub(super) fn render_daily_note(
-    note: &crate::model::DailyNote,
+    note: &crate::core::model::DailyNote,
     date_label: String,
     width: usize,
     theme: Theme,

@@ -146,7 +146,7 @@ fn render_agent_entry(
 }
 
 fn render_daily_note(
-    note: &crate::model::DailyNote,
+    note: &crate::core::model::DailyNote,
     date_label: String,
     width: usize,
 ) -> crate::app::DailyCardRenderCache {
@@ -162,7 +162,7 @@ use crate::agent::{
 };
 use crate::agent_session::AgentPanelEntry;
 use crate::app::{Document, DocumentKind, DocumentReturn};
-use crate::model::{LinkTarget, TodoItem, WikiLinkCandidate, WikiLinkLocation};
+use crate::core::model::{LinkTarget, TodoItem, WikiLinkCandidate, WikiLinkLocation};
 use crate::storage::Storage;
 
 fn make_app() -> (App, tempfile::TempDir) {
@@ -1235,13 +1235,13 @@ fn active_tag_renders_full_notes_as_chronological_cards() {
     app.center_view = CenterView::Tags;
     app.active_tag = Some("rust".to_string());
     app.tag_notes = vec![
-        crate::model::TagNote {
+        crate::core::model::TagNote {
             path: older,
             title: "Older".to_string(),
             body: "# Older body\n\nComplete first note with #nested.".to_string(),
             modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
         },
-        crate::model::TagNote {
+        crate::core::model::TagNote {
             path: newer,
             title: "Newer".to_string(),
             body: "# Newer body\n\nComplete second note.".to_string(),
@@ -1272,11 +1272,11 @@ fn active_tag_renders_full_notes_as_chronological_cards() {
 fn tag_card_matches_daily_card_except_for_buttons() {
     let title = "2026-07-01";
     let body = "# Heading\n\nThe [same body](https://example.com) and spacing.";
-    let daily = crate::model::DailyNote {
+    let daily = crate::core::model::DailyNote {
         date: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
         body: body.to_string(),
     };
-    let tag = crate::model::TagNote {
+    let tag = crate::core::model::TagNote {
         path: PathBuf::from("data/Note.md"),
         title: title.to_string(),
         body: body.to_string(),
@@ -1308,7 +1308,7 @@ fn tag_note_vlist_only_materializes_visible_cards() {
     let (mut app, directory) = make_app();
     app.active_tag = Some("many".to_string());
     app.tag_notes = (0..40)
-        .map(|index| crate::model::TagNote {
+        .map(|index| crate::core::model::TagNote {
             path: directory.path().join(format!("data/Note-{index}.md")),
             title: format!("Note-{index}"),
             body: format!("# Note {index}\n\nFull body for #many."),
@@ -2778,7 +2778,7 @@ fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
 #[test]
 fn daily_and_agent_render_caches_offset_markdown_images() {
     let date = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
-    let daily = crate::model::DailyNote {
+    let daily = crate::core::model::DailyNote {
         date,
         body: "![Daily diagram](../data/diagram.png)".to_string(),
     };
@@ -3498,7 +3498,7 @@ fn daily_vlist_only_renders_visible_cards_and_invalidates_changed_content() {
     let (mut app, _directory) = make_app();
     let first_date = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
     app.daily_notes = (0..40)
-        .map(|day| crate::model::DailyNote {
+        .map(|day| crate::core::model::DailyNote {
             date: first_date + chrono::Days::new(day),
             body: format!("# DailyNote {day}\n\nA DailyNote that may be off screen."),
         })

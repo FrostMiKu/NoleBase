@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::AttachmentUri;
-use crate::model::LinkTarget;
+use crate::core::model::LinkTarget;
 use crate::theme::Theme;
 
 /// Visit every Markdown leaf in document order, hiding MBDown's structural

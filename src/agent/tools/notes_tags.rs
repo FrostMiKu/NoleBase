@@ -14,7 +14,7 @@ use super::write_policy::{mbdown_warning, REPAIR_REQUIRED_MARKER};
 use crate::agent::{
     canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy,
 };
-use crate::model::SearchHit;
+use crate::core::model::SearchHit;
 use crate::storage::Storage;
 use crate::workspace_index::{TagRenamePlan, TagScope, WorkspaceIndexHandle};
 

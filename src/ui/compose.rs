@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::{stem_label, WIKI_COMPLETION_WINDOW};
-use crate::model::{WikiLinkCandidate, WikiLinkLocation};
+use crate::core::model::{WikiLinkCandidate, WikiLinkLocation};
 
 const BODY_TOP_MARGIN: u16 = 2;
 const BODY_BOTTOM_GAP: u16 = 2;

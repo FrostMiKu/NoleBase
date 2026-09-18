@@ -640,7 +640,7 @@ pub(super) fn draw_command_palette(
             if let Some(selection_area) = selection_area {
                 draw_selection_indicator(frame, selection_area, app.theme);
             }
-            app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
+            app.dialog_hitboxes.push(crate::tui::model::DialogOptionHitbox {
                 index,
                 area: item_area,
             });
@@ -896,12 +896,12 @@ pub(super) fn draw_select_dialog(
         if let Some(selection_area) = selection_area {
             draw_selection_indicator(frame, selection_area, app.theme);
         }
-        app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
+        app.dialog_hitboxes.push(crate::tui::model::DialogOptionHitbox {
             index,
             area: item_area,
         });
         if dialog.purpose == DialogPurpose::WikiLinkChoice {
-            app.wiki_link_hitboxes.push(crate::model::WikiLinkHitbox {
+            app.wiki_link_hitboxes.push(crate::tui::model::WikiLinkHitbox {
                 index,
                 area: item_area,
             });
@@ -965,7 +965,7 @@ pub(super) fn draw_select_dialog(
             if let Some(selection_area) = selection_area {
                 draw_selection_indicator(frame, selection_area, app.theme);
             }
-            app.dialog_hitboxes.push(crate::model::DialogOptionHitbox {
+            app.dialog_hitboxes.push(crate::tui::model::DialogOptionHitbox {
                 index: other_index,
                 area: item_area,
             });

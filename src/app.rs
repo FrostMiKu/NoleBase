@@ -22,16 +22,19 @@ use crate::attachment::{AttachmentId, AttachmentStore};
 use crate::attachment_usage::AttachmentUsageHandle;
 use crate::embedded_terminal::{is_terminal_toggle, EmbeddedTerminal, TerminalSnapshot};
 use crate::export::ExportFormat;
-use crate::model::{
-    Action, AttachmentHitbox, BacklinkHitbox, ButtonHitbox, DailyNote, DialogOptionHitbox,
-    FileGroup, FileGroupHitbox, FileHitbox, FileListRow, LinkHitbox, LinkTarget, NoteFile,
-    SearchHit, SearchHitbox, TagHitbox, TagNote, TagNoteHitbox, TodoHitbox, TodoItem,
-    WikiLinkCandidate, WikiLinkHitbox, WikiLinkLocation, WorkspaceViewHitbox,
+use crate::core::model::{
+    Action, DailyNote, FileGroup, FileListRow, LinkTarget, NoteFile, SearchHit, TagNote, TodoItem,
+    WikiLinkCandidate, WikiLinkLocation,
 };
 use crate::notification::NotificationService;
 use crate::observable::Observable;
 use crate::skill::Skill;
 use crate::storage::{ExportOutcome, LoadedTheme, Storage};
+use crate::tui::model::{
+    AttachmentHitbox, BacklinkHitbox, ButtonHitbox, DialogOptionHitbox, FileGroupHitbox,
+    FileHitbox, LinkHitbox, SearchHitbox, TagHitbox, TagNoteHitbox, TodoHitbox, WikiLinkHitbox,
+    WorkspaceViewHitbox,
+};
 use crate::workspace_index::{
     TagDocument, TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle,
 };

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent_session::AgentSession;
 use crate::export::{ExportDiagnostic, ExportFormat};
-use crate::model::{DailyNote, NoteFile, TodoItem};
+use crate::core::model::{DailyNote, NoteFile, TodoItem};
 use crate::theme::Theme;
 
 mod atomic;

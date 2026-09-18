@@ -223,7 +223,7 @@ fn draw_tag_note_stream(frame: &mut Frame, app: &mut App, area: Rect, interactiv
                 .saturating_add(cached.lines.len().saturating_sub(1))
                 .min(end);
             if card_last > card_first {
-                app.tag_note_hitboxes.push(crate::model::TagNoteHitbox {
+                app.tag_note_hitboxes.push(crate::tui::model::TagNoteHitbox {
                     index: *index,
                     area: Rect::new(
                         cards.x,
@@ -368,7 +368,7 @@ pub(super) fn measure_visible_tag_note_cards(
 }
 
 pub(super) fn render_tag_note_card(
-    note: &crate::model::TagNote,
+    note: &crate::core::model::TagNote,
     width: usize,
     theme: Theme,
 ) -> crate::app::TagNoteCardRenderCache {
