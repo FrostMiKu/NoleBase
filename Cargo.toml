@@ -10,9 +10,13 @@ homepage = "https://github.com/FrostMiKu/NoleBase"
 readme = "README.md"
 exclude = [".github/**", "AGENTS.md"]
 
+[lib]
+name = "nole"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nole"
-path = "src/main.rs"
+path = "src/bin/nole.rs"
 
 [dependencies]
 ratatui = "0.30.2"

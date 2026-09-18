@@ -80,7 +80,7 @@ struct AgentTerminalState {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct AgentTerminalHandle {
+pub struct AgentTerminalHandle {
     inner: Arc<Mutex<AgentTerminalState>>,
 }
 

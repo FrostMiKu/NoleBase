@@ -22,7 +22,7 @@ pub(crate) const WIKI_COMPLETION_WINDOW: usize = 8;
 /// visible row) is reconciled from `index` at render time and held steady
 /// while the selection still fits inside the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WikiCompletionState {
+pub struct WikiCompletionState {
     /// Character offset of the first `[` of the opening marker.
     pub(crate) span_start: usize,
     /// The query typed between `[[` and the cursor.

@@ -150,7 +150,7 @@ impl JobState {
 /// tools, and the App UI. All methods are thread-safe; settlement may come from
 /// any job thread.
 #[derive(Clone)]
-pub(crate) struct AgentJobsHandle {
+pub struct AgentJobsHandle {
     inner: Arc<Mutex<JobState>>,
     events: AgentEventSender,
 }

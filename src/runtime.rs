@@ -1,30 +1,4 @@
-//! Entry point: terminal lifecycle, event loop, and external-editor integration.
-
-mod agent;
-mod agent_session;
-mod app;
-mod attachment;
-mod attachment_index;
-mod attachment_usage;
-mod backend;
-mod clipboard;
-mod document_index;
-mod embedded_terminal;
-mod export;
-mod image_data;
-mod markdown;
-mod media;
-mod model;
-mod notification;
-mod observable;
-mod provider;
-mod skill;
-mod storage;
-mod theme;
-mod ui;
-mod vlist;
-mod wiki_link_index;
-mod workspace_index;
+//! Terminal lifecycle, event loop, and external-editor integration.
 
 use std::fs;
 use std::io::{self, Stdout, Write};
@@ -51,9 +25,13 @@ use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-use app::{App, Command};
-use backend::FrameBackend;
-use document_index::DocumentIndexer;
+use crate::agent;
+use crate::app::{self, App, Command};
+use crate::backend::FrameBackend;
+use crate::clipboard;
+use crate::document_index::DocumentIndexer;
+use crate::storage;
+use crate::ui;
 
 type Tui = Terminal<FrameBackend<Stdout>>;
 type WatchEvents = Receiver<notify::Result<notify::Event>>;
@@ -542,7 +520,8 @@ fn image_picker() -> ratatui_image::picker::Picker {
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
 }
 
-fn main() -> Result<()> {
+/// Binary entry: shell helper mode, version flag, then the TUI event loop.
+pub fn run_app() -> Result<()> {
     if let Some(mode) = agent::shell_helper_mode(std::env::args()) {
         let code = agent::run_shell_helper(mode).unwrap_or_else(|error| {
             eprintln!("Nole shell helper error: {error:#}");

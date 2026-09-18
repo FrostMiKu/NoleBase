@@ -272,7 +272,7 @@ pub struct PrivateTerminalInputRequest {
 /// Internal TUI-to-runtime response. Deliberately has no `Debug`, `Clone`, or
 /// serialization implementation so the private value cannot accidentally be
 /// formatted, copied into activity, or persisted with Agent state.
-pub(crate) enum PrivateTerminalInputDecision {
+pub enum PrivateTerminalInputDecision {
     Submit(zeroize::Zeroizing<String>),
     Cancelled,
 }
