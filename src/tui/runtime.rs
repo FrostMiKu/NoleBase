@@ -24,7 +24,7 @@ use ratatui::Terminal;
 
 use crate::core::agent;
 use crate::core::storage;
-use crate::core::workspace_watcher::{WorkspaceEvent, WorkspaceWatcher};
+use crate::core::workspace_watcher::WorkspaceEvent;
 use crate::tui::app::{self, App, Command};
 use crate::tui::backend::FrameBackend;
 use crate::tui::clipboard;
@@ -237,12 +237,12 @@ fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         .map(|_| ())
 }
 
-fn run(terminal: &mut Tui, app: &mut App, watcher: &mut WorkspaceWatcher) -> Result<()> {
+fn run(terminal: &mut Tui, app: &mut App, nole: &mut crate::core::nole::Nole) -> Result<()> {
     let animation_epoch = Instant::now();
     let mut focused = true;
     let mut needs_draw = true;
     loop {
-        needs_draw |= apply_workspace_events(app, watcher.poll(&app.workspace));
+        needs_draw |= apply_workspace_events(app, nole.poll_workspace());
         if app.workspace.poll_index_update() {
             app.on_index_update();
             needs_draw = true;
@@ -408,10 +408,8 @@ pub fn run_app() -> Result<()> {
     }
     let storage = resolve_storage()?;
     storage.ensure_files()?;
-    let mut watcher = WorkspaceWatcher::new(&storage)?;
-    let workspace = std::sync::Arc::new(crate::core::workspace::Workspace::open(storage)?);
-    let agent = std::sync::Arc::new(crate::core::agent_service::AgentService::new(&workspace));
-    let mut app = App::new(workspace, agent)?;
+    let mut nole = crate::core::nole::Nole::open(storage)?;
+    let mut app = App::new(nole.workspace().clone(), nole.agent().clone())?;
 
     enter_tui()?;
     let _guard = TerminalGuard;
@@ -420,7 +418,7 @@ pub fn run_app() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    run(&mut terminal, &mut app, &mut watcher).context("event loop failed")?;
+    run(&mut terminal, &mut app, &mut nole).context("event loop failed")?;
     Ok(())
 }
 
@@ -456,6 +454,7 @@ mod tests {
         assert!(should_query_image_capabilities(Some("iTerm.app")));
         assert!(should_query_image_capabilities(None));
     }
+    use crate::core::workspace_watcher::WorkspaceWatcher;
     use crate::tui::app::{CenterView, Document, DocumentKind, DocumentReturn};
     use notify::event::{EventKind, ModifyKind};
     use ratatui::backend::TestBackend;

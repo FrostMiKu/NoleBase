@@ -14,6 +14,7 @@ pub mod export;
 pub mod image_data;
 pub mod markup;
 pub mod model;
+pub mod nole;
 pub mod observable;
 pub mod provider;
 pub mod skill;
