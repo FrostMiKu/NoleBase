@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use mbdown::{Event, Node};
 
 use crate::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
-use crate::markdown::visit_markdown;
+use crate::core::markup::visit_markdown;
 #[cfg(test)]
 use crate::storage::Storage;
 

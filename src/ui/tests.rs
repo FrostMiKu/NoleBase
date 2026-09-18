@@ -139,7 +139,7 @@ fn render_agent_entry(
     animate: bool,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     super::render_agent_entry(entry, width, tick, animate, Theme::default())
@@ -225,7 +225,7 @@ fn rendering_uses_colors_loaded_from_the_app_theme() {
     assert_eq!(buffer[(1, 23)].bg, Color::Rgb(4, 5, 6));
     assert_eq!(buffer[(219, 23)].bg, Color::Rgb(16, 17, 18));
 
-    let markdown = crate::markdown::render_at_width("# Heading", 40, app.theme);
+    let markdown = crate::tui::markdown::render_at_width("# Heading", 40, app.theme);
     assert!(markdown
         .lines
         .iter()

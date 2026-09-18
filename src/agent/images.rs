@@ -15,7 +15,7 @@ use tokio::fs as async_fs;
 use crate::agent::tools::read::fetch_web_response;
 use crate::attachment::{AttachmentStore, AttachmentUri};
 use crate::image_data::{decode_image, MAX_IMAGE_BYTES};
-use crate::markdown::visit_markdown;
+use crate::core::markup::visit_markdown;
 use crate::provider::{ImageBlock, ImageMediaType, ImageSource, Message, MessagePart, MessageRole};
 
 /// Accumulated normalized byte cap for a single provider request, checked

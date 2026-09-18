@@ -454,7 +454,7 @@ pub(super) fn compose_rect(area: Rect) -> Rect {
 
 pub(super) fn register_link_hitboxes(
     hitboxes: &mut Vec<LinkHitbox>,
-    links: &[crate::markdown::RenderedLink],
+    links: &[crate::tui::markdown::RenderedLink],
     viewport: Rect,
     scroll: usize,
     base_dir: &Path,
@@ -491,7 +491,7 @@ pub(super) fn register_link_hitboxes(
 
 pub(super) fn register_tag_hitboxes(
     hitboxes: &mut Vec<TagHitbox>,
-    tags: &[crate::markdown::RenderedTag],
+    tags: &[crate::tui::markdown::RenderedTag],
     viewport: Rect,
     scroll: usize,
 ) {

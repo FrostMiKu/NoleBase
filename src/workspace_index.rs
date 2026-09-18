@@ -11,7 +11,7 @@ use mbdown::{Event, Node};
 use crate::document_index::{
     self, DocumentGroup as FileGroup, DocumentIndex, IndexedDocument, IndexedLine,
 };
-use crate::markdown::visit_markdown;
+use crate::core::markup::visit_markdown;
 use crate::core::model::SearchHit;
 use crate::storage::Storage;
 

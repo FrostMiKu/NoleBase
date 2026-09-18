@@ -29,7 +29,7 @@ use mbdown::{Container, Event, InlineTag, Node, SpannedEvent};
 
 use crate::attachment::AttachmentUri;
 use crate::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
-use crate::markdown::visit_markdown;
+use crate::core::markup::visit_markdown;
 use crate::storage::Storage;
 
 /// Derived reference index: canonical attachment URI -> referencing notes.

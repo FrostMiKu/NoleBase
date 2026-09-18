@@ -568,7 +568,7 @@ pub(super) fn render_agent_entry(
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     let mut lines = Vec::new();
@@ -595,7 +595,7 @@ pub(super) fn render_agent_entry(
             // A gap row separates the label from the message body.
             lines.push(agent_message_line(Line::default(), width, background));
             let row = lines.len();
-            let mut rendered = crate::markdown::render_at_width(text, width, theme);
+            let mut rendered = crate::tui::markdown::render_at_width(text, width, theme);
             if *muted {
                 for line in &mut rendered.lines {
                     for span in &mut line.spans {
@@ -639,7 +639,7 @@ pub(super) fn render_agent_entry(
             // A gap row separates the label from the message body.
             lines.push(agent_message_line(Line::default(), width, background));
             let row = lines.len();
-            let rendered = crate::markdown::render_at_width(text, width, theme);
+            let rendered = crate::tui::markdown::render_at_width(text, width, theme);
             links.extend(rendered.links.into_iter().map(|mut link| {
                 link.row += row;
                 link
@@ -725,7 +725,7 @@ pub(super) fn visible_agent_lines(
     view_height: usize,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     let end = scroll.saturating_add(view_height);
@@ -803,7 +803,7 @@ fn render_agent_entry_current(
     index: usize,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     let entry = app.agent_panel[index].as_ref();

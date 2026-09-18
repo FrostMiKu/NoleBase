@@ -167,7 +167,7 @@ pub(super) fn draw_document(
         document.ensure_rendered(document_area.width as usize, app.theme);
         if let Some(target_line) = document.target_line.take() {
             let target_scroll = DOCUMENT_TOP_MARGIN
-                .saturating_add(crate::markdown::rendered_row_for_source_line_in(
+                .saturating_add(crate::tui::markdown::rendered_row_for_source_line_in(
                     &document.source,
                     target_line,
                     &document

@@ -329,8 +329,8 @@ pub(super) fn measure_visible_daily_cards(
 pub(super) struct NoteCardRender {
     pub(super) body_start: usize,
     pub(super) lines: Vec<Line<'static>>,
-    pub(super) links: Vec<crate::markdown::RenderedLink>,
-    pub(super) tags: Vec<crate::markdown::RenderedTag>,
+    pub(super) links: Vec<crate::tui::markdown::RenderedLink>,
+    pub(super) tags: Vec<crate::tui::markdown::RenderedTag>,
     pub(super) images: Vec<mbtui::ImagePlacement>,
 }
 
@@ -365,7 +365,7 @@ pub(super) fn render_note_card_content(
         ),
         line_with_background(Vec::new(), width, card_style),
     ];
-    let markdown = crate::markdown::render_at_width(body, body_width, theme);
+    let markdown = crate::tui::markdown::render_at_width(body, body_width, theme);
     let body_line_start = lines.len();
     let links = markdown
         .links

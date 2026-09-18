@@ -104,7 +104,7 @@ pub(super) fn render_chat_entry(
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     render_chat_entry_with_thinking_mode(entry, width, false, theme)
@@ -117,7 +117,7 @@ pub(super) fn render_chat_entry_with_thinking_mode(
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     match entry {
@@ -203,7 +203,7 @@ fn render_chat_prompt_bar(
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     let background = theme.selection_background;
@@ -212,7 +212,7 @@ fn render_chat_prompt_bar(
     let body_width = width
         .saturating_sub(CHAT_BLOCK_PAD * 2 + prefix.len())
         .max(1);
-    let mut markdown = crate::markdown::render_at_width(text, body_width, theme);
+    let mut markdown = crate::tui::markdown::render_at_width(text, body_width, theme);
     if muted {
         for line in &mut markdown.lines {
             for span in &mut line.spans {
@@ -267,11 +267,11 @@ pub(super) fn render_chat_plain_text(
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     let body_width = width.saturating_sub(CHAT_BLOCK_PAD * 2).max(1);
-    let markdown = crate::markdown::render_at_width(text, body_width, theme);
+    let markdown = crate::tui::markdown::render_at_width(text, body_width, theme);
     let links = markdown
         .links
         .into_iter()
@@ -312,7 +312,7 @@ pub(super) fn render_chat_thinking_box(
     theme: Theme,
 ) -> (
     Vec<Line<'static>>,
-    Vec<crate::markdown::RenderedLink>,
+    Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
     let background = theme.surface_message_agent;
@@ -326,7 +326,7 @@ pub(super) fn render_chat_thinking_box(
     };
     let body_indent = CHAT_BLOCK_PAD + 1 + 1;
     let body_width = width.saturating_sub(body_indent * 2).max(1);
-    let text = crate::markdown::expand_tabs(text);
+    let text = crate::core::markup::expand_tabs(text);
     let mut body_lines = wrap_spans_to_width(&[Span::raw(text.into_owned())], body_width)
         .into_iter()
         .map(Line::from)

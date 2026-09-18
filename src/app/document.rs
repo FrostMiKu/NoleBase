@@ -39,7 +39,7 @@ pub struct Document {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DocumentRenderCache {
     pub width: usize,
-    pub rendered: crate::markdown::RenderedMarkup,
+    pub rendered: crate::tui::markdown::RenderedMarkup,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +128,7 @@ impl Document {
         }
         self.render_cache = Some(DocumentRenderCache {
             width,
-            rendered: crate::markdown::render_at_width(&self.source, width, theme),
+            rendered: crate::tui::markdown::render_at_width(&self.source, width, theme),
         });
         true
     }

@@ -15,8 +15,8 @@ pub(crate) struct DailyCardRenderCache {
     pub date_label: String,
     pub body: String,
     pub lines: Vec<ratatui::text::Line<'static>>,
-    pub links: Vec<crate::markdown::RenderedLink>,
-    pub tags: Vec<crate::markdown::RenderedTag>,
+    pub links: Vec<crate::tui::markdown::RenderedLink>,
+    pub tags: Vec<crate::tui::markdown::RenderedTag>,
     pub images: Vec<mbtui::ImagePlacement>,
     pub button_line: usize,
     pub button_start: usize,
@@ -29,7 +29,7 @@ pub(crate) struct AgentEntryRenderCache {
     /// instead of deep-comparing the entry text every frame.
     pub entry: Arc<AgentPanelEntry>,
     pub lines: Vec<ratatui::text::Line<'static>>,
-    pub links: Vec<crate::markdown::RenderedLink>,
+    pub links: Vec<crate::tui::markdown::RenderedLink>,
     pub images: Vec<mbtui::ImagePlacement>,
 }
 
@@ -70,8 +70,8 @@ pub(crate) struct TagNoteCardRenderCache {
     pub title: String,
     pub body: String,
     pub lines: Vec<ratatui::text::Line<'static>>,
-    pub links: Vec<crate::markdown::RenderedLink>,
-    pub tags: Vec<crate::markdown::RenderedTag>,
+    pub links: Vec<crate::tui::markdown::RenderedLink>,
+    pub tags: Vec<crate::tui::markdown::RenderedTag>,
     pub images: Vec<mbtui::ImagePlacement>,
 }
 

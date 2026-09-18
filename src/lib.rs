@@ -16,7 +16,6 @@ pub mod document_index;
 pub mod embedded_terminal;
 pub mod export;
 pub mod image_data;
-pub mod markdown;
 pub mod media;
 pub mod notification;
 pub mod observable;
