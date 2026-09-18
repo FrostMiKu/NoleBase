@@ -182,6 +182,15 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Build a storage rooted at `~/.nole`, or at the directory named by the
+    /// `NOLE_DIR` environment variable when it is set to a non-empty value.
+    pub fn resolve_root() -> Result<Self> {
+        match std::env::var("NOLE_DIR") {
+            Ok(dir) if !dir.trim().is_empty() => Self::new(dir.trim()),
+            _ => Self::default_root(),
+        }
+    }
+
     /// Build a storage rooted at `~/.nole`.
     pub fn default_root() -> Result<Self> {
         let home = dirs::home_dir().context("could not determine home directory")?;

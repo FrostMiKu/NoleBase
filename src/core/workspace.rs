@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::core::attachment::{AttachmentId, AttachmentMetadata, AttachmentStore};
 use crate::core::attachment_usage::{AttachmentUsageHandle, TrashError, TrashResult};
@@ -146,6 +146,120 @@ impl Workspace {
         self.attachments.metadata(id)
     }
 
+    /// Read the source of a managed document addressed by its
+    /// workspace-relative path (`data/note.md`, `daily/2026-09-19.md`,
+    /// `archives/old.mb`). The address is validated lexically and the target
+    /// is validated in full (regular non-symlink `.md`/`.mb` file inside the
+    /// Nole root) before reading.
+    pub fn read_document(&self, relative: &str) -> Result<String> {
+        let target = self.document_path(relative)?;
+        self.storage.read_document_file(&target)
+    }
+
+    /// Write the source of a managed document addressed by its
+    /// workspace-relative path. The same addressing rules as
+    /// [`Workspace::read_document`] apply; existing documents are replaced
+    /// atomically through a same-directory temporary file, so the filesystem
+    /// watcher and the index pipeline observe one consistent change.
+    ///
+    /// There is no revision or optimistic-concurrency token on document
+    /// storage; a write unconditionally replaces the current content.
+    pub fn write_document(&self, relative: &str, source: &str) -> Result<()> {
+        let target = self.document_path(relative)?;
+        let directory = target
+            .parent()
+            .context("managed document path has no parent directory")?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("managed document must not be a symlink: {relative}");
+            }
+        }
+        let temporary = directory.join(format!(
+            ".{}.{}.web.tmp",
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("document"),
+            fastrand::u64(..)
+        ));
+        std::fs::write(&temporary, source)
+            .with_context(|| format!("staging document write for {relative}"))?;
+        if let Err(error) = crate::core::storage::replace_file_atomically(&temporary, &target) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("publishing document {relative}"));
+        }
+        Ok(())
+    }
+
+    /// Validate a workspace-relative document address and resolve it to an
+    /// absolute path without checking existence. Accepted addresses are
+    /// exactly one managed directory component (`data`, `daily`, or
+    /// `archives`) followed by one `.md`/`.mb` file name. Absolute paths,
+    /// parent-directory components, backslashes, and deeper or shallower
+    /// paths are rejected, so the resolved path can never escape the managed
+    /// note directories. Clients use this to translate a wire address into a
+    /// path for index queries such as backlinks.
+    pub fn document_path(&self, relative: &str) -> Result<PathBuf> {
+        if relative.is_empty() {
+            anyhow::bail!("document path must not be empty");
+        }
+        if relative.contains('\\') {
+            anyhow::bail!("document path must use '/' separators");
+        }
+        let path = std::path::Path::new(relative);
+        if path.is_absolute() || path.has_root() {
+            anyhow::bail!("document path must be workspace-relative");
+        }
+        let mut components = path.components();
+        let (directory, name) = match (components.next(), components.next(), components.next()) {
+            (Some(first), Some(second), None) => (first, second),
+            _ => anyhow::bail!(
+                "document path must be `<data|daily|archives>/<name>.<md|mb>`: {relative}"
+            ),
+        };
+        let directory = match directory.as_os_str().to_str() {
+            Some("data") => self.storage.data_dir.clone(),
+            Some("daily") => self.storage.daily_dir.clone(),
+            Some("archives") => self.storage.archives_dir.clone(),
+            _ => anyhow::bail!(
+                "document path must be `<data|daily|archives>/<name>.<md|mb>`: {relative}"
+            ),
+        };
+        let name = name
+            .as_os_str()
+            .to_str()
+            .context("document name is not UTF-8")?;
+        if name.is_empty() || name == "." || name == ".." {
+            anyhow::bail!("document name must be a file name: {relative}");
+        }
+        let candidate = directory.join(name);
+        if !crate::core::storage::is_note_path(&candidate) {
+            anyhow::bail!("document must be a .md or .mb file: {relative}");
+        }
+        Ok(candidate)
+    }
+
+    /// The workspace-relative, `/`-separated form of `path` when it lives
+    /// inside this workspace, for clients that must not observe absolute
+    /// local paths. Falls back to `None` for outside paths.
+    pub fn relative_path(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(&self.storage.root).ok().or_else(|| {
+            let canonical_root = std::fs::canonicalize(&self.storage.root).ok()?;
+            path.strip_prefix(canonical_root).ok()
+        })?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        let mut joined = String::new();
+        for component in relative.components() {
+            if !joined.is_empty() {
+                joined.push('/');
+            }
+            joined.push_str(&component.as_os_str().to_string_lossy());
+        }
+        Some(joined)
+    }
+
     /// The application-managed content path for an attachment; external
     /// saves update the attachment in place.
     pub fn open_attachment(&self, id: AttachmentId) -> Result<PathBuf> {
@@ -253,5 +367,119 @@ mod tests {
         assert_eq!(documents[0].path, note);
         let backlinks = workspace.backlinks(&other).unwrap();
         assert_eq!(backlinks, vec![note]);
+    }
+
+    #[test]
+    fn read_document_resolves_relative_addresses_and_rejects_escapes() {
+        let (workspace, directory) = workspace();
+        let storage = Storage::new(directory.path()).unwrap();
+        fs::write(storage.data_dir.join("note.md"), "# managed").unwrap();
+        fs::write(storage.daily_dir.join("2026-09-19.md"), "day").unwrap();
+        let secret = directory.path().join("secret.txt");
+        fs::write(&secret, "outside").unwrap();
+
+        assert_eq!(
+            workspace.read_document("data/note.md").unwrap(),
+            "# managed"
+        );
+        assert_eq!(
+            workspace.read_document("daily/2026-09-19.md").unwrap(),
+            "day"
+        );
+
+        for rejected in [
+            "",
+            "/etc/passwd",
+            "data/note.md/extra",
+            "data",
+            "data/../data/note.md",
+            "../secret.txt",
+            "data/../../secret.txt",
+            "config/settings.toml",
+            "attachments/0000/content.png",
+            "data\\note.md",
+            "data/note.txt",
+            "MEMORY.md",
+            "data/.hidden",
+        ] {
+            assert!(
+                workspace.read_document(rejected).is_err(),
+                "address must be rejected: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_document_creates_and_replaces_atomically() {
+        let (workspace, directory) = workspace();
+        let storage = Storage::new(directory.path()).unwrap();
+
+        workspace.write_document("data/new.md", "# first").unwrap();
+        assert_eq!(
+            fs::read_to_string(storage.data_dir.join("new.md")).unwrap(),
+            "# first"
+        );
+
+        workspace.write_document("data/new.md", "# second").unwrap();
+        assert_eq!(
+            fs::read_to_string(storage.data_dir.join("new.md")).unwrap(),
+            "# second"
+        );
+        workspace.write_document("daily/2026-09-19.md", "").unwrap();
+        assert_eq!(
+            fs::read_to_string(storage.daily_dir.join("2026-09-19.md")).unwrap(),
+            ""
+        );
+
+        // No staging files are left behind in managed directories.
+        for directory in [&storage.data_dir, &storage.daily_dir, &storage.archives_dir] {
+            let strays: Vec<_> = fs::read_dir(directory)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+                .collect();
+            assert!(strays.is_empty(), "stray staging files: {strays:?}");
+        }
+    }
+
+    #[test]
+    fn write_document_rejects_traversal_and_special_locations() {
+        let (workspace, directory) = workspace();
+        let secret = directory.path().join("secret.txt");
+        fs::write(&secret, "outside").unwrap();
+
+        for rejected in [
+            "",
+            "/tmp/evil.md",
+            "data/../../../evil.md",
+            "config/settings.toml",
+            "workspace/main/scratch.md",
+            "attachments/0000/content.md",
+            "skills/tool.md",
+            "data/sub/nested.md",
+            "note.md",
+        ] {
+            assert!(
+                workspace.write_document(rejected, "x").is_err(),
+                "write address must be rejected: {rejected}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "outside");
+        assert!(!directory.path().join("tmp").join("evil.md").exists());
+    }
+
+    #[test]
+    fn relative_path_strips_the_workspace_root_with_forward_slashes() {
+        let (workspace, directory) = workspace();
+        let storage = Storage::new(directory.path()).unwrap();
+        assert_eq!(
+            workspace.relative_path(&storage.data_dir.join("note.md")),
+            Some("data/note.md".to_string())
+        );
+        assert_eq!(workspace.relative_path(&storage.root), None);
+        assert_eq!(
+            workspace.relative_path(Path::new("/definitely/outside.md")),
+            None
+        );
     }
 }
