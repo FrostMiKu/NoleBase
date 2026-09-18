@@ -40,15 +40,42 @@ pub(crate) struct WatchContext {
     attachments_dir: PathBuf,
     settings_path: PathBuf,
     themes_dir: PathBuf,
+    /// The lexical storage root, used to rewrite canonicalized event paths.
+    lexical_root: PathBuf,
+    /// The canonical spelling of the storage root when it differs from the
+    /// lexical one. Some notify backends (macOS FSEvents) report fully
+    /// resolved paths, so a workspace rooted through a symlink (`NOLE_DIR`
+    /// under `/tmp`, for example) would otherwise produce paths that fail
+    /// every prefix comparison against the storage's own spelling and never
+    /// reach the document index.
+    canonical_root: Option<PathBuf>,
 }
 
 impl WatchContext {
     pub(crate) fn from_storage(storage: &Storage) -> Self {
+        let canonical_root = std::fs::canonicalize(&storage.root)
+            .ok()
+            .filter(|canonical| canonical != &storage.root);
         Self {
             workspace_dir: storage.workspace_dir.clone(),
             attachments_dir: storage.attachments_dir.clone(),
             settings_path: storage.settings_path.clone(),
             themes_dir: storage.themes_dir.clone(),
+            lexical_root: storage.root.clone(),
+            canonical_root,
+        }
+    }
+
+    /// Rewrite a canonicalized event path back onto the storage's lexical
+    /// root spelling. Paths outside the canonical root pass through
+    /// unchanged.
+    pub(crate) fn normalize(&self, path: &PathBuf) -> PathBuf {
+        match &self.canonical_root {
+            Some(canonical) => path
+                .strip_prefix(canonical)
+                .map(|relative| self.lexical_root.join(relative))
+                .unwrap_or_else(|_| path.clone()),
+            None => path.clone(),
         }
     }
 }
@@ -142,6 +169,11 @@ impl WorkspaceWatcher {
 /// Classify drained notify events into domain events plus the managed
 /// markdown paths that need re-indexing.
 ///
+/// Event paths are first rewritten onto the storage's lexical root spelling
+/// (see [`WatchContext`]); notify backends may report fully resolved paths
+/// for a workspace rooted through a symlink, which would otherwise fail
+/// every prefix comparison downstream.
+///
 /// Ordering note: the returned events list agent-read invalidation first,
 /// then attachment changes, then content changes — the order consumers
 /// applied when this logic lived in the terminal runtime.
@@ -161,47 +193,47 @@ pub(crate) fn classify_events(
     let mut watcher_error = None;
     for event in raw {
         if let Ok(event) = &event {
-            if !event.paths.is_empty()
-                && event
-                    .paths
+            let paths: Vec<PathBuf> = event
+                .paths
+                .iter()
+                .map(|path| context.normalize(path))
+                .collect();
+            if !paths.is_empty()
+                && paths
                     .iter()
                     .all(|path| path.starts_with(&context.workspace_dir))
             {
                 continue;
             }
-            agent_read_paths.extend(event.paths.iter().cloned());
-            if event
-                .paths
+            agent_read_paths.extend(paths.iter().cloned());
+            if paths
                 .iter()
                 .any(|path| path.starts_with(&context.attachments_dir))
             {
-                attachment_paths.extend(event.paths.iter().cloned());
+                attachment_paths.extend(paths.iter().cloned());
             }
-        }
-        match event {
-            Ok(event)
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| {
-                    path == &context.settings_path
-                        || (path.parent() == Some(context.themes_dir.as_path())
-                            && path
-                                .extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml")))
-                        || is_managed_markdown(path)
-                }) =>
-            {
+            if matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            ) && paths.iter().any(|path| {
+                path == &context.settings_path
+                    || (path.parent() == Some(context.themes_dir.as_path())
+                        && path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("toml")))
+                    || is_managed_markdown(path)
+            }) {
                 markdown_paths.extend(
-                    event
-                        .paths
+                    paths
                         .iter()
                         .filter(|path| is_managed_markdown(path))
                         .cloned(),
                 );
                 content_changed = true;
             }
+        }
+        match event {
             Ok(_) => {}
             Err(error) => watcher_error = Some(error),
         }
@@ -240,6 +272,8 @@ fn is_managed_markdown(path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use notify::event::ModifyKind;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     fn context() -> (WatchContext, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -258,6 +292,56 @@ mod tests {
         context: &WatchContext,
     ) -> (Vec<WorkspaceEvent>, Vec<PathBuf>) {
         classify_events(&events, context)
+    }
+
+    #[test]
+    fn canonicalized_event_paths_are_rewritten_to_the_lexical_root() {
+        // A workspace rooted through a symlink (NOLE_DIR=/tmp/... on macOS,
+        // for example): notify reports fully resolved paths, but every
+        // downstream comparison uses the storage's lexical spelling.
+        let directory = tempfile::tempdir().unwrap();
+        let canonical_directory = std::fs::canonicalize(directory.path()).unwrap();
+        let link_name = format!(
+            "nole-lexical-{}",
+            directory
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("link")
+        );
+        let lexical_root = canonical_directory.parent().unwrap().join(&link_name);
+        symlink(&directory.path(), &lexical_root).unwrap();
+        let storage = Storage::new(&lexical_root).unwrap();
+
+        let context = WatchContext::from_storage(&storage);
+        let canonical_note = canonical_directory.join("data").join("note.md");
+        assert_ne!(canonical_note, storage.data_dir.join("note.md"));
+
+        let (events, markdown_paths) = classify(vec![modify_event(vec![canonical_note])], &context);
+        assert_eq!(markdown_paths, vec![storage.data_dir.join("note.md")]);
+        assert_eq!(
+            events,
+            vec![
+                WorkspaceEvent::AgentReadsDirty {
+                    paths: vec![storage.data_dir.join("note.md")],
+                },
+                WorkspaceEvent::ContentChanged {
+                    markdown_paths: vec![storage.data_dir.join("note.md")],
+                },
+            ]
+        );
+
+        // Sandbox events reported through the canonical spelling are still
+        // recognized as workspace events and ignored.
+        let canonical_session = canonical_directory
+            .join("workspace")
+            .join("main")
+            .join("session.json");
+        let (events, markdown_paths) =
+            classify(vec![modify_event(vec![canonical_session])], &context);
+        assert!(events.is_empty());
+        assert!(markdown_paths.is_empty());
+        std::fs::remove_file(&lexical_root).unwrap();
     }
 
     #[test]

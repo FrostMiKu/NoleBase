@@ -348,6 +348,59 @@ async fn agent_commands_validate_input() {
     assert_eq!(json["running"], json!(false));
 }
 
+/// Regression: a workspace rooted through a symlink (macOS `/tmp`, an
+/// `NOLE_DIR` override) must still index external writes. notify reports
+/// canonicalized paths there; the watcher rewrites them back onto the
+/// storage's lexical spelling before classification.
+#[tokio::test]
+async fn watcher_pipeline_refreshes_index_after_external_write() {
+    use crate::core::nole::Nole;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path()).unwrap();
+    storage.ensure_files().unwrap();
+    let mut nole = Nole::open(storage).unwrap();
+    let workspace = nole.workspace().clone();
+
+    // Drain the initial snapshot like the web watcher loop does.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !workspace.poll_index_update() {
+        assert!(
+            Instant::now() < deadline,
+            "initial index snapshot must settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    std::fs::write(
+        directory.path().join("data").join("live.md"),
+        "live needle word\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut saw_event = false;
+    for _ in 0..50 {
+        let events = nole.poll_workspace();
+        if !events.is_empty() {
+            saw_event = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw_event, "watcher must observe the external write");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !workspace.poll_index_update() {
+        assert!(Instant::now() < deadline, "refreshed snapshot must settle");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let hits = workspace.search("needle").unwrap_or_default();
+    assert!(
+        hits.iter().any(|hit| matches!(hit,
+            crate::core::model::SearchHit::FileLine { path, .. } if path.ends_with("live.md"))),
+        "index must contain the externally written file; hits: {hits:?}"
+    );
+}
+
 #[tokio::test]
 async fn agent_run_is_accepted_and_reports_conflict_while_active() {
     let (state, _directory) = test_state();
