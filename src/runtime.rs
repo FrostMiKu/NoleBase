@@ -860,7 +860,7 @@ mod tests {
         storage.ensure_files().unwrap();
         let mut app = App::new(storage).unwrap();
         let custom =
-            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+            crate::storage::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
         let theme_path = app.storage.themes_dir.join("custom.toml");
         fs::write(&theme_path, custom).unwrap();
         app.storage.write_theme_selection("custom").unwrap();
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
 
         let updated =
-            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#040506\"");
+            crate::storage::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#040506\"");
         fs::write(&theme_path, updated).unwrap();
         sender
             .send(Ok(

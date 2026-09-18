@@ -29,7 +29,8 @@ use crate::core::model::{
 use crate::notification::NotificationService;
 use crate::observable::Observable;
 use crate::skill::Skill;
-use crate::storage::{ExportOutcome, LoadedTheme, Storage};
+use crate::storage::{ExportOutcome, Storage};
+use crate::theme::LoadedTheme;
 use crate::tui::model::{
     AttachmentHitbox, BacklinkHitbox, ButtonHitbox, DialogOptionHitbox, FileGroupHitbox,
     FileHitbox, LinkHitbox, SearchHitbox, TagHitbox, TagNoteHitbox, TodoHitbox, WikiLinkHitbox,
@@ -449,7 +450,7 @@ struct CodeCopyFeedback {
 
 impl App {
     pub fn new(storage: Storage) -> anyhow::Result<Self> {
-        let loaded_theme = storage.load_theme(None)?;
+        let loaded_theme = crate::theme::load_theme(&storage, None)?;
         let (
             agent_conversation,
             agent_panel,
@@ -805,7 +806,7 @@ impl App {
         let previous_random_source = (self.theme_selection == "random")
             .then_some(self.theme_source.as_deref())
             .flatten();
-        match self.storage.load_theme(previous_random_source) {
+        match crate::theme::load_theme(&self.storage, previous_random_source) {
             Ok(loaded) => self.apply_loaded_theme(loaded),
             Err(error) => self.set_error(format!("Theme reload error: {error}")),
         }

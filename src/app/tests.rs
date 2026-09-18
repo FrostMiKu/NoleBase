@@ -1215,7 +1215,7 @@ fn editable_support_files_open_through_the_editor_pipeline() {
 fn command_palette_switches_theme_and_persists_the_selection() {
     let (mut app, _directory) = make_app();
     let custom =
-        crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        crate::storage::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
     fs::write(app.storage.themes_dir.join("custom.toml"), custom).unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
@@ -2801,7 +2801,7 @@ fn workspace_reload_applies_theme_changes_and_invalidates_render_caches() {
     app.daily_vlist.width = 80;
     app.agent_vlist.width = 40;
     let custom =
-        crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        crate::storage::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
     fs::write(app.storage.themes_dir.join("custom.toml"), custom).unwrap();
     app.storage.write_theme_selection("custom").unwrap();
 

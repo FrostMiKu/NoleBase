@@ -1,81 +1,12 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use anyhow::{bail, Context, Result};
 use mbtui::{CornerStyle, Theme as MarkdownTheme};
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
-pub const DEFAULT_THEME_TOML: &str = r##"# Nole semantic color tokens. Values accept #RRGGBB or "terminal".
-# For background tokens, "terminal" means the terminal's own default background color.
-[surface]
-canvas = "terminal"
-panel = "#181825"
-compose = "#313244"
-overlay = "#11111b"
-message_user = "#313244"
-message_agent = "#1e1e2e"
-status_bar = "terminal"
-status_context = "#89b4fa"
-status_mode = "#74c7ec"
-
-[selection]
-background = "#45475a"
-background_inactive = "#313244"
-foreground = "#cdd6f4"
-indicator = "#cba6f7"
-
-[text]
-primary = "#cdd6f4"
-secondary = "#bac2de"
-muted = "#6c7086"
-subtle = "#7f849c"
-disabled = "#a6adc8"
-on_accent = "#11111b"
-
-[ui]
-border = "#6c7086"
-border_subtle = "#45475a"
-focus_border = "#a6e3a1"
-input_prompt = "#a6e3a1"
-shortcut = "#a6e3a1"
-page_heading = "#b4befe"
-section_heading = "#74c7ec"
-group_marker = "#94e2d5"
-activity_marker = "#94e2d5"
-task_open = "#94e2d5"
-task_done = "#a6e3a1"
-agent_user = "#74c7ec"
-agent_assistant = "#a6e3a1"
-search_marker = "#94e2d5"
-dialog_choice = "#89dceb"
-dialog_input = "#cba6f7"
-action = "#94e2d5"
-action_ai = "#f5c2e7"
-warning = "#f9e2af"
-error = "#f5c2e7"
-
-[diff]
-addition_background = "#29423c"
-deletion_background = "#49313f"
-
-[markdown]
-heading_1 = "#b4befe"
-heading_2 = "#89b4fa"
-heading_3 = "#cba6f7"
-heading_minor = "#74c7ec"
-quote = "#cba6f7"
-list = "#94e2d5"
-rule = "#6c7086"
-code = "#fab387"
-code_block_text = "#cdd6f4"
-code_block_background = "#313244"
-code_label = "#7f849c"
-link = "#89b4fa"
-hashtag = "#f5c2e7"
-wikilink = "#89dceb"
-box_border = "#6c7086"
-
-[animation]
-gradient = ["#89dceb", "#89b4fa", "#cba6f7", "#f5c2e7", "#f9e2af", "#a6e3a1"]
-"##;
+use crate::storage::{Storage, DEFAULT_THEME_TOML};
 
 #[cfg(test)]
 pub mod catppuccin {
@@ -398,6 +329,114 @@ impl Default for Theme {
     }
 }
 
+/// A theme resolved for presentation: which selection was requested, which
+/// theme file ended up active, where it came from, and the parsed theme.
+///
+/// Storage owns the raw selection and theme files; turning them into
+/// Ratatui colors belongs here, next to the token definitions.
+#[derive(Debug, Clone)]
+pub struct LoadedTheme {
+    pub requested: String,
+    pub active: String,
+    pub source: Option<PathBuf>,
+    pub theme: Theme,
+}
+
+impl LoadedTheme {
+    fn built_in_default_for(requested: &str) -> Self {
+        Self {
+            requested: requested.to_string(),
+            active: "default".to_string(),
+            source: None,
+            theme: Theme::default(),
+        }
+    }
+}
+
+/// Resolve the theme named by the settings file.
+pub fn load_theme(storage: &Storage, previous_random_source: Option<&Path>) -> Result<LoadedTheme> {
+    let requested = storage.load_theme_selection()?;
+    resolve_theme(storage, &requested, previous_random_source)
+}
+
+/// Resolve `selection`, persist it as the active theme selection, and return
+/// the loaded theme.
+pub fn select_theme(storage: &Storage, selection: &str) -> Result<LoadedTheme> {
+    let loaded = resolve_theme(storage, selection, None)?;
+    storage.write_theme_selection(selection)?;
+    Ok(loaded)
+}
+
+fn resolve_theme(
+    storage: &Storage,
+    requested: &str,
+    previous_random_source: Option<&Path>,
+) -> Result<LoadedTheme> {
+    if requested == "default" {
+        return load_default_theme(storage, requested);
+    }
+
+    let files = storage.theme_files()?;
+    if requested == "random" {
+        if let Some(previous) = previous_random_source {
+            if let Some((name, path)) = files.iter().find(|(_, path)| path == previous) {
+                return load_theme_file(requested, name, path);
+            }
+        }
+
+        let mut valid = Vec::new();
+        for (name, path) in &files {
+            if let Ok(theme) = parse_theme_file(path) {
+                valid.push((name, path, theme));
+            }
+        }
+        if valid.is_empty() {
+            return load_default_theme(storage, requested);
+        }
+        let (name, path, theme) = valid.swap_remove(fastrand::usize(..valid.len()));
+        return Ok(LoadedTheme {
+            requested: requested.to_string(),
+            active: name.clone(),
+            source: Some(path.clone()),
+            theme,
+        });
+    }
+
+    match files.into_iter().find(|(name, _)| name == requested) {
+        Some((name, path)) => load_theme_file(requested, &name, &path),
+        None => load_default_theme(storage, requested),
+    }
+}
+
+fn load_default_theme(storage: &Storage, requested: &str) -> Result<LoadedTheme> {
+    let path = storage.themes_dir.join("default.toml");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            load_theme_file(requested, "default", &path)
+        }
+        Ok(_) => Ok(LoadedTheme::built_in_default_for(requested)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(LoadedTheme::built_in_default_for(requested))
+        }
+        Err(error) => Err(error).with_context(|| format!("reading theme {}", path.display())),
+    }
+}
+
+fn load_theme_file(requested: &str, name: &str, path: &Path) -> Result<LoadedTheme> {
+    Ok(LoadedTheme {
+        requested: requested.to_string(),
+        active: name.to_string(),
+        source: Some(path.to_path_buf()),
+        theme: parse_theme_file(path)?,
+    })
+}
+
+fn parse_theme_file(path: &Path) -> Result<Theme> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("reading theme {}", path.display()))?;
+    Theme::from_toml(&source).with_context(|| format!("loading theme {}", path.display()))
+}
+
 fn parse_gradient(values: &[String; 6]) -> Result<[Color; 6]> {
     let mut colors = [Color::Reset; 6];
     for (index, value) in values.iter().enumerate() {
@@ -430,6 +469,101 @@ fn parse_rgb_color(field: &str, value: &str) -> Result<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh() -> (tempfile::TempDir, Storage) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path()).unwrap();
+        storage.ensure_files().unwrap();
+        (dir, storage)
+    }
+
+    #[test]
+    fn default_theme_selection_loads_the_seeded_default_file() {
+        let (_dir, storage) = fresh();
+        let default_theme_path = storage.themes_dir.join("default.toml");
+        let loaded = load_theme(&storage, None).unwrap();
+        assert_eq!(loaded.requested, "default");
+        assert_eq!(loaded.active, "default");
+        assert_eq!(loaded.source.as_deref(), Some(default_theme_path.as_path()));
+        assert_eq!(loaded.theme, Theme::default());
+    }
+
+    #[test]
+    fn custom_theme_selection_is_preserved_and_loaded() {
+        let (_dir, storage) = fresh();
+        let custom =
+            DEFAULT_THEME_TOML.replace("message_agent = \"#1e1e2e\"", "message_agent = \"#010203\"");
+        let path = storage.themes_dir.join("custom.toml");
+        fs::write(&path, &custom).unwrap();
+        storage.write_theme_selection("custom").unwrap();
+
+        storage.ensure_files().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
+        assert_eq!(storage.load_theme_selection().unwrap(), "custom");
+        let loaded = load_theme(&storage, None).unwrap();
+        assert_eq!(loaded.requested, "custom");
+        assert_eq!(loaded.active, "custom");
+        assert_eq!(loaded.source.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            loaded.theme.surface_message_agent,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn missing_and_random_theme_selections_fall_back_or_resolve() {
+        let (_dir, storage) = fresh();
+        let default_path = storage.themes_dir.join("default.toml");
+        let edited_default =
+            DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#090807\"");
+        fs::write(&default_path, &edited_default).unwrap();
+        storage.ensure_files().unwrap();
+        assert_eq!(fs::read_to_string(&default_path).unwrap(), edited_default);
+        storage.write_theme_selection("missing").unwrap();
+        let missing = load_theme(&storage, None).unwrap();
+        assert_eq!(missing.requested, "missing");
+        assert_eq!(missing.active, "default");
+        assert_eq!(missing.source.as_deref(), Some(default_path.as_path()));
+        assert_eq!(
+            missing.theme.surface_panel,
+            ratatui::style::Color::Rgb(9, 8, 7)
+        );
+
+        let custom = DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
+        let path = storage.themes_dir.join("only.toml");
+        fs::write(&path, custom).unwrap();
+        assert_eq!(storage.list_theme_names().unwrap(), vec!["only"]);
+        storage.write_theme_selection("random").unwrap();
+
+        let default_random = load_theme(&storage, Some(&default_path)).unwrap();
+        assert_eq!(default_random.requested, "random");
+        assert_eq!(default_random.active, "default");
+        assert_eq!(
+            default_random.source.as_deref(),
+            Some(default_path.as_path())
+        );
+        assert_eq!(
+            default_random.theme.surface_panel,
+            ratatui::style::Color::Rgb(9, 8, 7)
+        );
+
+        let custom_random = load_theme(&storage, Some(&path)).unwrap();
+        assert_eq!(custom_random.requested, "random");
+        assert_eq!(custom_random.active, "only");
+        assert_eq!(custom_random.source.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            custom_random.theme.surface_panel,
+            ratatui::style::Color::Rgb(1, 2, 3)
+        );
+
+        fs::remove_file(default_path).unwrap();
+        storage.write_theme_selection("missing").unwrap();
+        let built_in = load_theme(&storage, None).unwrap();
+        assert_eq!(built_in.active, "default");
+        assert_eq!(built_in.source, None);
+        assert_eq!(built_in.theme, Theme::default());
+    }
 
     #[test]
     fn default_file_reproduces_the_current_theme() {

@@ -199,7 +199,7 @@ fn buffer_string(terminal: &Terminal<TestBackend>) -> String {
 #[test]
 fn rendering_uses_colors_loaded_from_the_app_theme() {
     let (mut app, _directory) = make_app();
-    let custom = crate::theme::DEFAULT_THEME_TOML
+    let custom = crate::storage::DEFAULT_THEME_TOML
         .replace("canvas = \"terminal\"", "canvas = \"#0a0b0c\"")
         .replace("panel = \"#181825\"", "panel = \"#010203\"")
         .replace("compose = \"#313244\"", "compose = \"#0d0e0f\"")

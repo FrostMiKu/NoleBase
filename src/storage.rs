@@ -18,7 +18,6 @@ use sha2::{Digest, Sha256};
 use crate::agent_session::AgentSession;
 use crate::export::{ExportDiagnostic, ExportFormat};
 use crate::core::model::{DailyNote, NoteFile, TodoItem};
-use crate::theme::Theme;
 
 mod atomic;
 mod theme;
@@ -44,6 +43,82 @@ export_directory = "~"
 # Executable used by the floating terminal. Defaults to the system login shell.
 # shell = "fish"
 "#;
+
+/// Seed content of `themes/default.toml`. Storage owns this default config
+/// file; parsing it into presentation colors lives in the TUI theme module.
+pub const DEFAULT_THEME_TOML: &str = r##"# Nole semantic color tokens. Values accept #RRGGBB or "terminal".
+# For background tokens, "terminal" means the terminal's own default background color.
+[surface]
+canvas = "terminal"
+panel = "#181825"
+compose = "#313244"
+overlay = "#11111b"
+message_user = "#313244"
+message_agent = "#1e1e2e"
+status_bar = "terminal"
+status_context = "#89b4fa"
+status_mode = "#74c7ec"
+
+[selection]
+background = "#45475a"
+background_inactive = "#313244"
+foreground = "#cdd6f4"
+indicator = "#cba6f7"
+
+[text]
+primary = "#cdd6f4"
+secondary = "#bac2de"
+muted = "#6c7086"
+subtle = "#7f849c"
+disabled = "#a6adc8"
+on_accent = "#11111b"
+
+[ui]
+border = "#6c7086"
+border_subtle = "#45475a"
+focus_border = "#a6e3a1"
+input_prompt = "#a6e3a1"
+shortcut = "#a6e3a1"
+page_heading = "#b4befe"
+section_heading = "#74c7ec"
+group_marker = "#94e2d5"
+activity_marker = "#94e2d5"
+task_open = "#94e2d5"
+task_done = "#a6e3a1"
+agent_user = "#74c7ec"
+agent_assistant = "#a6e3a1"
+search_marker = "#94e2d5"
+dialog_choice = "#89dceb"
+dialog_input = "#cba6f7"
+action = "#94e2d5"
+action_ai = "#f5c2e7"
+warning = "#f9e2af"
+error = "#f5c2e7"
+
+[diff]
+addition_background = "#29423c"
+deletion_background = "#49313f"
+
+[markdown]
+heading_1 = "#b4befe"
+heading_2 = "#89b4fa"
+heading_3 = "#cba6f7"
+heading_minor = "#74c7ec"
+quote = "#cba6f7"
+list = "#94e2d5"
+rule = "#6c7086"
+code = "#fab387"
+code_block_text = "#cdd6f4"
+code_block_background = "#313244"
+code_label = "#7f849c"
+link = "#89b4fa"
+hashtag = "#f5c2e7"
+wikilink = "#89dceb"
+box_border = "#6c7086"
+
+[animation]
+gradient = ["#89dceb", "#89b4fa", "#cba6f7", "#f5c2e7", "#f9e2af", "#a6e3a1"]
+"##;
 const AGENT_SESSION_DIR: &str = "agent-session";
 const AGENT_SESSION_FILE: &str = "session.json";
 const AGENTS_FILE: &str = "AGENTS.md";
@@ -74,25 +149,6 @@ struct SettingsFile {
     #[serde(default)]
     show_full_thinking: bool,
     export_directory: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedTheme {
-    pub requested: String,
-    pub active: String,
-    pub source: Option<PathBuf>,
-    pub theme: Theme,
-}
-
-impl LoadedTheme {
-    fn built_in_default_for(requested: &str) -> Self {
-        Self {
-            requested: requested.to_string(),
-            active: "default".to_string(),
-            source: None,
-            theme: Theme::default(),
-        }
-    }
 }
 
 fn nonempty_setting(value: Option<String>) -> Option<String> {
@@ -635,13 +691,8 @@ impl Storage {
             .create_new(true)
             .open(path)
             .with_context(|| format!("creating {}", path.display()))?;
-        file.write_all(crate::theme::DEFAULT_THEME_TOML.as_bytes())?;
+        file.write_all(DEFAULT_THEME_TOML.as_bytes())?;
         Ok(())
-    }
-
-    pub fn load_theme(&self, previous_random_source: Option<&Path>) -> Result<LoadedTheme> {
-        let requested = self.load_theme_selection()?;
-        self.resolve_theme(&requested, previous_random_source)
     }
 
     pub fn load_theme_selection(&self) -> Result<String> {
@@ -2374,14 +2425,9 @@ mod tests {
         assert!(settings.contains("show_full_thinking = false"));
         assert!(settings.contains("export_directory = \"~\""));
         assert_eq!(st.default_export_directory().unwrap(), "~");
-        let loaded = st.load_theme(None).unwrap();
-        assert_eq!(loaded.requested, "default");
-        assert_eq!(loaded.active, "default");
-        assert_eq!(loaded.source.as_deref(), Some(default_theme_path.as_path()));
-        assert_eq!(loaded.theme, crate::theme::Theme::default());
         assert_eq!(
             fs::read_to_string(default_theme_path).unwrap(),
-            crate::theme::DEFAULT_THEME_TOML
+            DEFAULT_THEME_TOML
         );
     }
 
@@ -2551,29 +2597,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_theme_selection_is_preserved_and_loaded() {
-        let (_directory, storage) = fresh();
-        let custom = crate::theme::DEFAULT_THEME_TOML
-            .replace("message_agent = \"#1e1e2e\"", "message_agent = \"#010203\"");
-        let path = storage.themes_dir.join("custom.toml");
-        fs::write(&path, &custom).unwrap();
-        storage.write_theme_selection("custom").unwrap();
-
-        storage.ensure_files().unwrap();
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
-        assert_eq!(storage.load_theme_selection().unwrap(), "custom");
-        let loaded = storage.load_theme(None).unwrap();
-        assert_eq!(loaded.requested, "custom");
-        assert_eq!(loaded.active, "custom");
-        assert_eq!(loaded.source.as_deref(), Some(path.as_path()));
-        assert_eq!(
-            loaded.theme.surface_message_agent,
-            ratatui::style::Color::Rgb(1, 2, 3)
-        );
-    }
-
-    #[test]
     fn editor_setting_precedes_environment_fallbacks() {
         assert_eq!(
             resolve_editor_command(Some("code -w"), Some("nvim"), Some("vim")),
@@ -2670,60 +2693,6 @@ mod tests {
         assert!(storage.default_export_directory().is_err());
     }
 
-    #[test]
-    fn missing_and_random_theme_selections_fall_back_or_resolve() {
-        let (_directory, storage) = fresh();
-        let default_path = storage.themes_dir.join("default.toml");
-        let edited_default =
-            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#090807\"");
-        fs::write(&default_path, &edited_default).unwrap();
-        storage.ensure_files().unwrap();
-        assert_eq!(fs::read_to_string(&default_path).unwrap(), edited_default);
-        storage.write_theme_selection("missing").unwrap();
-        let missing = storage.load_theme(None).unwrap();
-        assert_eq!(missing.requested, "missing");
-        assert_eq!(missing.active, "default");
-        assert_eq!(missing.source.as_deref(), Some(default_path.as_path()));
-        assert_eq!(
-            missing.theme.surface_panel,
-            ratatui::style::Color::Rgb(9, 8, 7)
-        );
-
-        let custom =
-            crate::theme::DEFAULT_THEME_TOML.replace("panel = \"#181825\"", "panel = \"#010203\"");
-        let path = storage.themes_dir.join("only.toml");
-        fs::write(&path, custom).unwrap();
-        assert_eq!(storage.list_theme_names().unwrap(), vec!["only"]);
-        storage.write_theme_selection("random").unwrap();
-
-        let default_random = storage.load_theme(Some(&default_path)).unwrap();
-        assert_eq!(default_random.requested, "random");
-        assert_eq!(default_random.active, "default");
-        assert_eq!(
-            default_random.source.as_deref(),
-            Some(default_path.as_path())
-        );
-        assert_eq!(
-            default_random.theme.surface_panel,
-            ratatui::style::Color::Rgb(9, 8, 7)
-        );
-
-        let custom_random = storage.load_theme(Some(&path)).unwrap();
-        assert_eq!(custom_random.requested, "random");
-        assert_eq!(custom_random.active, "only");
-        assert_eq!(custom_random.source.as_deref(), Some(path.as_path()));
-        assert_eq!(
-            custom_random.theme.surface_panel,
-            ratatui::style::Color::Rgb(1, 2, 3)
-        );
-
-        fs::remove_file(default_path).unwrap();
-        storage.write_theme_selection("missing").unwrap();
-        let built_in = storage.load_theme(None).unwrap();
-        assert_eq!(built_in.active, "default");
-        assert_eq!(built_in.source, None);
-        assert_eq!(built_in.theme, crate::theme::Theme::default());
-    }
 
     #[test]
     fn ensure_files_never_moves_existing_root_files() {

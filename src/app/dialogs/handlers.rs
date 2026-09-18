@@ -210,7 +210,7 @@ impl App {
                     .and_then(DialogState::selected_option)
                     .map(|option| option.label.clone());
                 let selection = selection?;
-                match self.storage.select_theme(&selection) {
+                match crate::theme::select_theme(&self.storage, &selection) {
                     Ok(loaded) => {
                         let active = loaded.active.clone();
                         self.apply_loaded_theme(loaded);
