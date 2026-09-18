@@ -301,7 +301,7 @@ pub(super) fn draw_agent_output(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     fill_agent_message_rows(frame, message_rows, &visible);
     frame.render_widget(Paragraph::new(visible), inner);
-    let image_base = app.storage.root.clone();
+    let image_base = app.storage().root.clone();
     app.images.render(
         frame,
         &rendered_images,

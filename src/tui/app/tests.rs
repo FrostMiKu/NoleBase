@@ -3,6 +3,7 @@ use std::sync::{mpsc, Arc};
 
 use crate::core::agent::CommandApproval;
 use crate::core::attachment::AttachmentStore;
+use crate::core::workspace_index::WorkspaceIndex;
 
 use super::*;
 
@@ -40,7 +41,7 @@ fn make_app() -> (App, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
-    (App::new(storage).unwrap(), directory)
+    (App::new_for_tests(storage).unwrap(), directory)
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -57,15 +58,27 @@ fn home_dest(file_name: &str) -> String {
         .into_owned()
 }
 
+fn publish_wiki_index(app: &mut App) {
+    app.workspace
+        .wiki_links()
+        .replace(crate::core::wiki_link_index::WikiLinkIndex::build(
+            app.storage(),
+        ));
+    app.recompute_document_backlinks();
+}
+
 fn add_daily_note(app: &mut App, body: &str) {
-    app.storage.append_to_today(body).unwrap();
+    app.storage().append_to_today(body).unwrap();
     app.reload();
     app.selected = app.daily_notes.len() - 1;
     app.focus = Focus::Center;
 }
 
 fn refresh_test_index(app: &mut App) {
-    app.apply_workspace_index(WorkspaceIndex::build(&app.storage));
+    app.workspace
+        .workspace_index()
+        .replace(WorkspaceIndex::build(app.storage()));
+    app.on_index_update();
 }
 
 fn wait_for_export(app: &mut App) {
@@ -187,7 +200,7 @@ fn command_palette_filters_and_clears_the_agent_session() {
         muted: false,
     }));
     app.persist_agent_session().unwrap();
-    assert!(app.storage.agent_session_path.exists());
+    assert!(app.storage().agent_session_path.exists());
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     assert_eq!(app.overlay, Some(Overlay::Dialog));
@@ -220,7 +233,7 @@ fn command_palette_filters_and_clears_the_agent_session() {
     assert_eq!(app.overlay, None);
     assert!(!app.agent_conversation.clear());
     assert!(app.agent_panel.is_empty());
-    assert!(!app.storage.agent_session_path.exists());
+    assert!(!app.storage().agent_session_path.exists());
     assert_eq!(app.status, "Agent session cleared");
 }
 
@@ -303,7 +316,7 @@ fn app_restores_the_single_agent_session() {
         ))
         .unwrap();
 
-    let mut app = App::new(storage).unwrap();
+    let mut app = App::new_for_tests(storage).unwrap();
 
     assert!(app.agent_conversation.clear());
     assert_eq!(app.agent_panel, panel);
@@ -332,7 +345,7 @@ fn conversation_update_overwrites_the_saved_agent_session() {
     app.poll_agent();
 
     let (mut conversation, panel, _, _, _) = app
-        .storage
+        .storage()
         .load_agent_session()
         .unwrap()
         .unwrap()
@@ -445,7 +458,11 @@ fn failed_session_delete_keeps_the_in_memory_session() {
     let (mut app, _directory) = make_app();
     app.agent_conversation = AgentConversation::seeded_for_test();
     install_agent_terminal_snapshot(&mut app);
-    fs::write(app.storage.agent_session_path.parent().unwrap(), "blocked").unwrap();
+    fs::write(
+        app.storage().agent_session_path.parent().unwrap(),
+        "blocked",
+    )
+    .unwrap();
 
     app.clear_agent_session();
 
@@ -478,7 +495,7 @@ fn command_palette_interrupts_the_running_agent() {
 #[test]
 fn command_palette_creates_and_opens_a_regular_note() {
     let (mut app, _directory) = make_app();
-    fs::write(&app.storage.template_path, "# From template\n").unwrap();
+    fs::write(&app.storage().template_path, "# From template\n").unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_paste("note new");
@@ -495,7 +512,7 @@ fn command_palette_creates_and_opens_a_regular_note() {
     app.handle_paste("Scratch");
     app.handle_key(key(KeyCode::Enter));
 
-    let path = app.storage.data_dir.join("Scratch.md");
+    let path = app.storage().data_dir.join("Scratch.md");
     assert!(path.exists());
     assert_eq!(fs::read_to_string(&path).unwrap(), "# Scratch\n\n");
     assert_eq!(app.files_context, FilesContext::Browse);
@@ -515,7 +532,7 @@ fn command_palette_creates_and_opens_a_regular_note() {
 #[test]
 fn command_palette_creates_a_note_from_the_template_only_when_requested() {
     let (mut app, _directory) = make_app();
-    fs::write(&app.storage.template_path, "# From template\n").unwrap();
+    fs::write(&app.storage().template_path, "# From template\n").unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_paste("new from template");
@@ -527,7 +544,7 @@ fn command_palette_creates_a_note_from_the_template_only_when_requested() {
     app.handle_paste("Templated");
     app.handle_key(key(KeyCode::Enter));
 
-    let path = app.storage.data_dir.join("Templated.md");
+    let path = app.storage().data_dir.join("Templated.md");
     assert_eq!(fs::read_to_string(&path).unwrap(), "# From template\n");
     assert_eq!(
         app.document.as_ref().map(|document| &document.kind),
@@ -538,8 +555,8 @@ fn command_palette_creates_a_note_from_the_template_only_when_requested() {
 #[test]
 fn command_palette_adds_contextual_note_and_agent_output_commands() {
     let (mut app, _directory) = make_app();
-    let current = app.storage.data_dir.join("Current.md");
-    let other = app.storage.data_dir.join("Other.md");
+    let current = app.storage().data_dir.join("Current.md");
+    let other = app.storage().data_dir.join("Other.md");
     fs::write(&current, "# Current\n").unwrap();
     fs::write(&other, "# Other\n").unwrap();
     app.reload_files();
@@ -579,7 +596,7 @@ fn command_palette_adds_contextual_note_and_agent_output_commands() {
 fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let current = app.storage.data_dir.join("Export me.md");
+    let current = app.storage().data_dir.join("Export me.md");
     fs::write(&current, b"# Export me\n\nExact bytes.\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
@@ -668,7 +685,7 @@ fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
 #[test]
 fn export_format_switch_changes_default_destination_extension() {
     let (mut app, _directory) = make_app();
-    let current = app.storage.data_dir.join("Quarterly Report.mb");
+    let current = app.storage().data_dir.join("Quarterly Report.mb");
     fs::write(&current, b"# Quarterly\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
@@ -700,7 +717,7 @@ fn export_format_switch_changes_default_destination_extension() {
 #[test]
 fn export_destination_default_follows_configured_export_directory() {
     let (mut app, _directory) = make_app();
-    let current = app.storage.data_dir.join("Doc.md");
+    let current = app.storage().data_dir.join("Doc.md");
     fs::write(&current, b"# Doc\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
@@ -713,7 +730,7 @@ fn export_destination_default_follows_configured_export_directory() {
     let export_dir = tempfile::tempdir().unwrap();
     let export_dir_text = export_dir.path().display().to_string();
     fs::write(
-        &app.storage.settings_path,
+        &app.storage().settings_path,
         format!("theme = \"default\"\nexport_directory = '{export_dir_text}'\n"),
     )
     .unwrap();
@@ -732,12 +749,12 @@ fn export_destination_default_follows_configured_export_directory() {
 #[test]
 fn export_destination_falls_back_to_file_name_when_export_directory_invalid() {
     let (mut app, _directory) = make_app();
-    let current = app.storage.data_dir.join("Doc.md");
+    let current = app.storage().data_dir.join("Doc.md");
     fs::write(&current, b"# Doc\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
     fs::write(
-        &app.storage.settings_path,
+        &app.storage().settings_path,
         "theme = \"default\"\nexport_directory = \"   \"\n",
     )
     .unwrap();
@@ -753,14 +770,14 @@ fn daily_note_export_is_available_and_publishes_the_daily_file() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
     let note = app
-        .storage
+        .storage()
         .append_daily("2026-08-05", "Daily body\n")
         .unwrap();
     app.reload();
     app.open_daily_document(note.date, DocumentReturn::Daily);
     assert_eq!(
         app.current_export_path(),
-        Some(app.storage.daily_file_path("2026-08-05").unwrap())
+        Some(app.storage().daily_file_path("2026-08-05").unwrap())
     );
     assert!(app.command_available(AppCommand::ExportCurrentFile));
 
@@ -788,8 +805,8 @@ fn daily_note_export_is_available_and_publishes_the_daily_file() {
 fn skill_document_can_be_exported() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let skill_path = app.storage.skills_dir.join("guide.md");
-    fs::create_dir_all(&app.storage.skills_dir).unwrap();
+    let skill_path = app.storage().skills_dir.join("guide.md");
+    fs::create_dir_all(&app.storage().skills_dir).unwrap();
     fs::write(&skill_path, "# Guide\n\nStep one.\n").unwrap();
     app.show_document(
         DocumentKind::Skill(skill_path.clone()),
@@ -820,7 +837,7 @@ fn skill_document_can_be_exported() {
 fn html_export_surfaces_renderer_diagnostics_in_success_status() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let current = app.storage.data_dir.join("Broken image.md");
+    let current = app.storage().data_dir.join("Broken image.md");
     fs::write(&current, "# Broken image\n\n![missing](missing.png)\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
@@ -845,7 +862,7 @@ fn html_export_surfaces_renderer_diagnostics_in_success_status() {
 fn failed_background_export_restores_destination_for_direct_retry() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let current = app.storage.data_dir.join("Retry me.md");
+    let current = app.storage().data_dir.join("Retry me.md");
     fs::write(&current, "# Retry me\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
@@ -899,7 +916,7 @@ fn failed_background_export_restores_destination_for_direct_retry() {
 fn existing_export_destination_offers_confirmation_and_cancel_restores_input() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let current = app.storage.data_dir.join("Overwrite me.md");
+    let current = app.storage().data_dir.join("Overwrite me.md");
     fs::write(&current, b"# New body\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
     let destination = output.path().join("target.md");
@@ -962,7 +979,7 @@ fn existing_export_destination_offers_confirmation_and_cancel_restores_input() {
 fn confirmed_overwrite_replaces_the_existing_destination() {
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let current = app.storage.data_dir.join("Confirmed.md");
+    let current = app.storage().data_dir.join("Confirmed.md");
     fs::write(&current, b"# Replacement body\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
     let destination = output.path().join("target.md");
@@ -997,7 +1014,7 @@ fn existing_directory_or_symlink_destination_never_offers_overwrite() {
     use std::os::unix::fs::symlink;
     let (mut app, _directory) = make_app();
     let output = tempfile::tempdir().unwrap();
-    let current = app.storage.data_dir.join("Kind check.md");
+    let current = app.storage().data_dir.join("Kind check.md");
     fs::write(&current, "# Body\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
     let directory = output.path().join("dir");
@@ -1028,7 +1045,7 @@ fn existing_directory_or_symlink_destination_never_offers_overwrite() {
 #[test]
 fn failed_export_retry_survives_an_unrelated_dialog() {
     let (mut app, _directory) = make_app();
-    let source = app.storage.data_dir.join("Retry after help.md");
+    let source = app.storage().data_dir.join("Retry after help.md");
     fs::write(&source, "content").unwrap();
     app.pending_export_source = Some(source);
     app.pending_export_format = Some(ExportFormat::Original);
@@ -1068,9 +1085,9 @@ fn failed_export_retry_survives_an_unrelated_dialog() {
 #[test]
 fn archived_note_gets_restore_instead_of_archive_command() {
     let (mut app, _directory) = make_app();
-    let note = app.storage.data_dir.join("Archived.md");
+    let note = app.storage().data_dir.join("Archived.md");
     fs::write(&note, "archive me\n").unwrap();
-    let archived = app.storage.archive_note(&note).unwrap();
+    let archived = app.storage().archive_note(&note).unwrap();
     app.reload_files();
     app.open_file_document(&archived, DocumentReturn::Daily);
 
@@ -1086,7 +1103,7 @@ fn archived_note_gets_restore_instead_of_archive_command() {
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_key(key(KeyCode::Char('u')));
 
-    let restored = app.storage.data_dir.join("Archived.md");
+    let restored = app.storage().data_dir.join("Archived.md");
     assert!(!archived.exists());
     assert!(restored.exists());
     assert_eq!(app.status, "Note restored");
@@ -1099,8 +1116,8 @@ fn archived_note_gets_restore_instead_of_archive_command() {
 #[test]
 fn opening_a_note_keeps_the_file_tree_selection_in_sync() {
     let (mut app, _directory) = make_app();
-    let first = app.storage.data_dir.join("First.md");
-    let second = app.storage.data_dir.join("Second.md");
+    let first = app.storage().data_dir.join("First.md");
+    let second = app.storage().data_dir.join("Second.md");
     fs::write(&first, "first\n").unwrap();
     fs::write(&second, "second\n").unwrap();
     app.reload_files();
@@ -1120,8 +1137,8 @@ fn opening_a_note_keeps_the_file_tree_selection_in_sync() {
 #[test]
 fn right_from_the_file_tree_returns_to_the_open_document_without_opening_selection() {
     let (mut app, _directory) = make_app();
-    let first = app.storage.data_dir.join("First.md");
-    let second = app.storage.data_dir.join("Second.md");
+    let first = app.storage().data_dir.join("First.md");
+    let second = app.storage().data_dir.join("Second.md");
     fs::write(&first, "first\n").unwrap();
     fs::write(&second, "second\n").unwrap();
     app.reload_files();
@@ -1154,7 +1171,7 @@ fn right_from_the_file_tree_returns_to_the_open_document_without_opening_selecti
 #[test]
 fn right_from_an_open_document_focuses_workspace_views_without_changing_page() {
     let (mut app, _directory) = make_app();
-    let note = app.storage.data_dir.join("Open.md");
+    let note = app.storage().data_dir.join("Open.md");
     fs::write(&note, "open document\n").unwrap();
     app.open_file_document(&note, DocumentReturn::Daily);
 
@@ -1171,7 +1188,7 @@ fn right_from_an_open_document_focuses_workspace_views_without_changing_page() {
 #[test]
 fn right_from_the_file_tree_returns_to_daily_without_opening_a_note() {
     let (mut app, _directory) = make_app();
-    let note = app.storage.data_dir.join("Selected.md");
+    let note = app.storage().data_dir.join("Selected.md");
     fs::write(&note, "selected note\n").unwrap();
     app.reload_files();
     app.center_view = CenterView::Daily;
@@ -1200,10 +1217,10 @@ fn editable_support_files_open_through_the_editor_pipeline() {
     let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
     for (query, expected) in [
-        ("ai settings", app.storage.ai_config_path.clone()),
-        ("agent instructions", app.storage.agents_path.clone()),
-        ("agent memory", app.storage.memory_path.clone()),
-        ("template edit", app.storage.template_path.clone()),
+        ("ai settings", app.storage().ai_config_path.clone()),
+        ("agent instructions", app.storage().agents_path.clone()),
+        ("agent memory", app.storage().memory_path.clone()),
+        ("template edit", app.storage().template_path.clone()),
     ] {
         app.handle_key(ctrl_p);
         app.handle_paste(query);
@@ -1218,7 +1235,7 @@ fn command_palette_switches_theme_and_persists_the_selection() {
     let (mut app, _directory) = make_app();
     let custom = crate::core::storage::DEFAULT_THEME_TOML
         .replace("panel = \"#181825\"", "panel = \"#010203\"");
-    fs::write(app.storage.themes_dir.join("custom.toml"), custom).unwrap();
+    fs::write(app.storage().themes_dir.join("custom.toml"), custom).unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
     app.handle_paste("theme switch");
@@ -1235,7 +1252,7 @@ fn command_palette_switches_theme_and_persists_the_selection() {
     assert_eq!(app.overlay, None);
     assert_eq!(app.theme_selection, "custom");
     assert_eq!(app.active_theme, "custom");
-    assert_eq!(app.storage.load_theme_selection().unwrap(), "custom");
+    assert_eq!(app.storage().load_theme_selection().unwrap(), "custom");
     assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
 }
 
@@ -1243,7 +1260,7 @@ fn command_palette_switches_theme_and_persists_the_selection() {
 fn command_palette_and_hash_shortcut_open_centered_tag_browser() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "daily #rust and #rust\nnot #rustlang");
-    fs::write(app.storage.data_dir.join("Project.md"), "note #rust\n").unwrap();
+    fs::write(app.storage().data_dir.join("Project.md"), "note #rust\n").unwrap();
     refresh_test_index(&mut app);
 
     app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
@@ -1310,7 +1327,7 @@ fn command_palette_and_hash_shortcut_open_centered_tag_browser() {
 fn command_palette_renames_an_exact_tag_across_the_workspace() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "daily #old and `#old`");
-    let note = app.storage.data_dir.join("Project.md");
+    let note = app.storage().data_dir.join("Project.md");
     fs::write(&note, "note #old and #oldlang\n").unwrap();
     refresh_test_index(&mut app);
 
@@ -1346,7 +1363,7 @@ fn command_palette_renames_an_exact_tag_across_the_workspace() {
         "note #new/tag and #oldlang\n"
     );
     let daily = app
-        .storage
+        .storage()
         .daily_file_path(&app.daily_notes[0].date.to_string())
         .unwrap();
     assert_eq!(
@@ -1354,7 +1371,8 @@ fn command_palette_renames_an_exact_tag_across_the_workspace() {
         "daily #new/tag and `#old`\n"
     );
     assert_eq!(
-        app.workspace_index
+        app.workspace
+            .workspace_index()
             .with_index(|index| index.exact_tag_hits("new/tag", None).len()),
         Some(2)
     );
@@ -1418,9 +1436,9 @@ fn daily_ai_custom_prompt_includes_the_daily_file_path() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "card body that should not become the prompt");
     let date = app.selected_date().unwrap();
-    let path = app.storage.daily_file_path(&date.to_string()).unwrap();
+    let path = app.storage().daily_file_path(&date.to_string()).unwrap();
     let display_path = path
-        .strip_prefix(&app.storage.root)
+        .strip_prefix(&app.storage().root)
         .unwrap()
         .to_string_lossy()
         .into_owned();
@@ -1447,9 +1465,9 @@ fn empty_daily_ai_prompt_requests_in_place_markdown_formatting() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "unformatted card body");
     let date = app.selected_date().unwrap();
-    let path = app.storage.daily_file_path(&date.to_string()).unwrap();
+    let path = app.storage().daily_file_path(&date.to_string()).unwrap();
     let display_path = path
-        .strip_prefix(&app.storage.root)
+        .strip_prefix(&app.storage().root)
         .unwrap()
         .to_string_lossy()
         .into_owned();
@@ -1601,7 +1619,7 @@ fn private_terminal_input_is_masked_and_sent_only_on_its_private_channel() {
         .iter()
         .any(|entry| format!("{entry:?}").contains(secret)));
     app.persist_agent_session().unwrap();
-    let persisted = fs::read_to_string(&app.storage.agent_session_path).unwrap();
+    let persisted = fs::read_to_string(&app.storage().agent_session_path).unwrap();
     assert!(!persisted.contains(secret));
 
     app.handle_key(key(KeyCode::Enter));
@@ -2234,7 +2252,7 @@ fn agent_effort_label_follows_the_ai_config_file() {
     assert_eq!(app.agent_effort.as_deref(), Some("high"));
 
     fs::write(
-        &app.storage.ai_config_path,
+        &app.storage().ai_config_path,
         "api_format = 'messages'\napi_key = ''\nmodel = ''\nbase_url = ''\neffort = 'max'\n",
     )
     .unwrap();
@@ -2242,7 +2260,7 @@ fn agent_effort_label_follows_the_ai_config_file() {
     assert_eq!(app.agent_effort.as_deref(), Some("max"));
 
     fs::write(
-        &app.storage.ai_config_path,
+        &app.storage().ai_config_path,
         "api_format = 'messages'\napi_key = 'k'\nmodel = 'm'\nbase_url = 'https://example.com'\n",
     )
     .unwrap();
@@ -2530,7 +2548,7 @@ fn next_round_replaces_a_failed_tool_status_with_working_state() {
 #[test]
 fn agent_open_file_event_displays_the_note_in_the_tui() {
     let (mut app, _directory) = make_app();
-    let note = app.storage.data_dir.join("Agent View.md");
+    let note = app.storage().data_dir.join("Agent View.md");
     fs::write(&note, "# Opened by Agent\n").unwrap();
     let note = fs::canonicalize(note).unwrap();
     let sender = install_agent_observable(&mut app);
@@ -2666,7 +2684,7 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
 #[test]
 fn recording_from_a_document_appends_silently_and_pins_scroll_to_end() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Article.md");
+    let path = app.storage().data_dir.join("Article.md");
     fs::write(&path, "# Article\n\nInspiration\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
     let document = app.document.as_mut().unwrap();
@@ -2701,7 +2719,7 @@ fn recording_from_a_document_appends_silently_and_pins_scroll_to_end() {
 #[test]
 fn ctrl_u_recalls_an_article_append_into_compose() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Article.md");
+    let path = app.storage().data_dir.join("Article.md");
     fs::write(&path, "# Article\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
     app.handle_key(key(KeyCode::Char('i')));
@@ -2736,7 +2754,7 @@ fn ctrl_u_recalls_the_first_daily_append_and_removes_its_file() {
 #[test]
 fn ctrl_u_refuses_to_truncate_a_note_changed_after_append() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Article.md");
+    let path = app.storage().data_dir.join("Article.md");
     fs::write(&path, "# Article\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
     app.handle_key(key(KeyCode::Char('i')));
@@ -2757,7 +2775,7 @@ fn ctrl_u_refuses_to_truncate_a_note_changed_after_append() {
 #[test]
 fn recording_from_a_daily_preview_appends_to_that_date() {
     let (mut app, _directory) = make_app();
-    app.storage.append_daily("2026-07-26", "first").unwrap();
+    app.storage().append_daily("2026-07-26", "first").unwrap();
     app.reload();
     app.open_daily_document(
         NaiveDate::from_ymd_opt(2026, 7, 26).unwrap(),
@@ -2769,7 +2787,7 @@ fn recording_from_a_daily_preview_appends_to_that_date() {
 
     assert_eq!(app.center_view, CenterView::Document);
     assert_eq!(
-        app.storage.read_daily_by_date("2026-07-26").unwrap().body,
+        app.storage().read_daily_by_date("2026-07-26").unwrap().body,
         "first\n\nsecond"
     );
     assert_eq!(app.document.as_ref().unwrap().source, "first\n\nsecond");
@@ -2782,8 +2800,8 @@ fn recording_from_a_daily_preview_appends_to_that_date() {
 #[test]
 fn reload_keeps_the_selected_daily_note_by_date() {
     let (mut app, _directory) = make_app();
-    let first = app.storage.append_daily("2026-07-26", "first").unwrap();
-    let second = app.storage.append_daily("2026-07-27", "second").unwrap();
+    let first = app.storage().append_daily("2026-07-26", "first").unwrap();
+    let second = app.storage().append_daily("2026-07-27", "second").unwrap();
     app.reload();
     app.selected = app
         .daily_notes
@@ -2791,7 +2809,7 @@ fn reload_keeps_the_selected_daily_note_by_date() {
         .position(|note| note.date == second.date)
         .unwrap();
 
-    app.storage.remove_daily(&first.date.to_string()).unwrap();
+    app.storage().remove_daily(&first.date.to_string()).unwrap();
     app.reload();
 
     assert_eq!(app.selected_date(), Some(second.date));
@@ -2804,8 +2822,8 @@ fn workspace_reload_applies_theme_changes_and_invalidates_render_caches() {
     app.agent_vlist.width = 40;
     let custom = crate::core::storage::DEFAULT_THEME_TOML
         .replace("panel = \"#181825\"", "panel = \"#010203\"");
-    fs::write(app.storage.themes_dir.join("custom.toml"), custom).unwrap();
-    app.storage.write_theme_selection("custom").unwrap();
+    fs::write(app.storage().themes_dir.join("custom.toml"), custom).unwrap();
+    app.storage().write_theme_selection("custom").unwrap();
 
     app.reload_workspace();
 
@@ -2836,7 +2854,7 @@ fn compose_agent_prompt_includes_the_path_for_the_current_content_view() {
     assert!(prompt.contains(&format!("currently viewing daily note: daily/{date}.md")));
     assert!(prompt.ends_with("Summarize the key point"));
 
-    let path = app.storage.data_dir.join("Reference.md");
+    let path = app.storage().data_dir.join("Reference.md");
     fs::write(&path, "# Reference\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
 
@@ -3041,8 +3059,8 @@ fn arrows_move_focus_across_the_workspace() {
 #[test]
 fn file_tree_keeps_both_groups_and_expands_archives_on_demand() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Note.md"), "note").unwrap();
-    fs::write(app.storage.archives_dir.join("Old.md"), "old").unwrap();
+    fs::write(app.storage().data_dir.join("Note.md"), "note").unwrap();
+    fs::write(app.storage().archives_dir.join("Old.md"), "old").unwrap();
     app.reload_files();
 
     let rows = app.visible_file_rows();
@@ -3067,8 +3085,8 @@ fn file_tree_keeps_both_groups_and_expands_archives_on_demand() {
 #[test]
 fn file_search_includes_archives_but_move_targets_do_not() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Active.md"), "active").unwrap();
-    fs::write(app.storage.archives_dir.join("Archived.md"), "old").unwrap();
+    fs::write(app.storage().data_dir.join("Active.md"), "active").unwrap();
+    fs::write(app.storage().archives_dir.join("Archived.md"), "old").unwrap();
     app.reload_files();
     app.files_context = FilesContext::Search;
     app.file_query = "arch".to_string();
@@ -3134,8 +3152,8 @@ fn enter_on_agent_panel_does_not_move_output_to_daily() {
 #[test]
 fn files_search_uses_note_files_without_duplicate_lists() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
-    fs::write(app.storage.data_dir.join("Personal.md"), "personal").unwrap();
+    fs::write(app.storage().data_dir.join("Work.md"), "work").unwrap();
+    fs::write(app.storage().data_dir.join("Personal.md"), "personal").unwrap();
     app.open_files();
     app.handle_key(key(KeyCode::Char('/')));
     assert_eq!(app.files_context, FilesContext::Search);
@@ -3162,7 +3180,7 @@ fn files_search_uses_note_files_without_duplicate_lists() {
 #[test]
 fn file_enter_opens_center_document_and_escape_returns_to_daily() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "# Project\n").unwrap();
     app.open_files();
     app.selected_file = Some(path.clone());
@@ -3186,7 +3204,7 @@ fn file_enter_opens_center_document_and_escape_returns_to_daily() {
 #[test]
 fn file_edit_returns_terminal_command() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "# Project\n").unwrap();
     app.open_files();
     app.file_index = app
@@ -3204,7 +3222,7 @@ fn file_edit_returns_terminal_command() {
 #[test]
 fn document_edit_returns_terminal_command() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "# Project\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
 
@@ -3242,8 +3260,8 @@ fn document_render_cache_survives_scroll_and_invalidates_on_content_or_width() {
 #[test]
 fn reopening_a_document_restores_its_app_level_render_cache() {
     let (mut app, _directory) = make_app();
-    let first = app.storage.data_dir.join("First.md");
-    let second = app.storage.data_dir.join("Second.md");
+    let first = app.storage().data_dir.join("First.md");
+    let second = app.storage().data_dir.join("Second.md");
     fs::write(&first, "```rust\nfn main() {}\n```".repeat(100)).unwrap();
     fs::write(&second, "# Second").unwrap();
 
@@ -3265,8 +3283,8 @@ fn reopening_a_document_restores_its_app_level_render_cache() {
 #[test]
 fn reopening_a_changed_document_rejects_the_stale_render_cache() {
     let (mut app, _directory) = make_app();
-    let first = app.storage.data_dir.join("First.md");
-    let second = app.storage.data_dir.join("Second.md");
+    let first = app.storage().data_dir.join("First.md");
+    let second = app.storage().data_dir.join("Second.md");
     fs::write(&first, "old source").unwrap();
     fs::write(&second, "second source").unwrap();
 
@@ -3286,9 +3304,9 @@ fn reopening_a_changed_document_rejects_the_stale_render_cache() {
 #[test]
 fn inactive_document_cache_follows_a_file_rename() {
     let (mut app, _directory) = make_app();
-    let from = app.storage.data_dir.join("Before.md");
-    let to = app.storage.data_dir.join("After.md");
-    let other = app.storage.data_dir.join("Other.md");
+    let from = app.storage().data_dir.join("Before.md");
+    let to = app.storage().data_dir.join("After.md");
+    let other = app.storage().data_dir.join("Other.md");
     fs::write(&from, "cached source").unwrap();
     fs::write(&other, "other source").unwrap();
 
@@ -3314,7 +3332,7 @@ fn document_render_lru_evicts_the_oldest_entries() {
     let (mut app, _directory) = make_app();
     let paths = (0..DOCUMENT_CACHE_CAPACITY + 3)
         .map(|index| {
-            let path = app.storage.data_dir.join(format!("Note{index}.md"));
+            let path = app.storage().data_dir.join(format!("Note{index}.md"));
             fs::write(&path, format!("note {index}")).unwrap();
             path
         })
@@ -3341,7 +3359,7 @@ fn document_render_lru_evicts_the_oldest_entries() {
 #[test]
 fn file_document_archives_and_restores_date_named_articles_as_regular_notes() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("2026-08-02.md");
+    let path = app.storage().data_dir.join("2026-08-02.md");
     fs::write(&path, "# Project\n").unwrap();
     app.reload_files();
     app.open_file_document(&path, DocumentReturn::Daily);
@@ -3361,7 +3379,7 @@ fn file_document_archives_and_restores_date_named_articles_as_regular_notes() {
     app.handle_key(key(KeyCode::Esc));
 
     app.handle_key(key(KeyCode::Char('a')));
-    let archived = app.storage.archives_dir.join("2026-08-02.md");
+    let archived = app.storage().archives_dir.join("2026-08-02.md");
     assert!(!path.exists());
     assert!(archived.exists());
     assert_eq!(app.center_view, CenterView::Document);
@@ -3395,10 +3413,10 @@ fn file_document_archives_and_restores_date_named_articles_as_regular_notes() {
 #[test]
 fn document_search_reuses_search_view_and_jumps_to_source_line() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "# Project\nfirst needle\nother\nsecond NEEDLE\n").unwrap();
     fs::write(
-        app.storage.data_dir.join("Other.md"),
+        app.storage().data_dir.join("Other.md"),
         "needle outside document\n",
     )
     .unwrap();
@@ -3463,7 +3481,7 @@ fn single_line_search_inputs_edit_at_the_shared_character_cursor() {
 #[test]
 fn escape_from_document_search_returns_to_document() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "# Project\n").unwrap();
     app.open_file_document(&path, DocumentReturn::Daily);
     app.handle_key(key(KeyCode::Char('/')));
@@ -3482,13 +3500,13 @@ fn daily_shortcuts_exclude_archive_and_keep_move_and_new_contexts() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "file this");
     let daily_path = app
-        .storage
+        .storage()
         .daily_file_path(&app.selected_date().unwrap().to_string())
         .unwrap();
     app.handle_key(key(KeyCode::Char('a')));
     assert!(daily_path.is_file());
     assert!(app
-        .storage
+        .storage()
         .archives_dir
         .read_dir()
         .unwrap()
@@ -3509,7 +3527,7 @@ fn daily_shortcuts_exclude_archive_and_keep_move_and_new_contexts() {
 #[test]
 fn file_rename_is_a_context_and_delete_is_an_overlay() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Old.md"), "old").unwrap();
+    fs::write(app.storage().data_dir.join("Old.md"), "old").unwrap();
     app.open_files();
     app.file_index = app
         .note_files
@@ -3531,7 +3549,7 @@ fn file_rename_is_a_context_and_delete_is_an_overlay() {
 #[test]
 fn enter_confirms_file_deletion_dialog() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("DeleteMe.md");
+    let path = app.storage().data_dir.join("DeleteMe.md");
     fs::write(&path, "delete me").unwrap();
     app.open_files();
     app.file_index = app
@@ -3553,7 +3571,7 @@ fn enter_confirms_file_deletion_dialog() {
 #[test]
 fn renaming_the_open_document_retargets_it_before_workspace_reload() {
     let (mut app, _directory) = make_app();
-    let from = app.storage.data_dir.join("Old.md");
+    let from = app.storage().data_dir.join("Old.md");
     fs::write(&from, "# Old\n\nBody\n").unwrap();
     app.reload_files();
     app.file_index = app
@@ -3572,7 +3590,7 @@ fn renaming_the_open_document_retargets_it_before_workspace_reload() {
     }
     app.handle_key(key(KeyCode::Enter));
 
-    let to = app.storage.data_dir.join("Renamed.md");
+    let to = app.storage().data_dir.join("Renamed.md");
     assert_eq!(app.center_view, CenterView::Document);
     assert_eq!(app.selected_file.as_ref(), Some(&to));
     assert_eq!(
@@ -3600,10 +3618,10 @@ fn renaming_the_open_document_retargets_it_before_workspace_reload() {
 #[test]
 fn agent_move_event_keeps_the_open_document_across_watcher_reload() {
     let (mut app, _directory) = make_app();
-    let from = app.storage.data_dir.join("Old.md");
+    let from = app.storage().data_dir.join("Old.md");
     fs::write(&from, "# Old\n\nBody\n").unwrap();
     app.open_file_document(&from, DocumentReturn::Daily);
-    let destination_dir = app.storage.data_dir.join("moved");
+    let destination_dir = app.storage().data_dir.join("moved");
     fs::create_dir(&destination_dir).unwrap();
     let to = destination_dir.join("Renamed.md");
     fs::rename(&from, &to).unwrap();
@@ -3666,7 +3684,7 @@ fn search_result_daily_edit_returns_physical_file_command() {
         Some(DocumentReturn::Search)
     );
     let expected = app
-        .storage
+        .storage()
         .daily_file_path(&app.daily_notes[0].date.to_string())
         .unwrap();
     assert_eq!(
@@ -3679,7 +3697,7 @@ fn search_result_daily_edit_returns_physical_file_command() {
 #[test]
 fn file_search_result_keeps_its_source_line_as_a_document_anchor() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "# Project\n\nintro\n\nunique needle\n").unwrap();
     app.reload_files();
     refresh_test_index(&mut app);
@@ -3697,8 +3715,8 @@ fn file_search_result_keeps_its_source_line_as_a_document_anchor() {
 fn full_text_search_orders_daily_active_and_archived_results() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "shared needle in Daily");
-    let active = app.storage.data_dir.join("Active.md");
-    let archived = app.storage.archives_dir.join("Archived.md");
+    let active = app.storage().data_dir.join("Active.md");
+    let archived = app.storage().archives_dir.join("Archived.md");
     fs::write(&active, "shared needle in active note\n").unwrap();
     fs::write(&archived, "shared needle in archived note\n").unwrap();
     refresh_test_index(&mut app);
@@ -3708,7 +3726,7 @@ fn full_text_search_orders_daily_active_and_archived_results() {
 
     assert_eq!(app.search_results.len(), 3);
     let daily = app
-        .storage
+        .storage()
         .daily_file_path(&app.daily_notes[0].date.to_string())
         .unwrap();
     assert!(matches!(
@@ -3741,7 +3759,7 @@ fn daily_edit_returns_its_physical_file() {
     let (mut app, _directory) = make_app();
     add_daily_note(&mut app, "before");
     let expected = app
-        .storage
+        .storage()
         .daily_file_path(&app.daily_notes[0].date.to_string())
         .unwrap();
     assert_eq!(
@@ -3753,10 +3771,13 @@ fn daily_edit_returns_its_physical_file() {
 #[test]
 fn workspace_reload_refreshes_an_open_daily_note_from_disk() {
     let (mut app, _directory) = make_app();
-    let note = app.storage.append_daily("2026-07-26", "before").unwrap();
+    let note = app.storage().append_daily("2026-07-26", "before").unwrap();
     app.reload();
     app.open_daily_document(note.date, DocumentReturn::Daily);
-    let path = app.storage.daily_file_path(&note.date.to_string()).unwrap();
+    let path = app
+        .storage()
+        .daily_file_path(&note.date.to_string())
+        .unwrap();
     fs::write(path, "after\n").unwrap();
 
     app.reload_workspace();
@@ -3911,7 +3932,7 @@ fn link_clicks_open_external_targets_or_internal_wiki_notes() {
         Some(Command::OpenLink("https://example.test".to_string()))
     );
 
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "linked note").unwrap();
     app.reload_files();
     app.link_hitboxes.clear();
@@ -3937,7 +3958,7 @@ fn link_clicks_open_external_targets_or_internal_wiki_notes() {
 #[test]
 fn local_file_clicks_open_existing_files_from_any_location() {
     let (mut app, _directory) = make_app();
-    let attachment = app.storage.data_dir.join("report.pdf");
+    let attachment = app.storage().data_dir.join("report.pdf");
     fs::write(&attachment, b"report").unwrap();
     app.link_hitboxes.push(LinkHitbox {
         target: LinkTarget::LocalFile(attachment.clone()),
@@ -3955,7 +3976,7 @@ fn local_file_clicks_open_existing_files_from_any_location() {
 
     app.link_hitboxes.clear();
     app.link_hitboxes.push(LinkHitbox {
-        target: LinkTarget::LocalFile(app.storage.data_dir.join("missing.pdf")),
+        target: LinkTarget::LocalFile(app.storage().data_dir.join("missing.pdf")),
         area: Rect::new(4, 3, 7, 1),
     });
     assert!(app
@@ -3988,7 +4009,7 @@ fn local_file_clicks_open_existing_files_from_any_location() {
 #[test]
 fn attachment_link_clicks_open_the_real_managed_file() {
     let (mut app, _directory) = make_app();
-    let store = AttachmentStore::new(app.storage.attachments_dir.clone());
+    let store = AttachmentStore::new(app.storage().attachments_dir.clone());
     store.ensure_layout().unwrap();
     let metadata = store
         .import_bytes(b"attachment payload", Some("report.pdf"))
@@ -4011,7 +4032,7 @@ fn attachment_link_clicks_open_the_real_managed_file() {
     // nothing is copied to the workspace and the custom URI never reaches a
     // web opener.
     assert_eq!(fs::read(&path).unwrap(), b"attachment payload");
-    assert!(path.starts_with(app.storage.attachments_dir));
+    assert!(path.starts_with(&app.storage().attachments_dir));
     assert_eq!(
         path.extension().and_then(|extension| extension.to_str()),
         Some("pdf")
@@ -4039,11 +4060,11 @@ fn malformed_attachment_links_error_without_opening() {
 #[test]
 fn wikilink_searches_daily_notes_and_chooses_between_all_matching_locations() {
     let (mut app, _directory) = make_app();
-    app.storage
+    app.storage()
         .append_daily("2026-08-02", "daily version")
         .unwrap();
-    let data = app.storage.data_dir.join("2026-08-02.md");
-    let archived = app.storage.archives_dir.join("2026-08-02.md");
+    let data = app.storage().data_dir.join("2026-08-02.md");
+    let archived = app.storage().archives_dir.join("2026-08-02.md");
     fs::write(&data, "data version").unwrap();
     fs::write(&archived, "archived version").unwrap();
     app.link_hitboxes.push(LinkHitbox {
@@ -4088,7 +4109,7 @@ fn wikilink_searches_daily_notes_and_chooses_between_all_matching_locations() {
         row: 1,
         modifiers: KeyModifiers::NONE,
     });
-    let created = app.storage.data_dir.join("New Note.md");
+    let created = app.storage().data_dir.join("New Note.md");
     assert!(created.is_file());
     assert_eq!(
         app.document.as_ref().unwrap().kind,
@@ -4099,16 +4120,14 @@ fn wikilink_searches_daily_notes_and_chooses_between_all_matching_locations() {
 #[test]
 fn wiki_index_publishes_backlinks_for_the_open_note() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
-    let source = app.storage.data_dir.join("Source.md");
+    let target = app.storage().data_dir.join("Target.md");
+    let source = app.storage().data_dir.join("Source.md");
     fs::write(&target, "body").unwrap();
     fs::write(&source, "see [[Target]]\n").unwrap();
     app.open_file_document(&target, DocumentReturn::Daily);
     assert!(app.document_backlinks.is_empty(), "index not published yet");
 
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    publish_wiki_index(&mut app);
     assert_eq!(app.document_backlinks, vec![source.clone()]);
 
     // Reopening the note re-derives backlinks from the stored index.
@@ -4120,14 +4139,12 @@ fn wiki_index_publishes_backlinks_for_the_open_note() {
 #[test]
 fn clicking_a_backlink_opens_the_referencing_note() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
-    let source = app.storage.data_dir.join("Source.md");
+    let target = app.storage().data_dir.join("Target.md");
+    let source = app.storage().data_dir.join("Source.md");
     fs::write(&target, "body").unwrap();
     fs::write(&source, "see [[Target]]\n").unwrap();
     app.open_file_document(&target, DocumentReturn::Daily);
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    publish_wiki_index(&mut app);
     assert_eq!(app.document_backlinks, vec![source.clone()]);
 
     app.backlink_hitboxes.push(BacklinkHitbox {
@@ -4151,14 +4168,12 @@ fn clicking_a_backlink_opens_the_referencing_note() {
 #[test]
 fn clicking_a_backlink_keeps_the_open_documents_return_context() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
-    let source = app.storage.data_dir.join("Source.md");
+    let target = app.storage().data_dir.join("Target.md");
+    let source = app.storage().data_dir.join("Source.md");
     fs::write(&target, "body").unwrap();
     fs::write(&source, "see [[Target]]\n").unwrap();
     app.open_file_document(&target, DocumentReturn::Search);
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    publish_wiki_index(&mut app);
     assert_eq!(app.document_backlinks, vec![source.clone()]);
 
     app.backlink_hitboxes.push(BacklinkHitbox {
@@ -4196,7 +4211,7 @@ fn base_escape_and_q_both_quit() {
 #[test]
 fn clicking_a_file_opens_it_in_center() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Clicked.md");
+    let path = app.storage().data_dir.join("Clicked.md");
     fs::write(&path, "# Clicked\n").unwrap();
     app.open_files();
     app.file_hitboxes.push(FileHitbox {
@@ -4220,7 +4235,7 @@ fn clicking_a_file_opens_it_in_center() {
 #[test]
 fn move_targets_list_managed_data_notes() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Work.md"), "# Work\n").unwrap();
+    fs::write(app.storage().data_dir.join("Work.md"), "# Work\n").unwrap();
     add_daily_note(&mut app, "file this");
     app.handle_key(key(KeyCode::Char('m')));
     let names: Vec<String> = app
@@ -4241,8 +4256,8 @@ fn move_targets_list_managed_data_notes() {
 #[test]
 fn rename_error_keeps_modal_context_for_retry() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Old.md"), "old").unwrap();
-    fs::write(app.storage.data_dir.join("Taken.md"), "taken").unwrap();
+    fs::write(app.storage().data_dir.join("Old.md"), "old").unwrap();
+    fs::write(app.storage().data_dir.join("Taken.md"), "taken").unwrap();
     app.open_files();
     app.file_index = app
         .note_files
@@ -4356,16 +4371,17 @@ fn delete_overlay_and_undo_keep_business_behavior() {
 }
 
 fn import_attachment(app: &mut App, name: &str, bytes: &[u8]) -> AttachmentId {
-    app.attachment_store
+    app.workspace
+        .attachments()
         .import_bytes(bytes, Some(name))
         .unwrap()
         .id
 }
 
 fn refresh_attachment_refs(app: &mut App) {
-    app.apply_attachment_index(
+    app.workspace.attachment_usage().publish_snapshot(
         0,
-        crate::core::attachment_index::AttachmentReferenceIndex::build(&app.storage),
+        crate::core::attachment_index::AttachmentReferenceIndex::build(app.storage()),
     );
 }
 
@@ -4389,22 +4405,20 @@ fn app_index_publish_reaches_the_agent_delete_handles_shared_state() {
 #[test]
 fn app_wiki_index_publish_reaches_the_agent_wiki_tools_shared_state() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("A.md"), "[[B]]\n").unwrap();
-    fs::write(app.storage.data_dir.join("B.md"), "body\n").unwrap();
+    fs::write(app.storage().data_dir.join("A.md"), "[[B]]\n").unwrap();
+    fs::write(app.storage().data_dir.join("B.md"), "body\n").unwrap();
     // The Agent worker's wiki-link tools observe the same shared index the
     // app publishes to: it starts empty and sees the note the moment the app
     // publishes its first wiki index. This fails if App::new stores a
     // separate handle instead of the one it cloned into AgentWorker::spawn.
     let worker_wiki = app.agent_worker.wiki_links().clone();
     assert!(worker_wiki
-        .with_index(|index| index.backlinks(&app.storage.data_dir.join("B.md")).len())
+        .with_index(|index| index.backlinks(&app.storage().data_dir.join("B.md")).len())
         .is_none());
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    publish_wiki_index(&mut app);
     assert_eq!(
         worker_wiki
-            .with_index(|index| index.backlinks(&app.storage.data_dir.join("B.md")).len())
+            .with_index(|index| index.backlinks(&app.storage().data_dir.join("B.md")).len())
             .unwrap(),
         1,
         "apply_wiki_link_index must publish to the handle AgentWorker::spawn received"
@@ -4417,12 +4431,12 @@ fn attachments_view_lists_name_kind_size_and_distinct_locations() {
     let id = import_attachment(&mut app, "report.pdf", b"%PDF-1.4x");
     let uri = crate::core::attachment::AttachmentUri::from_id(id).to_string();
     fs::write(
-        app.storage.data_dir.join("Note.md"),
+        app.storage().data_dir.join("Note.md"),
         format!("[report]({uri}) twice [report]({uri})\n"),
     )
     .unwrap();
     fs::write(
-        app.storage.daily_dir.join("2026-07-28.md"),
+        app.storage().daily_dir.join("2026-07-28.md"),
         format!("[a]({uri})\n"),
     )
     .unwrap();
@@ -4449,7 +4463,7 @@ fn referenced_attachment_delete_is_refused_and_reports_locations() {
     let id = import_attachment(&mut app, "report.pdf", b"pdf-bytes");
     let uri = crate::core::attachment::AttachmentUri::from_id(id).to_string();
     fs::write(
-        app.storage.data_dir.join("Note.md"),
+        app.storage().data_dir.join("Note.md"),
         format!("[a]({uri})\n"),
     )
     .unwrap();
@@ -4461,7 +4475,7 @@ fn referenced_attachment_delete_is_refused_and_reports_locations() {
     // Refused up front: no confirm dialog, attachment stays, locations shown.
     assert_eq!(app.overlay, None);
     assert_eq!(app.dialog, None);
-    assert!(app.attachment_store.lookup(id).unwrap().is_some());
+    assert!(app.workspace.attachments().lookup(id).unwrap().is_some());
     assert!(app.status.contains("referenced"), "{}", app.status);
     assert!(app.status.contains("Note.md"), "{}", app.status);
 }
@@ -4483,7 +4497,7 @@ fn unreferenced_attachment_confirm_moves_to_trash() {
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.overlay, None);
-    assert!(app.attachment_store.lookup(id).unwrap().is_none());
+    assert!(app.workspace.attachments().lookup(id).unwrap().is_none());
     assert!(app.attachment_entries.is_empty());
     assert!(app.status.contains("trash"), "{}", app.status);
 }
@@ -4498,7 +4512,7 @@ fn cancel_keeps_unreferenced_attachment() {
     app.request_delete_attachment();
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.overlay, None);
-    assert!(app.attachment_store.lookup(id).unwrap().is_some());
+    assert!(app.workspace.attachments().lookup(id).unwrap().is_some());
 }
 
 #[test]
@@ -4515,14 +4529,14 @@ fn opening_attachment_opens_the_real_managed_file() {
     // The opened path is the store's real application-managed content file:
     // the attachment bytes live there, no workspace/cache copy is written.
     assert_eq!(fs::read(&path).unwrap(), b"pdf-bytes");
-    assert!(path.starts_with(app.storage.attachments_dir));
+    assert!(path.starts_with(&app.storage().attachments_dir));
     assert_eq!(
         path.extension().and_then(|extension| extension.to_str()),
         Some("pdf")
     );
     assert_eq!(
         fs::canonicalize(&path).unwrap(),
-        fs::canonicalize(app.attachment_store.open(id).unwrap()).unwrap()
+        fs::canonicalize(app.workspace.attachments().open(id).unwrap()).unwrap()
     );
 }
 
@@ -4551,11 +4565,13 @@ fn paste_clipboard_references_insert_at_compose_cursor_in_order() {
     app.input = "left right".to_string();
     app.input_cursor = 5;
     let first = app
-        .attachment_store
+        .workspace
+        .attachments()
         .import_bytes(b"a", Some("a.txt"))
         .unwrap();
     let second = app
-        .attachment_store
+        .workspace
+        .attachments()
         .import_bytes(b"b", Some("b.txt"))
         .unwrap();
     let references = format!(
@@ -4584,7 +4600,8 @@ fn paste_clipboard_shortcut_is_ignored_outside_compose_and_by_terminal_overlay()
     app.handle_key(shortcut);
     assert_eq!(app.input, "unchanged");
     assert_eq!(
-        app.attachment_store
+        app.workspace
+            .attachments()
             .list(&crate::core::attachment::AttachmentQuery::default())
             .unwrap()
             .total,
@@ -4596,7 +4613,8 @@ fn paste_clipboard_shortcut_is_ignored_outside_compose_and_by_terminal_overlay()
     app.handle_key(shortcut);
     assert_eq!(app.input, "unchanged");
     assert_eq!(
-        app.attachment_store
+        app.workspace
+            .attachments()
             .list(&crate::core::attachment::AttachmentQuery::default())
             .unwrap()
             .total,
@@ -4607,9 +4625,9 @@ fn paste_clipboard_shortcut_is_ignored_outside_compose_and_by_terminal_overlay()
 #[test]
 fn wiki_completion_opens_filters_accepts_and_stays_dismissed_after_esc() {
     let (mut app, _directory) = make_app();
-    app.storage.create_named_file("Alpha").unwrap();
-    app.storage.create_named_file("Alpine").unwrap();
-    app.storage.create_named_file("Salad").unwrap();
+    app.storage().create_named_file("Alpha").unwrap();
+    app.storage().create_named_file("Alpine").unwrap();
+    app.storage().create_named_file("Salad").unwrap();
     app.reload_files();
     app.focus = Focus::Compose;
 
@@ -4674,7 +4692,7 @@ fn wiki_completion_opens_filters_accepts_and_stays_dismissed_after_esc() {
 fn wiki_completion_selection_clamps_at_the_edges() {
     let (mut app, _directory) = make_app();
     for index in 0..12 {
-        app.storage
+        app.storage()
             .create_named_file(&format!("Cycle {index:02}"))
             .unwrap();
     }

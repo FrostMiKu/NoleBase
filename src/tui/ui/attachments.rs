@@ -70,7 +70,7 @@ pub(super) fn draw_attachments(
         let row_area = inset_horizontal(Rect::new(item_area.x, item_area.y, item_area.width, 1), 2);
         // Distinct managed notes rather than occurrence counts; the ellipsis
         // marks the interval before the shared usage index delivers its snapshot.
-        let references = if !app.attachment_usage.is_ready() {
+        let references = if !app.workspace.attachment_usage().is_ready() {
             "…".to_string()
         } else if entry.locations == 1 {
             "1 note".to_string()

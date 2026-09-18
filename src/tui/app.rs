@@ -18,8 +18,7 @@ use crate::core::agent::{
     PrivateTerminalInputDecision, PrivateTerminalInputRequest, AGENT_STREAM_BUFFER,
 };
 use crate::core::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
-use crate::core::attachment::{AttachmentId, AttachmentStore};
-use crate::core::attachment_usage::AttachmentUsageHandle;
+use crate::core::attachment::AttachmentId;
 use crate::core::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
 use crate::core::export::ExportFormat;
 use crate::core::model::{
@@ -29,9 +28,8 @@ use crate::core::model::{
 use crate::core::observable::Observable;
 use crate::core::skill::Skill;
 use crate::core::storage::{ExportOutcome, Storage};
-use crate::core::workspace_index::{
-    TagDocument, TagRenamePlan, TagSummary, WorkspaceIndex, WorkspaceIndexHandle,
-};
+use crate::core::workspace::Workspace;
+use crate::core::workspace_index::{TagDocument, TagRenamePlan, TagSummary};
 use crate::tui::model::{
     AttachmentHitbox, BacklinkHitbox, ButtonHitbox, DialogOptionHitbox, FileGroupHitbox,
     FileHitbox, LinkHitbox, SearchHitbox, TagHitbox, TagNoteHitbox, TodoHitbox, WikiLinkHitbox,
@@ -227,7 +225,9 @@ pub(in crate::tui::app) fn move_cursor(buffer: &str, cursor: usize, movement: Cu
 }
 
 pub struct App {
-    pub storage: Storage,
+    /// The workspace application service: storage, shared indexes, and
+    /// attachments. The TUI is a consumer; it does not assemble these.
+    pub workspace: Arc<Workspace>,
     pub theme: crate::tui::theme::Theme,
     pub theme_selection: String,
     pub active_theme: String,
@@ -315,18 +315,11 @@ pub struct App {
     pub(crate) tag_note_vlist: TagNoteVirtualList,
     /// Rebuilt every frame by the renderer: one entry per visible card.
     pub tag_note_hitboxes: Vec<TagNoteHitbox>,
-    workspace_index: WorkspaceIndexHandle,
     pending_tag_rename: Option<String>,
 
-    /// The latest published wiki-link index, used to resolve backlinks for the
-    /// open document and shared with agent wiki-link tools. Publish via
-    /// [`App::apply_wiki_link_index`].
-    wiki_links: crate::core::wiki_link_index::WikiLinkIndexHandle,
     /// Distinct managed notes linking to the currently open document.
     pub document_backlinks: Vec<PathBuf>,
 
-    pub attachment_store: AttachmentStore,
-    pub attachment_usage: AttachmentUsageHandle,
     pub attachment_entries: Vec<AttachmentEntry>,
     pub attachment_index: usize,
     pub attachment_list_start: usize,
@@ -450,8 +443,9 @@ struct CodeCopyFeedback {
 }
 
 impl App {
-    pub fn new(storage: Storage) -> anyhow::Result<Self> {
-        let loaded_theme = crate::tui::theme::load_theme(&storage, None)?;
+    pub fn new(workspace: Arc<Workspace>) -> anyhow::Result<Self> {
+        let storage = workspace.storage();
+        let loaded_theme = crate::tui::theme::load_theme(storage, None)?;
         let (
             agent_conversation,
             agent_panel,
@@ -465,18 +459,16 @@ impl App {
         let agent_follow_tail = !agent_panel.is_empty();
         let agent_scroll = 0;
         let agent_panel = agent_panel.into_iter().map(Arc::new).collect();
-        let daily_notes = storage.load_daily_notes()?;
+        let daily_notes = workspace.daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
-        let mut note_files = storage.list_note_files()?;
-        let first_note = note_files.first().map(|file| file.path.clone());
-        note_files.extend(storage.list_archived_note_files()?);
+        let note_files = workspace.note_files()?;
+        let first_note = note_files
+            .iter()
+            .find(|file| !file.archived)
+            .map(|file| file.path.clone());
         let file_row = usize::from(first_note.is_some());
-        let todo_items = storage.load_todo_tasks()?;
+        let todo_items = workspace.todos()?;
         let images = crate::tui::media::ImageService::new(&storage.root);
-        let attachment_store = AttachmentStore::new(storage.attachments_dir.clone());
-        let attachment_usage = AttachmentUsageHandle::new();
-        let workspace_index = WorkspaceIndexHandle::default();
-        let wiki_links = crate::core::wiki_link_index::WikiLinkIndexHandle::default();
         let agent_input_buffer = Arc::new(Mutex::new(Vec::new()));
         let permission_mode_atomic = Arc::new(AtomicU8::new(PermissionMode::Approve.code()));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -501,9 +493,9 @@ impl App {
             )
             .with_terminal(agent_terminal.clone())
             .with_jobs(agent_jobs.clone())
-            .with_workspace_index(workspace_index.clone())
-            .with_wiki_link_index(wiki_links.clone()),
-            attachment_usage.clone(),
+            .with_workspace_index(workspace.workspace_index().clone())
+            .with_wiki_link_index(workspace.wiki_links().clone()),
+            workspace.attachment_usage().clone(),
         );
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
         let mut agent_effort = None;
@@ -513,7 +505,7 @@ impl App {
             );
         }
         Ok(Self {
-            storage,
+            workspace,
             theme: loaded_theme.theme,
             theme_selection: loaded_theme.requested,
             active_theme: loaded_theme.active,
@@ -581,12 +573,8 @@ impl App {
             reveal_selected_tag_note: false,
             tag_note_vlist: TagNoteVirtualList::default(),
             tag_note_hitboxes: Vec::new(),
-            workspace_index,
             pending_tag_rename: None,
-            wiki_links,
             document_backlinks: Vec::new(),
-            attachment_store,
-            attachment_usage,
             attachment_entries: Vec::new(),
             attachment_index: 0,
             attachment_list_start: 0,
@@ -717,8 +705,21 @@ impl App {
             .then_some(feedback.area)
     }
 
+    /// Transitional accessor over the workspace service's storage; new code
+    /// should prefer workspace-level operations.
+    pub(crate) fn storage(&self) -> &Storage {
+        self.workspace.storage()
+    }
+
+    /// Construct an app for tests, assembling the workspace service the way
+    /// the application bootstrap does.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(storage: Storage) -> anyhow::Result<Self> {
+        Self::new(Arc::new(Workspace::open(storage)?))
+    }
+
     pub(super) fn reload_thinking_display_config(&mut self) {
-        let Ok(show_full_thinking) = self.storage.show_full_thinking() else {
+        let Ok(show_full_thinking) = self.storage().show_full_thinking() else {
             return;
         };
         if self.show_full_thinking != show_full_thinking {
@@ -730,7 +731,7 @@ impl App {
     /// Refresh the effort label from the AI config file. Kept on parse or read
     /// failure so a broken config does not blank a previously known tier.
     pub(super) fn reload_agent_effort(&mut self) {
-        if let Ok(effort) = AgentConfig::load_effort(&self.storage.ai_config_path) {
+        if let Ok(effort) = AgentConfig::load_effort(&self.storage().ai_config_path) {
             self.agent_effort = Some(
                 effort.map_or_else(|| "default".to_string(), |tier| tier.as_str().to_string()),
             );
@@ -740,7 +741,7 @@ impl App {
         self.reload_thinking_display_config();
         self.reload_agent_effort();
         let selected_date = self.selected_date();
-        match self.storage.load_daily_notes() {
+        match self.workspace.daily_notes() {
             Ok(daily_notes) => {
                 self.daily_notes = daily_notes;
                 self.selected = selected_date
@@ -753,7 +754,7 @@ impl App {
 
     pub fn reload_files(&mut self) {
         let selected = self.selected_file.clone();
-        match self.combined_note_files() {
+        match self.workspace.note_files() {
             Ok(files) => self.note_files = files,
             Err(error) => {
                 self.set_error(format!("Reload error: {error}"));
@@ -769,14 +770,8 @@ impl App {
         self.ensure_visible_file_selection();
     }
 
-    fn combined_note_files(&self) -> anyhow::Result<Vec<NoteFile>> {
-        let mut files = self.storage.list_note_files()?;
-        files.extend(self.storage.list_archived_note_files()?);
-        Ok(files)
-    }
-
     pub fn reload_todos(&mut self) {
-        match self.storage.load_todo_tasks() {
+        match self.workspace.todos() {
             Ok(items) => {
                 self.todo_items = items;
                 self.todo_index = self.todo_index.min(self.todo_items.len().saturating_sub(1));
@@ -807,7 +802,7 @@ impl App {
         let previous_random_source = (self.theme_selection == "random")
             .then_some(self.theme_source.as_deref())
             .flatten();
-        match crate::tui::theme::load_theme(&self.storage, previous_random_source) {
+        match crate::tui::theme::load_theme(self.storage(), previous_random_source) {
             Ok(loaded) => self.apply_loaded_theme(loaded),
             Err(error) => self.set_error(format!("Theme reload error: {error}")),
         }
@@ -824,7 +819,7 @@ impl App {
         }
         let document_kind = self.document.as_ref().map(|document| document.kind.clone());
         match document_kind {
-            Some(DocumentKind::File(path)) => match self.storage.read_document_file(&path) {
+            Some(DocumentKind::File(path)) => match self.storage().read_document_file(&path) {
                 Ok(updated) => {
                     if let Some(document) = self.document.as_mut() {
                         document.replace_source(updated);
@@ -846,7 +841,7 @@ impl App {
                 }
             },
             Some(DocumentKind::Daily(date)) => {
-                match self.storage.read_daily_by_date(&date.to_string()) {
+                match self.storage().read_daily_by_date(&date.to_string()) {
                     Ok(updated) => {
                         if let Some(document) = self.document.as_mut() {
                             document.replace_source(updated.body);
@@ -862,7 +857,7 @@ impl App {
                     }
                 }
             }
-            Some(DocumentKind::Skill(path)) => match self.storage.read_skill(&path) {
+            Some(DocumentKind::Skill(path)) => match self.storage().read_skill(&path) {
                 Ok(updated) => {
                     if let Some(document) = self.document.as_mut() {
                         document.title = updated.name;

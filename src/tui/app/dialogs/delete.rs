@@ -11,7 +11,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(date) = self.pending_daily_date.take() {
                     let note = self.daily_note_clone(date);
-                    match self.storage.remove_daily(&date.to_string()) {
+                    match self.storage().remove_daily(&date.to_string()) {
                         Ok(true) => {
                             if let Some(note) = note {
                                 self.record_undo(UndoOp::Delete(note));
@@ -66,17 +66,12 @@ impl App {
     /// attachment reaches deletion.
     fn trash_attachment(&mut self, id: AttachmentId, expected_revision: u64) {
         let name = self
-            .attachment_store
-            .metadata(id)
+            .workspace
+            .attachment_metadata(id)
             .ok()
             .map(|metadata| metadata.display_name)
             .unwrap_or_else(|| "attachment".to_string());
-        let outcome = self.attachment_usage.trash(
-            &self.attachment_store,
-            &self.storage,
-            id,
-            expected_revision,
-        );
+        let outcome = self.workspace.trash_attachment(id, expected_revision);
         match outcome {
             Ok(TrashResult::Trashed) => {
                 self.set_status(format!("Moved {name} to trash"));
@@ -93,7 +88,7 @@ impl App {
                 let names = locations
                     .iter()
                     .map(|path| {
-                        path.strip_prefix(&self.storage.root)
+                        path.strip_prefix(&self.storage().root)
                             .unwrap_or(path)
                             .to_string_lossy()
                             .into_owned()
@@ -133,11 +128,11 @@ impl App {
                         .find(|file| file.path == path)
                         .is_some_and(|file| file.archived);
                     let result = if skill {
-                        self.storage.delete_skill(&path)
+                        self.storage().delete_skill(&path)
                     } else if archived {
-                        self.storage.delete_archived_file(&path)
+                        self.storage().delete_archived_file(&path)
                     } else {
-                        self.storage.delete_file(&path)
+                        self.storage().delete_file(&path)
                     };
                     match result {
                         Ok(()) => {

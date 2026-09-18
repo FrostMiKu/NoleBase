@@ -577,8 +577,10 @@ impl App {
         }
     }
 
-    pub fn apply_workspace_index(&mut self, index: WorkspaceIndex) {
-        self.workspace_index.replace(index);
+    /// Respond to a freshly published document-index snapshot (applied to
+    /// the shared handles by the workspace service): refresh the views that
+    /// read those indexes.
+    pub fn on_index_update(&mut self) {
         if self.status == "Workspace index is still building" {
             self.status.clear();
         }
@@ -587,42 +589,29 @@ impl App {
         } else if self.center_view == CenterView::Tags {
             self.recompute_tags();
         }
-    }
-
-    pub fn apply_attachment_index(
-        &mut self,
-        revision: u64,
-        index: crate::core::attachment_index::AttachmentReferenceIndex,
-    ) {
-        self.attachment_usage.publish_snapshot(revision, index);
         if self.center_view == CenterView::Attachments {
             self.recompute_attachments();
         }
-    }
-
-    pub fn apply_wiki_link_index(&mut self, index: crate::core::wiki_link_index::WikiLinkIndex) {
-        self.wiki_links.replace(index);
         self.recompute_document_backlinks();
     }
 
     /// Recompute [`App::document_backlinks`] from the published wiki-link index
     /// for the currently open managed note (daily, data, or archives). Skills
     /// and previews use local content, leaving the managed backlink list empty.
-    pub(in crate::tui::app) fn recompute_document_backlinks(&mut self) {
+    pub(crate) fn recompute_document_backlinks(&mut self) {
         self.document_backlinks.clear();
         let Some(document) = self.document.as_ref() else {
             return;
         };
         let path = match &document.kind {
             DocumentKind::File(path) => Some(path.clone()),
-            DocumentKind::Daily(date) => self.storage.daily_file_path(&date.to_string()).ok(),
+            DocumentKind::Daily(date) => self.storage().daily_file_path(&date.to_string()).ok(),
             DocumentKind::Skill(_) => None,
         };
-        let Some(path) = path else {
-            return;
-        };
-        if let Some(backlinks) = self.wiki_links.with_index(|index| index.backlinks(&path)) {
-            self.document_backlinks = backlinks;
+        if let Some(path) = path {
+            if let Some(backlinks) = self.workspace.backlinks(&path) {
+                self.document_backlinks = backlinks;
+            }
         }
     }
 
@@ -648,7 +637,7 @@ impl App {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.storage.root.join(path)
+            self.storage().root.join(path)
         }
     }
 
@@ -691,7 +680,7 @@ impl App {
             self.overlay = None;
             return;
         };
-        let Ok(path) = self.storage.daily_file_path(&date.to_string()) else {
+        let Ok(path) = self.storage().daily_file_path(&date.to_string()) else {
             self.overlay = None;
             self.set_status("Daily note not found");
             return;
@@ -702,7 +691,7 @@ impl App {
             return;
         }
         let display_path = path
-            .strip_prefix(&self.storage.root)
+            .strip_prefix(&self.storage().root)
             .unwrap_or(&path)
             .to_string_lossy();
         let requested = self.ai_prompt_input.trim();
@@ -777,7 +766,7 @@ impl App {
         let context =
             match self.center_view {
                 CenterView::Daily => self.selected_date().and_then(|date| {
-                    self.storage
+                    self.storage()
                         .daily_file_path(&date.to_string())
                         .ok()
                         .map(|path| ("daily note", path))
@@ -788,7 +777,7 @@ impl App {
                     DocumentKind::File(path) => Some(("note", path.clone())),
                     DocumentKind::Skill(path) => Some(("skill", path.clone())),
                     DocumentKind::Daily(date) => self
-                        .storage
+                        .storage()
                         .daily_file_path(&date.to_string())
                         .ok()
                         .map(|path| ("daily note", path)),
@@ -802,7 +791,7 @@ impl App {
             };
         Some(if let Some((kind, path)) = context {
             let display = path
-                .strip_prefix(&self.storage.root)
+                .strip_prefix(&self.storage().root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
@@ -985,7 +974,7 @@ impl App {
         // Cancel jobs that belong to the session being cleared; the Agent
         // workspace itself persists and keeps its files.
         self.agent_jobs.terminate();
-        let had_saved_session = match self.storage.clear_agent_session() {
+        let had_saved_session = match self.storage().clear_agent_session() {
             Ok(had_saved_session) => had_saved_session,
             Err(error) => {
                 self.set_error(format!("Agent session clear error: {error}"));
@@ -1032,7 +1021,7 @@ impl App {
             self.agent_timed_output_tokens,
             self.agent_response_duration,
         );
-        self.storage.write_agent_session(&session)
+        self.storage().write_agent_session(&session)
     }
 
     pub(super) fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {

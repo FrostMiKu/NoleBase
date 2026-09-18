@@ -139,12 +139,13 @@ pub(super) fn draw_daily_notes(
 
     if interactive {
         let interactive_area = Rect::new(area.x, area.y, area.width, unoccluded_height);
+        let daily_dir = app.storage().daily_dir.clone();
         register_link_hitboxes(
             &mut app.link_hitboxes,
             &rendered_links,
             interactive_area,
             scroll,
-            &app.storage.daily_dir,
+            &daily_dir,
         );
         register_tag_hitboxes(
             &mut app.tag_hitboxes,
@@ -174,7 +175,7 @@ pub(super) fn draw_daily_notes(
     }
 
     frame.render_widget(Paragraph::new(visible), area);
-    let image_base = app.storage.daily_dir.clone();
+    let image_base = app.storage().daily_dir.clone();
     app.images.render(
         frame,
         &rendered_images,

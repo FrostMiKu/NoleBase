@@ -35,10 +35,7 @@ impl App {
                 );
             }
         } else if !query.is_empty() {
-            if let Some(indexed) = self
-                .workspace_index
-                .with_index(|index| index.search(&query))
-            {
+            if let Some(indexed) = self.workspace.search(&query) {
                 results = indexed;
             } else {
                 self.set_status("Workspace index is still building");
@@ -67,7 +64,7 @@ impl App {
         }
         match hit {
             SearchHit::FileLine { path, line_no, .. } => {
-                if let Some(date) = self.storage.daily_date_for_path(&path) {
+                if let Some(date) = self.storage().daily_date_for_path(&path) {
                     self.open_daily_document(date, DocumentReturn::Search);
                 } else {
                     self.open_file_document(&path, DocumentReturn::Search);

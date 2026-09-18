@@ -48,7 +48,7 @@ impl App {
     }
 
     pub(in crate::tui::app) fn toggle_todo(&mut self, index: usize) {
-        match self.storage.toggle_todo_task(index) {
+        match self.storage().toggle_todo_task(index) {
             Ok(true) => {
                 self.reload_todos();
                 self.reload_files();

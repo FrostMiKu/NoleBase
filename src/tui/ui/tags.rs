@@ -179,8 +179,9 @@ fn draw_tag_note_stream(frame: &mut Frame, app: &mut App, area: Rect, interactiv
     }
     frame.render_widget(Paragraph::new(visible_lines), cards);
 
+    let workspace_root = app.storage().root.clone();
     for (index, first, cached) in &visible_cards {
-        let parent = cached.path.parent().unwrap_or(app.storage.root.as_path());
+        let parent = cached.path.parent().unwrap_or(workspace_root.as_path());
         let links = cached
             .links
             .iter()

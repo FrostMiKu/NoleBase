@@ -16,7 +16,7 @@ impl App {
             return;
         }
         let query = self.tag_query.trim().trim_start_matches('#').to_lowercase();
-        let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
+        let Some(tags) = self.workspace.tags() else {
             self.tag_results.clear();
             self.tag_index = 0;
             self.set_status("Workspace index is still building");
@@ -56,7 +56,7 @@ impl App {
         let Some(note) = self.tag_notes.get(index).cloned() else {
             return;
         };
-        if let Some(date) = self.storage.daily_date_for_path(&note.path) {
+        if let Some(date) = self.storage().daily_date_for_path(&note.path) {
             self.open_daily_document(date, DocumentReturn::Tags);
         } else {
             self.open_file_document(&note.path, DocumentReturn::Tags);
@@ -92,10 +92,7 @@ impl App {
         let Some(tag) = self.active_tag.clone() else {
             return;
         };
-        let Some(documents) = self
-            .workspace_index
-            .with_index(|index| index.tag_documents(&tag))
-        else {
+        let Some(documents) = self.workspace.tag_documents(&tag) else {
             self.tag_notes.clear();
             self.tag_note_index = 0;
             self.set_status("Workspace index is still building");
@@ -126,7 +123,7 @@ impl App {
     }
 
     fn load_tag_note(&self, document: TagDocument) -> anyhow::Result<TagNote> {
-        let body = self.storage.read_document_file(&document.path)?;
+        let body = self.storage().read_document_file(&document.path)?;
         let title = document
             .path
             .file_stem()

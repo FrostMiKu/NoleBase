@@ -169,7 +169,7 @@ fn make_app() -> (App, tempfile::TempDir) {
     let directory = tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
-    (App::new(storage).unwrap(), directory)
+    (App::new_for_tests(storage).unwrap(), directory)
 }
 
 fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -576,7 +576,7 @@ fn workspace_view_sidebar_is_rendered_from_the_registry_and_switches_pages() {
 #[test]
 fn center_view_interface_assigns_the_visible_sidebar_cursor() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.data_dir.join("Project.md");
+    let path = app.storage().data_dir.join("Project.md");
     fs::write(&path, "project").unwrap();
     app.reload_files();
     app.focus = Focus::Center;
@@ -684,7 +684,7 @@ fn footer_animates_background_export_status() {
 #[test]
 fn archived_document_footer_offers_restore_instead_of_archive() {
     let (mut app, _directory) = make_app();
-    let path = app.storage.archives_dir.join("Archived.md");
+    let path = app.storage().archives_dir.join("Archived.md");
     fs::write(&path, "archived").unwrap();
     app.reload_files();
     app.center_view = CenterView::Document;
@@ -896,7 +896,7 @@ fn virtual_line_window_clones_only_visible_rows() {
 #[test]
 fn narrow_files_and_todo_page_each_use_the_full_body_without_duplicates() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    fs::write(app.storage().data_dir.join("Work.md"), "work").unwrap();
     app.reload_files();
     app.focus = Focus::Files;
     let terminal = render(&mut app, 80, 18);
@@ -946,7 +946,7 @@ fn sidebars_use_mantle_background_with_square_ui_borders() {
 #[test]
 fn selected_file_background_covers_name_and_modified_time_rows() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    fs::write(app.storage().data_dir.join("Work.md"), "work").unwrap();
     app.reload_files();
     app.focus = Focus::Files;
     let modified: DateTime<Local> = app.note_files[app.file_index].modified.into();
@@ -978,7 +978,7 @@ fn selected_file_background_covers_name_and_modified_time_rows() {
 #[test]
 fn archived_file_metadata_does_not_repeat_its_group() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.archives_dir.join("Old.md"), "old").unwrap();
+    fs::write(app.storage().archives_dir.join("Old.md"), "old").unwrap();
     app.reload_files();
     app.archives_expanded = true;
 
@@ -991,8 +991,8 @@ fn archived_file_metadata_does_not_repeat_its_group() {
 #[test]
 fn file_selection_includes_both_shared_spacing_lines() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("First.md"), "first").unwrap();
-    fs::write(app.storage.data_dir.join("Second.md"), "second").unwrap();
+    fs::write(app.storage().data_dir.join("First.md"), "first").unwrap();
+    fs::write(app.storage().data_dir.join("Second.md"), "second").unwrap();
     app.reload_files();
     app.focus = Focus::Files;
 
@@ -1047,7 +1047,7 @@ fn file_selection_includes_both_shared_spacing_lines() {
 #[test]
 fn file_groups_use_teal_markers_and_muted_counts() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    fs::write(app.storage().data_dir.join("Work.md"), "work").unwrap();
     app.reload_files();
     app.focus = Focus::Files;
 
@@ -1342,25 +1342,27 @@ fn attachments_browser_keeps_blank_row_and_full_area_selection_invariants() {
         ("photo.png", b"png-bytes".as_slice()),
         ("notes.txt", b"text-bytes".as_slice()),
     ] {
-        app.attachment_store
+        app.workspace
+            .attachments()
             .import_bytes(bytes, Some(name))
             .unwrap();
     }
     let uri = app
-        .attachment_store
+        .workspace
+        .attachments()
         .list(&crate::core::attachment::AttachmentQuery::default())
         .unwrap()
         .items[0]
         .uri()
         .to_string();
     fs::write(
-        app.storage.data_dir.join("Note.md"),
+        app.storage().data_dir.join("Note.md"),
         format!("[a]({uri})\n"),
     )
     .unwrap();
-    app.apply_attachment_index(
+    app.workspace.attachment_usage().publish_snapshot(
         0,
-        crate::core::attachment_index::AttachmentReferenceIndex::build(&app.storage),
+        crate::core::attachment_index::AttachmentReferenceIndex::build(app.storage()),
     );
     app.open_attachments();
 
@@ -1486,7 +1488,7 @@ fn chat_compose_and_button_hitboxes_stay_inside_visible_center_viewport() {
     for width in [60, 80, 120, 169, 170, 171, 220] {
         let (mut app, _directory) = make_app();
         for index in 0..30 {
-            app.storage
+            app.storage()
                 .append_to_today(&format!("message {index}"))
                 .unwrap();
         }
@@ -1514,9 +1516,9 @@ fn chat_compose_and_button_hitboxes_stay_inside_visible_center_viewport() {
 #[test]
 fn overlay_records_geometry_and_disables_all_background_hitboxes() {
     let (mut app, _directory) = make_app();
-    fs::write(app.storage.data_dir.join("Work.md"), "work").unwrap();
+    fs::write(app.storage().data_dir.join("Work.md"), "work").unwrap();
     app.reload_files();
-    app.storage.append_to_today("hello").unwrap();
+    app.storage().append_to_today("hello").unwrap();
     app.reload();
     app.todo_items = vec![TodoItem {
         checked: false,
@@ -1538,7 +1540,7 @@ fn overlay_records_geometry_and_disables_all_background_hitboxes() {
 #[test]
 fn links_are_clickable_in_daily_documents_and_agent_output() {
     let (mut app, _directory) = make_app();
-    app.storage
+    app.storage()
         .append_to_today("Open [site](https://example.test)")
         .unwrap();
     app.reload();
@@ -1577,18 +1579,18 @@ fn links_are_clickable_in_daily_documents_and_agent_output() {
 #[test]
 fn local_link_hitboxes_resolve_against_each_content_base() {
     let (mut app, _directory) = make_app();
-    app.storage
+    app.storage()
         .append_to_today("[Daily report](daily-report.pdf) and ![[daily-attachment.pdf]]")
         .unwrap();
     app.reload();
     render(&mut app, 170, 24);
     for filename in ["daily-report.pdf", "daily-attachment.pdf"] {
         assert!(app.link_hitboxes.iter().any(|hitbox| {
-            hitbox.target == LinkTarget::LocalFile(app.storage.daily_dir.join(filename))
+            hitbox.target == LinkTarget::LocalFile(app.storage().daily_dir.join(filename))
         }));
     }
 
-    let note = app.storage.data_dir.join("Article.md");
+    let note = app.storage().data_dir.join("Article.md");
     app.document = Some(Document {
         kind: DocumentKind::File(note),
         title: "Preview".to_string(),
@@ -1602,7 +1604,7 @@ fn local_link_hitboxes_resolve_against_each_content_base() {
     render(&mut app, 170, 24);
     for filename in ["article-report.pdf", "article-attachment.pdf"] {
         assert!(app.link_hitboxes.iter().any(|hitbox| {
-            hitbox.target == LinkTarget::LocalFile(app.storage.data_dir.join(filename))
+            hitbox.target == LinkTarget::LocalFile(app.storage().data_dir.join(filename))
         }));
     }
 
@@ -1614,7 +1616,7 @@ fn local_link_hitboxes_resolve_against_each_content_base() {
     render(&mut app, 170, 40);
     for filename in ["agent-report.pdf", "agent-attachment.pdf"] {
         assert!(app.link_hitboxes.iter().any(|hitbox| {
-            hitbox.target == LinkTarget::LocalFile(app.storage.root.join(filename))
+            hitbox.target == LinkTarget::LocalFile(app.storage().root.join(filename))
         }));
     }
 }
@@ -1622,7 +1624,7 @@ fn local_link_hitboxes_resolve_against_each_content_base() {
 #[test]
 fn hashtags_are_clickable_in_daily_and_document_views() {
     let (mut app, _directory) = make_app();
-    app.storage.append_to_today("Daily #rust").unwrap();
+    app.storage().append_to_today("Daily #rust").unwrap();
     app.reload();
     render(&mut app, 170, 24);
     let daily = app
@@ -1690,8 +1692,8 @@ fn wikilink_choice_marks_location_and_file_format_as_muted_metadata() {
 #[test]
 fn document_view_renders_backlink_section_after_body() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
-    let source = app.storage.data_dir.join("Source.md");
+    let target = app.storage().data_dir.join("Target.md");
+    let source = app.storage().data_dir.join("Source.md");
     fs::write(&target, "body line one\n").unwrap();
     fs::write(&source, "see [[Target]]\n").unwrap();
     app.document = Some(Document {
@@ -1705,9 +1707,12 @@ fn document_view_renders_backlink_section_after_body() {
     });
     app.center_view = CenterView::Document;
     app.focus = Focus::Center;
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    app.workspace
+        .wiki_links()
+        .replace(crate::core::wiki_link_index::WikiLinkIndex::build(
+            app.storage(),
+        ));
+    app.recompute_document_backlinks();
     assert_eq!(app.document_backlinks, vec![source.clone()]);
 
     let terminal = render(&mut app, 170, 24);
@@ -1758,9 +1763,9 @@ fn document_view_renders_backlink_section_after_body() {
 #[test]
 fn backlink_hitbox_width_matches_the_rendered_truncated_name() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
+    let target = app.storage().data_dir.join("Target.md");
     let source = app
-        .storage
+        .storage()
         .data_dir
         .join("Source-With-A-Very-Long-Name-That-Forces-Truncation.md");
     fs::write(&target, "body line one\n").unwrap();
@@ -1776,9 +1781,12 @@ fn backlink_hitbox_width_matches_the_rendered_truncated_name() {
     });
     app.center_view = CenterView::Document;
     app.focus = Focus::Center;
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    app.workspace
+        .wiki_links()
+        .replace(crate::core::wiki_link_index::WikiLinkIndex::build(
+            app.storage(),
+        ));
+    app.recompute_document_backlinks();
     assert_eq!(app.document_backlinks, vec![source.clone()]);
 
     // Narrow enough that the long name is ellipsized; the hitbox must cover
@@ -1812,7 +1820,7 @@ fn backlink_hitbox_width_matches_the_rendered_truncated_name() {
 #[test]
 fn document_view_hides_backlink_section_when_nothing_links_to_the_note() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
+    let target = app.storage().data_dir.join("Target.md");
     fs::write(&target, "body").unwrap();
     app.document = Some(Document {
         kind: DocumentKind::File(target),
@@ -1825,9 +1833,12 @@ fn document_view_hides_backlink_section_when_nothing_links_to_the_note() {
     });
     app.center_view = CenterView::Document;
     app.focus = Focus::Center;
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    app.workspace
+        .wiki_links()
+        .replace(crate::core::wiki_link_index::WikiLinkIndex::build(
+            app.storage(),
+        ));
+    app.recompute_document_backlinks();
     assert!(app.document_backlinks.is_empty());
 
     let terminal = render(&mut app, 170, 24);
@@ -1838,8 +1849,8 @@ fn document_view_hides_backlink_section_when_nothing_links_to_the_note() {
 #[test]
 fn backlink_section_scrolls_with_the_document_and_stays_clickable() {
     let (mut app, _directory) = make_app();
-    let target = app.storage.data_dir.join("Target.md");
-    let source = app.storage.data_dir.join("Source.md");
+    let target = app.storage().data_dir.join("Target.md");
+    let source = app.storage().data_dir.join("Source.md");
     // A tall body pushes the Backlinks section below the fold.
     let body = (0..60)
         .map(|line| format!("filler line {line}"))
@@ -1858,9 +1869,12 @@ fn backlink_section_scrolls_with_the_document_and_stays_clickable() {
     });
     app.center_view = CenterView::Document;
     app.focus = Focus::Center;
-    app.apply_wiki_link_index(crate::core::wiki_link_index::WikiLinkIndex::build(
-        &app.storage,
-    ));
+    app.workspace
+        .wiki_links()
+        .replace(crate::core::wiki_link_index::WikiLinkIndex::build(
+            app.storage(),
+        ));
+    app.recompute_document_backlinks();
 
     // Unscrolled: section is below the fold, no hitbox visible.
     let _terminal = render(&mut app, 170, 24);
@@ -2814,7 +2828,7 @@ fn document_keeps_compose_visible_and_notification_uses_top_right() {
     app.center_view = CenterView::Document;
     app.focus = Focus::Center;
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
+        kind: DocumentKind::File(app.storage().archives_dir.join("2026-07-27.md")),
         title: "Article".to_string(),
         source: "# Reading\n\nUseful paragraph".to_string(),
         scroll: 0,
@@ -2840,7 +2854,7 @@ fn focused_compose_sits_below_the_document_with_an_animated_border() {
     app.focus = Focus::Compose;
     app.animation_tick = 3;
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.data_dir.join("Article.md")),
+        kind: DocumentKind::File(app.storage().data_dir.join("Article.md")),
         title: "Article".to_string(),
         source: (0..40)
             .map(|line| format!("paragraph {line}"))
@@ -2889,7 +2903,7 @@ fn document_paper_scrolls_behind_the_compose_while_content_remains() {
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Document;
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.data_dir.join("Article.md")),
+        kind: DocumentKind::File(app.storage().data_dir.join("Article.md")),
         title: "Article".to_string(),
         source: (0..40)
             .map(|line| format!("paper line {line}"))
@@ -2951,7 +2965,9 @@ fn tiny_terminals_and_requested_widths_do_not_panic() {
 #[test]
 fn multiline_chat_and_compose_content_render() {
     let (mut app, _directory) = make_app();
-    app.storage.append_to_today("alpha\nbeta **bold**").unwrap();
+    app.storage()
+        .append_to_today("alpha\nbeta **bold**")
+        .unwrap();
     app.reload();
     app.focus = Focus::Compose;
     app.input = "first\nsecond".to_string();
@@ -3083,7 +3099,7 @@ fn todo_display_groups_open_items_before_completed_items() {
 #[test]
 fn chat_renders_block_markdown_on_colored_cards() {
     let (mut app, _directory) = make_app();
-    app.storage
+    app.storage()
         .append_to_today(concat!(
             "# Heading\n\n- first\n- second\n\n`code`\n\n",
             "[columns gap=2]\n",
@@ -3162,7 +3178,7 @@ fn chat_renders_block_markdown_on_colored_cards() {
 #[test]
 fn selected_daily_card_uses_an_animated_gradient_border() {
     let (mut app, _directory) = make_app();
-    app.storage.append_to_today("A daily note").unwrap();
+    app.storage().append_to_today("A daily note").unwrap();
     app.reload();
     app.animation_tick = 0;
 
@@ -3211,7 +3227,7 @@ fn oversized_selected_card_keeps_a_stable_scroll_position() {
         .map(|line| format!("line {line}"))
         .collect::<Vec<_>>()
         .join("\n");
-    app.storage.append_to_today(&body).unwrap();
+    app.storage().append_to_today(&body).unwrap();
     app.reload();
     app.selected = app.daily_notes.len() - 1;
     app.scroll = u16::MAX;
@@ -3261,14 +3277,16 @@ fn selection_viewports_move_the_cursor_before_scrolling_up() {
 #[test]
 fn manual_scroll_can_cross_an_oversized_selected_card_boundary() {
     let (mut app, _directory) = make_app();
-    app.storage
+    app.storage()
         .append_daily("2026-07-26", "previous day")
         .unwrap();
     let long_body = (0..80)
         .map(|line| format!("long line {line}"))
         .collect::<Vec<_>>()
         .join("\n");
-    app.storage.append_daily("2026-07-27", &long_body).unwrap();
+    app.storage()
+        .append_daily("2026-07-27", &long_body)
+        .unwrap();
     app.reload();
     app.selected = 1;
     app.scroll = u16::MAX;
@@ -3287,7 +3305,7 @@ fn manual_scroll_can_cross_an_oversized_selected_card_boundary() {
 #[test]
 fn single_line_daily_card_spaces_date_body_and_buttons() {
     let (mut app, _directory) = make_app();
-    app.storage.append_to_today("one line").unwrap();
+    app.storage().append_to_today("one line").unwrap();
     app.reload();
     let date = app.daily_notes[0].date.format(DATE_FMT).to_string();
 
@@ -3327,7 +3345,7 @@ fn document_view_uses_a_scrollable_page_margin_without_an_outer_border() {
     app.focus = Focus::Center;
     app.center_view = CenterView::Document;
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
+        kind: DocumentKind::File(app.storage().archives_dir.join("2026-07-27.md")),
         title: "Archive".to_string(),
         source: "# Heading\n\nintro\n\nneedle".to_string(),
         scroll: 0,
@@ -3372,7 +3390,7 @@ fn document_scroll_overwrites_box_borders_from_the_previous_frame() {
         .collect::<Vec<_>>()
         .join("\n\n");
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.data_dir.join("scroll.md")),
+        kind: DocumentKind::File(app.storage().data_dir.join("scroll.md")),
         title: "Scroll".to_string(),
         source: format!(
             "{plain}\n\n[box width=full border=single border-color=#df7f3f bg=16]\n{boxed}\n[/box]"
@@ -3426,7 +3444,7 @@ fn document_code_block_renders_and_exposes_a_clickable_copy_button() {
     app.focus = Focus::Center;
     app.center_view = CenterView::Document;
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.archives_dir.join("2026-07-27.md")),
+        kind: DocumentKind::File(app.storage().archives_dir.join("2026-07-27.md")),
         title: "Code".to_string(),
         source: "```rust\nfn main() {\n    println!(\"hello\");\n}\n```".to_string(),
         scroll: 0,
@@ -3687,7 +3705,7 @@ fn wiki_completion_popup_is_opaque_over_body_content() {
     // A long document scrolled to its end so body text reaches the rows the
     // popup floats over.
     app.document = Some(Document {
-        kind: DocumentKind::File(app.storage.data_dir.join("Behind.md")),
+        kind: DocumentKind::File(app.storage().data_dir.join("Behind.md")),
         title: "Behind".to_string(),
         source: ["BEHIND BEHIND"; 24].join("\n"),
         // At this scroll the last line lands on the row the popup's title

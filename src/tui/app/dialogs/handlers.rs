@@ -210,7 +210,7 @@ impl App {
                     .and_then(DialogState::selected_option)
                     .map(|option| option.label.clone());
                 let selection = selection?;
-                match crate::tui::theme::select_theme(&self.storage, &selection) {
+                match crate::tui::theme::select_theme(self.storage(), &selection) {
                     Ok(loaded) => {
                         let active = loaded.active.clone();
                         self.apply_loaded_theme(loaded);
@@ -268,7 +268,7 @@ impl App {
         // replacement. Directories, symlinks, and special files enter the
         // normal preparation error path.
         if self
-            .storage
+            .storage()
             .export_destination_is_overwritable(Path::new(&destination))
             .unwrap_or(false)
         {
@@ -276,7 +276,7 @@ impl App {
             self.open_export_overwrite_dialog();
             return;
         }
-        let prepared = match self.storage.prepare_export(
+        let prepared = match self.storage().prepare_export(
             &source,
             Path::new(&destination),
             format,
@@ -305,7 +305,7 @@ impl App {
         format: ExportFormat,
     ) {
         let resolved = prepared.destination().display().to_string();
-        let storage = self.storage.clone();
+        let storage = self.storage().clone();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("nole-export".to_string())
@@ -346,7 +346,7 @@ impl App {
             self.close_dialog();
             return;
         };
-        match self.storage.prepare_export(
+        match self.storage().prepare_export(
             &source,
             Path::new(&destination),
             format,
@@ -441,13 +441,14 @@ impl App {
             .map(|dialog| dialog.input.clone())
             .unwrap_or_default();
         let Some(paths) = self
-            .workspace_index
+            .workspace
+            .workspace_index()
             .with_index(|index| index.tag_paths(&from))
         else {
             self.set_status("Tag index is still building");
             return;
         };
-        let plan = match TagRenamePlan::prepare(&self.storage, paths, &from, &to) {
+        let plan = match TagRenamePlan::prepare(self.storage(), paths, &from, &to) {
             Ok(plan) => plan,
             Err(error) => {
                 self.set_error(format!("Tag rename error: {error}"));
@@ -456,8 +457,7 @@ impl App {
         };
         match plan.apply() {
             Ok(outcome) => {
-                self.workspace_index
-                    .refresh_paths(&self.storage, outcome.paths.clone());
+                self.workspace.refresh_index_paths(outcome.paths.clone());
                 self.pending_tag_rename = None;
                 self.close_dialog();
                 self.reload_workspace();

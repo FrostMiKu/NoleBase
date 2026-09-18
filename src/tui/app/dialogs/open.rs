@@ -97,7 +97,7 @@ impl App {
                 .map(str::to_owned)
         })?;
         let file_name = format!("{stem}.{extension}");
-        match self.storage.default_export_directory() {
+        match self.storage().default_export_directory() {
             Ok(directory) => Some(
                 Path::new(&directory)
                     .join(&file_name)
@@ -112,7 +112,7 @@ impl App {
     }
 
     pub(in crate::tui::app) fn open_theme_picker(&mut self) {
-        let names = match self.storage.list_theme_names() {
+        let names = match self.storage().list_theme_names() {
             Ok(names) => names,
             Err(error) => {
                 self.set_error(format!("Theme list error: {error}"));
@@ -147,7 +147,7 @@ impl App {
     }
 
     pub(in crate::tui::app) fn open_tag_rename_picker(&mut self) {
-        let Some(tags) = self.workspace_index.with_index(WorkspaceIndex::tags) else {
+        let Some(tags) = self.workspace.tags() else {
             self.set_status("Tag index is still building");
             return;
         };
@@ -189,7 +189,7 @@ impl App {
             .skill_entries
             .get(self.skill_index)
             .map(|skill| skill.path.clone());
-        let catalog = match self.storage.load_skills() {
+        let catalog = match self.storage().load_skills() {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.set_error(format!("Skill list error: {error}"));

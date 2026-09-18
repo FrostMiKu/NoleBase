@@ -8,7 +8,7 @@ fn make_app() -> (App, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
-    (App::new(storage).unwrap(), directory)
+    (App::new_for_tests(storage).unwrap(), directory)
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -16,7 +16,7 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 fn write_skill(app: &App, id: &str, description: &str, body: &str) -> PathBuf {
-    let directory = app.storage.skills_dir.join(id);
+    let directory = app.storage().skills_dir.join(id);
     fs::create_dir_all(&directory).unwrap();
     let path = directory.join(crate::core::skill::SKILL_FILE_NAME);
     fs::write(
@@ -90,7 +90,7 @@ fn skill_document_supports_append_edit_rename_delete_and_returns_to_browser() {
     }
     app.handle_key(key(KeyCode::Enter));
     let renamed = app
-        .storage
+        .storage()
         .skills_dir
         .join("renamed-skill")
         .join(crate::core::skill::SKILL_FILE_NAME);

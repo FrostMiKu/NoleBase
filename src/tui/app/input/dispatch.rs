@@ -274,7 +274,8 @@ impl App {
             return;
         }
         let metadata =
-            match crate::tui::clipboard::import_clipboard_attachments(&self.attachment_store) {
+            match crate::tui::clipboard::import_clipboard_attachments(self.workspace.attachments())
+            {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     self.set_error(format!("Clipboard attachment error: {error:#}"));

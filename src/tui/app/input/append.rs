@@ -37,12 +37,12 @@ impl App {
         body: &str,
         original_input: &str,
     ) -> anyhow::Result<()> {
-        let receipt = self.storage.append_document_tracked(path, body)?;
+        let receipt = self.storage().append_document_tracked(path, body)?;
         self.record_undo(UndoOp::Append {
             receipt,
             input: original_input.to_string(),
         });
-        let source = self.storage.read_document_file(path)?;
+        let source = self.storage().read_document_file(path)?;
         if let Some(document) = self.document.as_mut() {
             document.replace_source(source);
             document.scroll = u16::MAX;
@@ -60,12 +60,12 @@ impl App {
         body: &str,
         original_input: &str,
     ) -> anyhow::Result<()> {
-        let receipt = self.storage.append_document_tracked(path, body)?;
+        let receipt = self.storage().append_document_tracked(path, body)?;
         self.record_undo(UndoOp::Append {
             receipt,
             input: original_input.to_string(),
         });
-        let skill = self.storage.read_skill(path)?;
+        let skill = self.storage().read_skill(path)?;
         if let Some(document) = self.document.as_mut() {
             document.replace_source(skill.body);
             document.scroll = u16::MAX;
@@ -82,7 +82,7 @@ impl App {
         body: &str,
         original_input: &str,
     ) -> anyhow::Result<()> {
-        let (note, receipt) = self.storage.append_daily_tracked(date, body)?;
+        let (note, receipt) = self.storage().append_daily_tracked(date, body)?;
         self.record_undo(UndoOp::Append {
             receipt,
             input: original_input.to_string(),
@@ -104,7 +104,7 @@ impl App {
         body: &str,
         original_input: &str,
     ) -> anyhow::Result<()> {
-        let (_, receipt) = self.storage.append_to_today_tracked(body)?;
+        let (_, receipt) = self.storage().append_to_today_tracked(body)?;
         self.record_undo(UndoOp::Append {
             receipt,
             input: original_input.to_string(),
@@ -145,7 +145,7 @@ impl App {
             return;
         };
 
-        match self.storage.undo_append(&receipt) {
+        match self.storage().undo_append(&receipt) {
             Ok(()) => {
                 self.restore_recalled_input(input);
                 self.reload_workspace();
@@ -181,14 +181,14 @@ impl App {
             return;
         };
         let status = match operation {
-            UndoOp::Append { receipt, input } => match self.storage.undo_append(&receipt) {
+            UndoOp::Append { receipt, input } => match self.storage().undo_append(&receipt) {
                 Ok(()) => {
                     self.restore_recalled_input(input);
                     "Recalled last append".to_string()
                 }
                 Err(error) => format!("Undo error: {error}"),
             },
-            UndoOp::Delete(note) => match self.storage.restore_daily(&note) {
+            UndoOp::Delete(note) => match self.storage().restore_daily(&note) {
                 Ok(()) => "Undid delete".to_string(),
                 Err(error) => format!("Undo error: {error}"),
             },
@@ -196,13 +196,13 @@ impl App {
                 daily_note,
                 target,
                 appended,
-            } => match self.storage.restore_daily(&daily_note) {
+            } => match self.storage().restore_daily(&daily_note) {
                 Ok(()) => {
                     let name = target
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    match self.storage.remove_first_occurrence(&target, &appended) {
+                    match self.storage().remove_first_occurrence(&target, &appended) {
                         Ok(true) => format!("Undid move to {name}"),
                         Ok(false) => format!("Undid move; cleanup skipped for {name}"),
                         Err(error) => {

@@ -81,7 +81,7 @@ impl App {
             AppCommand::NewNote => self.begin_new_note(),
             AppCommand::NewNoteFromTemplate => self.begin_new_note_from_template(),
             AppCommand::EditTemplate => {
-                return Some(Command::Edit(self.storage.template_path.clone()));
+                return Some(Command::Edit(self.storage().template_path.clone()));
             }
             AppCommand::EditCurrentNote => {
                 return self.current_note_path().map(Command::Edit);
@@ -92,16 +92,16 @@ impl App {
             AppCommand::ArchiveCurrentNote => self.manage_current_note(false),
             AppCommand::RestoreCurrentNote => self.manage_current_note(true),
             AppCommand::EditAiConfig => {
-                return Some(Command::Edit(self.storage.ai_config_path.clone()));
+                return Some(Command::Edit(self.storage().ai_config_path.clone()));
             }
             AppCommand::SwitchTheme => self.open_theme_picker(),
             AppCommand::BrowseTags => self.open_tags(),
             AppCommand::RenameTag => self.open_tag_rename_picker(),
             AppCommand::EditAgentInstructions => {
-                return Some(Command::Edit(self.storage.agents_path.clone()));
+                return Some(Command::Edit(self.storage().agents_path.clone()));
             }
             AppCommand::EditAgentMemory => {
-                return Some(Command::Edit(self.storage.memory_path.clone()));
+                return Some(Command::Edit(self.storage().memory_path.clone()));
             }
             AppCommand::BrowseSkills => self.open_skill_browser(),
             AppCommand::BrowseAttachments => self.open_attachments(),

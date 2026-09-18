@@ -42,7 +42,7 @@ impl App {
                     self.set_status("No skills found");
                     return None;
                 };
-                match self.storage.read_skill(&path) {
+                match self.storage().read_skill(&path) {
                     Ok(skill) => {
                         self.close_dialog();
                         self.show_document(

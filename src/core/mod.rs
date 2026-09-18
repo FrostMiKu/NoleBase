@@ -18,4 +18,5 @@ pub mod provider;
 pub mod skill;
 pub mod storage;
 pub mod wiki_link_index;
+pub mod workspace;
 pub mod workspace_index;

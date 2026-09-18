@@ -138,12 +138,12 @@ pub(super) fn draw_document(
         crate::tui::app::DocumentKind::File(path) => path
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| app.storage.root.clone()),
-        crate::tui::app::DocumentKind::Daily(_) => app.storage.daily_dir.clone(),
+            .unwrap_or_else(|| app.storage().root.clone()),
+        crate::tui::app::DocumentKind::Daily(_) => app.storage().daily_dir.clone(),
         crate::tui::app::DocumentKind::Skill(path) => path
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| app.storage.skills_dir.clone()),
+            .unwrap_or_else(|| app.storage().skills_dir.clone()),
     };
     let backlink_lines = backlink_section_lines(app, document_area.width as usize);
     let (

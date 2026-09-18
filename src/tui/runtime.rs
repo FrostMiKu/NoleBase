@@ -26,7 +26,6 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::core::agent;
-use crate::core::document_index::DocumentIndexer;
 use crate::core::storage;
 use crate::tui::app::{self, App, Command};
 use crate::tui::backend::FrameBackend;
@@ -132,7 +131,7 @@ fn handle_command(cmd: Option<Command>, app: &mut App, terminal: &mut Tui) -> Re
         Some(Command::Edit(path)) => {
             // run_editor re-enters the TUI itself; the outer guard in main
             // restores the terminal if anything here panics.
-            match app.storage.editor_command() {
+            match app.storage().editor_command() {
                 Ok(editor) => {
                     if let Err(e) = run_editor(&path, &editor, terminal) {
                         app.set_error(format!("Editor error: {e}"));
@@ -248,8 +247,8 @@ fn process_workspace_events(
     // Agent task runs. It stays outside the watcher, and the check below adds
     // defense in depth. Workspace events leave workspace UI and note/attachment
     // indexes unchanged; session file handling is the workspace policy's job.
-    let workspace_dir = app.storage.workspace_dir.clone();
-    let attachments_dir = app.storage.attachments_dir.clone();
+    let workspace_dir = app.storage().workspace_dir.clone();
+    let attachments_dir = app.storage().attachments_dir.clone();
     let mut changed = false;
     let mut indexed_paths = Vec::new();
     let mut attachment_paths = Vec::new();
@@ -279,8 +278,8 @@ fn process_workspace_events(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) && event.paths.iter().any(|path| {
-                    path == &app.storage.settings_path
-                        || (path.parent() == Some(app.storage.themes_dir.as_path())
+                    path == &app.storage().settings_path
+                        || (path.parent() == Some(app.storage().themes_dir.as_path())
                             && path
                                 .extension()
                                 .and_then(|extension| extension.to_str())
@@ -355,22 +354,15 @@ fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         .map(|_| ())
 }
 
-fn run(
-    terminal: &mut Tui,
-    app: &mut App,
-    workspace_events: &WatchEvents,
-    document_indexer: &DocumentIndexer,
-) -> Result<()> {
+fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Result<()> {
     let animation_epoch = Instant::now();
     let mut focused = true;
     let mut needs_draw = true;
     loop {
         let (indexed_paths, workspace_changed) = process_workspace_events(workspace_events, app);
-        document_indexer.paths_changed(indexed_paths);
-        if let Some(snapshot) = document_indexer.try_latest_update() {
-            app.apply_workspace_index(snapshot.workspace);
-            app.apply_attachment_index(snapshot.revision, snapshot.attachments);
-            app.apply_wiki_link_index(snapshot.wiki_links);
+        app.workspace.refresh_documents(indexed_paths);
+        if app.workspace.poll_index_update() {
+            app.on_index_update();
             needs_draw = true;
         }
         needs_draw |= workspace_changed;
@@ -536,8 +528,9 @@ pub fn run_app() -> Result<()> {
     let storage = resolve_storage()?;
     storage.ensure_files()?;
     let (_watcher, workspace_events) = watch_workspace(&storage)?;
-    let document_indexer = DocumentIndexer::spawn(storage.clone());
-    let mut app = App::new(storage)?;
+    let mut app = App::new(std::sync::Arc::new(
+        crate::core::workspace::Workspace::open(storage)?,
+    ))?;
 
     enter_tui()?;
     let _guard = TerminalGuard;
@@ -546,13 +539,7 @@ pub fn run_app() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    run(
-        &mut terminal,
-        &mut app,
-        &workspace_events,
-        &document_indexer,
-    )
-    .context("event loop failed")?;
+    run(&mut terminal, &mut app, &workspace_events).context("event loop failed")?;
     Ok(())
 }
 
@@ -592,7 +579,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
         assert!(!defer_quit_for_export(&mut app));
         app.export_in_progress = true;
         assert!(defer_quit_for_export(&mut app));
@@ -626,7 +613,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
 
         app.center_view = CenterView::Chat;
         app.focus = app::Focus::Center;
@@ -646,7 +633,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         draw_frame(&mut terminal, &mut app).unwrap();
         assert!(!terminal.backend().cursor_visible());
@@ -692,7 +679,7 @@ mod tests {
         let document_path = storage.data_dir.join("live.mb");
         fs::write(&document_path, "before").unwrap();
 
-        let mut app = App::new(storage).unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
         app.center_view = CenterView::Document;
         app.document = Some(Document {
             kind: DocumentKind::File(document_path.clone()),
@@ -704,8 +691,10 @@ mod tests {
             render_cache: None,
         });
 
-        app.storage.append_to_today("external message").unwrap();
-        app.storage.append_to_today("- [ ] external task").unwrap();
+        app.storage().append_to_today("external message").unwrap();
+        app.storage()
+            .append_to_today("- [ ] external task")
+            .unwrap();
         fs::write(&document_path, "after").unwrap();
 
         let (sender, receiver) = mpsc::channel();
@@ -727,8 +716,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
-        app.storage.append_to_today("not loaded yet").unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
+        app.storage().append_to_today("not loaded yet").unwrap();
 
         let (sender, receiver) = mpsc::channel();
         sender
@@ -745,12 +734,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
-        app.storage.append_to_today("loaded").unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
+        app.storage().append_to_today("loaded").unwrap();
         app.reload();
         assert_eq!(app.daily_notes.len(), 1);
 
-        let workspace_dir = app.storage.workspace_dir.clone();
+        let workspace_dir = app.storage().workspace_dir.clone();
         let session = workspace_dir.join("main").join("session.json");
         fs::create_dir_all(session.parent().unwrap()).unwrap();
         fs::write(&session, "{}").unwrap();
@@ -860,17 +849,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
         let custom = crate::core::storage::DEFAULT_THEME_TOML
             .replace("panel = \"#181825\"", "panel = \"#010203\"");
-        let theme_path = app.storage.themes_dir.join("custom.toml");
+        let theme_path = app.storage().themes_dir.join("custom.toml");
         fs::write(&theme_path, custom).unwrap();
-        app.storage.write_theme_selection("custom").unwrap();
+        app.storage().write_theme_selection("custom").unwrap();
 
         let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
-                .add_path(app.storage.settings_path.clone())))
+                .add_path(app.storage().settings_path.clone())))
             .unwrap();
         process_workspace_events(&receiver, &mut app);
 
@@ -894,7 +883,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let mut app = App::new(storage).unwrap();
+        let mut app = App::new_for_tests(storage).unwrap();
         app.focus = crate::tui::app::Focus::Center;
         app.center_view = CenterView::Document;
         app.layout.center = Some(Rect::new(0, 0, 80, 20));

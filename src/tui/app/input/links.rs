@@ -21,7 +21,7 @@ impl App {
                 // Open the store's real application-managed content file in
                 // place; external saves update the attachment itself. The
                 // workspace and cache remain unchanged.
-                match self.attachment_store.open(uri.id()) {
+                match self.workspace.open_attachment(uri.id()) {
                     Ok(path) => Some(Command::OpenPath(path)),
                     Err(error) => {
                         self.set_error(format!("Attachment error: {error}"));
@@ -29,7 +29,7 @@ impl App {
                     }
                 }
             }
-            LinkTarget::LocalFile(target) => match self.storage.validate_local_file(&target) {
+            LinkTarget::LocalFile(target) => match self.storage().validate_local_file(&target) {
                 Ok(path) => Some(Command::OpenPath(path)),
                 Err(error) => {
                     self.set_error(format!("File error: {error}"));
@@ -39,7 +39,7 @@ impl App {
             LinkTarget::WikiLink(target) => {
                 let requested = target.trim().to_string();
                 let mut candidates = self
-                    .storage
+                    .storage()
                     .list_daily_file_paths()
                     .unwrap_or_default()
                     .into_iter()
@@ -50,7 +50,7 @@ impl App {
                     })
                     .collect::<Vec<_>>();
                 candidates.extend(
-                    self.storage
+                    self.storage()
                         .list_note_files()
                         .unwrap_or_default()
                         .into_iter()
@@ -61,7 +61,7 @@ impl App {
                         }),
                 );
                 candidates.extend(
-                    self.storage
+                    self.storage()
                         .list_archived_note_files()
                         .unwrap_or_default()
                         .into_iter()
@@ -72,7 +72,7 @@ impl App {
                         }),
                 );
                 if candidates.is_empty() {
-                    match self.storage.create_named_file(&requested) {
+                    match self.storage().create_named_file(&requested) {
                         Ok(path) => {
                             self.reload_files();
                             self.open_file_document(&path, DocumentReturn::Daily);
@@ -95,9 +95,9 @@ impl App {
 
     pub(in crate::tui::app) fn open_wiki_candidate(&mut self, candidate: &WikiLinkCandidate) {
         let source = match candidate.location {
-            WikiLinkLocation::Daily => self.storage.read_document_file(&candidate.path),
-            WikiLinkLocation::Notes => self.storage.read_note_file(&candidate.path),
-            WikiLinkLocation::Archives => self.storage.read_archived_note_file(&candidate.path),
+            WikiLinkLocation::Daily => self.storage().read_document_file(&candidate.path),
+            WikiLinkLocation::Notes => self.storage().read_note_file(&candidate.path),
+            WikiLinkLocation::Archives => self.storage().read_archived_note_file(&candidate.path),
         };
         match source {
             Ok(source) => {

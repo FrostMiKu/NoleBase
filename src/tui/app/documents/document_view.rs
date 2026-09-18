@@ -23,7 +23,7 @@ impl App {
         path: &Path,
         return_to: DocumentReturn,
     ) {
-        match self.storage.read_document_file(path) {
+        match self.storage().read_document_file(path) {
             Ok(source) => {
                 self.sync_file_tree_to_note(path);
                 let title = path
@@ -133,7 +133,7 @@ impl App {
     }
 
     pub(in crate::tui::app) fn daily_edit_command(&self, date: NaiveDate) -> Option<Command> {
-        self.storage
+        self.storage()
             .daily_file_path(&date.to_string())
             .ok()
             .filter(|path| path.is_file())

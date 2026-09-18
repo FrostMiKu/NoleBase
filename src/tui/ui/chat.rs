@@ -77,7 +77,7 @@ fn draw_chat_messages(
 
     fill_agent_message_rows(frame, area, &visible);
     frame.render_widget(Paragraph::new(visible), area);
-    let image_base = app.storage.root.clone();
+    let image_base = app.storage().root.clone();
     app.images.render(
         frame,
         &rendered_images,
@@ -403,7 +403,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        (App::new(storage).unwrap(), directory)
+        (App::new_for_tests(storage).unwrap(), directory)
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -1036,7 +1036,7 @@ mod tests {
             .replace("show_full_thinking = false", "show_full_thinking = true");
         std::fs::write(&storage.settings_path, config).unwrap();
 
-        let app = App::new(storage).unwrap();
+        let app = App::new_for_tests(storage).unwrap();
 
         assert!(app.show_full_thinking);
     }

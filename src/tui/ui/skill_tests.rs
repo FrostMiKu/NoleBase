@@ -9,7 +9,7 @@ fn make_app() -> (App, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
-    (App::new(storage).unwrap(), directory)
+    (App::new_for_tests(storage).unwrap(), directory)
 }
 
 fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {

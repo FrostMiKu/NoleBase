@@ -34,7 +34,7 @@ impl App {
             sort_by: AttachmentSortBy::ImportedAt,
             order: AttachmentSortOrder::Desc,
         };
-        let page = match self.attachment_store.list(&query) {
+        let page = match self.workspace.attachments().list(&query) {
             Ok(page) => page,
             Err(error) => {
                 self.attachment_entries.clear();
@@ -43,7 +43,7 @@ impl App {
                 return;
             }
         };
-        let snapshot = self.attachment_usage.snapshot();
+        let snapshot = self.workspace.attachment_usage().snapshot();
         self.attachment_entries = page
             .items
             .into_iter()
@@ -79,7 +79,7 @@ impl App {
             // Watcher events arrive as attachments/<uuid>/... paths. Rendered
             // attachment images are cached by URI alone, so drop the cache
             // entry and let the next frame decode the changed bytes fresh.
-            let Some(relative) = path.strip_prefix(&self.storage.attachments_dir).ok() else {
+            let Some(relative) = path.strip_prefix(&self.storage().attachments_dir).ok() else {
                 continue;
             };
             let Some(component) = relative.components().next() else {
@@ -113,7 +113,7 @@ impl App {
     /// workspace or the cache.
     pub(in crate::tui::app) fn open_attachment_at(&mut self, index: usize) -> Option<Command> {
         let entry = self.attachment_entries.get(index).cloned()?;
-        match self.attachment_store.open(entry.id) {
+        match self.workspace.open_attachment(entry.id) {
             Ok(path) => Some(Command::OpenPath(path)),
             Err(error) => {
                 self.set_error(format!("Attachment open error: {error}"));
@@ -130,7 +130,7 @@ impl App {
             self.set_status("No attachment selected");
             return;
         };
-        let snapshot = self.attachment_usage.snapshot();
+        let snapshot = self.workspace.attachment_usage().snapshot();
         if !snapshot.ready {
             self.set_status("Attachment index is still loading; try again");
             return;
@@ -172,7 +172,7 @@ impl App {
     }
 
     fn relative_note_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.storage.root)
+        path.strip_prefix(&self.storage().root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned()
