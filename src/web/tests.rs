@@ -426,6 +426,39 @@ async fn agent_run_is_accepted_and_reports_conflict_while_active() {
 }
 
 #[test]
+fn error_texts_never_carry_absolute_workspace_paths() {
+    let (state, directory) = test_state();
+    let workspace = &state.workspace;
+    let root = directory.path().to_str().unwrap().to_string();
+
+    let event = WebWorkspaceEvent::from_workspace_event(
+        workspace,
+        &WorkspaceEvent::WatcherFailed(format!("watching {root}/data failed")),
+    );
+    match &event {
+        WebWorkspaceEvent::WatcherFailed { message } => {
+            assert_eq!(message, "watching data failed");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    let event = WebAgentEvent::from_agent_event(
+        workspace,
+        &AgentEvent::Finished(Err(format!(
+            "parsing AI config {root}/config/ai.toml failed"
+        ))),
+    );
+    match &event {
+        WebAgentEvent::Finished {
+            error: Some(error), ..
+        } => {
+            assert_eq!(error, "parsing AI config config/ai.toml failed");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
 fn workspace_events_map_to_structured_dtos_with_relative_paths() {
     let (state, directory) = test_state();
     let workspace = &state.workspace;

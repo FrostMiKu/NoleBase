@@ -174,7 +174,7 @@ impl WebWorkspaceEvent {
                     .collect(),
             },
             WorkspaceEvent::WatcherFailed(message) => Self::WatcherFailed {
-                message: message.clone(),
+                message: scrub_workspace_paths(workspace, message),
             },
         }
     }
@@ -364,7 +364,7 @@ impl WebAgentEvent {
                 message_count: conversation.messages.len(),
             },
             AgentEvent::Notification(message) => Self::Notification {
-                message: message.clone(),
+                message: scrub_workspace_paths(workspace, message),
             },
             AgentEvent::FileMoved { from, to } => Self::FileMoved {
                 from: relative_path(workspace, from),
@@ -403,8 +403,14 @@ impl WebAgentEvent {
             },
             AgentEvent::Finished(result) => Self::Finished {
                 ok: result.is_ok(),
-                text: result.as_ref().ok().cloned(),
-                error: result.as_ref().err().cloned(),
+                text: result
+                    .as_ref()
+                    .ok()
+                    .map(|text| scrub_workspace_paths(workspace, text)),
+                error: result
+                    .as_ref()
+                    .err()
+                    .map(|error| scrub_workspace_paths(workspace, error)),
             },
         }
     }
@@ -418,6 +424,29 @@ pub fn relative_path(workspace: &Workspace, path: &std::path::Path) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     })
+}
+
+/// Strip absolute workspace-root prefixes from a free-text message that
+/// originates inside core (error chains, watcher diagnostics), so the wire
+/// never carries local absolute paths. Both the lexical and the canonical
+/// root spelling are replaced. Streamed model deltas are not scrubbed — a
+/// path split across chunk boundaries would defeat it — but tool and
+/// approval messages are root-relative by core design.
+pub fn scrub_workspace_paths(workspace: &Workspace, text: &str) -> String {
+    let root = workspace.storage().root.clone();
+    let canonical = std::fs::canonicalize(&root).ok();
+    let mut scrubbed = text.to_string();
+    for spelling in std::iter::once(root).chain(canonical) {
+        let spelling = spelling.to_string_lossy().into_owned();
+        if spelling.is_empty() {
+            continue;
+        }
+        scrubbed = scrubbed
+            .replace(format!("{spelling}/").as_str(), "")
+            .replace(format!("{spelling}\\").as_str(), "")
+            .replace(&spelling, ".");
+    }
+    scrubbed
 }
 
 /// RFC 3339 timestamp for a file mtime. SystemTime values from filesystem
