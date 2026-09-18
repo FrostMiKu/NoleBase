@@ -1,9 +1,7 @@
 //! Terminal lifecycle, event loop, and external-editor integration.
 
-use std::fs;
 use std::io::{self, Stdout, Write};
 use std::process::Command as ProcCommand;
-use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -20,20 +18,19 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::core::agent;
 use crate::core::storage;
+use crate::core::workspace_watcher::{WorkspaceEvent, WorkspaceWatcher};
 use crate::tui::app::{self, App, Command};
 use crate::tui::backend::FrameBackend;
 use crate::tui::clipboard;
 use crate::tui::ui;
 
 type Tui = Terminal<FrameBackend<Stdout>>;
-type WatchEvents = Receiver<notify::Result<notify::Event>>;
 
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const EVENT_BATCH_LIMIT: usize = 16_384;
@@ -192,145 +189,31 @@ fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
     }
 }
 
-/// Register the file watcher for application-managed content only.
-///
-/// The watcher covers only locations whose changes require application
-/// refresh. The agent workspace (`workspace/`) churns constantly while a task
-/// runs, so its events stay outside the notify queue. Registered locations are:
-///
-/// - `daily/`, `data/`, `archives/` — managed notes (workspace reload and
-///   the note/attachment reference indexes);
-/// - `themes/` — theme TOMLs (theme reload);
-/// - `config/` — the specific config files that refresh reactively
-///   (settings.toml for the theme selection, and AGENTS.md for agent read
-///   caches). The directory is registered rather than the settings file
-///   alone so atomic-rename saves by external editors are still observed;
-/// - `attachments/` — per-attachment directories (`<uuid>/content.<ext>` and
-///   `<uuid>/metadata.json`); events refresh mutable externally edited
-///   attachment metadata in the browser.
-///
-/// Optional directories contribute watches when present; an absent directory
-/// contributes no watch, matching the previous root-recursive behavior for
-/// directories that had not appeared yet.
-fn watch_workspace(storage: &storage::Storage) -> Result<(RecommendedWatcher, WatchEvents)> {
-    let (sender, receiver) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = sender.send(event);
-    })
-    .context("creating Nole directory watcher")?;
-    for directory in [
-        &storage.daily_dir,
-        &storage.data_dir,
-        &storage.archives_dir,
-        &storage.themes_dir,
-        &storage.attachments_dir,
-    ] {
-        if fs::metadata(directory).is_ok_and(|metadata| metadata.is_dir()) {
-            watcher
-                .watch(directory, RecursiveMode::Recursive)
-                .with_context(|| format!("watching {}", directory.display()))?;
-        }
-    }
-    if fs::metadata(&storage.config_dir).is_ok_and(|metadata| metadata.is_dir()) {
-        watcher
-            .watch(&storage.config_dir, RecursiveMode::NonRecursive)
-            .with_context(|| format!("watching {}", storage.config_dir.display()))?;
-    }
-    Ok((watcher, receiver))
-}
-
-fn process_workspace_events(
-    events: &WatchEvents,
-    app: &mut App,
-) -> (Vec<std::path::PathBuf>, bool) {
-    // The agent workspace sandbox (workspace/) churns constantly while an
-    // Agent task runs. It stays outside the watcher, and the check below adds
-    // defense in depth. Workspace events leave workspace UI and note/attachment
-    // indexes unchanged; session file handling is the workspace policy's job.
-    let workspace_dir = app.storage().workspace_dir.clone();
-    let attachments_dir = app.storage().attachments_dir.clone();
-    let mut changed = false;
-    let mut indexed_paths = Vec::new();
-    let mut attachment_paths = Vec::new();
-    let mut watcher_error = None;
-    for event in events.try_iter() {
-        if let Ok(event) = &event {
-            if !event.paths.is_empty()
-                && event
-                    .paths
-                    .iter()
-                    .all(|path| path.starts_with(&workspace_dir))
-            {
-                continue;
-            }
-            app.mark_agent_reads_dirty(&event.paths);
-            if event
-                .paths
-                .iter()
-                .any(|path| path.starts_with(&attachments_dir))
-            {
-                attachment_paths.extend(event.paths.iter().cloned());
-            }
-        }
-        match event {
-            Ok(event)
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| {
-                    path == &app.storage().settings_path
-                        || (path.parent() == Some(app.storage().themes_dir.as_path())
-                            && path
-                                .extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| extension.eq_ignore_ascii_case("toml")))
-                        || path
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            .is_some_and(|extension| {
-                                extension.eq_ignore_ascii_case("md")
-                                    || extension.eq_ignore_ascii_case("mb")
-                            })
-                }) =>
-            {
-                indexed_paths.extend(
-                    event
-                        .paths
-                        .iter()
-                        .filter(|path| {
-                            path.extension()
-                                .and_then(|extension| extension.to_str())
-                                .is_some_and(|extension| {
-                                    extension.eq_ignore_ascii_case("md")
-                                        || extension.eq_ignore_ascii_case("mb")
-                                })
-                        })
-                        .cloned(),
-                );
-                changed = true;
-            }
-            Ok(_) => {}
-            Err(error) => watcher_error = Some(error),
-        }
-    }
+/// Apply domain workspace events to the app. Returns whether anything the
+/// UI shows changed. Attachment events refresh the browser: mutable metadata
+/// (e.g. display_name) can be edited externally. They leave the workspace
+/// UI and note/attachment reference indexes unchanged; those indexes track
+/// managed Markdown files only.
+fn apply_workspace_events(app: &mut App, events: Vec<WorkspaceEvent>) -> bool {
     let mut ui_changed = false;
-    if !attachment_paths.is_empty() {
-        // Attachment events refresh the browser: mutable metadata (e.g.
-        // display_name) can be edited externally. They leave the workspace UI
-        // and note/attachment reference indexes unchanged; those indexes track
-        // managed Markdown files only.
-        app.attachment_paths_changed(&attachment_paths);
-        ui_changed = true;
+    for event in events {
+        match event {
+            WorkspaceEvent::ContentChanged { .. } => {
+                app.reload_workspace();
+                ui_changed = true;
+            }
+            WorkspaceEvent::AttachmentsChanged { paths } => {
+                app.attachment_paths_changed(&paths);
+                ui_changed = true;
+            }
+            WorkspaceEvent::AgentReadsDirty { paths } => app.mark_agent_reads_dirty(&paths),
+            WorkspaceEvent::WatcherFailed(error) => {
+                app.set_error(format!("File watcher error: {error}"));
+                ui_changed = true;
+            }
+        }
     }
-    if changed {
-        app.reload_workspace();
-        ui_changed = true;
-    }
-    if let Some(error) = watcher_error {
-        app.set_error(format!("File watcher error: {error}"));
-        ui_changed = true;
-    }
-    (indexed_paths, ui_changed)
+    ui_changed
 }
 
 fn event_wait_duration(app: &App, focused: bool) -> Duration {
@@ -354,18 +237,16 @@ fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         .map(|_| ())
 }
 
-fn run(terminal: &mut Tui, app: &mut App, workspace_events: &WatchEvents) -> Result<()> {
+fn run(terminal: &mut Tui, app: &mut App, watcher: &mut WorkspaceWatcher) -> Result<()> {
     let animation_epoch = Instant::now();
     let mut focused = true;
     let mut needs_draw = true;
     loop {
-        let (indexed_paths, workspace_changed) = process_workspace_events(workspace_events, app);
-        app.workspace.refresh_documents(indexed_paths);
+        needs_draw |= apply_workspace_events(app, watcher.poll(&app.workspace));
         if app.workspace.poll_index_update() {
             app.on_index_update();
             needs_draw = true;
         }
-        needs_draw |= workspace_changed;
 
         let was_ai_running = app.ai_running;
         let was_overlay = app.overlay;
@@ -527,7 +408,7 @@ pub fn run_app() -> Result<()> {
     }
     let storage = resolve_storage()?;
     storage.ensure_files()?;
-    let (_watcher, workspace_events) = watch_workspace(&storage)?;
+    let mut watcher = WorkspaceWatcher::new(&storage)?;
     let workspace = std::sync::Arc::new(crate::core::workspace::Workspace::open(storage)?);
     let agent = std::sync::Arc::new(crate::core::agent_service::AgentService::new(&workspace));
     let mut app = App::new(workspace, agent)?;
@@ -539,16 +420,35 @@ pub fn run_app() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    run(&mut terminal, &mut app, &workspace_events).context("event loop failed")?;
+    run(&mut terminal, &mut app, &mut watcher).context("event loop failed")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::mpsc;
     use std::sync::Arc;
 
     use super::*;
+
+    fn inject_watcher(
+        storage: &storage::Storage,
+    ) -> (
+        WorkspaceWatcher,
+        mpsc::Sender<notify::Result<notify::Event>>,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let watcher = WorkspaceWatcher::from_parts(
+            crate::core::workspace_watcher::WatchContext::from_storage(storage),
+            receiver,
+        );
+        (watcher, sender)
+    }
+
+    fn pump_watcher(watcher: &mut WorkspaceWatcher, app: &mut App) -> bool {
+        apply_workspace_events(app, watcher.poll(&app.workspace))
+    }
 
     #[test]
     fn embedded_nole_terminal_skips_image_capability_queries() {
@@ -557,7 +457,7 @@ mod tests {
         assert!(should_query_image_capabilities(None));
     }
     use crate::tui::app::{CenterView, Document, DocumentKind, DocumentReturn};
-    use notify::event::ModifyKind;
+    use notify::event::{EventKind, ModifyKind};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -679,6 +579,7 @@ mod tests {
         let document_path = storage.data_dir.join("live.mb");
         fs::write(&document_path, "before").unwrap();
 
+        let (mut watcher, sender) = inject_watcher(&storage);
         let mut app = App::new_for_tests(storage).unwrap();
         app.center_view = CenterView::Document;
         app.document = Some(Document {
@@ -697,13 +598,12 @@ mod tests {
             .unwrap();
         fs::write(&document_path, "after").unwrap();
 
-        let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(
                 notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(document_path)
             ))
             .unwrap();
-        process_workspace_events(&receiver, &mut app);
+        pump_watcher(&mut watcher, &mut app);
 
         assert_eq!(app.daily_notes.len(), 1);
         assert_eq!(app.todo_items.len(), 1);
@@ -716,15 +616,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
+        let (mut watcher, sender) = inject_watcher(&storage);
         let mut app = App::new_for_tests(storage).unwrap();
         app.storage().append_to_today("not loaded yet").unwrap();
 
-        let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(directory.path().join("editor.tmp"))))
             .unwrap();
-        process_workspace_events(&receiver, &mut app);
+        pump_watcher(&mut watcher, &mut app);
 
         assert!(app.daily_notes.is_empty());
     }
@@ -734,6 +634,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
+        let (mut watcher, sender) = inject_watcher(&storage);
         let mut app = App::new_for_tests(storage).unwrap();
         app.storage().append_to_today("loaded").unwrap();
         app.reload();
@@ -746,7 +647,6 @@ mod tests {
         let session_note = workspace_dir.join("main").join("scratch.md");
         fs::write(&session_note, "# scratch").unwrap();
 
-        let (sender, receiver) = mpsc::channel();
         for path in [session, session_note] {
             sender
                 .send(Ok(
@@ -754,9 +654,9 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let (indexed, _) = process_workspace_events(&receiver, &mut app);
+        let events = watcher.poll(&app.workspace);
         assert!(
-            indexed.is_empty(),
+            events.is_empty(),
             "workspace events must not reach the note/attachment indexes"
         );
         assert_eq!(
@@ -767,88 +667,11 @@ mod tests {
     }
 
     #[test]
-    fn watch_workspace_registers_managed_content_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = storage::Storage::new(fs::canonicalize(directory.path()).unwrap()).unwrap();
-        storage.ensure_files().unwrap();
-
-        // One stored attachment in the per-attachment directory layout.
-        let attachment_dir = storage
-            .attachments_dir
-            .join("00000000-0000-4000-8000-000000000001");
-        fs::create_dir_all(&attachment_dir).unwrap();
-        let metadata_path = attachment_dir.join("metadata.json");
-        fs::write(&metadata_path, "{}").unwrap();
-
-        let (_watcher, events) = watch_workspace(&storage).unwrap();
-
-        // Agent workspace churn stays outside the notify queue because the
-        // workspace is unregistered; a settle window therefore remains empty.
-        let workspace = storage.workspace_dir.clone();
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(workspace.join("session.json"), "{}").unwrap();
-        fs::write(workspace.join("scratch.md"), "# scratch").unwrap();
-        let deadline = Instant::now() + Duration::from_millis(400);
-        let mut workspace_events = Vec::new();
-        while Instant::now() < deadline {
-            for event in events.try_iter().flatten() {
-                workspace_events.extend(
-                    event
-                        .paths
-                        .into_iter()
-                        .filter(|path| path.starts_with(&workspace)),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            workspace_events.is_empty(),
-            "workspace activity must not enter notify queues: {workspace_events:?}"
-        );
-
-        // Application-managed content that requires refresh is still watched:
-        // a managed note, a theme file, the settings config file, and mutable
-        // attachment metadata.
-        let daily = storage.daily_dir.join("2026-08-03.md");
-        fs::write(&daily, "note").unwrap();
-        let theme = storage.themes_dir.join("custom.toml");
-        fs::write(&theme, "panel = \"#010203\"\n").unwrap();
-        fs::write(&storage.settings_path, "theme = \"custom\"\n").unwrap();
-        fs::write(&metadata_path, "{\"display_name\":\"renamed\"}").unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut seen = Vec::new();
-        while Instant::now() < deadline {
-            for event in events.try_iter().flatten() {
-                seen.extend(event.paths.iter().cloned());
-            }
-            let observed = [&daily, &theme, &storage.settings_path, &metadata_path]
-                .iter()
-                .all(|path| seen.iter().any(|seen| seen == *path));
-            if observed {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        for expected in [&daily, &theme, &storage.settings_path, &metadata_path] {
-            assert!(
-                seen.iter().any(|seen| seen == expected),
-                "managed content must be observed by the watcher: {} (seen: {seen:?})",
-                expected.display()
-            );
-        }
-        assert!(
-            seen.iter()
-                .all(|path| !path.starts_with(&storage.workspace_dir)),
-            "no watcher event may come from the agent workspace: {seen:?}"
-        );
-    }
-
-    #[test]
     fn settings_and_theme_file_events_reload_the_theme() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
+        let (mut watcher, sender) = inject_watcher(&storage);
         let mut app = App::new_for_tests(storage).unwrap();
         let custom = crate::core::storage::DEFAULT_THEME_TOML
             .replace("panel = \"#181825\"", "panel = \"#010203\"");
@@ -856,12 +679,11 @@ mod tests {
         fs::write(&theme_path, custom).unwrap();
         app.storage().write_theme_selection("custom").unwrap();
 
-        let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(app.storage().settings_path.clone())))
             .unwrap();
-        process_workspace_events(&receiver, &mut app);
+        pump_watcher(&mut watcher, &mut app);
 
         assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
 
@@ -873,7 +695,7 @@ mod tests {
                 notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(theme_path)
             ))
             .unwrap();
-        process_workspace_events(&receiver, &mut app);
+        pump_watcher(&mut watcher, &mut app);
 
         assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(4, 5, 6));
     }
