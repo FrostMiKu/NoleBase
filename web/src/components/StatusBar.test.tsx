@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { StatusBar } from './StatusBar'
 import { editorStore } from '@/editor/editor-state'
-import { useAgentStore } from '@/stores/agent-store'
 import { useUiStore } from '@/stores/ui-store'
 
 function resetStores() {
@@ -13,7 +12,6 @@ function resetStores() {
     workspaceResyncing: false,
     watcherError: null,
   })
-  useAgentStore.setState({ connection: 'connected', running: false })
 }
 
 beforeEach(resetStores)
@@ -21,11 +19,11 @@ beforeEach(resetStores)
 afterEach(cleanup)
 
 describe('StatusBar', () => {
-  it('shows both connection states and no document', () => {
+  it('shows the workspace dot only, without agent status', () => {
     render(<StatusBar />)
-    expect(screen.getByTestId('status-bar').textContent).toContain('Agent: idle')
-    const dots = screen.getAllByTitle('WS: connected')
-    expect(dots.length).toBeGreaterThanOrEqual(1)
+    expect(screen.getAllByTitle('WS: connected')).toHaveLength(1)
+    expect(screen.queryByTitle('WS: disconnected')).toBeNull()
+    expect(screen.getByTestId('status-bar').textContent).not.toContain('Agent')
   })
 
   it('marks a dirty document as modified without showing its path', () => {
@@ -40,12 +38,6 @@ describe('StatusBar', () => {
     useUiStore.setState({ watcherError: 'watcher died' })
     render(<StatusBar />)
     expect(screen.getByTestId('status-bar').textContent).toContain('Workspace watcher error')
-  })
-
-  it('shows the running agent', () => {
-    useAgentStore.setState({ running: true })
-    render(<StatusBar />)
-    expect(screen.getByTestId('status-bar').textContent).toContain('Agent: running')
   })
 
   it('shows a disconnected workspace socket', () => {

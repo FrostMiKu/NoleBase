@@ -1,5 +1,4 @@
 import { useEditorState } from '@/editor/editor-state'
-import { useAgentStore } from '@/stores/agent-store'
 import { useUiStore } from '@/stores/ui-store'
 
 function ConnectionDot({ state, label }: { state: 'connecting' | 'connected' | 'disconnected'; label: string }) {
@@ -22,8 +21,6 @@ export function StatusBar() {
   const workspaceConnection = useUiStore((state) => state.workspaceConnection)
   const watcherError = useUiStore((state) => state.watcherError)
   const workspaceResyncing = useUiStore((state) => state.workspaceResyncing)
-  const agentConnection = useAgentStore((state) => state.connection)
-  const agentRunning = useAgentStore((state) => state.running)
   const { dirty, saving } = useEditorState()
 
   return (
@@ -32,15 +29,12 @@ export function StatusBar() {
       data-testid="status-bar"
     >
       <ConnectionDot state={workspaceConnection} label="WS" />
-      <ConnectionDot state={agentConnection} label="Agent" />
       {workspaceResyncing && <span className="text-warn">Resyncing…</span>}
       {watcherError !== null && (
         <span className="text-danger" title={watcherError}>
           Workspace watcher error
         </span>
       )}
-      <span className="text-faint">|</span>
-      <span>{agentRunning ? 'Agent: running' : 'Agent: idle'}</span>
       <span className="ml-auto inline-flex items-center gap-2">
         {dirty && (
           <span className="flex items-center gap-1 text-warn">
