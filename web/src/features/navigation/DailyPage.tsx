@@ -1,8 +1,13 @@
 import { useNavigate } from '@tanstack/react-router'
+import { CalendarDays, Pencil } from 'lucide-react'
 
 import { useDailyNotes } from '@/queries/workspace'
+import { Markdown } from '@/features/agent/Markdown'
 
-/** The /daily route: every daily note, newest first. */
+/**
+ * The /daily route: a river of markdown-rendered daily note cards,
+ * newest first. The card header opens the note for editing.
+ */
 export function DailyPage() {
   const dailyQuery = useDailyNotes()
   const navigate = useNavigate()
@@ -18,20 +23,36 @@ export function DailyPage() {
           {dailyQuery.error instanceof Error ? dailyQuery.error.message : 'unknown error'}
         </p>
       )}
-      <ul className="space-y-0.5">
+      {daily.length === 0 && !dailyQuery.isLoading && !dailyQuery.isError && (
+        <p className="text-xs text-faint">No daily notes yet.</p>
+      )}
+
+      <div className="flex flex-col gap-2" data-testid="daily-river">
         {daily.map((note) => (
-          <li key={note.path}>
+          <article
+            key={note.path}
+            className="rounded-md border border-border bg-panel"
+            data-testid="daily-card"
+          >
             <button
               type="button"
-              className="w-full rounded-sm px-2 py-1 text-left transition-colors hover:bg-raised"
               onClick={() => void navigate({ to: '/document', search: { path: note.path } })}
+              className="flex w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left transition-colors hover:bg-raised"
+              title={`Open ${note.path}`}
             >
-              <span className="font-mono text-[12px] text-accent">{note.date}</span>
-              <span className="ml-3 truncate text-[11px] text-faint">{note.path}</span>
+              <CalendarDays size={12} className="shrink-0 text-accent" />
+              <span className="font-mono text-[12px] text-accent-strong">{note.date}</span>
+              <span className="ml-auto inline-flex items-center gap-1 font-mono text-[10px] text-faint">
+                <Pencil size={10} />
+                edit
+              </span>
             </button>
-          </li>
+            <div className="px-3 py-2">
+              <Markdown text={note.body} />
+            </div>
+          </article>
         ))}
-      </ul>
+      </div>
     </div>
   )
 }

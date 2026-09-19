@@ -26,7 +26,7 @@ export function TagsPage() {
         </p>
       )}
 
-      <div className="max-w-2xl">
+      <div>
         {tags.map((tag) => (
           <TagGroup key={tag.name} name={tag.name} documents={tag.documents} mentions={tag.mentions} />
         ))}

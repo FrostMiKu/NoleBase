@@ -46,7 +46,7 @@ export function SearchPage({ q }: SearchPageProps) {
   return (
     <div className="flex h-full flex-col overflow-y-auto p-4">
       <h1 className="mb-3 text-[15px] font-semibold text-fg">Search</h1>
-      <div className="mb-4 flex max-w-xl items-center gap-2 rounded-sm border border-border-strong bg-panel px-2.5 py-1.5 focus-within:border-accent">
+      <div className="mb-4 flex items-center gap-2 rounded-sm border border-border-strong bg-panel px-2.5 py-1.5 focus-within:border-accent">
         <SearchIcon size={13} className="text-faint" />
         <input
           autoFocus
@@ -83,7 +83,7 @@ function HitList({ hits }: { hits: SearchHit[] }) {
   const navigate = useNavigate()
   if (hits.length === 0) return null
   return (
-    <ul className="max-w-3xl space-y-1">
+    <ul className="space-y-1">
       {hits.map((hit, index) => (
         <li key={`${hit.path ?? 'doc'}:${hit.line_no}:${index}`}>
           <button
