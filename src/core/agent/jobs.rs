@@ -538,6 +538,24 @@ impl AgentJobsHandle {
         }
     }
 
+    /// Queue a settled-job delivery directly; test-only hook for the
+    /// session's idle-delivery tests.
+    #[cfg(test)]
+    pub(crate) fn enqueue_delivery_for_test(&self, label: &str, failed: bool) {
+        self.enqueue(JobDelivery {
+            id: "test-job".to_string(),
+            kind: JobKind::Tool,
+            label: label.to_string(),
+            status: if failed {
+                JobStatus::Failed
+            } else {
+                JobStatus::Done
+            },
+            duration: Duration::from_millis(10),
+            output: ToolOutput::text("done"),
+        });
+    }
+
     fn enqueue(&self, delivery: JobDelivery) {
         let id = delivery.id.clone();
         let failed = delivery.status == JobStatus::Failed;

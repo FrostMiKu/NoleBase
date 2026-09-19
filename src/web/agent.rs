@@ -1,106 +1,24 @@
-//! Agent HTTP command handlers and the web-local agent session.
+//! Agent HTTP command handlers over the shared core [`AgentSession`].
 //!
 //! HTTP carries commands; events flow only through the WebSocket stream.
-//! The session holds the caller-owned [`AgentConversation`] that
-//! [`AgentService::run`] requires — the same role the TUI app plays on its
-//! side. Web and TUI sessions are separate processes and stay fully
-//! independent; there is no web-side persistence.
-
-use std::sync::{Arc, Mutex};
+//! Session semantics — conversation ownership, run lifecycle, and idle
+//! background-job delivery — are a core runtime capability shared with the
+//! TUI; this layer only forwards commands. Web and TUI sessions are
+//! separate processes and stay fully independent; there is no web-side
+//! persistence.
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
-use tokio_util::sync::CancellationToken;
 
 use crate::core::agent::{
     ApprovalDecision, AskUserResponse, PermissionMode, PrivateTerminalInputDecision,
 };
-use crate::core::agent_service::AgentService;
-use crate::core::agent_session::AgentConversation;
+use crate::core::agent_session::AgentSessionStart;
 use crate::web::error::{ApiError, ApiResult};
 use crate::web::state::WebState;
-
-/// The outcome of a run request: a run started, or one was already active.
-pub enum RunOutcome {
-    Started,
-    AlreadyRunning,
-}
-
-/// Web-local agent session state: the conversation handle for continuation,
-/// plus the active run's cancellation token. Cloned handlers share one
-/// session.
-#[derive(Clone, Default)]
-pub struct WebAgentSession {
-    inner: Arc<SessionInner>,
-}
-
-#[derive(Default)]
-struct SessionInner {
-    conversation: Mutex<AgentConversation>,
-    run: Mutex<Option<CancellationToken>>,
-}
-
-impl WebAgentSession {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.inner.run.lock().is_ok_and(|run| run.is_some())
-    }
-
-    /// Accept a run on the shared agent service, remembering the active
-    /// run's cancellation token. A detached task drives the run's output
-    /// future so completion updates the session even with no WebSocket
-    /// attached.
-    pub fn start(&self, agent: &AgentService, prompt: String) -> anyhow::Result<RunOutcome> {
-        let mut run = self
-            .inner
-            .run
-            .lock()
-            .map_err(|_| anyhow::anyhow!("agent session lock poisoned"))?;
-        if run.is_some() {
-            return Ok(RunOutcome::AlreadyRunning);
-        }
-        let conversation = self
-            .inner
-            .conversation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("agent session lock poisoned"))?
-            .clone();
-        let observable = agent.run(prompt, conversation)?;
-        *run = Some(observable.cancel.clone());
-        drop(run);
-
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let output = observable.output.await;
-            if let Ok(output) = output {
-                if let Ok(mut conversation) = inner.conversation.lock() {
-                    *conversation = output.conversation;
-                }
-            }
-            if let Ok(mut run) = inner.run.lock() {
-                *run = None;
-            }
-        });
-        Ok(RunOutcome::Started)
-    }
-
-    /// Cancel the active run, mirroring the TUI: signal the service-level
-    /// flag and the run's own token. Idempotent.
-    pub fn cancel(&self, agent: &AgentService) {
-        agent.cancel();
-        if let Ok(run) = self.inner.run.lock() {
-            if let Some(cancel) = run.as_ref() {
-                cancel.cancel();
-            }
-        }
-    }
-}
 
 /// `GET /api/agent` — session bootstrap state.
 pub async fn status(State(state): State<WebState>) -> Json<serde_json::Value> {
@@ -128,13 +46,9 @@ pub async fn run(
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| ApiError::BadRequest("prompt must not be empty".to_string()))?
         .to_string();
-    match state
-        .session
-        .start(&state.agent, prompt)
-        .map_err(ApiError::Internal)?
-    {
-        RunOutcome::Started => Ok(StatusCode::ACCEPTED),
-        RunOutcome::AlreadyRunning => Err(ApiError::Conflict(
+    match state.session.start(prompt).map_err(ApiError::Internal)? {
+        AgentSessionStart::Started(_) => Ok(StatusCode::ACCEPTED),
+        AgentSessionStart::AlreadyRunning => Err(ApiError::Conflict(
             "an agent run is already active".to_string(),
         )),
     }
@@ -142,7 +56,7 @@ pub async fn run(
 
 /// `POST /api/agent/cancel` — idempotent.
 pub async fn cancel(State(state): State<WebState>) -> StatusCode {
-    state.session.cancel(&state.agent);
+    state.session.cancel();
     StatusCode::NO_CONTENT
 }
 

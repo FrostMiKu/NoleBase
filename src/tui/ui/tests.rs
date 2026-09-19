@@ -3645,20 +3645,24 @@ fn agent_sidebar_renders_the_todo_plan_above_jobs() {
 
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Chat;
-    app.agent_conversation.todos = vec![
-        TodoItem {
-            content: "Draft the compaction summary".to_string(),
-            status: TodoStatus::InProgress,
-        },
-        TodoItem {
-            content: "Cover the sidebar with renderer tests".to_string(),
-            status: TodoStatus::Pending,
-        },
-        TodoItem {
-            content: "Design the todo contract".to_string(),
-            status: TodoStatus::Completed,
-        },
-    ];
+    app.agent_session
+        .replace_conversation(crate::core::agent_session::AgentConversation {
+            todos: vec![
+                TodoItem {
+                    content: "Draft the compaction summary".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    content: "Cover the sidebar with renderer tests".to_string(),
+                    status: TodoStatus::Pending,
+                },
+                TodoItem {
+                    content: "Design the todo contract".to_string(),
+                    status: TodoStatus::Completed,
+                },
+            ],
+            ..crate::core::agent_session::AgentConversation::default()
+        });
     app.agent
         .jobs()
         .start_background(crate::core::agent::JobKind::Shell, "cargo build --release")
@@ -3676,7 +3680,8 @@ fn agent_sidebar_renders_the_todo_plan_above_jobs() {
     assert!(screen.contains("Design the todo contract"));
 
     // An empty plan renders no section at all.
-    app.agent_conversation.todos.clear();
+    app.agent_session
+        .replace_conversation(crate::core::agent_session::AgentConversation::default());
     let terminal = render(&mut app, 220, 60);
     assert!(!buffer_string(&terminal).contains("Todos"));
 }
@@ -3687,12 +3692,16 @@ fn agent_sidebar_does_not_cap_long_todo_plans() {
 
     let (mut app, _directory) = make_app();
     app.center_view = CenterView::Chat;
-    app.agent_conversation.todos = (0..24)
-        .map(|index| TodoItem {
-            content: format!("Follow-up step {index}"),
-            status: TodoStatus::Pending,
-        })
-        .collect();
+    app.agent_session
+        .replace_conversation(crate::core::agent_session::AgentConversation {
+            todos: (0..24)
+                .map(|index| TodoItem {
+                    content: format!("Follow-up step {index}"),
+                    status: TodoStatus::Pending,
+                })
+                .collect(),
+            ..crate::core::agent_session::AgentConversation::default()
+        });
 
     // Every item renders — there is no "+N more" truncation — and the
     // section itself scrolls once it outgrows the viewport.

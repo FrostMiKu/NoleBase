@@ -15,7 +15,7 @@ use chrono::{Local, NaiveDate};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::core::agent_session::AgentSession;
+use crate::core::agent_session::AgentSessionScope;
 use crate::core::export::{ExportDiagnostic, ExportFormat};
 use crate::core::model::{DailyNote, NoteFile, TodoItem};
 
@@ -703,7 +703,7 @@ impl Storage {
         toml::from_str(source).with_context(|| format!("parsing {}", self.settings_path.display()))
     }
 
-    pub fn load_agent_session(&self) -> Result<Option<AgentSession>> {
+    pub fn load_agent_session(&self) -> Result<Option<AgentSessionScope>> {
         let file = match fs::File::open(&self.agent_session_path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -717,7 +717,7 @@ impl Storage {
             .map(Some)
     }
 
-    pub fn write_agent_session(&self, session: &AgentSession) -> Result<()> {
+    pub fn write_agent_session(&self, session: &AgentSessionScope) -> Result<()> {
         if session.is_empty() {
             self.clear_agent_session()?;
             return Ok(());
@@ -2375,7 +2375,7 @@ mod tests {
         use crate::core::agent_session::{AgentConversation, AgentPanelEntry};
 
         let (_directory, storage) = fresh();
-        let first = AgentSession::from_parts(
+        let first = AgentSessionScope::from_parts(
             &AgentConversation {
                 messages: vec![crate::core::provider::Message::user("first")],
                 last_request_input_tokens: 0,
@@ -2395,7 +2395,7 @@ mod tests {
         storage.write_agent_session(&first).unwrap();
         assert_eq!(storage.load_agent_session().unwrap(), Some(first));
 
-        let second = AgentSession::from_parts(
+        let second = AgentSessionScope::from_parts(
             &AgentConversation {
                 messages: vec![crate::core::provider::Message::user("second")],
                 last_request_input_tokens: 0,
@@ -2458,7 +2458,7 @@ mod tests {
         storage.append_daily("2026-07-27", "note").unwrap();
         assert!(workspace.is_dir());
 
-        let session = AgentSession::from_parts(
+        let session = AgentSessionScope::from_parts(
             &AgentConversation::seeded_for_test(),
             &[AgentPanelEntry::Prompt {
                 text: "work".to_string(),
@@ -2501,7 +2501,7 @@ mod tests {
 
         let (_directory, storage) = fresh();
         storage
-            .write_agent_session(&AgentSession::from_parts(
+            .write_agent_session(&AgentSessionScope::from_parts(
                 &crate::core::agent_session::AgentConversation::seeded_for_test(),
                 &[],
                 crate::core::agent_session::TokenUsage::default(),

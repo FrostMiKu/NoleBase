@@ -1,6 +1,7 @@
 use std::sync::{mpsc, Arc};
 
 use crate::core::agent::{CommandApproval, AGENT_STREAM_BUFFER};
+use crate::core::agent_session::AgentConversation;
 use crate::core::attachment::AttachmentStore;
 use crate::core::workspace_index::WorkspaceIndex;
 
@@ -17,11 +18,7 @@ use std::fs;
 
 fn install_agent_observable(app: &mut App) -> tokio::sync::broadcast::Sender<AgentEvent> {
     let (sender, events) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
-    app.active_agent = Some(Observable {
-        output: Box::pin(std::future::pending()),
-        events,
-        cancel: tokio_util::sync::CancellationToken::new(),
-    });
+    app.active_agent_events = Some(events);
     sender
 }
 
@@ -194,7 +191,8 @@ fn command_palette_names_mouse_support_action_for_the_next_state() {
 #[test]
 fn command_palette_filters_and_clears_the_agent_session() {
     let (mut app, _directory) = make_app();
-    app.agent_conversation = AgentConversation::seeded_for_test();
+    app.agent_session
+        .replace_conversation(AgentConversation::seeded_for_test());
     app.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
         text: "Previous prompt".to_string(),
         muted: false,
@@ -231,7 +229,7 @@ fn command_palette_filters_and_clears_the_agent_session() {
     app.handle_key(key(KeyCode::Enter));
 
     assert_eq!(app.overlay, None);
-    assert!(!app.agent_conversation.clear());
+    assert!(!app.agent_session.clear_conversation());
     assert!(app.agent_panel.is_empty());
     assert!(!app.storage().agent_session_path.exists());
     assert_eq!(app.status, "Agent session cleared");
@@ -299,7 +297,7 @@ fn app_restores_the_single_agent_session() {
         final_output: true,
     })];
     storage
-        .write_agent_session(&AgentSession::from_parts(
+        .write_agent_session(&AgentSessionScope::from_parts(
             &conversation,
             &panel
                 .iter()
@@ -316,9 +314,9 @@ fn app_restores_the_single_agent_session() {
         ))
         .unwrap();
 
-    let mut app = App::new_for_tests(storage).unwrap();
+    let app = App::new_for_tests(storage).unwrap();
 
-    assert!(app.agent_conversation.clear());
+    assert!(app.agent_session.clear_conversation());
     assert_eq!(app.agent_panel, panel);
     assert_eq!(app.agent_scroll, 0);
     assert!(app.agent_follow_tail);
@@ -459,7 +457,8 @@ fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
 #[test]
 fn failed_session_delete_keeps_the_in_memory_session() {
     let (mut app, _directory) = make_app();
-    app.agent_conversation = AgentConversation::seeded_for_test();
+    app.agent_session
+        .replace_conversation(AgentConversation::seeded_for_test());
     install_agent_terminal_snapshot(&mut app);
     fs::write(
         app.storage().agent_session_path.parent().unwrap(),
@@ -469,7 +468,7 @@ fn failed_session_delete_keeps_the_in_memory_session() {
 
     app.clear_agent_session();
 
-    assert!(app.agent_conversation.clear());
+    assert!(app.agent_session.clear_conversation());
     assert!(!app.agent.terminal().is_running());
     assert!(app.status.starts_with("Agent session clear error:"));
     assert!(app.notifications.visible().is_some());
@@ -2560,13 +2559,8 @@ fn agent_open_file_event_displays_the_note_in_the_tui() {
 #[test]
 fn c_cancels_a_running_agent_only_from_the_agent_panel() {
     let (mut app, _directory) = make_app();
-    let observable_cancel = tokio_util::sync::CancellationToken::new();
     let (_sender, events) = tokio::sync::broadcast::channel(1);
-    app.active_agent = Some(Observable {
-        output: Box::pin(std::future::pending()),
-        events,
-        cancel: observable_cancel.clone(),
-    });
+    app.active_agent_events = Some(events);
     app.ai_running = true;
     app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
@@ -2578,13 +2572,11 @@ fn c_cancels_a_running_agent_only_from_the_agent_panel() {
     app.handle_key(key(KeyCode::Char('c')));
     assert!(app.ai_running);
     assert!(!app.agent.is_cancel_requested());
-    assert!(!observable_cancel.is_cancelled());
 
     app.focus = Focus::Agent;
     app.handle_key(key(KeyCode::Char('c')));
     assert!(!app.ai_running);
     assert!(app.agent.is_cancel_requested());
-    assert!(observable_cancel.is_cancelled());
     assert!(
         matches!(app.agent_panel.last().map(|entry| entry.as_ref()), Some(AgentPanelEntry::Error(text)) if text == "Cancelled")
     );
@@ -2653,7 +2645,8 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
             final_output: false,
         }),
     ];
-    app.agent_conversation = AgentConversation::seeded_for_test();
+    app.agent_session
+        .replace_conversation(AgentConversation::seeded_for_test());
     app.focus = Focus::Agent;
     install_agent_terminal_snapshot(&mut app);
 
@@ -2661,7 +2654,7 @@ fn uppercase_c_cancels_work_and_clears_the_agent_session() {
 
     assert!(app.agent.is_cancel_requested());
     assert!(!app.ai_running);
-    assert!(!app.agent_conversation.clear());
+    assert!(!app.agent_session.clear_conversation());
     assert!(app.agent_panel.is_empty());
     assert!(!app.agent.terminal().is_running());
     assert_eq!(app.status, "Agent session cleared");

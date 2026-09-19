@@ -66,9 +66,9 @@ impl App {
     pub fn poll_agent(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
-        if let Some(observable) = &mut self.active_agent {
+        if let Some(run_events) = &mut self.active_agent_events {
             loop {
-                match observable.events.try_recv() {
+                match run_events.try_recv() {
                     Ok(event) => events.push(event),
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
@@ -76,8 +76,7 @@ impl App {
                         break;
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                        observable.cancel.cancel();
-                        self.agent.cancel();
+                        self.agent_session.cancel();
                         events.push(AgentEvent::Finished(Err(
                             "Agent event stream lagged; task cancelled".to_string(),
                         )));
@@ -91,7 +90,7 @@ impl App {
         // would sit queued forever. The permanent subscription fills that
         // gap; every other event it sees is a duplicate of the run's own
         // stream and is dropped.
-        let idle = self.active_agent.is_none();
+        let idle = self.active_agent_events.is_none();
         loop {
             match self.agent_events_rx.try_recv() {
                 Ok(event @ AgentEvent::JobSettled { .. }) if idle => events.push(event),
@@ -360,8 +359,10 @@ impl App {
                     } else {
                         format!("Background job {id} finished: {label}")
                     });
-                    if !self.ai_running && !self.ai_cancelling {
-                        self.start_job_delivery_run();
+                    // Idle settlement: no run will drain the delivery, so
+                    // start the wake-up run through the session capability.
+                    if !self.ai_cancelling {
+                        self.adopt_delivery_run();
                     }
                 }
                 AgentEvent::JobDelivered(ids) => {
@@ -413,7 +414,10 @@ impl App {
                     }
                 }
                 AgentEvent::ConversationUpdated(conversation) => {
-                    self.agent_conversation = conversation;
+                    // Apply before persisting: the supervisor syncs the
+                    // session's copy asynchronously, but the TUI's own
+                    // stream order is deterministic for persistence.
+                    self.agent_session.replace_conversation(conversation);
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
                     }
@@ -460,7 +464,7 @@ impl App {
                     self.set_overlay(Overlay::PrivateTerminalInput);
                 }
                 AgentEvent::Stopped(reason) => {
-                    self.active_agent = None;
+                    self.active_agent_events = None;
                     self.deactivate_agent_tools();
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
@@ -489,11 +493,11 @@ impl App {
                     // A job that settled during the denied stop needs its
                     // wake-up run too; one started above drains the rest.
                     if !self.ai_running && !self.ai_cancelling {
-                        self.start_job_delivery_run();
+                        self.adopt_delivery_run();
                     }
                 }
                 AgentEvent::Finished(result) => {
-                    self.active_agent = None;
+                    self.active_agent_events = None;
                     self.deactivate_agent_tools();
                     // A finished run executes none of the tool calls it was
                     // still streaming, so unclaimed preparation rows are
@@ -546,7 +550,7 @@ impl App {
                     // it. A run started for buffered input drains the rest
                     // itself at its first round boundary.
                     if !self.ai_running && !self.ai_cancelling {
-                        self.start_job_delivery_run();
+                        self.adopt_delivery_run();
                     }
                 }
             }
@@ -804,10 +808,15 @@ impl App {
         self.ai_running = true;
         self.agent_round = 0;
         self.set_status("AI is working...");
-        match self.agent.run(prompt, self.agent_conversation.clone()) {
-            Ok(observable) => {
-                self.active_agent = Some(observable);
+        match self.agent_session.start(prompt) {
+            Ok(AgentSessionStart::Started(events)) => {
+                self.active_agent_events = Some(events);
                 true
+            }
+            Ok(AgentSessionStart::AlreadyRunning) => {
+                self.ai_running = false;
+                self.set_status("AI is already working");
+                false
             }
             Err(error) => {
                 self.ai_running = false;
@@ -820,29 +829,32 @@ impl App {
         }
     }
 
-    /// Start one wake-up run for every queued background-job delivery.
-    /// Called whenever the Agent is or has just gone idle: an idle settlement
-    /// (no run to observe it), or a delivery that settled while the previous
-    /// run was already finishing its last answer. A delivery left queued
-    /// here would strand its job's result until an unrelated future run.
-    pub(super) fn start_job_delivery_run(&mut self) -> bool {
-        let deliveries = self.agent.jobs().take_deliveries();
-        if deliveries.is_empty() {
+    /// Start the wake-up run for queued background-job deliveries via the
+    /// session's core capability, adopting its prompt echo and event
+    /// stream into the panel. Called whenever the Agent is or has just
+    /// gone idle: an idle settlement (no run to observe it), or a delivery
+    /// that settled while the previous run was already finishing its last
+    /// answer. A delivery left queued here would strand its job's result
+    /// until an unrelated future run.
+    pub(super) fn adopt_delivery_run(&mut self) -> bool {
+        if self.ai_running || self.ai_cancelling {
             return false;
         }
-        let first = &deliveries[0];
-        let label = first.label.clone();
-        let text = if deliveries.len() > 1 {
-            format!("Jobs settled: {label} (+{} more)", deliveries.len() - 1)
-        } else if first.status == crate::core::agent::JobStatus::Failed {
-            format!("Job failed: {label}")
-        } else {
-            format!("Job completed: {label}")
+        let Ok(Some(delivery)) = self.agent_session.deliver_jobs_if_idle() else {
+            return false;
         };
-        let prompt = crate::core::agent::format_job_deliveries(&deliveries);
-        self.agent_panel
-            .push(Arc::new(AgentPanelEntry::Prompt { text, muted: true }));
-        self.start_agent_worker(prompt)
+        self.reload_thinking_display_config();
+        self.reload_agent_effort();
+        self.agent.clear_buffered_prompts();
+        self.ai_running = true;
+        self.agent_round = 0;
+        self.set_status("AI is working...");
+        self.agent_panel.push(Arc::new(AgentPanelEntry::Prompt {
+            text: delivery.echo,
+            muted: true,
+        }));
+        self.active_agent_events = Some(delivery.events);
+        true
     }
 
     pub(super) fn mark_buffered_prompts_consumed(&mut self, count: usize) {
@@ -866,10 +878,7 @@ impl App {
             self.set_status("Agent is not running");
             return;
         }
-        self.agent.cancel();
-        if let Some(observable) = &self.active_agent {
-            observable.cancel.cancel();
-        }
+        self.agent_session.cancel();
         self.ai_running = false;
         self.ai_cancelling = true;
         self.agent.clear_buffered_prompts();
@@ -945,7 +954,7 @@ impl App {
                 return;
             }
         };
-        let had_history = self.agent_conversation.clear();
+        let had_history = self.agent_session.clear_conversation();
         if let Err(error) = self.agent.clear_read_state() {
             self.set_error(format!("Agent state clear error: {error:#}"));
         }
@@ -972,8 +981,8 @@ impl App {
     }
 
     pub(super) fn persist_agent_session(&self) -> anyhow::Result<()> {
-        let session = AgentSession::from_parts(
-            &self.agent_conversation,
+        let session = AgentSessionScope::from_parts(
+            &self.agent_session.conversation(),
             &self
                 .agent_panel
                 .iter()

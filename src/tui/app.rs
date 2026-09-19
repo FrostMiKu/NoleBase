@@ -17,7 +17,9 @@ use crate::core::agent::{
     PrivateTerminalInputRequest,
 };
 use crate::core::agent_service::AgentService;
-use crate::core::agent_session::{AgentConversation, AgentPanelEntry, AgentSession, TokenUsage};
+use crate::core::agent_session::{
+    AgentPanelEntry, AgentSession, AgentSessionScope, AgentSessionStart, TokenUsage,
+};
 use crate::core::attachment::AttachmentId;
 use crate::core::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
 use crate::core::export::ExportFormat;
@@ -25,7 +27,6 @@ use crate::core::model::{
     Action, DailyNote, FileGroup, FileListRow, LinkTarget, NoteFile, SearchHit, TagNote, TodoItem,
     WikiLinkCandidate, WikiLinkLocation,
 };
-use crate::core::observable::Observable;
 use crate::core::skill::Skill;
 use crate::core::storage::{ExportOutcome, Storage};
 use crate::core::workspace::Workspace;
@@ -367,7 +368,7 @@ pub struct App {
     terminal: Option<EmbeddedTerminal>,
     terminal_return_overlay: Option<Overlay>,
     terminal_return_dialog: Option<DialogState>,
-    active_agent: Option<Observable<crate::core::agent::AgentRunOutput, AgentEvent>>,
+    active_agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     pub ai_running: bool,
     pub agent_panel: Vec<Arc<AgentPanelEntry>>,
     preparing_agent_tools: HashMap<usize, usize>,
@@ -389,7 +390,7 @@ pub struct App {
     /// Reasoning-effort tier label from the active AI config, published by the
     /// worker at run start; `None` until the first run announces it.
     pub agent_effort: Option<String>,
-    pub(crate) agent_conversation: AgentConversation,
+    pub(crate) agent_session: Arc<AgentSession>,
     /// Permanent subscription to the agent event channel. Runs deliver their
     /// stream through their own subscription in `active_agent`; this one only
     /// exists so `JobSettled` can still be observed while the agent is idle.
@@ -437,6 +438,8 @@ struct CodeCopyFeedback {
 
 impl App {
     pub fn new(workspace: Arc<Workspace>, agent: Arc<AgentService>) -> anyhow::Result<Self> {
+        // One agent service, one session: the presentation layer only ever
+        // observes events and forwards commands.
         let storage = workspace.storage();
         let loaded_theme = crate::tui::theme::load_theme(storage, None)?;
         let (
@@ -449,6 +452,11 @@ impl App {
             .load_agent_session()?
             .unwrap_or_default()
             .into_parts();
+        // The session owns the conversation from here on: the supervisor
+        // thread keeps it current from `ConversationUpdated` events and
+        // starts idle background-job delivery runs on `JobSettled`.
+        let agent_session =
+            crate::core::agent_session::AgentSession::new(agent.clone(), agent_conversation, false);
         let agent_follow_tail = !agent_panel.is_empty();
         let agent_scroll = 0;
         let agent_panel = agent_panel.into_iter().map(Arc::new).collect();
@@ -462,7 +470,7 @@ impl App {
         let file_row = usize::from(first_note.is_some());
         let todo_items = workspace.todos()?;
         let images = crate::tui::media::ImageService::new(&storage.root);
-        let agent_events_rx = agent.subscribe();
+        let agent_events_rx = agent_session.service().subscribe();
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
         let mut agent_effort = None;
         if let Ok(effort) = AgentConfig::load_effort(&storage.ai_config_path) {
@@ -576,7 +584,7 @@ impl App {
             terminal: None,
             terminal_return_overlay: None,
             terminal_return_dialog: None,
-            active_agent: None,
+            active_agent_events: None,
             ai_running: false,
             agent_panel,
             preparing_agent_tools: HashMap::new(),
@@ -594,7 +602,7 @@ impl App {
             agent_retry_count: 0,
             agent_round: 0,
             agent_effort,
-            agent_conversation,
+            agent_session,
             agent_events_rx,
             ai_prompt_input: String::new(),
             ai_prompt_cursor: 0,

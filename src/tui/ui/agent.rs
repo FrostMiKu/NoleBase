@@ -149,12 +149,12 @@ const JOB_ROW_INDENT_WIDTH: usize = JOB_ROW_INDENT.len();
 fn append_todo_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
     use crate::core::agent_session::TodoStatus;
 
-    let todos = &app.agent_conversation.todos;
+    let todos = app.agent_session.conversation().todos;
     if todos.is_empty() {
         return;
     }
     let mut counts = [(0usize, "running"), (0, "pending"), (0, "done")];
-    for item in todos {
+    for item in &todos {
         let slot = match item.status {
             TodoStatus::Pending => &mut counts[1],
             TodoStatus::InProgress => &mut counts[0],
@@ -163,7 +163,7 @@ fn append_todo_summary(app: &App, lines: &mut Vec<Line<'static>>, width: u16) {
         slot.0 += 1;
     }
     lines.push(stats_label_row(app, "Todos", count_summary(&counts)));
-    for item in todos {
+    for item in &todos {
         let (marker, style) = match item.status {
             TodoStatus::InProgress => (
                 spinner_frame(app.animation_tick).to_string(),
