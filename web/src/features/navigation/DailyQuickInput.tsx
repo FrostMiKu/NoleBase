@@ -109,7 +109,7 @@ export function DailyQuickInput() {
     <div className="relative mb-4 rounded-md border border-border-strong bg-panel px-2.5 py-1.5 focus-within:border-accent">
       {open && (
         <ul
-          className="absolute bottom-full left-0 z-20 mb-1 max-h-48 w-full overflow-y-auto rounded-md border border-border-strong bg-overlay py-1 shadow-lg"
+          className="absolute left-0 top-full z-20 mt-1 max-h-48 w-full overflow-y-auto rounded-md border border-border-strong bg-overlay py-1 shadow-lg"
           data-testid="completion-popup"
           role="listbox"
         >
@@ -141,7 +141,7 @@ export function DailyQuickInput() {
         ref={inputRef}
         rows={1}
         value={text}
-        placeholder="今天有什么想记下来的…（Enter 发送，Shift+Enter 换行，# 与 [[ 触发补全）"
+        placeholder="今天有什么想记下来的"
         data-testid="daily-quick-input"
         onChange={(event) => handleChange(event.target.value)}
         onKeyDown={(event) => {

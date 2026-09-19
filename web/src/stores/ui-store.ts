@@ -53,7 +53,7 @@ export const useUiStore = create<UiStore>()((set) => ({
 
   leftSidebarSize: 20,
   rightSidebarSize: 28,
-  todoPanelSize: 62,
+  todoPanelSize: 50,
 
   // The file list opens with Notes visible and Archives collapsed.
   sidebarSections: { notes: true, archives: false },
