@@ -10,6 +10,19 @@ import type {
 import type { AgentEvent } from '@/types/events'
 
 /**
+ * A background job (subagent run) tracked at session level. Job identity
+ * is global — a job routinely outlives the turn that spawned it — so its
+ * lifecycle state lives here, not inside turn timelines.
+ */
+export interface JobRun {
+  id: string
+  label: string
+  status: 'running' | 'finished' | 'failed'
+  /** The turn that spawned the job, for display. */
+  turnId: number | null
+}
+
+/**
  * One conversational turn: the user prompt that started the run plus
  * everything the agent streamed for it. Turns accumulate — a new run
  * appends instead of overwriting the previous turn (the live text of the
@@ -46,6 +59,9 @@ export interface AgentState {
   askUser: AskUserRequest | null
   terminalInput: TerminalInputRequest | null
 
+  /** Session-level background-job registry, ordered by first appearance. */
+  jobs: JobRun[]
+
   contextWindow: ContextWindowInfo | null
   messageCount: number | null
 
@@ -67,6 +83,7 @@ export function initialAgentState(): AgentState {
     approval: null,
     askUser: null,
     terminalInput: null,
+    jobs: [],
     contextWindow: null,
     messageCount: null,
     streamInterrupted: false,
@@ -128,6 +145,32 @@ function withLastTurn(state: AgentState, update: (turn: AgentTurn) => AgentTurn)
     return updateLastTurn(appendTurn(state, null), update)
   }
   return updateLastTurn(state, update)
+}
+
+const MAX_JOBS = 50
+
+/** Insert or update a session-level job entry, keyed by job id. */
+function upsertJob(
+  state: AgentState,
+  id: string,
+  label: string,
+  status: JobRun['status'],
+): AgentState {
+  const existing = state.jobs.find((job) => job.id === id)
+  if (existing !== undefined) {
+    return {
+      ...state,
+      jobs: state.jobs.map((job) =>
+        job.id === id ? { ...job, label, status, turnId: job.turnId } : job,
+      ),
+    }
+  }
+  const turnId = state.turns[state.turns.length - 1]?.id ?? null
+  const jobs = [...state.jobs, { id, label, status, turnId }]
+  return {
+    ...state,
+    jobs: jobs.length > MAX_JOBS ? jobs.slice(jobs.length - MAX_JOBS) : jobs,
+  }
 }
 
 function updateLastTurn(state: AgentState, update: (turn: AgentTurn) => AgentTurn): AgentState {
@@ -316,22 +359,15 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       })
 
     case 'job_started':
-      // A job may be reported after the announcing turn closed (it can
-      // outlive the run); attach to the last turn instead of opening one.
-      return withLastTurn(state, (turn) => ({
-        ...turn,
-        tools: [
-          ...turn.tools,
-          {
-            key: `job:${event.id}`,
-            kind: 'job',
-            id: event.id,
-            status: 'running',
-            label: event.label,
-            detail: null,
-          },
-        ],
-      }))
+      return upsertJob(state, event.id, event.label, 'running')
+
+    case 'job_settled': {
+      // Update the job's own registry entry; if the start event was lost
+      // (a lagged stream), surface the settlement as its own entry.
+      const existing = state.jobs.find((job) => job.id === event.id)
+      const label = existing?.label ?? 'background job'
+      return upsertJob(state, event.id, label, event.failed ? 'failed' : 'finished')
+    }
 
     case 'job_settled':
       return withLastTurn(state, (turn) => {

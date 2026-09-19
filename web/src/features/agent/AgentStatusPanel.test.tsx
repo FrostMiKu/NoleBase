@@ -3,46 +3,20 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { AgentStatusPanel } from './AgentStatusPanel'
 import { useAgentStore } from '@/stores/agent-store'
-import type { AgentTurn } from '@/features/agent/agent-reducer'
+import type { JobRun } from '@/features/agent/agent-reducer'
 
-function turnWithJob(id: number, label: string, status: 'running' | 'finished' | 'failed'): AgentTurn {
-  return {
-    id,
-    prompt: null,
-    assistantText: '',
-    thinkingText: '',
-    tools: [
-      {
-        key: `job:${id}`,
-        kind: 'job',
-        id: `j${id}`,
-        status,
-        label,
-        detail: null,
-      },
-    ],
-    runtimeNotes: [],
-    usage: null,
-    timing: null,
-    round: null,
-    retries: 0,
-    finished: null,
-    stopReason: null,
-  }
+function job(id: string, label: string, status: JobRun['status'], turnId: number | null): JobRun {
+  return { id, label, status, turnId }
 }
-
-afterEach(() => {
-  useAgentStore.setState({ turns: [], running: false })
-})
 
 afterEach(cleanup)
 
 describe('AgentStatusPanel', () => {
-  it('lists background jobs from every turn with their state', () => {
+  it('lists session jobs once each with their lifecycle state', () => {
     useAgentStore.setState({
-      turns: [
-        turnWithJob(1, 'explore arxiv', 'finished'),
-        turnWithJob(2, 'index notes', 'running'),
+      jobs: [
+        job('job-1', 'explore arxiv', 'finished', 2),
+        job('job-2', 'index notes', 'running', 3),
       ],
       running: true,
     })
@@ -55,7 +29,7 @@ describe('AgentStatusPanel', () => {
   })
 
   it('renders the empty state without jobs', () => {
-    useAgentStore.setState({ turns: [], running: false })
+    useAgentStore.setState({ jobs: [], running: false })
     render(<AgentStatusPanel />)
     expect(screen.getByTestId('agent-status-panel').textContent).toContain(
       'No background jobs yet',

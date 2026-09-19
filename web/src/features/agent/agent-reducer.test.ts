@@ -204,23 +204,34 @@ describe('tool lifecycle', () => {
 })
 
 describe('background jobs and notices', () => {
-  it('tracks job_started and job_settled', () => {
+  it('tracks job_started and job_settled in the session registry', () => {
     let state = begin(stateWith(), 'p')
     state = reduce(state, { type: 'job_started', id: 'j1', label: 'indexing' })
-    expect(lastTurn(state).tools[0]).toMatchObject({ key: 'job:j1', kind: 'job', status: 'running' })
+    expect(state.jobs).toHaveLength(1)
+    expect(state.jobs[0]).toMatchObject({ id: 'j1', label: 'indexing', status: 'running' })
     state = reduce(state, { type: 'job_settled', id: 'j1', failed: true })
-    expect(lastTurn(state).tools[0]).toMatchObject({ key: 'job:j1', status: 'failed' })
+    expect(state.jobs[0]).toMatchObject({ id: 'j1', status: 'failed' })
   })
 
-  it('attaches a late job_settled to the last turn without a phantom turn', () => {
+  it('updates the spawning turn job even when other turns followed (regression)', () => {
+    // The real-world flow: turn 2 spawns a subagent job and closes; the
+    // user chats on (turn 3); only then does the job settle. The settled
+    // event must update the job registry — never synthesize a second row
+    // in the latest turn nor leave the first one spinning.
     let state = runTurn(stateWith(), 'spawn subagent', 'dispatched to background')
-    // The job settles after the run finished (job outlives the turn).
-    state = reduce(state, { type: 'job_started', id: 'j9', label: 'explore' })
-    state = reduce(state, { type: 'job_settled', id: 'j9', failed: false })
-    expect(state.turns).toHaveLength(1)
-    const tools = state.turns[0]?.tools ?? []
-    expect(tools).toHaveLength(1)
-    expect(tools[0]).toMatchObject({ key: 'job:j9', status: 'finished' })
+    state = reduce(state, { type: 'job_started', id: 'job-1', label: 'explore' })
+    state = reduce(state, { type: 'finished', ok: true, text: 'dispatched', error: null })
+    state = runTurn(state, 'say something short', 'short story')
+    expect(state.turns).toHaveLength(2)
+
+    state = reduce(state, { type: 'job_settled', id: 'job-1', failed: false })
+
+    expect(state.jobs).toHaveLength(1)
+    expect(state.jobs[0]).toMatchObject({ id: 'job-1', label: 'explore', status: 'finished' })
+    // No phantom job rows in either turn's tool timeline.
+    for (const turn of state.turns) {
+      expect(turn.tools.every((tool) => tool.kind === 'tool')).toBe(true)
+    }
   })
 
   it('records buffered input and delivery notices', () => {
