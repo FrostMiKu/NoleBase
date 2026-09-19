@@ -1,11 +1,13 @@
 import { Outlet, createRootRoute, createRoute, createRouter, redirect } from '@tanstack/react-router'
 
 import { AppShell } from '@/app/AppShell'
+import { AgentPage } from '@/features/agent/AgentPage'
 import { DocumentPage } from '@/editor/DocumentPage'
 import { DailyPage } from '@/features/navigation/DailyPage'
 import { WorkspaceHome } from '@/features/navigation/WorkspaceHome'
 import { SearchPage } from '@/features/search/SearchPage'
 import { TagPage } from '@/features/tags/TagPage'
+import { TagsPage } from '@/features/tags/TagsPage'
 
 const rootRoute = createRootRoute({ component: AppShell })
 
@@ -74,6 +76,20 @@ function TagRoute() {
   return <TagPage tag={params.tag} />
 }
 
+/** `/tags` — the tag-centred file list. */
+const tagsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/tags',
+  component: TagsPage,
+})
+
+/** `/agent` — the TUI-style main Agent view. */
+const agentRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/agent',
+  component: AgentPage,
+})
+
 /** `/daily` */
 const dailyRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -81,7 +97,15 @@ const dailyRoute = createRoute({
   component: DailyPage,
 })
 
-const routeTree = rootRoute.addChildren([indexRoute, documentRoute, searchRoute, tagRoute, dailyRoute])
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  documentRoute,
+  searchRoute,
+  tagRoute,
+  tagsRoute,
+  agentRoute,
+  dailyRoute,
+])
 
 export const router = createRouter({
   routeTree,

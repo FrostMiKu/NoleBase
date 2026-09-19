@@ -10,6 +10,7 @@ import { FileMovedConflict } from '@/editor/FileMovedConflict'
 import { editorStore } from '@/editor/editor-state'
 import { permitNavigationOnce } from '@/editor/navigation-guard'
 import { CommandPalette } from '@/components/CommandPalette'
+import { ActivityRail } from '@/components/ActivityRail'
 import { SplitGroup, SplitPanel, SplitSeparator } from '@/components/SplitPane'
 import { StatusBar } from '@/components/StatusBar'
 import { TopBar } from '@/components/TopBar'
@@ -28,7 +29,7 @@ function useCurrentDocumentPath(): string | null {
   return typeof search?.path === 'string' ? search.path : null
 }
 
-/** Left sidebar + main + right sidebar (Todo / Agent) desktop layout. */
+/** Left rail + sidebar + main + right sidebar (Todo / Agent) desktop layout. */
 export function AppShell() {
   const navigate = useNavigate()
   const currentPath = useCurrentDocumentPath()
@@ -47,17 +48,24 @@ export function AppShell() {
     },
   })
 
-  // Keep the WS layer's view of the open document in sync with the router.
+  // Keep the WS layer's view of the open document in sync with the router,
+  // and remember the latest document for the rail's Editor button.
   useEffect(() => {
     setCurrentDocumentPath(currentPath)
+    if (currentPath !== null) {
+      useUiStore.getState().setLastDocumentPath(currentPath)
+    }
   }, [currentPath])
 
   return (
     <div className="flex h-full flex-col">
       <TopBar />
-      <main className="min-h-0 flex-1">
-        <MainPanels />
-      </main>
+      <div className="flex min-h-0 flex-1">
+        <ActivityRail />
+        <main className="min-w-0 flex-1">
+          <MainPanels />
+        </main>
+      </div>
       <StatusBar />
       <CommandPalette />
       <DirtyGuard />
@@ -111,9 +119,17 @@ function MainPanels() {
   )
 }
 
-/** Right sidebar: Todo on top, Agent below, vertically resizable. */
+/** Right sidebar: Todo on top, Agent below, vertically resizable. The
+ * agent panel steps aside while the center shows the /agent view. */
 function RightSidebar() {
   const agentPanelSize = useUiStore((state) => state.agentPanelSize)
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
+  const agentCentered = pathname === '/agent'
+
+  if (agentCentered) {
+    return <TodoPanel />
+  }
+
   return (
     <SplitGroup orientation="vertical" className="h-full">
       <SplitPanel

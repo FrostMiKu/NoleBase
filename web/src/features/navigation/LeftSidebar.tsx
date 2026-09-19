@@ -1,14 +1,43 @@
 import { useNavigate } from '@tanstack/react-router'
+import { ChevronRight } from 'lucide-react'
 
-import { useDailyNotes, useNotes, useTags } from '@/queries/workspace'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { useEditorState } from '@/editor/editor-state'
+import { useDailyNotes, useNotes, useTags } from '@/queries/workspace'
+import { useUiStore, type SidebarSectionKey } from '@/stores/ui-store'
 
-function SectionHeader({ label, count }: { label: string; count?: number }) {
+interface SectionProps {
+  sectionKey: SidebarSectionKey
+  label: string
+  count?: number
+  children: React.ReactNode
+}
+
+/**
+ * A collapsible sidebar section, mirroring the TUI's section behaviour:
+ * the header toggles the list, the expanded state survives navigation.
+ */
+function Section({ sectionKey, label, count, children }: SectionProps) {
+  const expanded = useUiStore((state) => state.sidebarSections[sectionKey])
+  const toggle = useUiStore((state) => state.toggleSidebarSection)
   return (
-    <p className="flex items-center justify-between px-2 pt-3 pb-1 text-[10px] font-semibold tracking-wider text-faint uppercase">
-      <span>{label}</span>
-      {count !== undefined && <span className="font-mono text-[10px]">{count}</span>}
-    </p>
+    <Collapsible
+      open={expanded}
+      onOpenChange={() => toggle(sectionKey)}
+      data-section={sectionKey}
+    >
+      <CollapsibleTrigger className="group flex w-full items-center gap-1 px-2 pt-3 pb-1 text-[10px] font-semibold tracking-wider text-faint uppercase transition-colors hover:text-muted">
+        <ChevronRight
+          size={10}
+          className={`transition-transform group-data-[state=open]:rotate-90`}
+        />
+        <span>{label}</span>
+        {count !== undefined && <span className="ml-auto font-mono text-[10px]">{count}</span>}
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="px-1 pb-1">{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -35,8 +64,8 @@ function Row({ active = false, onClick, children, title }: RowProps) {
 }
 
 /**
- * Left navigation: Daily, Notes, Archives, Tags, Search. Notes and
- * Archives are flat lists split from the same endpoint by `archived`.
+ * Left navigation: Daily, Notes, Archives, Tags — each a collapsible flat
+ * list. Notes and Archives split the same endpoint by `archived`.
  */
 export function LeftSidebar() {
   const navigate = useNavigate()
@@ -51,14 +80,8 @@ export function LeftSidebar() {
   const daily = [...(dailyQuery.data ?? [])].reverse()
 
   return (
-    <nav className="flex h-full flex-col overflow-y-auto py-1" data-testid="left-sidebar">
-      <SectionHeader label="Search" />
-      <div className="px-2">
-        <Row onClick={() => void navigate({ to: '/search' })}>Search workspace…</Row>
-      </div>
-
-      <SectionHeader label="Daily" count={daily.length} />
-      <div className="px-1">
+    <nav className="flex h-full flex-col overflow-y-auto pb-2" data-testid="left-sidebar">
+      <Section sectionKey="daily" label="Daily" count={daily.length}>
         {dailyQuery.isLoading && <LoadingRow />}
         {daily.map((note) => (
           <Row
@@ -71,10 +94,9 @@ export function LeftSidebar() {
           </Row>
         ))}
         {dailyQuery.isError && <ErrorRow message="Daily notes failed to load" />}
-      </div>
+      </Section>
 
-      <SectionHeader label="Notes" count={active.length} />
-      <div className="px-1">
+      <Section sectionKey="notes" label="Notes" count={active.length}>
         {notesQuery.isLoading && <LoadingRow />}
         {active.map((note) => (
           <Row
@@ -87,10 +109,9 @@ export function LeftSidebar() {
           </Row>
         ))}
         {notesQuery.isError && <ErrorRow message="Notes failed to load" />}
-      </div>
+      </Section>
 
-      <SectionHeader label="Archives" count={archives.length} />
-      <div className="px-1">
+      <Section sectionKey="archives" label="Archives" count={archives.length}>
         {archives.map((note) => (
           <Row
             key={note.path}
@@ -101,10 +122,9 @@ export function LeftSidebar() {
             <span className="text-muted">{note.path}</span>
           </Row>
         ))}
-      </div>
+      </Section>
 
-      <SectionHeader label="Tags" />
-      <div className="px-1 pb-3">
+      <Section sectionKey="tags" label="Tags">
         {tagsQuery.isLoading && <LoadingRow />}
         {(tagsQuery.data ?? []).map((tag) => (
           <Row
@@ -119,6 +139,16 @@ export function LeftSidebar() {
           </Row>
         ))}
         {tagsQuery.isError && <ErrorRow message="Tags failed to load" />}
+      </Section>
+
+      <div className="px-2 pt-3">
+        <button
+          type="button"
+          onClick={() => void navigate({ to: '/search' })}
+          className="inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wider text-faint uppercase transition-colors hover:text-muted"
+        >
+          Search workspace…
+        </button>
       </div>
     </nav>
   )
