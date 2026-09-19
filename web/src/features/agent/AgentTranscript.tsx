@@ -3,87 +3,37 @@ import { ChevronRight, CircleCheck, CircleDashed, CircleX, Loader2 } from 'lucid
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { useAgentStore } from '@/stores/agent-store'
+import type { AgentTurn } from '@/features/agent/agent-reducer'
+import type { ToolRun } from '@/types/agent'
 
 /**
- * The live runtime view: assistant text (one block), a collapsed-by-default
- * thinking section, a compact tool/job timeline, runtime notices, and
- * session notifications. No chat bubbles.
+ * The live runtime view: one block per conversational turn (prompt echo,
+ * collapsed-by-default thinking, assistant text, compact tool/job
+ * timeline, runtime notices, outcome). Turns accumulate; no chat bubbles.
  */
 export function AgentTranscript() {
-  const assistantText = useAgentStore((state) => state.assistantText)
-  const thinkingText = useAgentStore((state) => state.thinkingText)
-  const tools = useAgentStore((state) => state.tools)
-  const runtimeNotes = useAgentStore((state) => state.runtimeNotes)
-  const notifications = useAgentStore((state) => state.notifications)
-  const finished = useAgentStore((state) => state.finished)
-  const stopReason = useAgentStore((state) => state.stopReason)
-  const usage = useAgentStore((state) => state.usage)
+  const turns = useAgentStore((state) => state.turns)
   const contextWindow = useAgentStore((state) => state.contextWindow)
-  const timing = useAgentStore((state) => state.timing)
-  const round = useAgentStore((state) => state.round)
-  const retries = useAgentStore((state) => state.retries)
   const messageCount = useAgentStore((state) => state.messageCount)
+  const notifications = useAgentStore((state) => state.notifications)
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2" data-testid="agent-transcript">
-      <ThinkingSection text={thinkingText} />
-
-      {assistantText !== '' ? (
-        <pre className="text-[12px] leading-relaxed whitespace-pre-wrap text-fg">
-          {assistantText}
-        </pre>
-      ) : (
-        thinkingText === '' &&
-        tools.length === 0 &&
-        runtimeNotes.length === 0 &&
-        finished === null &&
-        stopReason === null && (
-          <p className="text-[11px] text-faint">No agent activity yet. Send a prompt below.</p>
-        )
+      {turns.length === 0 && notifications.length === 0 && (
+        <p className="text-[11px] text-faint">No agent activity yet. Send a prompt below.</p>
       )}
 
-      {tools.length > 0 && (
-        <ul className="mt-2 space-y-0.5" data-testid="agent-tools">
-          {tools.map((tool) => (
-            <ToolRow key={tool.key} tool={tool} />
-          ))}
-        </ul>
-      )}
+      {turns.map((turn) => (
+        <TurnBlock key={turn.id} turn={turn} />
+      ))}
 
-      {runtimeNotes.length > 0 && (
-        <div className="mt-2 space-y-0.5">
-          {runtimeNotes.map((note, index) => (
-            <p key={index} className="font-mono text-[10px] text-faint">
-              · {note}
-            </p>
-          ))}
-        </div>
-      )}
-
-      <SessionMeta
-        usage={usage}
-        contextWindow={contextWindow}
-        timing={timing}
-        round={round}
-        retries={retries}
-        messageCount={messageCount}
-      />
-
-      {stopReason !== null && (
-        <p className="mt-2 rounded-sm border border-warn/40 bg-warn/10 px-2 py-1 text-[11px] text-warn">
-          Stopped: {stopReason}
+      {(contextWindow !== null || messageCount !== null) && (
+        <p className="mt-2 font-mono text-[10px] text-faint">
+          {contextWindow !== null &&
+            `ctx ${contextWindow.capacity > 0 ? Math.round((contextWindow.tokens / contextWindow.capacity) * 100) : 0}%`}
+          {contextWindow !== null && messageCount !== null && ' · '}
+          {messageCount !== null && `${messageCount} msg(s) in session`}
         </p>
-      )}
-      {finished !== null && (
-        finished.ok ? (
-          <p className="mt-2 rounded-sm border border-ok/40 bg-ok/10 px-2 py-1 text-[11px] text-ok">
-            Finished
-          </p>
-        ) : (
-          <p className="mt-2 rounded-sm border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] whitespace-pre-wrap text-danger">
-            Failed{finished.error !== null ? `: ${finished.error}` : ''}
-          </p>
-        )
       )}
 
       {notifications.length > 0 && (
@@ -95,6 +45,63 @@ export function AgentTranscript() {
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+function TurnBlock({ turn }: { turn: AgentTurn }) {
+  return (
+    <div className="mb-3 border-b border-border pb-2 last:border-b-0" data-testid={`agent-turn-${turn.id}`}>
+      {turn.prompt !== null && (
+        <p className="mb-1.5 flex items-start gap-1.5 text-[11px] text-muted">
+          <span className="mt-px shrink-0 text-faint">›</span>
+          <span className="whitespace-pre-wrap">{turn.prompt}</span>
+        </p>
+      )}
+
+      <ThinkingSection text={turn.thinkingText} />
+
+      {turn.assistantText !== '' && (
+        <pre className="text-[12px] leading-relaxed whitespace-pre-wrap text-fg">
+          {turn.assistantText}
+        </pre>
+      )}
+
+      {turn.tools.length > 0 && (
+        <ul className="mt-2 space-y-0.5" data-testid="agent-tools">
+          {turn.tools.map((tool) => (
+            <ToolRow key={tool.key} tool={tool} />
+          ))}
+        </ul>
+      )}
+
+      {turn.runtimeNotes.length > 0 && (
+        <div className="mt-2 space-y-0.5">
+          {turn.runtimeNotes.map((note, index) => (
+            <p key={index} className="font-mono text-[10px] text-faint">
+              · {note}
+            </p>
+          ))}
+        </div>
+      )}
+
+      <TurnMeta turn={turn} />
+
+      {turn.stopReason !== null && (
+        <p className="mt-2 rounded-sm border border-warn/40 bg-warn/10 px-2 py-1 text-[11px] text-warn">
+          Stopped: {turn.stopReason}
+        </p>
+      )}
+      {turn.finished !== null &&
+        (turn.finished.ok ? (
+          <p className="mt-2 rounded-sm border border-ok/40 bg-ok/10 px-2 py-1 text-[11px] text-ok">
+            Finished
+          </p>
+        ) : (
+          <p className="mt-2 rounded-sm border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] whitespace-pre-wrap text-danger">
+            Failed{turn.finished.error !== null ? `: ${turn.finished.error}` : ''}
+          </p>
+        ))}
     </div>
   )
 }
@@ -116,7 +123,7 @@ function ThinkingSection({ text }: { text: string }) {
   )
 }
 
-function ToolRow({ tool }: { tool: import('@/types/agent').ToolRun }) {
+function ToolRow({ tool }: { tool: ToolRun }) {
   const [expanded, setExpanded] = useState(false)
   const icon =
     tool.status === 'finished' ? (
@@ -152,42 +159,19 @@ function ToolRow({ tool }: { tool: import('@/types/agent').ToolRun }) {
   )
 }
 
-function SessionMeta({
-  usage,
-  contextWindow,
-  timing,
-  round,
-  retries,
-  messageCount,
-}: {
-  usage: import('@/types/agent').TokenUsage | null
-  contextWindow: import('@/types/agent').ContextWindowInfo | null
-  timing: import('@/types/agent').ResponseTimingInfo | null
-  round: number | null
-  retries: number
-  messageCount: number | null
-}) {
-  if (usage === null && contextWindow === null && timing === null && round === null && retries === 0 && messageCount === null) {
-    return null
-  }
+function TurnMeta({ turn }: { turn: AgentTurn }) {
   const parts: string[] = []
-  if (usage !== null) {
-    parts.push(`in ${fmtTokens(usage.input_tokens + usage.cache_read_input_tokens)}`)
-    parts.push(`out ${fmtTokens(usage.output_tokens)}`)
-    if (usage.cache_creation_input_tokens > 0) {
-      parts.push(`cache-w ${fmtTokens(usage.cache_creation_input_tokens)}`)
+  if (turn.usage !== null) {
+    parts.push(`in ${fmtTokens(turn.usage.input_tokens + turn.usage.cache_read_input_tokens)}`)
+    parts.push(`out ${fmtTokens(turn.usage.output_tokens)}`)
+    if (turn.usage.cache_creation_input_tokens > 0) {
+      parts.push(`cache-w ${fmtTokens(turn.usage.cache_creation_input_tokens)}`)
     }
   }
-  if (contextWindow !== null) {
-    const percent = contextWindow.capacity > 0 ? Math.round((contextWindow.tokens / contextWindow.capacity) * 100) : 0
-    parts.push(`ctx ${percent}%`)
-  }
-  if (timing !== null) {
-    parts.push(`${(timing.elapsed_ms / 1000).toFixed(1)}s`)
-  }
-  if (round !== null) parts.push(`round ${round}`)
-  if (retries > 0) parts.push(`retries ${retries}`)
-  if (messageCount !== null) parts.push(`${messageCount} msg(s)`)
+  if (turn.timing !== null) parts.push(`${(turn.timing.elapsed_ms / 1000).toFixed(1)}s`)
+  if (turn.round !== null) parts.push(`round ${turn.round}`)
+  if (turn.retries > 0) parts.push(`retries ${turn.retries}`)
+  if (parts.length === 0) return null
   return <p className="mt-2 font-mono text-[10px] text-faint">{parts.join(' · ')}</p>
 }
 

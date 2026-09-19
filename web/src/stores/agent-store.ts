@@ -7,13 +7,14 @@ import { beginAgentRun, initialAgentState, reduceAgentEvent, type AgentState } f
 /**
  * Realtime agent projection. WebSocket events flow through the pure
  * `reduceAgentEvent`; server snapshots (`GET /api/agent`) sync `running`
- * on (re)connect. Streaming text never enters TanStack Query.
+ * on (re)connect. Turns accumulate — a new run appends to the transcript
+ * instead of overwriting it. Streaming text never enters TanStack Query.
  */
 export interface AgentStore extends AgentState {
   connection: AgentConnectionState
 
   dispatchEvent: (event: AgentEvent) => void
-  beginRun: () => void
+  beginRun: (prompt: string) => void
   setConnection: (connection: AgentConnectionState) => void
   setRunning: (running: boolean) => void
   markDisconnected: () => void
@@ -28,7 +29,7 @@ export const useAgentStore = create<AgentStore>()((set) => ({
   connection: 'connecting',
 
   dispatchEvent: (event) => set((state) => reduceAgentEvent(state, event)),
-  beginRun: () => set((state) => beginAgentRun(state)),
+  beginRun: (prompt) => set((state) => beginAgentRun(state, prompt)),
   setConnection: (connection) => set({ connection }),
   setRunning: (running) => set({ running }),
   markDisconnected: () => set({ connection: 'disconnected', streamInterrupted: true }),

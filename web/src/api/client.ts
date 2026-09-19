@@ -51,7 +51,8 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
   if (!response.ok) {
     throw await parseErrorResponse(response)
   }
-  if (response.status === 204) {
+  // Mutations answer 202 Accepted / 204 No Content with an empty body.
+  if (response.status === 204 || response.status === 202) {
     return undefined as T
   }
   try {

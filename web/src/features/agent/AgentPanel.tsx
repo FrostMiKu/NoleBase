@@ -37,8 +37,13 @@ export function AgentPanel() {
   const [sending, setSending] = useState(false)
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null)
-  const assistantText = useAgentStore((state) => state.assistantText)
-  const toolsLength = useAgentStore((state) => state.tools.length)
+  const lastTurnId = useAgentStore((state) => state.turns[state.turns.length - 1]?.id)
+  const lastTurnTail =
+    useAgentStore((state) => {
+      const turn = state.turns[state.turns.length - 1]
+      if (turn === undefined) return 0
+      return turn.assistantText.length + turn.thinkingText.length + turn.tools.length
+    })
 
   // "Focus Agent" command.
   useEffect(() => {
@@ -50,7 +55,7 @@ export function AgentPanel() {
   useEffect(() => {
     const container = transcriptScrollRef.current
     if (container !== null) container.scrollTop = container.scrollHeight
-  }, [assistantText, toolsLength])
+  }, [lastTurnId, lastTurnTail])
 
   const send = () => {
     const trimmed = prompt.trim()
@@ -59,8 +64,9 @@ export function AgentPanel() {
     agentApi
       .run(trimmed)
       .then(() => {
-        // 202: the agent took the task; output arrives over the WS.
-        beginRun()
+        // 202: the agent took the task; output arrives over the WS as a
+        // new transcript turn — previous turns stay visible.
+        beginRun(trimmed)
         setPrompt('')
       })
       .catch((error: unknown) => {

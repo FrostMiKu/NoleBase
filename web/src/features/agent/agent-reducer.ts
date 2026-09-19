@@ -3,7 +3,6 @@ import type {
   ApprovalRequest,
   AskUserRequest,
   ContextWindowInfo,
-  ResponseTimingInfo,
   TerminalInputRequest,
   ToolRun,
   TokenUsage,
@@ -11,72 +10,137 @@ import type {
 import type { AgentEvent } from '@/types/events'
 
 /**
- * Live runtime projection of the agent event stream. This is a projection,
- * not chat history: each new run replaces the previous run's text, tools,
- * and pending interactions (notifications are kept, capped).
+ * One conversational turn: the user prompt that started the run plus
+ * everything the agent streamed for it. Turns accumulate — a new run
+ * appends instead of overwriting the previous turn (the live text of the
+ * newest turn is still the only thing the composer interacts with).
+ */
+export interface AgentTurn {
+  id: number
+  /** The prompt that started this run; null when the run was started elsewhere. */
+  prompt: string | null
+  assistantText: string
+  thinkingText: string
+  tools: ToolRun[]
+  runtimeNotes: string[]
+  usage: TokenUsage | null
+  timing: { output_tokens: number; elapsed_ms: number } | null
+  round: number | null
+  retries: number
+  finished: { ok: boolean; text: string | null; error: string | null } | null
+  stopReason: string | null
+}
+
+/**
+ * Live runtime projection of the agent event stream. Turns accumulate up
+ * to {@link MAX_TURNS}; the authoritative conversation lives in the
+ * backend session, this is the visible window on it.
  */
 export interface AgentState {
   running: boolean
 
-  assistantText: string
-  thinkingText: string
-
-  tools: ToolRun[]
+  turns: AgentTurn[]
+  turnSeq: number
 
   approval: ApprovalRequest | null
   askUser: AskUserRequest | null
   terminalInput: TerminalInputRequest | null
 
-  usage: TokenUsage | null
   contextWindow: ContextWindowInfo | null
-  timing: ResponseTimingInfo | null
-
-  round: number | null
-  retries: number
   messageCount: number | null
-
-  stopReason: string | null
-  finished: { ok: boolean; text: string | null; error: string | null } | null
 
   streamInterrupted: boolean
 
   notifications: AgentNotification[]
   /** Monotonic sequence for notification keys. */
   notificationSeq: number
-
-  runtimeNotes: string[]
 }
 
 export const MAX_NOTIFICATIONS = 50
-const MAX_RUNTIME_NOTES = 20
+export const MAX_TURNS = 20
 
 export function initialAgentState(): AgentState {
   return {
     running: false,
-    assistantText: '',
-    thinkingText: '',
-    tools: [],
+    turns: [],
+    turnSeq: 0,
     approval: null,
     askUser: null,
     terminalInput: null,
-    usage: null,
     contextWindow: null,
-    timing: null,
-    round: null,
-    retries: 0,
     messageCount: null,
-    stopReason: null,
-    finished: null,
     streamInterrupted: false,
     notifications: [],
     notificationSeq: 0,
-    runtimeNotes: [],
   }
+}
+
+function freshTurn(id: number, prompt: string | null): AgentTurn {
+  return {
+    id,
+    prompt,
+    assistantText: '',
+    thinkingText: '',
+    tools: [],
+    runtimeNotes: [],
+    usage: null,
+    timing: null,
+    round: null,
+    retries: 0,
+    finished: null,
+    stopReason: null,
+  }
+}
+
+function appendTurn(state: AgentState, prompt: string | null): AgentState {
+  const seq = state.turnSeq + 1
+  const turns = [...state.turns, freshTurn(seq, prompt)]
+  return {
+    ...state,
+    turnSeq: seq,
+    running: true,
+    turns: turns.length > MAX_TURNS ? turns.slice(turns.length - MAX_TURNS) : turns,
+  }
+}
+
+function turnClosed(turn: AgentTurn): boolean {
+  return turn.finished !== null || turn.stopReason !== null
+}
+
+/**
+ * Content events belong to the newest open turn. If the last turn is
+ * closed (or none exists), a run is in progress that this client did not
+ * begin — open an implicit turn for it.
+ */
+function withOpenTurn(state: AgentState, update: (turn: AgentTurn) => AgentTurn): AgentState {
+  const last = state.turns[state.turns.length - 1]
+  const base = last !== undefined && !turnClosed(last) ? state : appendTurn(state, null)
+  return updateLastTurn(base, update)
+}
+
+/**
+ * Meta events (usage, timing, retries, finish markers) attach to the last
+ * turn even if it is already closed — they routinely arrive after
+ * `finished` — and only create a turn when none exists at all.
+ */
+function withLastTurn(state: AgentState, update: (turn: AgentTurn) => AgentTurn): AgentState {
+  if (state.turns.length === 0) {
+    return updateLastTurn(appendTurn(state, null), update)
+  }
+  return updateLastTurn(state, update)
+}
+
+function updateLastTurn(state: AgentState, update: (turn: AgentTurn) => AgentTurn): AgentState {
+  const turns = [...state.turns]
+  const last = turns[turns.length - 1]
+  if (last === undefined) return state
+  turns[turns.length - 1] = update(last)
+  return { ...state, turns }
 }
 
 function appendRuntimeNote(notes: string[], note: string): string[] {
   const next = [...notes, note]
-  return next.length > MAX_RUNTIME_NOTES ? next.slice(next.length - MAX_RUNTIME_NOTES) : next
+  return next.length > 20 ? next.slice(next.length - 20) : next
 }
 
 function updateTool(tools: ToolRun[], key: string, update: (tool: ToolRun) => ToolRun): ToolRun[] {
@@ -92,25 +156,14 @@ function findToolKey(tools: ToolRun[], predicate: (tool: ToolRun) => boolean): s
 }
 
 /**
- * A new run started (the `POST /api/agent/run` returned 202). Transient
- * per-run state resets; notifications are kept for the session, capped.
+ * A new run started (the `POST /api/agent/run` returned 202). Appends a
+ * turn carrying the prompt; pending interactions clear; the interruption
+ * notice clears with the fresh run. Notifications are kept, capped.
  */
-export function beginAgentRun(state: AgentState): AgentState {
+export function beginAgentRun(state: AgentState, prompt: string): AgentState {
   return {
-    ...state,
-    running: true,
-    assistantText: '',
-    thinkingText: '',
-    tools: [],
-    approval: null,
-    askUser: null,
-    terminalInput: null,
-    round: null,
-    retries: 0,
-    stopReason: null,
-    finished: null,
+    ...clearPendingInteractions(appendTurn(state, prompt)),
     streamInterrupted: false,
-    runtimeNotes: [],
   }
 }
 
@@ -126,15 +179,21 @@ function clearPendingInteractions(state: AgentState): AgentState {
 export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentState {
   switch (event.type) {
     case 'assistant_delta':
-      return { ...state, assistantText: state.assistantText + event.text }
+      return withOpenTurn(state, (turn) => ({
+        ...turn,
+        assistantText: turn.assistantText + event.text,
+      }))
 
     case 'assistant_message_finished':
       // The finished message is authoritative over the delta accumulation
       // (protects against a dropped delta mid-stream).
-      return { ...state, assistantText: event.text }
+      return withOpenTurn(state, (turn) => ({ ...turn, assistantText: event.text }))
 
     case 'thinking_delta':
-      return { ...state, thinkingText: state.thinkingText + event.text }
+      return withOpenTurn(state, (turn) => ({
+        ...turn,
+        thinkingText: turn.thinkingText + event.text,
+      }))
 
     case 'thinking_finished':
       // No payload; the accumulated thinking text stays available.
@@ -142,113 +201,125 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
 
     case 'tool_preparing': {
       const key = `preparing:${event.index}`
-      const existing = findToolKey(state.tools, (tool) => tool.key === key)
-      const tool: ToolRun = {
-        key,
-        kind: 'tool',
-        id: null,
-        status: 'preparing',
-        label: event.message,
-        detail: null,
-      }
-      return {
-        ...state,
-        tools: existing !== null ? updateTool(state.tools, key, () => tool) : [...state.tools, tool],
-      }
+      return withOpenTurn(state, (turn) => {
+        const existing = findToolKey(turn.tools, (tool) => tool.key === key)
+        const tool: ToolRun = {
+          key,
+          kind: 'tool',
+          id: null,
+          status: 'preparing',
+          label: event.message,
+          detail: null,
+        }
+        return {
+          ...turn,
+          tools:
+            existing !== null ? updateTool(turn.tools, key, () => tool) : [...turn.tools, tool],
+        }
+      })
     }
 
     case 'tool_preparation_finished': {
       const key = `preparing:${event.index}`
-      const existing = findToolKey(state.tools, (tool) => tool.key === key)
-      if (existing === null) {
-        // Preparation finished without a preparing marker (e.g. after a
-        // reconnect): synthesize the row so the id is tracked.
-        return {
-          ...state,
-          tools: [
-            ...state.tools,
-            {
-              key: event.id !== null ? `tool:${event.id}` : key,
-              kind: 'tool',
-              id: event.id,
-              status: 'running',
-              label: 'prepared',
-              detail: null,
-            },
-          ],
+      return withOpenTurn(state, (turn) => {
+        const existing = findToolKey(turn.tools, (tool) => tool.key === key)
+        if (existing === null) {
+          // Preparation finished without a preparing marker (e.g. after a
+          // reconnect): synthesize the row so the id is tracked.
+          return {
+            ...turn,
+            tools: [
+              ...turn.tools,
+              {
+                key: event.id !== null ? `tool:${event.id}` : key,
+                kind: 'tool',
+                id: event.id,
+                status: 'running',
+                label: 'prepared',
+                detail: null,
+              },
+            ],
+          }
         }
-      }
-      return {
-        ...state,
-        tools: updateTool(state.tools, key, (tool) => ({
-          ...tool,
-          id: event.id,
-          status: 'running',
-          key: event.id !== null ? `tool:${event.id}` : tool.key,
-        })),
-      }
+        return {
+          ...turn,
+          tools: updateTool(turn.tools, key, (tool) => ({
+            ...tool,
+            id: event.id,
+            status: 'running',
+            key: event.id !== null ? `tool:${event.id}` : tool.key,
+          })),
+        }
+      })
     }
 
     case 'tool_started': {
-      const key = `tool:${event.id}`
-      const existing = findToolKey(state.tools, (tool) => tool.id === event.id)
-      const tool: ToolRun = {
-        key: existing ?? key,
-        kind: 'tool',
-        id: event.id,
-        status: 'running',
-        label: event.message,
-        detail: null,
-      }
-      return {
-        ...state,
-        tools:
-          existing !== null
-            ? updateTool(state.tools, existing, () => tool)
-            : [...state.tools, tool],
-      }
-    }
-
-    case 'tool_updated': {
-      const key = findToolKey(state.tools, (tool) => tool.id === event.id)
-      if (key === null) return state
-      return { ...state, tools: updateTool(state.tools, key, (tool) => ({ ...tool, label: event.message })) }
-    }
-
-    case 'tool_finished': {
-      const key = findToolKey(state.tools, (tool) => tool.id === event.id)
-      if (key === null) {
-        return {
-          ...state,
-          tools: [
-            ...state.tools,
-            {
-              key: `tool:${event.id}`,
-              kind: 'tool',
-              id: event.id,
-              status: 'finished',
-              label: event.message,
-              detail: event.preview,
-            },
-          ],
-        }
-      }
-      return {
-        ...state,
-        tools: updateTool(state.tools, key, (tool) => ({
-          ...tool,
-          status: 'finished',
+      const fallbackKey = `tool:${event.id}`
+      return withOpenTurn(state, (turn) => {
+        const existing = findToolKey(turn.tools, (tool) => tool.id === event.id)
+        const tool: ToolRun = {
+          key: existing ?? fallbackKey,
+          kind: 'tool',
+          id: event.id,
+          status: 'running',
           label: event.message,
-          detail: event.preview,
-        })),
-      }
+          detail: null,
+        }
+        return {
+          ...turn,
+          tools:
+            existing !== null
+              ? updateTool(turn.tools, existing, () => tool)
+              : [...turn.tools, tool],
+        }
+      })
     }
+
+    case 'tool_updated':
+      return withOpenTurn(state, (turn) => {
+        const key = findToolKey(turn.tools, (tool) => tool.id === event.id)
+        if (key === null) return turn
+        return {
+          ...turn,
+          tools: updateTool(turn.tools, key, (tool) => ({ ...tool, label: event.message })),
+        }
+      })
+
+    case 'tool_finished':
+      return withOpenTurn(state, (turn) => {
+        const key = findToolKey(turn.tools, (tool) => tool.id === event.id)
+        if (key === null) {
+          return {
+            ...turn,
+            tools: [
+              ...turn.tools,
+              {
+                key: `tool:${event.id}`,
+                kind: 'tool',
+                id: event.id,
+                status: 'finished',
+                label: event.message,
+                detail: event.preview,
+              },
+            ],
+          }
+        }
+        return {
+          ...turn,
+          tools: updateTool(turn.tools, key, (tool) => ({
+            ...tool,
+            status: 'finished',
+            label: event.message,
+            detail: event.preview,
+          })),
+        }
+      })
 
     case 'job_started':
-      return {
-        ...state,
+      return withOpenTurn(state, (turn) => ({
+        ...turn,
         tools: [
-          ...state.tools,
+          ...turn.tools,
           {
             key: `job:${event.id}`,
             kind: 'job',
@@ -258,65 +329,73 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
             detail: null,
           },
         ],
-      }
+      }))
 
-    case 'job_settled': {
-      const key = `job:${event.id}`
-      if (findToolKey(state.tools, (tool) => tool.key === key) === null) {
-        return {
-          ...state,
-          tools: [
-            ...state.tools,
-            {
-              key,
-              kind: 'job',
-              id: event.id,
-              status: event.failed ? 'failed' : 'finished',
-              label: 'background job',
-              detail: null,
-            },
-          ],
+    case 'job_settled':
+      return withOpenTurn(state, (turn) => {
+        const key = `job:${event.id}`
+        if (findToolKey(turn.tools, (tool) => tool.key === key) === null) {
+          return {
+            ...turn,
+            tools: [
+              ...turn.tools,
+              {
+                key,
+                kind: 'job',
+                id: event.id,
+                status: event.failed ? 'failed' : 'finished',
+                label: 'background job',
+                detail: null,
+              },
+            ],
+          }
         }
-      }
-      return {
-        ...state,
-        tools: updateTool(state.tools, key, (tool) => ({
-          ...tool,
-          status: event.failed ? 'failed' : 'finished',
-        })),
-      }
-    }
+        return {
+          ...turn,
+          tools: updateTool(turn.tools, key, (tool) => ({
+            ...tool,
+            status: event.failed ? 'failed' : 'finished',
+          })),
+        }
+      })
 
     case 'buffered_input_consumed':
-      return {
-        ...state,
-        runtimeNotes: appendRuntimeNote(state.runtimeNotes, `Consumed ${event.count} buffered input(s)`),
-      }
+      return withOpenTurn(state, (turn) => ({
+        ...turn,
+        runtimeNotes: appendRuntimeNote(
+          turn.runtimeNotes,
+          `Consumed ${event.count} buffered input(s)`,
+        ),
+      }))
 
     case 'job_delivered':
-      return {
-        ...state,
-        runtimeNotes: appendRuntimeNote(state.runtimeNotes, `Delivered: ${event.labels.join(', ')}`),
-      }
+      return withOpenTurn(state, (turn) => ({
+        ...turn,
+        runtimeNotes: appendRuntimeNote(turn.runtimeNotes, `Delivered: ${event.labels.join(', ')}`),
+      }))
 
     case 'usage':
-      return { ...state, usage: event.usage }
+      return withLastTurn(state, (turn) => ({ ...turn, usage: event.usage }))
 
     case 'context_window':
+      // Session-level capacity info; not tied to a single turn.
       return { ...state, contextWindow: { tokens: event.tokens, capacity: event.capacity } }
 
     case 'response_timing':
-      return { ...state, timing: { output_tokens: event.output_tokens, elapsed_ms: event.elapsed_ms } }
+      return withLastTurn(state, (turn) => ({
+        ...turn,
+        timing: { output_tokens: event.output_tokens, elapsed_ms: event.elapsed_ms },
+      }))
 
     case 'retry':
-      return {
-        ...state,
-        retries: state.retries + 1,
-        runtimeNotes: appendRuntimeNote(state.runtimeNotes, 'Retrying request'),
-      }
+      return withLastTurn(state, (turn) => ({
+        ...turn,
+        retries: turn.retries + 1,
+        runtimeNotes: appendRuntimeNote(turn.runtimeNotes, 'Retrying request'),
+      }))
 
     case 'round':
-      return { ...state, round: event.current }
+      return withLastTurn(state, (turn) => ({ ...turn, round: event.current }))
 
     case 'conversation_updated':
       // Only a count crosses the wire; the web UI is a live projection,
@@ -346,21 +425,21 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
 
     case 'approval_requested':
       return {
-        ...state,
+        ...withOpenTurn(state, (turn) => turn),
         running: true,
         approval: { title: event.title, message: event.message, kind: event.kind },
       }
 
     case 'ask_user_requested':
       return {
-        ...state,
+        ...withOpenTurn(state, (turn) => turn),
         running: true,
         askUser: { question: event.question, options: event.options },
       }
 
     case 'terminal_input_requested':
       return {
-        ...state,
+        ...withOpenTurn(state, (turn) => turn),
         running: true,
         terminalInput: {
           session_id: event.session_id,
@@ -371,19 +450,21 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
 
     case 'stopped':
       return {
-        ...clearPendingInteractions(state),
+        ...clearPendingInteractions({
+          ...withLastTurn(state, (turn) => ({ ...turn, stopReason: event.reason })),
+        }),
         running: false,
-        stopReason: event.reason,
       }
 
-    case 'finished': {
-      const next: AgentState = {
-        ...clearPendingInteractions(state),
+    case 'finished':
+      return clearPendingInteractions({
+        ...withLastTurn(state, (turn) => ({
+          ...turn,
+          finished: { ok: event.ok, text: event.text, error: event.error },
+          assistantText: event.text !== null ? event.text : turn.assistantText,
+        })),
         running: false,
-        finished: { ok: event.ok, text: event.text, error: event.error },
-      }
-      return event.text !== null ? { ...next, assistantText: event.text } : next
-    }
+      })
 
     case 'resync_required':
       // Events were dropped by a slow consumer; the missing output cannot

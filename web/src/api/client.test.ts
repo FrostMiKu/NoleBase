@@ -91,6 +91,12 @@ describe('success mapping', () => {
     })
   })
 
+  it('returns undefined for 202 accepted responses (agent commands)', async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(apiPost('/api/agent/run', { prompt: 'hello' })).resolves.toBeUndefined()
+  })
+
   it('returns undefined for 204 responses (mutations)', async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 204 }))
     vi.stubGlobal('fetch', fetchMock)
