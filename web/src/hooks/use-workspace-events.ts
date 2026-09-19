@@ -44,7 +44,10 @@ export function setCurrentDocumentPath(path: string | null): void {
  *   keeps no such cache.
  * - `watcher_failed`: reported to the caller (toast + status bar).
  */
-export function applyWorkspaceEvent(deps: WorkspaceEventDeps, event: WorkspaceEvent): void {
+export function applyWorkspaceEvent(
+  deps: WorkspaceEventDeps,
+  event: WorkspaceEvent,
+): void | Promise<void> {
   switch (event.type) {
     case 'content_changed': {
       invalidateWorkspaceContent(deps.queryClient, deps.getCurrentPath(), {

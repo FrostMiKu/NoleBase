@@ -33,7 +33,11 @@ export function AgentTranscript() {
           {assistantText}
         </pre>
       ) : (
-        thinkingText === '' && tools.length === 0 && (
+        thinkingText === '' &&
+        tools.length === 0 &&
+        runtimeNotes.length === 0 &&
+        finished === null &&
+        stopReason === null && (
           <p className="text-[11px] text-faint">No agent activity yet. Send a prompt below.</p>
         )
       )}
