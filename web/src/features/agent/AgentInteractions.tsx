@@ -15,6 +15,10 @@ export function AgentInteractions() {
   const askUser = useAgentStore((state) => state.askUser)
   const terminalInput = useAgentStore((state) => state.terminalInput)
 
+  // Nothing pending: render nothing at all, so no stray separator or
+  // padding appears above the composer.
+  if (approval === null && askUser === null && terminalInput === null) return null
+
   return (
     <div className="flex shrink-0 flex-col gap-2 border-t border-border bg-panel px-3 py-2">
       {approval !== null && <ApprovalBox kind={approval.kind} title={approval.title} message={approval.message} />}
