@@ -1,15 +1,25 @@
+import { useNavigate } from '@tanstack/react-router'
+
 import { useUiStore } from '@/stores/ui-store'
 
 /**
- * Slim top bar: app identity and the palette shortcut hint. The open
- * document is identified in the editor toolbar, not here.
+ * Slim top bar: the NólëBase home link (back to the workspace overview)
+ * and the palette shortcut hint. The open document is identified in the
+ * editor toolbar, not here.
  */
 export function TopBar() {
   const setCommandPaletteOpen = useUiStore((state) => state.setCommandPaletteOpen)
+  const navigate = useNavigate()
 
   return (
     <header className="flex h-8 shrink-0 items-center gap-3 border-b border-border bg-panel px-3">
-      <span className="text-[12px] font-semibold tracking-wide text-fg">Nole</span>
+      <button
+        type="button"
+        onClick={() => void navigate({ to: '/' })}
+        className="rounded-sm text-[12px] font-semibold tracking-wide text-fg transition-colors hover:text-muted"
+      >
+        NólëBase
+      </button>
       <span className="text-[11px] text-faint">workspace</span>
       <button
         type="button"
