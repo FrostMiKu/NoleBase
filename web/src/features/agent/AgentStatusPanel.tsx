@@ -1,4 +1,4 @@
-import { Bot } from 'lucide-react'
+import { Sparkles } from 'lucide-react'
 
 import { useAgentStore } from '@/stores/agent-store'
 
@@ -14,7 +14,7 @@ export function AgentStatusPanel() {
   return (
     <div className="flex h-full flex-col overflow-y-auto" data-testid="agent-status-panel">
       <p className="flex items-center gap-1.5 px-3 pt-2.5 pb-1 text-[10px] font-semibold tracking-wider text-faint uppercase">
-        <Bot size={11} />
+        <Sparkles size={11} />
         Agents
         <span className="ml-auto font-mono text-[10px]">
           {running ? 'running' : 'idle'}

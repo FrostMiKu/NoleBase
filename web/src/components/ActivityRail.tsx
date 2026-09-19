@@ -1,5 +1,5 @@
 import { useNavigate, useRouterState } from '@tanstack/react-router'
-import { Bot, CalendarDays, Hash, Search } from 'lucide-react'
+import { CalendarDays, Hash, Search, Sparkles } from 'lucide-react'
 
 type RailView = 'daily' | 'tags' | 'agent' | 'search'
 
@@ -11,8 +11,8 @@ interface RailItem {
 
 const ITEMS: RailItem[] = [
   { view: 'daily', label: 'Daily', icon: CalendarDays },
+  { view: 'agent', label: 'Agent', icon: Sparkles },
   { view: 'tags', label: 'Tags', icon: Hash },
-  { view: 'agent', label: 'Agent', icon: Bot },
   { view: 'search', label: 'Search', icon: Search },
 ]
 
