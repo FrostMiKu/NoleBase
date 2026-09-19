@@ -1,0 +1,137 @@
+@import 'tailwindcss';
+
+/*
+ * Nole web UI design tokens: a dense, neutral, IDE-like dark palette.
+ * Everything else is Tailwind utilities; only tokens, resets, scrollbars,
+ * and CodeMirror integration live here.
+ */
+@theme {
+  --color-bg: #131316;
+  --color-panel: #191a1e;
+  --color-raised: #1f2025;
+  --color-overlay: #232429;
+  --color-border: #2c2d33;
+  --color-border-strong: #3a3b42;
+
+  --color-fg: #d8d8dc;
+  --color-muted: #9a9ba3;
+  --color-faint: #6f7077;
+
+  --color-accent: #6c9ef8;
+  --color-accent-strong: #8db4fa;
+  --color-accent-dim: #253349;
+
+  --color-ok: #66b88f;
+  --color-warn: #d9a54a;
+  --color-danger: #e5645c;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-accent-dim);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-faint);
+  background-clip: content-box;
+  border: 2px solid transparent;
+}
+
+/* --- CodeMirror integration ------------------------------------------- */
+
+.cm-editor {
+  height: 100%;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: transparent;
+}
+.cm-editor.cm-focused {
+  outline: none;
+}
+.cm-scroller {
+  overflow: auto;
+  font-family: var(--font-mono) !important;
+  line-height: 1.55;
+}
+.cm-gutters {
+  background: transparent !important;
+  border-right: 1px solid var(--color-border) !important;
+  color: var(--color-faint) !important;
+  user-select: none;
+}
+.cm-activeLineGutter,
+.cm-activeLine {
+  background: color-mix(in srgb, var(--color-raised) 55%, transparent) !important;
+}
+.cm-selectionBackground,
+.cm-content ::selection,
+.cm-editor .cm-selectionBackground {
+  background: var(--color-accent-dim) !important;
+}
+.cm-cursor {
+  border-left-color: var(--color-accent) !important;
+}
+.cm-matchingBracket {
+  background: color-mix(in srgb, var(--color-accent) 25%, transparent) !important;
+  outline: none !important;
+  color: inherit !important;
+}
+.cm-tooltip {
+  background: var(--color-overlay) !important;
+  border: 1px solid var(--color-border-strong) !important;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul {
+  font-family: var(--font-mono);
+  max-height: 220px;
+}
+.cm-panels {
+  background: var(--color-panel) !important;
+  border-bottom: 1px solid var(--color-border) !important;
+  color: var(--color-fg);
+}
+.cm-searchMatch {
+  background: color-mix(in srgb, var(--color-warn) 30%, transparent) !important;
+  outline: none !important;
+}
+.cm-searchMatch-selected {
+  background: color-mix(in srgb, var(--color-warn) 55%, transparent) !important;
+}
+
+/* Radix popovers/overlays must sit above CodeMirror's own z-indexed bits. */
+[data-radix-popper-content-wrapper] {
+  z-index: 60 !important;
+}
