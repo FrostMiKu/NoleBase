@@ -23,18 +23,17 @@ afterEach(cleanup)
 describe('StatusBar', () => {
   it('shows both connection states and no document', () => {
     render(<StatusBar />)
-    expect(screen.getByTestId('status-bar').textContent).toContain('no document')
     expect(screen.getByTestId('status-bar').textContent).toContain('Agent: idle')
     const dots = screen.getAllByTitle('WS: connected')
     expect(dots.length).toBeGreaterThanOrEqual(1)
   })
 
-  it('marks a dirty document as modified', () => {
+  it('marks a dirty document as modified without showing its path', () => {
     editorStore.loadDocument('data/foo.md', 'base')
     editorStore.setLiveDirty(true)
     render(<StatusBar />)
     expect(screen.getByTestId('status-bar').textContent).toContain('Modified')
-    expect(screen.getByTestId('status-bar').textContent).toContain('data/foo.md')
+    expect(screen.getByTestId('status-bar').textContent).not.toContain('data/foo.md')
   })
 
   it('surfaces a watcher error', () => {

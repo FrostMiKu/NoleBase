@@ -24,7 +24,7 @@ export function StatusBar() {
   const workspaceResyncing = useUiStore((state) => state.workspaceResyncing)
   const agentConnection = useAgentStore((state) => state.connection)
   const agentRunning = useAgentStore((state) => state.running)
-  const { dirty, path, saving } = useEditorState()
+  const { dirty, saving } = useEditorState()
 
   return (
     <footer
@@ -48,9 +48,6 @@ export function StatusBar() {
             {saving ? 'Saving' : 'Modified'}
           </span>
         )}
-        <span className="max-w-[40vw] truncate" title={path ?? undefined}>
-          {path ?? 'no document'}
-        </span>
       </span>
     </footer>
   )

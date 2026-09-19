@@ -14,6 +14,7 @@ import { ActivityRail } from '@/components/ActivityRail'
 import { SplitGroup, SplitPanel, SplitSeparator } from '@/components/SplitPane'
 import { StatusBar } from '@/components/StatusBar'
 import { TopBar } from '@/components/TopBar'
+import { AgentPanel } from '@/features/agent/AgentPanel'
 import { AgentStatusPanel } from '@/features/agent/AgentStatusPanel'
 import { LeftSidebar } from '@/features/navigation/LeftSidebar'
 import { TodoPanel } from '@/features/todos/TodoPanel'
@@ -115,11 +116,14 @@ function MainPanels() {
   )
 }
 
-/** Right sidebar: Todos on top, agent status (background jobs and
- * subagent runs) below, vertically resizable. The full agent surface is
- * the /agent center view. */
+/** Right sidebar: Todos on top and, below, the compact agent surface —
+ * the mini composer/transcript everywhere except the /agent center view,
+ * where the transcript already fills the center and the slot shows
+ * background jobs and subagent runs instead. Vertically resizable. */
 function RightSidebar() {
   const todoPanelSize = useUiStore((state) => state.todoPanelSize)
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
+  const agentCentered = pathname === '/agent'
 
   return (
     <SplitGroup orientation="vertical" className="h-full">
@@ -134,8 +138,8 @@ function RightSidebar() {
         <TodoPanel />
       </SplitPanel>
       <SplitSeparator vertical />
-      <SplitPanel id="agent-status-slot" minSize="12">
-        <AgentStatusPanel />
+      <SplitPanel id="agent-slot" minSize="15">
+        {agentCentered ? <AgentStatusPanel /> : <AgentPanel />}
       </SplitPanel>
     </SplitGroup>
   )

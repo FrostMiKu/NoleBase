@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ChevronRight, CircleCheck, CircleDashed, CircleX, Loader2 } from 'lucide-react'
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { Markdown } from '@/features/agent/Markdown'
 import { useAgentStore } from '@/stores/agent-store'
 import type { AgentTurn } from '@/features/agent/agent-reducer'
 import type { ToolRun } from '@/types/agent'
@@ -83,11 +84,7 @@ function TurnBlock({ turn }: { turn: AgentTurn }) {
 
       <ThinkingSection text={turn.thinkingText} />
 
-      {turn.assistantText !== '' && (
-        <pre className="text-[12px] leading-[1.5] whitespace-pre-wrap text-fg">
-          {displayText(turn.assistantText)}
-        </pre>
-      )}
+      {turn.assistantText !== '' && <Markdown text={displayText(turn.assistantText)} />}
 
       {turn.tools.length > 0 && (
         <ul className="mt-1 space-y-px" data-testid="agent-tools">

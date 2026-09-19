@@ -13,6 +13,10 @@ export function BacklinksPopover({ path }: { path: string }) {
   const navigate = useNavigate()
   const backlinks = backlinksQuery.data?.backlinks ?? []
 
+  /** Bare note name: strip the directory and the extension. */
+  const displayName = (source: string) =>
+    source.split('/').pop()?.replace(/\.[^.]+$/, '') ?? source
+
   return (
     <Popover>
       <PopoverTrigger
@@ -40,13 +44,13 @@ export function BacklinksPopover({ path }: { path: string }) {
             <li key={source}>
               <button
                 type="button"
-                className="w-full truncate rounded-sm px-1.5 py-1 text-left font-mono text-[11px] text-fg transition-colors hover:bg-accent/20"
+                className="w-full truncate rounded-sm px-1.5 py-1 text-left text-[11px] text-fg transition-colors hover:bg-accent/20"
                 title={source}
                 onClick={() => {
                   void navigate({ to: '/document', search: { path: source } })
                 }}
               >
-                {source}
+                {displayName(source)}
               </button>
             </li>
           ))}
