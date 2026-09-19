@@ -140,11 +140,10 @@ export function AgentPanel() {
               send()
             }
           }}
-          rows={2}
           disabled={running}
-          placeholder={running ? 'Agent is running…' : 'Ask the agent… (Enter to send)'}
+          placeholder={running ? 'Agent is running…' : 'Ask the agent…'}
           data-testid="agent-composer"
-          className="w-full resize-none rounded-sm border border-border-strong bg-bg px-2 py-1.5 text-[12px] text-fg outline-none placeholder:text-faint focus:border-accent disabled:opacity-60"
+          className="max-h-48 w-full resize-none overflow-y-auto field-sizing-content rounded-sm border border-border-strong bg-bg px-2 py-1.5 text-[12px] text-fg outline-none placeholder:text-faint focus:border-accent disabled:opacity-60"
         />
       </div>
     </section>

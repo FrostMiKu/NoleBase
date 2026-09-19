@@ -139,7 +139,6 @@ export function DailyQuickInput() {
       )}
       <textarea
         ref={inputRef}
-        rows={1}
         value={text}
         placeholder="今天有什么想记下来的"
         data-testid="daily-quick-input"
@@ -177,7 +176,7 @@ export function DailyQuickInput() {
           // Allow the mousedown-accept path to run first.
           window.setTimeout(() => setCompletion(null), 120)
         }}
-        className="w-full resize-y bg-transparent text-[13px] text-fg outline-none placeholder:text-faint"
+        className="max-h-48 w-full resize-none overflow-y-auto field-sizing-content bg-transparent text-[13px] text-fg outline-none placeholder:text-faint"
       />
       <div className="flex justify-end">
         <button
