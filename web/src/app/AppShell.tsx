@@ -14,7 +14,7 @@ import { ActivityRail } from '@/components/ActivityRail'
 import { SplitGroup, SplitPanel, SplitSeparator } from '@/components/SplitPane'
 import { StatusBar } from '@/components/StatusBar'
 import { TopBar } from '@/components/TopBar'
-import { AgentPanel } from '@/features/agent/AgentPanel'
+import { AgentStatusPanel } from '@/features/agent/AgentStatusPanel'
 import { LeftSidebar } from '@/features/navigation/LeftSidebar'
 import { TodoPanel } from '@/features/todos/TodoPanel'
 import { useUiStore } from '@/stores/ui-store'
@@ -115,32 +115,27 @@ function MainPanels() {
   )
 }
 
-/** Right sidebar: Todo on top, Agent below, vertically resizable. The
- * agent panel steps aside while the center shows the /agent view. */
+/** Right sidebar: Todos on top, agent status (background jobs and
+ * subagent runs) below, vertically resizable. The full agent surface is
+ * the /agent center view. */
 function RightSidebar() {
-  const agentPanelSize = useUiStore((state) => state.agentPanelSize)
-  const pathname = useRouterState({ select: (state) => state.location.pathname })
-  const agentCentered = pathname === '/agent'
-
-  if (agentCentered) {
-    return <TodoPanel />
-  }
+  const todoPanelSize = useUiStore((state) => state.todoPanelSize)
 
   return (
     <SplitGroup orientation="vertical" className="h-full">
       <SplitPanel
-        id="todo-panel"
-        defaultSize={`${100 - agentPanelSize}`}
-        minSize="12"
-        maxSize="70"
+        id="todos-slot"
+        defaultSize={`${todoPanelSize}`}
+        minSize="15"
+        maxSize="80"
         className="border-b border-border"
-        onResize={(size) => useUiStore.getState().setAgentPanelSize(100 - size.asPercentage)}
+        onResize={(size) => useUiStore.getState().setTodoPanelSize(size.asPercentage)}
       >
         <TodoPanel />
       </SplitPanel>
       <SplitSeparator vertical />
-      <SplitPanel id="agent-panel" minSize="20">
-        <AgentPanel />
+      <SplitPanel id="agent-status-slot" minSize="12">
+        <AgentStatusPanel />
       </SplitPanel>
     </SplitGroup>
   )

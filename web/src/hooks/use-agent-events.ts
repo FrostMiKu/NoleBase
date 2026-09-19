@@ -111,7 +111,9 @@ export function useAgentEvents(handlers: AgentEventHandlers): void {
           handlersRef.current.onFileMoved(event.from, event.to)
           return
         }
-        if (event.type === 'resync_required') {
+        if (event.type === 'resync_required' || event.type === 'job_settled') {
+          // A settled job may trigger a session-initiated wake-up run;
+          // resync the running flag so the composer stays honest.
           void syncAgentFromServer(queryClient)
         }
         useAgentStore.getState().dispatchEvent(event)

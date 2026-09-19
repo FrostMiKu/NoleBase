@@ -316,7 +316,9 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       })
 
     case 'job_started':
-      return withOpenTurn(state, (turn) => ({
+      // A job may be reported after the announcing turn closed (it can
+      // outlive the run); attach to the last turn instead of opening one.
+      return withLastTurn(state, (turn) => ({
         ...turn,
         tools: [
           ...turn.tools,
@@ -332,7 +334,7 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       }))
 
     case 'job_settled':
-      return withOpenTurn(state, (turn) => {
+      return withLastTurn(state, (turn) => {
         const key = `job:${event.id}`
         if (findToolKey(turn.tools, (tool) => tool.key === key) === null) {
           return {

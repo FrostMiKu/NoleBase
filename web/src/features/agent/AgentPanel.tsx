@@ -97,7 +97,7 @@ export function AgentPanel() {
           {running && (
             <button
               type="button"
-              className={buttonStyles.danger}
+              className={`${buttonStyles.danger} h-6 px-2`}
               onClick={cancel}
               title="Stop the running agent"
             >

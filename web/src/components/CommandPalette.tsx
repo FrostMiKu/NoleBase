@@ -30,7 +30,10 @@ function useCommands(): PaletteCommand[] {
     {
       id: 'focus-agent',
       label: 'Focus Agent',
-      run: () => ui().requestAgentFocus(),
+      run: () => {
+        void navigate({ to: '/agent' })
+        ui().requestAgentFocus()
+      },
     },
     {
       id: 'save-document',

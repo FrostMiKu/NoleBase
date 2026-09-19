@@ -14,7 +14,8 @@ export interface UiState {
 
   leftSidebarSize: number
   rightSidebarSize: number
-  agentPanelSize: number
+  /** Percentage of the right sidebar's vertical split given to Todos. */
+  todoPanelSize: number
 
   /** Expanded state of the left sidebar's collapsible sections. */
   sidebarSections: Record<SidebarSectionKey, boolean>
@@ -35,7 +36,7 @@ export interface UiActions {
   toggleRightSidebar: () => void
   setLeftSidebarSize: (size: number) => void
   setRightSidebarSize: (size: number) => void
-  setAgentPanelSize: (size: number) => void
+  setTodoPanelSize: (size: number) => void
   toggleSidebarSection: (key: SidebarSectionKey) => void
   setCommandPaletteOpen: (open: boolean) => void
   setWorkspaceConnection: (state: WorkspaceConnectionState) => void
@@ -52,7 +53,7 @@ export const useUiStore = create<UiStore>()((set) => ({
 
   leftSidebarSize: 20,
   rightSidebarSize: 28,
-  agentPanelSize: 58,
+  todoPanelSize: 62,
 
   // The file list opens with Notes visible and Archives collapsed.
   sidebarSections: { notes: true, archives: false },
@@ -70,7 +71,7 @@ export const useUiStore = create<UiStore>()((set) => ({
   toggleRightSidebar: () => set((state) => ({ rightSidebarOpen: !state.rightSidebarOpen })),
   setLeftSidebarSize: (size) => set({ leftSidebarSize: size }),
   setRightSidebarSize: (size) => set({ rightSidebarSize: size }),
-  setAgentPanelSize: (size) => set({ agentPanelSize: size }),
+  setTodoPanelSize: (size) => set({ todoPanelSize: size }),
   toggleSidebarSection: (key) =>
     set((state) => ({
       sidebarSections: { ...state.sidebarSections, [key]: !state.sidebarSections[key] },

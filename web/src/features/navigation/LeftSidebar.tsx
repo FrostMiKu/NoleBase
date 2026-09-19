@@ -90,7 +90,7 @@ export function LeftSidebar() {
             title={note.path}
             onClick={() => void navigate({ to: '/document', search: { path: note.path } })}
           >
-            {note.path}
+            {note.name}
           </Row>
         ))}
         {notesQuery.isError && <ErrorRow message="Notes failed to load" />}
@@ -104,7 +104,7 @@ export function LeftSidebar() {
             title={note.path}
             onClick={() => void navigate({ to: '/document', search: { path: note.path } })}
           >
-            <span className="text-muted">{note.path}</span>
+            <span className="text-muted">{note.name}</span>
           </Row>
         ))}
       </Section>

@@ -6,10 +6,17 @@ import { useAgentStore } from '@/stores/agent-store'
 import type { AgentTurn } from '@/features/agent/agent-reducer'
 import type { ToolRun } from '@/types/agent'
 
+/** Collapse 3+ blank lines to one blank line and trim the ends: model
+ * output sometimes carries runs of newlines that read as huge gaps in a
+ * plain-text projection. Display-only; the store keeps the raw text. */
+function displayText(text: string): string {
+  return text.replace(/\n{3,}/g, '\n\n').trim()
+}
+
 /**
- * The live runtime view: one block per conversational turn (prompt echo,
- * collapsed-by-default thinking, assistant text, compact tool/job
- * timeline, runtime notices, outcome). Turns accumulate; no chat bubbles.
+ * The live runtime view: one compact block per conversational turn (prompt
+ * echo, collapsed-by-default thinking, assistant text, tool/job timeline,
+ * runtime notices, meta line with the outcome chip). Turns accumulate.
  */
 export function AgentTranscript() {
   const turns = useAgentStore((state) => state.turns)
@@ -28,7 +35,7 @@ export function AgentTranscript() {
       ))}
 
       {(contextWindow !== null || messageCount !== null) && (
-        <p className="mt-2 font-mono text-[10px] text-faint">
+        <p className="mt-1.5 font-mono text-[10px] text-faint">
           {contextWindow !== null &&
             `ctx ${contextWindow.capacity > 0 ? Math.round((contextWindow.tokens / contextWindow.capacity) * 100) : 0}%`}
           {contextWindow !== null && messageCount !== null && ' · '}
@@ -37,7 +44,7 @@ export function AgentTranscript() {
       )}
 
       {notifications.length > 0 && (
-        <div className="mt-3 border-t border-border pt-2">
+        <div className="mt-2 border-t border-border pt-1.5">
           {notifications.map((notification) => (
             <p key={notification.id} className="py-0.5 text-[11px] text-warn">
               ⚑ {notification.message}
@@ -50,10 +57,25 @@ export function AgentTranscript() {
 }
 
 function TurnBlock({ turn }: { turn: AgentTurn }) {
+  const outcome =
+    turn.finished !== null
+      ? turn.finished.ok
+        ? { tone: 'text-ok', label: '✓ Finished' }
+        : {
+            tone: 'text-danger',
+            label:
+              turn.finished.error !== null
+                ? `✗ Failed: ${turn.finished.error}`
+                : '✗ Failed',
+          }
+      : turn.stopReason !== null
+        ? { tone: 'text-warn', label: `■ Stopped: ${turn.stopReason}` }
+        : null
+
   return (
-    <div className="mb-3 border-b border-border pb-2 last:border-b-0" data-testid={`agent-turn-${turn.id}`}>
+    <div className="mb-2 border-b border-border pb-1.5 last:border-b-0" data-testid={`agent-turn-${turn.id}`}>
       {turn.prompt !== null && (
-        <p className="mb-1.5 flex items-start gap-1.5 text-[11px] text-muted">
+        <p className="flex items-start gap-1.5 text-[11px] text-muted">
           <span className="mt-px shrink-0 text-faint">›</span>
           <span className="whitespace-pre-wrap">{turn.prompt}</span>
         </p>
@@ -62,13 +84,13 @@ function TurnBlock({ turn }: { turn: AgentTurn }) {
       <ThinkingSection text={turn.thinkingText} />
 
       {turn.assistantText !== '' && (
-        <pre className="text-[12px] leading-relaxed whitespace-pre-wrap text-fg">
-          {turn.assistantText}
+        <pre className="text-[12px] leading-[1.5] whitespace-pre-wrap text-fg">
+          {displayText(turn.assistantText)}
         </pre>
       )}
 
       {turn.tools.length > 0 && (
-        <ul className="mt-2 space-y-0.5" data-testid="agent-tools">
+        <ul className="mt-1 space-y-px" data-testid="agent-tools">
           {turn.tools.map((tool) => (
             <ToolRow key={tool.key} tool={tool} />
           ))}
@@ -76,7 +98,7 @@ function TurnBlock({ turn }: { turn: AgentTurn }) {
       )}
 
       {turn.runtimeNotes.length > 0 && (
-        <div className="mt-2 space-y-0.5">
+        <div className="mt-1 space-y-px">
           {turn.runtimeNotes.map((note, index) => (
             <p key={index} className="font-mono text-[10px] text-faint">
               · {note}
@@ -85,23 +107,7 @@ function TurnBlock({ turn }: { turn: AgentTurn }) {
         </div>
       )}
 
-      <TurnMeta turn={turn} />
-
-      {turn.stopReason !== null && (
-        <p className="mt-2 rounded-sm border border-warn/40 bg-warn/10 px-2 py-1 text-[11px] text-warn">
-          Stopped: {turn.stopReason}
-        </p>
-      )}
-      {turn.finished !== null &&
-        (turn.finished.ok ? (
-          <p className="mt-2 rounded-sm border border-ok/40 bg-ok/10 px-2 py-1 text-[11px] text-ok">
-            Finished
-          </p>
-        ) : (
-          <p className="mt-2 rounded-sm border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] whitespace-pre-wrap text-danger">
-            Failed{turn.finished.error !== null ? `: ${turn.finished.error}` : ''}
-          </p>
-        ))}
+      <TurnMeta turn={turn} outcome={outcome} />
     </div>
   )
 }
@@ -109,14 +115,14 @@ function TurnBlock({ turn }: { turn: AgentTurn }) {
 function ThinkingSection({ text }: { text: string }) {
   if (text === '') return null
   return (
-    <Collapsible className="mb-2" data-testid="agent-thinking">
+    <Collapsible className="my-1" data-testid="agent-thinking">
       <CollapsibleTrigger className="group flex items-center gap-1 text-[10px] font-semibold tracking-wider text-faint uppercase hover:text-muted">
         <ChevronRight size={10} className="transition-transform group-data-[state=open]:rotate-90" />
         Thinking
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <pre className="mt-1 max-h-48 overflow-y-auto rounded-sm border border-border bg-panel px-2 py-1.5 text-[11px] whitespace-pre-wrap text-muted">
-          {text}
+        <pre className="mt-1 max-h-48 overflow-y-auto rounded-sm border border-border bg-panel px-2 py-1 text-[11px] whitespace-pre-wrap text-muted">
+          {displayText(text)}
         </pre>
       </CollapsibleContent>
     </Collapsible>
@@ -159,7 +165,13 @@ function ToolRow({ tool }: { tool: ToolRun }) {
   )
 }
 
-function TurnMeta({ turn }: { turn: AgentTurn }) {
+function TurnMeta({
+  turn,
+  outcome,
+}: {
+  turn: AgentTurn
+  outcome: { tone: string; label: string } | null
+}) {
   const parts: string[] = []
   if (turn.usage !== null) {
     parts.push(`in ${fmtTokens(turn.usage.input_tokens + turn.usage.cache_read_input_tokens)}`)
@@ -171,8 +183,15 @@ function TurnMeta({ turn }: { turn: AgentTurn }) {
   if (turn.timing !== null) parts.push(`${(turn.timing.elapsed_ms / 1000).toFixed(1)}s`)
   if (turn.round !== null) parts.push(`round ${turn.round}`)
   if (turn.retries > 0) parts.push(`retries ${turn.retries}`)
-  if (parts.length === 0) return null
-  return <p className="mt-2 font-mono text-[10px] text-faint">{parts.join(' · ')}</p>
+
+  if (parts.length === 0 && outcome === null) return null
+  return (
+    <p className="mt-1 font-mono text-[10px] text-faint">
+      {parts.join(' · ')}
+      {parts.length > 0 && outcome !== null && ' · '}
+      {outcome !== null && <span className={outcome.tone}>{outcome.label}</span>}
+    </p>
+  )
 }
 
 function fmtTokens(value: number): string {

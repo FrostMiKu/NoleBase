@@ -212,6 +212,17 @@ describe('background jobs and notices', () => {
     expect(lastTurn(state).tools[0]).toMatchObject({ key: 'job:j1', status: 'failed' })
   })
 
+  it('attaches a late job_settled to the last turn without a phantom turn', () => {
+    let state = runTurn(stateWith(), 'spawn subagent', 'dispatched to background')
+    // The job settles after the run finished (job outlives the turn).
+    state = reduce(state, { type: 'job_started', id: 'j9', label: 'explore' })
+    state = reduce(state, { type: 'job_settled', id: 'j9', failed: false })
+    expect(state.turns).toHaveLength(1)
+    const tools = state.turns[0]?.tools ?? []
+    expect(tools).toHaveLength(1)
+    expect(tools[0]).toMatchObject({ key: 'job:j9', status: 'finished' })
+  })
+
   it('records buffered input and delivery notices', () => {
     let state = begin(stateWith(), 'p')
     state = reduce(state, { type: 'buffered_input_consumed', count: 2 })
