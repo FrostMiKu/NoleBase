@@ -1,4 +1,5 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 
 import { workspaceApi } from '@/api/workspace'
 import { workspaceKeys } from './keys'
@@ -39,6 +40,24 @@ export function useSearchResults(query: string) {
     queryKey: workspaceKeys.search(query),
     queryFn: () => workspaceApi.search(query),
     enabled: query.trim() !== '',
+  })
+}
+
+export function useAppendToday() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: string) => workspaceApi.appendToday(body),
+    onSuccess: (note) => {
+      // The append may add tasks and always changes the daily set.
+      void queryClient.invalidateQueries({ queryKey: workspaceKeys.daily() })
+      void queryClient.invalidateQueries({ queryKey: workspaceKeys.todos() })
+      void queryClient.invalidateQueries({ queryKey: workspaceKeys.summary() })
+      void queryClient.invalidateQueries({ queryKey: workspaceKeys.document(note.path) })
+      toast.success(`Saved to ${note.date}`)
+    },
+    onError: (error) => {
+      toast.error(`Could not save: ${error instanceof Error ? error.message : 'unknown error'}`)
+    },
   })
 }
 

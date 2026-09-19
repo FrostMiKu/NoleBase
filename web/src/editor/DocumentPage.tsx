@@ -1,4 +1,4 @@
-import { FileWarning, Save } from 'lucide-react'
+import { FileWarning } from 'lucide-react'
 import { useNavigate } from '@tanstack/react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -7,7 +7,7 @@ import { workspaceApi } from '@/api/workspace'
 import { editorStore, useEditorState } from '@/editor/editor-state'
 import { DocumentEditor } from '@/editor/DocumentEditor'
 import { replaceEditorSource } from '@/editor/editor-bridge'
-import { saveCurrentDocument } from '@/editor/save'
+import { useAutoSave } from '@/editor/use-autosave'
 import { BacklinksPopover } from '@/features/backlinks/BacklinksPopover'
 import { workspaceKeys } from '@/queries/keys'
 import { useDocument } from '@/queries/workspace'
@@ -20,6 +20,7 @@ export function DocumentPage({ path }: { path: string }) {
   const navigate = useNavigate()
   const documentQuery = useDocument(path)
   const editor = useEditorState()
+  useAutoSave()
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -30,18 +31,14 @@ export function DocumentPage({ path }: { path: string }) {
         {editor.path === path && editor.dirty && (
           <span className="text-[10px] text-warn">● modified</span>
         )}
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex items-center gap-2">
+          {editor.path === path && editor.saving && (
+            <span className="font-mono text-[10px] text-faint">saving…</span>
+          )}
+          {editor.path === path && editor.dirty && !editor.saving && (
+            <span className="font-mono text-[10px] text-warn">unsaved</span>
+          )}
           <BacklinksPopover path={path} />
-          <button
-            type="button"
-            className="inline-flex h-6 items-center gap-1 rounded-sm border border-border-strong bg-raised px-2 text-[11px] text-fg transition-colors hover:bg-overlay disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={editor.path !== path || !editor.dirty || editor.saving}
-            onClick={() => void saveCurrentDocument()}
-            title="Save (⌘S)"
-          >
-            <Save size={11} />
-            {editor.saving ? 'Saving…' : 'Save'}
-          </button>
         </div>
       </div>
 

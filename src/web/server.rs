@@ -43,6 +43,7 @@ pub fn router_with_static_dir(state: web::state::WebState, static_dir: Option<Pa
         .route("/api/workspace", get(web::workspace::overview))
         .route("/api/notes", get(web::workspace::notes))
         .route("/api/daily", get(web::workspace::daily))
+        .route("/api/daily/today", post(web::workspace::append_to_today))
         .route("/api/todos", get(web::workspace::todos))
         .route("/api/search", get(web::workspace::search))
         .route("/api/tags", get(web::workspace::tags))

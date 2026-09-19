@@ -86,6 +86,12 @@ impl Workspace {
         self.storage.load_todo_tasks()
     }
 
+    /// Append content to today's daily note, creating it on first send —
+    /// the web quick-input primitive mirroring the TUI's daily send.
+    pub fn append_to_today(&self, body: &str) -> Result<DailyNote> {
+        self.storage.append_to_today(body)
+    }
+
     /// Workspace-wide search. `None` while the document index has not
     /// published its first snapshot yet.
     pub fn search(&self, query: &str) -> Option<Vec<SearchHit>> {

@@ -201,6 +201,41 @@ async fn daily_paths_open_through_the_document_endpoint() {
 }
 
 #[tokio::test]
+async fn daily_today_append_creates_then_appends() {
+    let (state, _directory) = test_state();
+    let router = server::router(state.clone());
+
+    // Empty content is rejected.
+    let (status, json, _) = post_json(&router, "/api/daily/today", json!({"body": "  "}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&json), "bad_request");
+
+    // First send creates today's note.
+    let (status, json, _) = post_json(&router, "/api/daily/today", json!({"body": "first line"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let path = json["path"].as_str().unwrap().to_string();
+    assert!(path.starts_with("daily/") && path.ends_with(".md"));
+    assert_eq!(json["body"], json!("first line"));
+
+    // A second send appends with blank-line separation.
+    let (status, _, _) = post_json(&router, "/api/daily/today", json!({"body": "second line"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, document, _) =
+        get(&router, &format!("/api/document?path={}", urlencoding_encode(&path))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(document["source"].as_str().unwrap().contains("first line"));
+    assert!(document["source"].as_str().unwrap().contains("second line"));
+
+    // The daily list reflects the created note.
+    let (status, daily, _) = get(&router, "/api/daily").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(daily[0]["path"], json!(path));
+}
+
+#[tokio::test]
 async fn static_serving_serves_the_spa_and_keeps_api_404s() {
     let (state, _directory) = test_state();
     let dist = tempfile::tempdir().unwrap();

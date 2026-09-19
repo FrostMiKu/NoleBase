@@ -1,4 +1,4 @@
-import { apiGet, apiPut } from './client'
+import { apiGet, apiPost, apiPut } from './client'
 import type {
   BacklinksResponse,
   DailyNote,
@@ -24,6 +24,7 @@ export const workspaceApi = {
     apiGet<DocumentDto>(`/api/document?path=${encodeURIComponent(path)}`),
   writeDocument: (path: string, source: string) =>
     apiPut<null>('/api/document', { path, source }),
+  appendToday: (body: string) => apiPost<DailyNote>('/api/daily/today', { body }),
   backlinks: (path: string) =>
     apiGet<BacklinksResponse>(`/api/backlinks?path=${encodeURIComponent(path)}`),
 }

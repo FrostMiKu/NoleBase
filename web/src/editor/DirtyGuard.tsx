@@ -24,21 +24,26 @@ function isLeavingDocument(
 }
 
 /**
- * Any navigation that would abandon the dirty document is blocked —
- * internal navigations, browser Back/Forward, address-bar changes alike.
- * TanStack Router's blocker is the single enforcement point; app buttons
- * never bypass it. Rendered once in the app shell.
+ * Autosave makes navigation safe: leaving a dirty document first flushes
+ * the pending edit, and only a FAILED save blocks the navigation and
+ * raises the dialog (retry via Save and Continue, or Discard). Covers
+ * internal navigations, browser Back/Forward, and address-bar changes
+ * alike. Rendered once in the app shell.
  */
 export function DirtyGuard() {
   const { dirty, path } = useEditorState()
 
   const blocker = useBlocker({
     withResolver: true,
-    shouldBlockFn: ({ current, next }) => {
+    shouldBlockFn: async ({ current, next }) => {
       if (consumeNavigationPermission()) return false
       const state = editorStore.getState()
       if (!state.dirty || state.path === null) return false
-      return isLeavingDocument(state.path, current, next)
+      if (!isLeavingDocument(state.path, current, next)) return false
+      // Autosave-on-navigate: a successful flush lets the navigation
+      // through; only a failure blocks and asks.
+      const saved = await saveCurrentDocument()
+      return !saved
     },
   })
 
@@ -67,7 +72,7 @@ export function DirtyGuard() {
         if (saved) {
           blocker.proceed()
         } else {
-          // Save failed: stay on the document; the toast explains why.
+          // Save failed again: stay on the document; the toast explains.
           blocker.reset()
         }
       }}

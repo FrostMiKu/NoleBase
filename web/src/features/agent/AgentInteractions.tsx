@@ -137,6 +137,7 @@ function AskUserBox({ question, options }: { question: string; options: string[]
           autoFocus
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
             if (event.key === 'Enter' && value.trim() !== '' && !busy) {
               answer.mutate(value, { onSuccess: clearAskUser })
             }
@@ -191,6 +192,7 @@ function TerminalInputBox({ purpose, prompt }: { purpose: string; prompt: string
         autoFocus
         onChange={(event) => setValue(event.target.value)}
         onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
           if (event.key === 'Enter' && !busy) {
             terminalInput.mutate(value, { onSuccess: clearTerminalInput })
           }

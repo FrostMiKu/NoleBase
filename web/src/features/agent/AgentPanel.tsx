@@ -133,6 +133,8 @@ export function AgentPanel() {
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
           onKeyDown={(event) => {
+            // IME composition confirms candidates with Enter; never send.
+            if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
               send()

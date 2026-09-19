@@ -3,6 +3,7 @@ import { CalendarDays, Pencil } from 'lucide-react'
 
 import { useDailyNotes } from '@/queries/workspace'
 import { Markdown } from '@/features/agent/Markdown'
+import { DailyQuickInput } from '@/features/navigation/DailyQuickInput'
 
 /**
  * The /daily route: a river of markdown-rendered daily note cards,
@@ -16,16 +17,8 @@ export function DailyPage() {
   return (
     <div className="flex h-full flex-col overflow-y-auto p-4">
       <h1 className="mb-3 text-[15px] font-semibold text-fg">Daily</h1>
-      {dailyQuery.isLoading && <p className="text-xs text-faint">Loading daily notes…</p>}
-      {dailyQuery.isError && (
-        <p className="text-xs text-danger">
-          Failed to load daily notes:{' '}
-          {dailyQuery.error instanceof Error ? dailyQuery.error.message : 'unknown error'}
-        </p>
-      )}
-      {daily.length === 0 && !dailyQuery.isLoading && !dailyQuery.isError && (
-        <p className="text-xs text-faint">No daily notes yet.</p>
-      )}
+
+      <DailyQuickInput />
 
       <div className="flex flex-col gap-2" data-testid="daily-river">
         {daily.map((note) => (

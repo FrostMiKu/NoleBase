@@ -45,6 +45,30 @@ pub async fn todos(State(state): State<WebState>) -> ApiResult<Json<Vec<TodoDto>
 }
 
 #[derive(Deserialize)]
+pub struct DailyAppendRequest {
+    body: Option<String>,
+}
+
+/// `POST /api/daily/today` — append content to today's daily note,
+/// creating it on first send. Returns the updated note.
+pub async fn append_to_today(
+    State(state): State<WebState>,
+    Json(request): Json<DailyAppendRequest>,
+) -> ApiResult<Json<DailyNoteDto>> {
+    let body = request
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("daily content must not be empty".to_string()))?;
+    let note = state
+        .workspace
+        .append_to_today(body)
+        .map_err(ApiError::Internal)?;
+    Ok(Json(DailyNoteDto::from_daily_note(&state.workspace, &note)))
+}
+
+#[derive(Deserialize)]
 pub struct SearchQuery {
     q: Option<String>,
 }
