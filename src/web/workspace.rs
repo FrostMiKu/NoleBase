@@ -32,7 +32,10 @@ pub async fn notes(State(state): State<WebState>) -> ApiResult<Json<Vec<NoteSumm
 pub async fn daily(State(state): State<WebState>) -> ApiResult<Json<Vec<DailyNoteDto>>> {
     let notes = state.workspace.daily_notes().map_err(ApiError::Internal)?;
     Ok(Json(
-        notes.iter().map(DailyNoteDto::from_daily_note).collect(),
+        notes
+            .iter()
+            .map(|note| DailyNoteDto::from_daily_note(&state.workspace, note))
+            .collect(),
     ))
 }
 

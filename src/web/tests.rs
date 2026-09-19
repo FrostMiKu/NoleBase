@@ -144,6 +144,12 @@ async fn workspace_read_endpoints_return_dtos() {
     assert_eq!(status, StatusCode::OK);
     assert!(json[0]["date"].is_string());
     assert!(json[0]["body"].is_string());
+    assert!(
+        json[0]["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("daily/") && path.ends_with(".md")),
+        "daily note must carry an openable workspace-relative path: {json}"
+    );
 
     let (status, json, _) = get(&router, "/api/todos").await;
     assert_eq!(status, StatusCode::OK);
@@ -173,6 +179,65 @@ async fn search_requires_a_query() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
         assert_eq!(error_code(&json), "bad_request");
     }
+}
+
+#[tokio::test]
+async fn daily_paths_open_through_the_document_endpoint() {
+    let (state, _directory) = test_state();
+    let storage = Storage::new(state.workspace.storage().root.clone()).unwrap();
+    storage.append_to_today("daily body").unwrap();
+    let router = server::router(state.clone());
+
+    let (_, json, _) = get(&router, "/api/daily").await;
+    let path = json[0]["path"].as_str().unwrap().to_string();
+    let (status, document, _) = get(
+        &router,
+        &format!("/api/document?path={}", urlencoding_encode(&path)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document["path"], json!(path));
+    assert_eq!(document["source"], json!("daily body\n"));
+}
+
+#[tokio::test]
+async fn static_serving_serves_the_spa_and_keeps_api_404s() {
+    let (state, _directory) = test_state();
+    let dist = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dist.path().join("assets")).unwrap();
+    std::fs::write(dist.path().join("index.html"), "<html>nole app</html>").unwrap();
+    std::fs::write(dist.path().join("assets/app.js"), "console.log('nole')").unwrap();
+
+    let router = server::router_with_static_dir(state.clone(), Some(dist.path().to_path_buf()));
+
+    // The SPA root and a deep client route both answer with index.html.
+    let (status, _, text) = get(&router, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "<html>nole app</html>");
+    let (status, _, text) = get(&router, "/document?path=data/note.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "<html>nole app</html>");
+
+    // Real asset files are served from disk.
+    let (status, _, text) = get(&router, "/assets/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "console.log('nole')");
+
+    // Unknown non-API paths fall back to the SPA; unknown API paths must
+    // never leak index.html.
+    let (status, _, text) = get(&router, "/not-a-route").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "<html>nole app</html>");
+    let (status, json, _) = get(&router, "/api/not-found").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+    let (status, json, _) = get(&router, "/api/definitely/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+
+    // Registered API routes still take precedence over the wildcard.
+    let (status, _, _) = get(&router, "/api/health").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

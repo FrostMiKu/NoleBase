@@ -2,12 +2,17 @@
 //! background task that drives the workspace watcher the way the TUI event
 //! loop does.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::routing::{get, post, put};
-use axum::Router;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{any, get, post, put};
+use axum::{Json, Router};
+use serde_json::json;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::core::agent_service::AgentService;
 use crate::core::nole::Nole;
@@ -22,8 +27,15 @@ use crate::web;
 const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub fn router(state: web::state::WebState) -> Router {
-    Router::new()
-        .route("/", get(|| async { web::error::index_response() }))
+    router_with_static_dir(state, None)
+}
+
+/// The full router with an optional static frontend directory. `Some(dir)`
+/// serves the built React app with an SPA fallback (unmatched non-API GETs
+/// return `index.html`); `None` keeps the plain-text API greeting so the
+/// API still starts without a frontend build.
+pub fn router_with_static_dir(state: web::state::WebState, static_dir: Option<PathBuf>) -> Router {
+    let api = Router::new()
         .route(
             "/api/health",
             get(|| async { web::error::health_response() }),
@@ -51,12 +63,35 @@ pub fn router(state: web::state::WebState) -> Router {
         )
         .route("/api/agent/permission", get(web::agent::get_permission))
         .route("/api/agent/permission", put(web::agent::put_permission))
-        .with_state(state)
+        // Registered API endpoints above take precedence; anything else
+        // under /api must answer with the API error model, never the SPA
+        // fallback's index.html.
+        .route("/api/{*rest}", any(api_not_found))
+        .with_state(state);
+
+    match static_dir {
+        Some(dir) => api
+            .fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")))),
+        None => api.route("/", get(|| async { web::error::index_response() })),
+    }
+}
+
+/// `GET /api/unknown-path`: a stable API 404 so SPA fallback never masks a
+/// mistyped API address.
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": {"code": "not_found", "message": "Unknown API endpoint"}})),
+    )
 }
 
 /// Run `nole web`: open the application, start the watcher hub, and serve
-/// the API on `127.0.0.1:<port>` until the process is interrupted.
+/// the API on `127.0.0.1:<port>` until the process is interrupted. When a
+/// production frontend build exists at `web/dist` (relative to the working
+/// directory), it is served as the React UI; without one the API still
+/// starts, answering `/` with the plain-text greeting.
 pub fn serve(port: u16) -> Result<()> {
+    let static_dir = frontend_dist_dir();
     let storage = Storage::resolve_root().context("resolving Nole storage")?;
     storage.ensure_files().context("preparing Nole workspace")?;
     let nole = Nole::open(storage).context("opening Nole application")?;
@@ -76,15 +111,33 @@ pub fn serve(port: u16) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .with_context(|| format!("binding 127.0.0.1:{port}"))?;
-        println!("Nole web API listening on http://127.0.0.1:{port}");
-        axum::serve(listener, router(state))
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            .context("serving the web API")
+        match &static_dir {
+            Some(dir) => println!(
+                "Nole web UI + API listening on http://127.0.0.1:{port} (static: {})",
+                dir.display()
+            ),
+            None => {
+                println!("Nole web API listening on http://127.0.0.1:{port} (no web/dist build found; API only)")
+            }
+        }
+        axum::serve(
+            listener,
+            router_with_static_dir(state, static_dir),
+        )
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("serving the web API")
     })?;
     Ok(())
+}
+
+/// Locate the built frontend at `web/dist` relative to the current working
+/// directory. Absence is normal (API-only mode), not an error.
+fn frontend_dist_dir() -> Option<PathBuf> {
+    let candidate = PathBuf::from("web").join("dist");
+    candidate.is_dir().then_some(candidate)
 }
 
 /// The web backend's replacement for the TUI event loop: drain the watcher,

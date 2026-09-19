@@ -60,6 +60,7 @@ toml = "1"
 toml_edit = "0.25"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 eventsource-stream = "0.2"

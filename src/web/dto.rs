@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::agent::{AgentEvent, AgentStopReason, ApprovalKind};
 use crate::core::agent_session::TokenUsage;
 use crate::core::model::{DailyNote, NoteFile, SearchHit, TodoItem};
+use crate::core::storage::Storage;
 use crate::core::workspace::Workspace;
 use crate::core::workspace_index::{TagDocument, TagSummary};
 use crate::core::workspace_watcher::WorkspaceEvent;
@@ -40,11 +41,14 @@ pub struct NoteSummaryDto {
     pub modified: Option<String>,
 }
 
-/// One daily note in `GET /api/daily`.
+/// One daily note in `GET /api/daily`. `path` is the workspace-relative
+/// document address so a client can open the note without guessing the
+/// daily file naming convention.
 #[derive(Serialize)]
 pub struct DailyNoteDto {
     pub date: String,
     pub body: String,
+    pub path: String,
 }
 
 /// One `- [ ]` task in `GET /api/todos`.
@@ -486,10 +490,15 @@ impl NoteSummaryDto {
 }
 
 impl DailyNoteDto {
-    pub fn from_daily_note(note: &DailyNote) -> Self {
+    pub fn from_daily_note(workspace: &Workspace, note: &DailyNote) -> Self {
+        let absolute = workspace
+            .storage()
+            .daily_dir
+            .join(Storage::daily_file_name(note.date));
         Self {
             date: note.date.to_string(),
             body: note.body.clone(),
+            path: relative_path(workspace, &absolute),
         }
     }
 }
