@@ -2,7 +2,7 @@ import { create } from 'zustand'
 
 export type WorkspaceConnectionState = 'connecting' | 'connected' | 'disconnected'
 
-export type SidebarSectionKey = 'daily' | 'notes' | 'archives' | 'tags'
+export type SidebarSectionKey = 'notes' | 'archives'
 
 /**
  * Pure UI/layout state. Server data (notes, documents, tags, ...) belongs
@@ -26,14 +26,6 @@ export interface UiState {
 
   watcherError: string | null
 
-  /**
-   * The most recently open document path, kept only as a revisit hint for
-   * the activity rail's Editor button. The selected document itself stays
-   * router-authoritative; opening a document always navigates via the
-   * router, so no second copy of the selection can drift.
-   */
-  lastDocumentPath: string | null
-
   /** Incremented to request focus on the agent composer. */
   agentFocusTick: number
 }
@@ -49,7 +41,6 @@ export interface UiActions {
   setWorkspaceConnection: (state: WorkspaceConnectionState) => void
   setWorkspaceResyncing: (resyncing: boolean) => void
   setWatcherError: (message: string | null) => void
-  setLastDocumentPath: (path: string | null) => void
   requestAgentFocus: () => void
 }
 
@@ -63,7 +54,8 @@ export const useUiStore = create<UiStore>()((set) => ({
   rightSidebarSize: 28,
   agentPanelSize: 58,
 
-  sidebarSections: { daily: true, notes: true, archives: true, tags: true },
+  // The file list opens with Notes visible and Archives collapsed.
+  sidebarSections: { notes: true, archives: false },
 
   commandPaletteOpen: false,
 
@@ -71,8 +63,6 @@ export const useUiStore = create<UiStore>()((set) => ({
   workspaceResyncing: false,
 
   watcherError: null,
-
-  lastDocumentPath: null,
 
   agentFocusTick: 0,
 
@@ -89,6 +79,5 @@ export const useUiStore = create<UiStore>()((set) => ({
   setWorkspaceConnection: (connection) => set({ workspaceConnection: connection }),
   setWorkspaceResyncing: (resyncing) => set({ workspaceResyncing: resyncing }),
   setWatcherError: (watcherError) => set({ watcherError }),
-  setLastDocumentPath: (lastDocumentPath) => set({ lastDocumentPath }),
   requestAgentFocus: () => set((state) => ({ agentFocusTick: state.agentFocusTick + 1 })),
 }))

@@ -1,25 +1,23 @@
 import { useNavigate, useRouterState } from '@tanstack/react-router'
-import { Bot, FileText, Hash, Search } from 'lucide-react'
+import { Bot, CalendarDays, Hash, Search } from 'lucide-react'
 
-import { useUiStore } from '@/stores/ui-store'
-
-type RailView = 'editor' | 'tags' | 'agent' | 'search'
+type RailView = 'daily' | 'tags' | 'agent' | 'search'
 
 interface RailItem {
   view: RailView
   label: string
-  icon: typeof FileText
+  icon: typeof CalendarDays
 }
 
 const ITEMS: RailItem[] = [
-  { view: 'editor', label: 'Editor', icon: FileText },
+  { view: 'daily', label: 'Daily', icon: CalendarDays },
   { view: 'tags', label: 'Tags', icon: Hash },
   { view: 'agent', label: 'Agent', icon: Bot },
   { view: 'search', label: 'Search', icon: Search },
 ]
 
 function activeView(pathname: string): RailView | null {
-  if (pathname.startsWith('/document')) return 'editor'
+  if (pathname === '/daily') return 'daily'
   if (pathname === '/tags' || pathname.startsWith('/tag/')) return 'tags'
   if (pathname === '/agent') return 'agent'
   if (pathname === '/search') return 'search'
@@ -28,25 +26,20 @@ function activeView(pathname: string): RailView | null {
 
 /**
  * The vertical activity rail (leftmost strip). Switches the center area
- * between the document editor, the tag-centred file lists, the TUI-style
- * main Agent view, and global search — all through router navigation, so
- * the dirty guard and URL state keep working unchanged.
+ * between the daily list, the tag-centred file lists, the TUI-style main
+ * Agent view, and global search — all through router navigation, so the
+ * dirty guard and URL state keep working unchanged. Documents open from
+ * any list by clicking them; the rail holds no editor entry.
  */
 export function ActivityRail() {
   const navigate = useNavigate()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const active = activeView(pathname)
-  const lastDocumentPath = useUiStore((state) => state.lastDocumentPath)
 
   const go = (view: RailView) => {
     switch (view) {
-      case 'editor':
-        // Reopen the most recent document; with none, fall back home.
-        if (lastDocumentPath !== null) {
-          void navigate({ to: '/document', search: { path: lastDocumentPath } })
-        } else {
-          void navigate({ to: '/' })
-        }
+      case 'daily':
+        void navigate({ to: '/daily' })
         return
       case 'tags':
         void navigate({ to: '/tags' })

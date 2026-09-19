@@ -48,13 +48,9 @@ export function AppShell() {
     },
   })
 
-  // Keep the WS layer's view of the open document in sync with the router,
-  // and remember the latest document for the rail's Editor button.
+  // Keep the WS layer's view of the open document in sync with the router.
   useEffect(() => {
     setCurrentDocumentPath(currentPath)
-    if (currentPath !== null) {
-      useUiStore.getState().setLastDocumentPath(currentPath)
-    }
   }, [currentPath])
 
   return (

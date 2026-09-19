@@ -3,13 +3,14 @@ import { ChevronRight } from 'lucide-react'
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { useEditorState } from '@/editor/editor-state'
-import { useDailyNotes, useNotes, useTags } from '@/queries/workspace'
+import { useNotes } from '@/queries/workspace'
 import { useUiStore, type SidebarSectionKey } from '@/stores/ui-store'
 
 interface SectionProps {
   sectionKey: SidebarSectionKey
   label: string
   count?: number
+  defaultOpen?: boolean
   children: React.ReactNode
 }
 
@@ -64,38 +65,22 @@ function Row({ active = false, onClick, children, title }: RowProps) {
 }
 
 /**
- * Left navigation: Daily, Notes, Archives, Tags — each a collapsible flat
- * list. Notes and Archives split the same endpoint by `archived`.
+ * The file list: Notes and Archives as collapsible flat lists split from
+ * the same endpoint by `archived`. Notes start expanded, Archives
+ * collapsed. Daily notes, tags, and search live in the activity rail's
+ * center views, not here.
  */
 export function LeftSidebar() {
   const navigate = useNavigate()
   const notesQuery = useNotes()
-  const dailyQuery = useDailyNotes()
-  const tagsQuery = useTags()
   const { path: openPath } = useEditorState()
 
   const notes = notesQuery.data ?? []
   const active = notes.filter((note) => !note.archived)
   const archives = notes.filter((note) => note.archived)
-  const daily = [...(dailyQuery.data ?? [])].reverse()
 
   return (
     <nav className="flex h-full flex-col overflow-y-auto pb-2" data-testid="left-sidebar">
-      <Section sectionKey="daily" label="Daily" count={daily.length}>
-        {dailyQuery.isLoading && <LoadingRow />}
-        {daily.map((note) => (
-          <Row
-            key={note.path}
-            active={openPath === note.path}
-            title={note.path}
-            onClick={() => void navigate({ to: '/document', search: { path: note.path } })}
-          >
-            {note.date}
-          </Row>
-        ))}
-        {dailyQuery.isError && <ErrorRow message="Daily notes failed to load" />}
-      </Section>
-
       <Section sectionKey="notes" label="Notes" count={active.length}>
         {notesQuery.isLoading && <LoadingRow />}
         {active.map((note) => (
@@ -123,33 +108,6 @@ export function LeftSidebar() {
           </Row>
         ))}
       </Section>
-
-      <Section sectionKey="tags" label="Tags">
-        {tagsQuery.isLoading && <LoadingRow />}
-        {(tagsQuery.data ?? []).map((tag) => (
-          <Row
-            key={tag.name}
-            title={`${tag.documents} documents, ${tag.mentions} mentions`}
-            onClick={() => void navigate({ to: '/tag/$tag', params: { tag: tag.name } })}
-          >
-            <span className="inline-flex w-full items-center justify-between gap-2">
-              <span className="truncate text-accent">#{tag.name}</span>
-              <span className="font-mono text-[10px] text-faint">{tag.documents}</span>
-            </span>
-          </Row>
-        ))}
-        {tagsQuery.isError && <ErrorRow message="Tags failed to load" />}
-      </Section>
-
-      <div className="px-2 pt-3">
-        <button
-          type="button"
-          onClick={() => void navigate({ to: '/search' })}
-          className="inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wider text-faint uppercase transition-colors hover:text-muted"
-        >
-          Search workspace…
-        </button>
-      </div>
     </nav>
   )
 }
