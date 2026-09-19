@@ -1,14 +1,16 @@
 import { ListTodo } from 'lucide-react'
 
-import { useTodos } from '@/queries/workspace'
+import { useTodos, useToggleTodo } from '@/queries/workspace'
 
 /**
- * Read-only todo panel (right sidebar). Checkboxes are disabled visuals —
- * the backend has no todo mutation contract this phase.
+ * Todo panel (right sidebar). Each checkbox flips the task's completion
+ * state through the backend toggle endpoint; the array index is the task's
+ * identity on the wire, so the list order must stay as delivered.
  */
 export function TodoPanel() {
   const todosQuery = useTodos()
   const todos = todosQuery.data ?? []
+  const toggle = useToggleTodo()
 
   return (
     <div className="flex h-full flex-col overflow-y-auto" data-testid="todo-panel">
@@ -29,9 +31,10 @@ export function TodoPanel() {
             <input
               type="checkbox"
               checked={todo.checked}
-              disabled
-              readOnly
-              className="mt-[3px] h-3 w-3 accent-[var(--color-accent)]"
+              disabled={toggle.isPending}
+              onChange={() => toggle.mutate(index)}
+              aria-label={`Toggle task: ${todo.text}`}
+              className="mt-[3px] h-3 w-3 cursor-pointer accent-[var(--color-accent)] hover:opacity-80"
             />
             <span
               className={`text-[12px] leading-snug ${todo.checked ? 'text-faint line-through' : 'text-fg'}`}

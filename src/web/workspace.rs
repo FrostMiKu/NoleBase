@@ -44,6 +44,24 @@ pub async fn todos(State(state): State<WebState>) -> ApiResult<Json<Vec<TodoDto>
     Ok(Json(items.iter().map(TodoDto::from_todo_item).collect()))
 }
 
+/// `POST /api/todos/{index}/toggle` — flip the completion state of the
+/// indexed daily task and answer with the refreshed list so the client
+/// needs no second round trip.
+pub async fn toggle_todo(
+    State(state): State<WebState>,
+    axum::extract::Path(index): axum::extract::Path<usize>,
+) -> ApiResult<Json<Vec<TodoDto>>> {
+    let toggled = state
+        .workspace
+        .toggle_todo_task(index)
+        .map_err(ApiError::Internal)?;
+    if !toggled {
+        return Err(ApiError::NotFound(format!("no task at index {index}")));
+    }
+    let items = state.workspace.todos().map_err(ApiError::Internal)?;
+    Ok(Json(items.iter().map(TodoDto::from_todo_item).collect()))
+}
+
 #[derive(Deserialize)]
 pub struct DailyAppendRequest {
     body: Option<String>,

@@ -45,6 +45,10 @@ pub fn router_with_static_dir(state: web::state::WebState, static_dir: Option<Pa
         .route("/api/daily", get(web::workspace::daily))
         .route("/api/daily/today", post(web::workspace::append_to_today))
         .route("/api/todos", get(web::workspace::todos))
+        .route(
+            "/api/todos/{index}/toggle",
+            post(web::workspace::toggle_todo),
+        )
         .route("/api/search", get(web::workspace::search))
         .route("/api/tags", get(web::workspace::tags))
         .route("/api/tags/{tag}", get(web::workspace::tag_documents))

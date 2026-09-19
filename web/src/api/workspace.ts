@@ -16,6 +16,7 @@ export const workspaceApi = {
   notes: () => apiGet<NoteSummary[]>('/api/notes'),
   daily: () => apiGet<DailyNote[]>('/api/daily'),
   todos: () => apiGet<TodoItem[]>('/api/todos'),
+  toggleTodo: (index: number) => apiPost<TodoItem[]>(`/api/todos/${index}/toggle`),
   search: (query: string) => apiGet<SearchResponse>(`/api/search?q=${encodeURIComponent(query)}`),
   tags: () => apiGet<TagSummary[]>('/api/tags'),
   tagDocuments: (tag: string) =>

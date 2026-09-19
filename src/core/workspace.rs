@@ -86,6 +86,12 @@ impl Workspace {
         self.storage.load_todo_tasks()
     }
 
+    /// Flip the completion state of the indexed daily task (same ordering as
+    /// [`Workspace::todos`]). Returns whether a task was toggled.
+    pub fn toggle_todo_task(&self, index: usize) -> Result<bool> {
+        self.storage.toggle_todo_task(index)
+    }
+
     /// Append content to today's daily note, creating it on first send —
     /// the web quick-input primitive mirroring the TUI's daily send.
     pub fn append_to_today(&self, body: &str) -> Result<DailyNote> {
@@ -322,6 +328,26 @@ mod tests {
         assert_eq!(todos.len(), 1);
         let files = workspace.note_files().unwrap();
         assert!(files.iter().any(|file| file.path.ends_with("note.md")));
+    }
+
+    #[test]
+    fn toggle_todo_task_flips_the_indexed_daily_task() {
+        let (workspace, directory) = workspace();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.append_to_today("- [ ] first task").unwrap();
+        storage.append_to_today("- [x] second task").unwrap();
+
+        assert!(workspace.toggle_todo_task(0).unwrap());
+        let todos = workspace.todos().unwrap();
+        assert!(todos[0].checked);
+        assert!(todos[1].checked, "untouched task keeps its state");
+
+        // Toggling again restores the open state.
+        assert!(workspace.toggle_todo_task(0).unwrap());
+        assert!(!workspace.todos().unwrap()[0].checked);
+
+        // Out-of-range indices report "nothing toggled", not an error.
+        assert!(!workspace.toggle_todo_task(9).unwrap());
     }
 
     #[test]

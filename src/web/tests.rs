@@ -206,25 +206,27 @@ async fn daily_today_append_creates_then_appends() {
     let router = server::router(state.clone());
 
     // Empty content is rejected.
-    let (status, json, _) = post_json(&router, "/api/daily/today", json!({"body": "  "}))
-        .await;
+    let (status, json, _) = post_json(&router, "/api/daily/today", json!({"body": "  "})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&json), "bad_request");
 
     // First send creates today's note.
-    let (status, json, _) = post_json(&router, "/api/daily/today", json!({"body": "first line"}))
-        .await;
+    let (status, json, _) =
+        post_json(&router, "/api/daily/today", json!({"body": "first line"})).await;
     assert_eq!(status, StatusCode::OK);
     let path = json["path"].as_str().unwrap().to_string();
     assert!(path.starts_with("daily/") && path.ends_with(".md"));
     assert_eq!(json["body"], json!("first line"));
 
     // A second send appends with blank-line separation.
-    let (status, _, _) = post_json(&router, "/api/daily/today", json!({"body": "second line"}))
-        .await;
+    let (status, _, _) =
+        post_json(&router, "/api/daily/today", json!({"body": "second line"})).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, document, _) =
-        get(&router, &format!("/api/document?path={}", urlencoding_encode(&path))).await;
+    let (status, document, _) = get(
+        &router,
+        &format!("/api/document?path={}", urlencoding_encode(&path)),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(document["source"].as_str().unwrap().contains("first line"));
     assert!(document["source"].as_str().unwrap().contains("second line"));
@@ -233,6 +235,43 @@ async fn daily_today_append_creates_then_appends() {
     let (status, daily, _) = get(&router, "/api/daily").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(daily[0]["path"], json!(path));
+}
+
+#[tokio::test]
+async fn todo_toggle_flips_the_indexed_task_and_404s_out_of_range() {
+    let (state, _directory) = test_state();
+    state
+        .workspace
+        .storage()
+        .append_to_today("- [ ] first task")
+        .unwrap();
+    state
+        .workspace
+        .storage()
+        .append_to_today("- [ ] second task")
+        .unwrap();
+    let router = server::router(state.clone());
+
+    // Toggling index 0 answers with the refreshed list.
+    let (status, json, _) = post_json(&router, "/api/todos/0/toggle", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json[0]["checked"], json!(true));
+    assert_eq!(json[1]["checked"], json!(false));
+
+    // Out-of-range indices are a stable 404, not an error.
+    let (status, json, _) = post_json(&router, "/api/todos/9/toggle", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+
+    // Toggling again restores the open state.
+    let (status, json, _) = post_json(&router, "/api/todos/0/toggle", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json[0]["checked"], json!(false));
+    assert_eq!(json[1]["checked"], json!(false));
+
+    // Non-numeric indices never reach the handler.
+    let (status, _, _) = post_json(&router, "/api/todos/abc/toggle", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
