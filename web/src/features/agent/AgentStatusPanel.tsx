@@ -43,7 +43,9 @@ export function AgentStatusPanel() {
                   ? 'animate-pulse bg-accent'
                   : job.status === 'failed'
                     ? 'bg-danger'
-                    : 'bg-ok'
+                    : job.status === 'cancelled'
+                      ? 'bg-faint'
+                      : 'bg-ok'
               }`}
             />
             <span className={`truncate ${job.status === 'running' ? 'text-fg' : 'text-muted'}`} title={job.label}>

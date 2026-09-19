@@ -50,8 +50,20 @@ const AGENT_EVENT_TYPES = [
 /** Sync `running` and the cached permission state after (re)connecting. */
 async function syncAgentFromServer(queryClient: ReturnType<typeof useQueryClient>): Promise<void> {
   try {
-    const [status, permission] = await Promise.all([agentApi.status(), agentApi.permission()])
+    const [status, permission, jobRows] = await Promise.all([
+      agentApi.status(),
+      agentApi.permission(),
+      agentApi.jobs(),
+    ])
     useAgentStore.getState().setRunning(status.running)
+    useAgentStore.getState().setJobs(
+      jobRows.jobs.map((row) => ({
+        id: row.id,
+        label: row.label,
+        status: row.status,
+        turnId: null,
+      })),
+    )
     queryClient.setQueryData(agentKeys.state(), status)
     queryClient.setQueryData(agentKeys.permission(), permission)
   } catch (error) {

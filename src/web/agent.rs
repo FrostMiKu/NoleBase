@@ -28,6 +28,25 @@ pub async fn status(State(state): State<WebState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// `GET /api/agent/jobs` — every background job row, so a (re)connecting
+/// client can rebuild the session-level job registry it missed events for.
+pub async fn jobs(State(state): State<WebState>) -> Json<serde_json::Value> {
+    let rows: Vec<serde_json::Value> = state
+        .agent
+        .jobs()
+        .rows()
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "label": row.label,
+                "status": row.status.as_str(),
+            })
+        })
+        .collect();
+    Json(json!({ "jobs": rows }))
+}
+
 #[derive(Deserialize)]
 pub struct RunRequest {
     prompt: Option<String>,

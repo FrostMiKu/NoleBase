@@ -2,7 +2,7 @@ import { create } from 'zustand'
 
 import type { AgentConnectionState } from '@/types/agent'
 import type { AgentEvent } from '@/types/events'
-import { beginAgentRun, initialAgentState, reduceAgentEvent, type AgentState } from '@/features/agent/agent-reducer'
+import { beginAgentRun, initialAgentState, reduceAgentEvent, type AgentState, type JobRun } from '@/features/agent/agent-reducer'
 
 /**
  * Realtime agent projection. WebSocket events flow through the pure
@@ -15,6 +15,8 @@ export interface AgentStore extends AgentState {
 
   dispatchEvent: (event: AgentEvent) => void
   beginRun: (prompt: string) => void
+  /** Replace the session job registry from a server snapshot. */
+  setJobs: (jobs: JobRun[]) => void
   setConnection: (connection: AgentConnectionState) => void
   setRunning: (running: boolean) => void
   markDisconnected: () => void
@@ -30,6 +32,7 @@ export const useAgentStore = create<AgentStore>()((set) => ({
 
   dispatchEvent: (event) => set((state) => reduceAgentEvent(state, event)),
   beginRun: (prompt) => set((state) => beginAgentRun(state, prompt)),
+  setJobs: (jobs) => set({ jobs }),
   setConnection: (connection) => set({ connection }),
   setRunning: (running) => set({ running }),
   markDisconnected: () => set({ connection: 'disconnected', streamInterrupted: true }),

@@ -17,7 +17,7 @@ import type { AgentEvent } from '@/types/events'
 export interface JobRun {
   id: string
   label: string
-  status: 'running' | 'finished' | 'failed'
+  status: 'running' | 'finished' | 'failed' | 'cancelled'
   /** The turn that spawned the job, for display. */
   turnId: number | null
 }
@@ -368,6 +368,7 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       const label = existing?.label ?? 'background job'
       return upsertJob(state, event.id, label, event.failed ? 'failed' : 'finished')
     }
+
 
     case 'job_settled':
       return withLastTurn(state, (turn) => {

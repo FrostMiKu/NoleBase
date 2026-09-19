@@ -57,6 +57,13 @@ export interface TerminalInputRequest {
 
 export type ToolStatus = 'preparing' | 'running' | 'finished' | 'failed'
 
+/** One background job row from `GET /api/agent/jobs`. */
+export interface AgentJobRow {
+  id: string
+  label: string
+  status: 'running' | 'finished' | 'failed' | 'cancelled'
+}
+
 /** One compact timeline row: a tool run or a background job. */
 export interface ToolRun {
   /** Stable store key; tool ids may only be known after preparation. */

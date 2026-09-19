@@ -55,6 +55,7 @@ pub fn router_with_static_dir(state: web::state::WebState, static_dir: Option<Pa
         .route("/api/agent", get(web::agent::status))
         .route("/api/agent/run", post(web::agent::run))
         .route("/api/agent/cancel", post(web::agent::cancel))
+        .route("/api/agent/jobs", get(web::agent::jobs))
         .route("/api/agent/approval", post(web::agent::approval))
         .route("/api/agent/answer", post(web::agent::answer))
         .route(
