@@ -1,10 +1,17 @@
 import { apiGet, apiPost, apiPut } from './client'
-import type { AgentJobRow, AgentStatus, PermissionMode, PermissionState } from '@/types/agent'
+import type {
+  AgentHistory,
+  AgentJobRow,
+  AgentStatus,
+  PermissionMode,
+  PermissionState,
+} from '@/types/agent'
 
 export type ApprovalDecision = 'approve' | 'deny'
 
 export const agentApi = {
   status: () => apiGet<AgentStatus>('/api/agent'),
+  history: () => apiGet<AgentHistory>('/api/agent/history'),
   jobs: () => apiGet<{ jobs: AgentJobRow[] }>('/api/agent/jobs'),
   run: (prompt: string) => apiPost<null>('/api/agent/run', { prompt }),
   cancel: () => apiPost<null>('/api/agent/cancel'),

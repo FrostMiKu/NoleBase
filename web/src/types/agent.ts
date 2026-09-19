@@ -91,3 +91,19 @@ export interface ResponseTimingInfo {
 }
 
 export type AgentConnectionState = 'connecting' | 'connected' | 'disconnected'
+
+/** One settled transcript entry from `GET /api/agent/history` (mirrors
+ * `AgentHistoryEntryDto` in `src/web/dto.rs`; history entries are persisted
+ * snapshots, so live-only flags like `streaming`/`active` are absent). */
+export type AgentHistoryEntry =
+  | { kind: 'prompt'; entry: { text: string } }
+  | { kind: 'assistant'; entry: { text: string } }
+  | { kind: 'thinking'; entry: { text: string } }
+  | { kind: 'tool'; entry: { text: string; preview: string | null } }
+  | { kind: 'error'; entry: string }
+
+/** `GET /api/agent/history` */
+export interface AgentHistory {
+  entries: AgentHistoryEntry[]
+  message_count: number
+}

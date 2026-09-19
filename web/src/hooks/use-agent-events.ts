@@ -47,13 +47,22 @@ const AGENT_EVENT_TYPES = [
   'resync_required',
 ] as const
 
-/** Sync `running` and the cached permission state after (re)connecting. */
+/** Whether this is the app's first agent sync (page load), not a reconnect. */
+let firstAgentSync = true
+
+/**
+ * Sync the durable session facts after (re)connecting: `running`, cached
+ * permission, the job registry, and — on first load or after a stream
+ * interruption — the persisted transcript, so the previous session shows
+ * up the way it does in the TUI.
+ */
 async function syncAgentFromServer(queryClient: ReturnType<typeof useQueryClient>): Promise<void> {
   try {
-    const [status, permission, jobRows] = await Promise.all([
+    const [status, permission, jobRows, history] = await Promise.all([
       agentApi.status(),
       agentApi.permission(),
       agentApi.jobs(),
+      agentApi.history(),
     ])
     useAgentStore.getState().setRunning(status.running)
     useAgentStore.getState().setJobs(
@@ -66,6 +75,17 @@ async function syncAgentFromServer(queryClient: ReturnType<typeof useQueryClient
     )
     queryClient.setQueryData(agentKeys.state(), status)
     queryClient.setQueryData(agentKeys.permission(), permission)
+
+    const store = useAgentStore.getState()
+    if (firstAgentSync || store.turns.length === 0 || store.streamInterrupted) {
+      firstAgentSync = false
+      // The server transcript is authoritative: seeding recovers output a
+      // dropped stream lost, so the interruption notice can be dismissed.
+      store.seedHistory(history.entries, status.running, history.message_count)
+      if (store.streamInterrupted) {
+        store.dismissInterruption()
+      }
+    }
   } catch (error) {
     toast.error(
       `Agent sync failed: ${error instanceof Error ? error.message : 'unknown error'}`,

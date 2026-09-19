@@ -23,6 +23,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
 
     let prompts = app
         .agent_panel
+        .entries()
         .iter()
         .filter(|entry| {
             matches!(
@@ -33,6 +34,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
         .count();
     let replies = app
         .agent_panel
+        .entries()
         .iter()
         .filter(|entry| {
             matches!(
@@ -46,6 +48,7 @@ pub(super) fn draw_agent_statistics(frame: &mut Frame, app: &mut App, area: Rect
         .count();
     let tools = app
         .agent_panel
+        .entries()
         .iter()
         .filter(|entry| {
             matches!(
@@ -340,14 +343,14 @@ fn sync_agent_vlist_with_style(
     }
     app.agent_vlist.caches.resize(app.agent_panel.len(), None);
     app.agent_vlist.geometry.resize(app.agent_panel.len());
-    for (index, entry) in app.agent_panel.iter().enumerate() {
+    for (index, entry) in app.agent_panel.entries().iter().enumerate() {
         app.agent_vlist.geometry.set_estimate(
             index,
             estimated_agent_entry_height(entry, width, style, app.show_full_thinking),
         );
     }
     for (index, cache) in app.agent_vlist.caches.iter_mut().enumerate() {
-        let entry = &app.agent_panel[index];
+        let entry = &app.agent_panel.entries()[index];
         let volatile = is_volatile_agent_entry(entry);
         // A stable entry must always carry a render cache: its measured height
         // is only trustworthy while the cached render it was measured from is
@@ -446,7 +449,7 @@ pub(super) fn ensure_agent_entry_rendered(app: &mut App, index: usize) {
     if app.agent_vlist.caches[index].is_some() {
         return;
     }
-    let entry = Arc::clone(&app.agent_panel[index]);
+    let entry = Arc::clone(&app.agent_panel.entries()[index]);
     // Measure with the same renderer the display pass uses so volatile entry
     // heights preserve content and scroll anchors between frames.
     let (lines, links, images) = render_agent_entry_current(app, index);
@@ -807,7 +810,7 @@ fn render_agent_entry_current(
     Vec<crate::tui::markdown::RenderedLink>,
     Vec<mbtui::ImagePlacement>,
 ) {
-    let entry = app.agent_panel[index].as_ref();
+    let entry = app.agent_panel.entries()[index].as_ref();
     match app.agent_vlist.style {
         crate::tui::app::AgentEntryRenderStyle::Panel => render_agent_entry(
             entry,

@@ -6,6 +6,7 @@ import {
   beginAgentRun,
   initialAgentState,
   reduceAgentEvent,
+  seedAgentHistory,
 } from './agent-reducer'
 import type { AgentEvent } from '@/types/events'
 import type { AgentState, AgentTurn } from './agent-reducer'
@@ -407,3 +408,103 @@ describe('parse safety', () => {
 
 // Keep the console.warn default branch honest without silencing it globally.
 vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+describe('seeding from persisted server history', () => {
+  const history = [
+    { kind: 'prompt', entry: { text: 'first question' } },
+    { kind: 'thinking', entry: { text: 'reasoning' } },
+    { kind: 'tool', entry: { text: 'Completed Read.', preview: '3 lines' } },
+    { kind: 'assistant', entry: { text: 'first answer' } },
+    { kind: 'prompt', entry: { text: 'second question' } },
+    { kind: 'error', entry: 'Agent failed: boom' },
+  ] as const
+
+  it('maps panel entries onto closed turns', () => {
+    const state = seedAgentHistory(stateWith(), [...history], false, 4)
+
+    expect(state.turns).toHaveLength(2)
+    expect(state.turns[0]).toMatchObject({
+      prompt: 'first question',
+      assistantText: 'first answer',
+      thinkingText: 'reasoning',
+      restored: true,
+    })
+    expect(state.turns[0]?.tools[0]).toMatchObject({
+      kind: 'tool',
+      status: 'finished',
+      label: 'Completed Read.',
+      detail: '3 lines',
+    })
+    expect(state.turns[1]).toMatchObject({
+      prompt: 'second question',
+      finished: { ok: false, text: null, error: 'Agent failed: boom' },
+      restored: true,
+    })
+    expect(state.messageCount).toBe(4)
+  })
+
+  it('keeps live events out of restored turns but keeps the newest one open while running', () => {
+    const idle = seedAgentHistory(stateWith(), [...history], false, 2)
+    // The last live delta must open a fresh turn, not append to history.
+    const afterIdle = reduce(idle, { type: 'assistant_delta', text: 'live' })
+    expect(afterIdle.turns).toHaveLength(3)
+    expect(lastTurn(afterIdle)).toMatchObject({ prompt: null, assistantText: 'live' })
+
+    // Mid-run the newest entry is content (an error entry closes its run),
+    // so the newest turn stays open and the delta appends to it.
+    const running = seedAgentHistory(
+      stateWith(),
+      [...history.slice(0, 4)],
+      true,
+      2,
+    )
+    // A single turn is the newest one, so it is kept open while running.
+    expect(running.turns).toHaveLength(1)
+    expect(running.turns[0]?.restored).toBe(false)
+    const afterRunning = reduce(running, { type: 'assistant_delta', text: ' live tail' })
+    expect(afterRunning.turns).toHaveLength(1)
+    expect(lastTurn(afterRunning).assistantText).toBe('first answer live tail')
+  })
+
+  it('joins multiple thinking entries and overwrites assistant text like live events', () => {
+    const state = seedAgentHistory(
+      stateWith(),
+      [
+        { kind: 'thinking', entry: { text: 'first thought' } },
+        { kind: 'thinking', entry: { text: 'second thought' } },
+        { kind: 'assistant', entry: { text: 'interim' } },
+        { kind: 'assistant', entry: { text: 'final' } },
+      ],
+      false,
+      0,
+    )
+    expect(state.turns).toHaveLength(1)
+    expect(state.turns[0]).toMatchObject({
+      thinkingText: 'first thought\n\nsecond thought',
+      assistantText: 'final',
+    })
+  })
+
+  it('caps restored turns at MAX_TURNS and leaves ids unique', () => {
+    const entries = Array.from({ length: MAX_TURNS + 5 }, (_, index) => ({
+      kind: 'prompt' as const,
+      entry: { text: `question ${index}` },
+    }))
+    const state = seedAgentHistory(stateWith(), entries, false, 0)
+    expect(state.turns).toHaveLength(MAX_TURNS)
+    expect(state.turns[0]?.prompt).toBe(`question ${5}`)
+    expect(new Set(state.turns.map((turn) => turn.id)).size).toBe(MAX_TURNS)
+  })
+
+  it('streaming events keep appending to an open restored turn (mid-run reload)', () => {
+    const state = seedAgentHistory(
+      stateWith(),
+      [{ kind: 'assistant', entry: { text: 'partial an' } }],
+      true,
+      3,
+    )
+    const next = reduce(state, { type: 'assistant_delta', text: 'swer' })
+    expect(next.turns).toHaveLength(1)
+    expect(lastTurn(next).assistantText).toBe('partial answer')
+  })
+})

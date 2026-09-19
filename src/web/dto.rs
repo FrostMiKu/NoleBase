@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::core::agent::{AgentEvent, AgentStopReason, ApprovalKind};
-use crate::core::agent_session::TokenUsage;
+use crate::core::agent_session::{AgentPanelEntry, TokenUsage};
 use crate::core::model::{DailyNote, NoteFile, SearchHit, TodoItem};
 use crate::core::storage::Storage;
 use crate::core::workspace::Workspace;
@@ -115,6 +115,52 @@ impl From<TokenUsage> for TokenUsageDto {
             cache_read_input_tokens: usage.cache_read_input_tokens,
         }
     }
+}
+
+/// One settled transcript entry in `GET /api/agent/history`. History entries
+/// are persisted snapshots, so the live-only fields (`streaming`, `active`)
+/// of `AgentPanelEntry` are dropped from the wire shape.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", content = "entry", rename_all = "snake_case")]
+pub enum AgentHistoryEntryDto {
+    Prompt {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    Tool {
+        text: String,
+        preview: Option<String>,
+    },
+    Error(String),
+}
+
+impl From<&AgentPanelEntry> for AgentHistoryEntryDto {
+    fn from(entry: &AgentPanelEntry) -> Self {
+        match entry {
+            AgentPanelEntry::Prompt { text, .. } => Self::Prompt { text: text.clone() },
+            AgentPanelEntry::Assistant { text, .. } => Self::Assistant { text: text.clone() },
+            AgentPanelEntry::Thinking { text, .. } => Self::Thinking { text: text.clone() },
+            AgentPanelEntry::Tool { text, preview, .. } => Self::Tool {
+                text: text.clone(),
+                preview: preview.clone(),
+            },
+            AgentPanelEntry::Error(text) => Self::Error(text.clone()),
+        }
+    }
+}
+
+/// `GET /api/agent/history` — the persisted session transcript for
+/// (re)connecting clients, plus the conversation length so the client can
+/// show session context without a `conversation_updated` event.
+#[derive(Serialize)]
+pub struct AgentHistoryDto {
+    pub entries: Vec<AgentHistoryEntryDto>,
+    pub message_count: usize,
 }
 
 /// How an approval request is presented. Mirrors [`ApprovalKind`] with the

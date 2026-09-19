@@ -539,7 +539,7 @@ mod tests {
 
         app.center_view = CenterView::Chat;
         app.focus = app::Focus::Compose;
-        app.agent_panel.push(Arc::new(
+        app.agent_panel.push_entry(Arc::new(
             crate::core::agent_session::AgentPanelEntry::Assistant {
                 text: "Streaming response".to_string(),
                 streaming: true,
@@ -555,7 +555,7 @@ mod tests {
         assert!(cursor.x > compose.x && cursor.x < compose.right() - 1);
         assert!(cursor.y > compose.y && cursor.y < compose.bottom() - 1);
 
-        let Some(entry) = app.agent_panel.last_mut() else {
+        let Some(entry) = app.agent_panel.entries_mut().last_mut() else {
             panic!("streaming assistant entry");
         };
         if let crate::core::agent_session::AgentPanelEntry::Assistant { text, .. } =

@@ -58,6 +58,7 @@ pub fn router_with_static_dir(state: web::state::WebState, static_dir: Option<Pa
         .route("/api/ws/workspace", get(web::ws::workspace_events))
         .route("/api/ws/agent", get(web::ws::agent_events))
         .route("/api/agent", get(web::agent::status))
+        .route("/api/agent/history", get(web::agent::history))
         .route("/api/agent/run", post(web::agent::run))
         .route("/api/agent/cancel", post(web::agent::cancel))
         .route("/api/agent/jobs", get(web::agent::jobs))
@@ -100,8 +101,14 @@ pub fn serve(port: u16) -> Result<()> {
     let static_dir = frontend_dist_dir();
     let storage = Storage::resolve_root().context("resolving Nole storage")?;
     storage.ensure_files().context("preparing Nole workspace")?;
-    let nole = Nole::open(storage).context("opening Nole application")?;
-    let state = web::state::WebState::new(nole.workspace().clone(), nole.agent().clone());
+    let nole = Nole::open(storage.clone()).context("opening Nole application")?;
+    // Same restore the TUI performs: the persisted conversation continues
+    // the agent's context and the persisted panel seeds the transcript.
+    let restored = storage
+        .load_agent_session()
+        .context("loading the persisted agent session")?
+        .unwrap_or_default();
+    let state = web::state::WebState::new(nole.workspace().clone(), nole.agent().clone(), restored);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -113,6 +120,13 @@ pub fn serve(port: u16) -> Result<()> {
             state.workspace_events.clone(),
             state.workspace.clone(),
             state.agent.clone(),
+        ));
+        // The session recorder: the web backend's replacement for the TUI
+        // event loop's persistence duty, keeping `session.json` current.
+        tokio::spawn(session_recorder_loop(
+            state.agent.subscribe(),
+            state.clone(),
+            storage,
         ));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
@@ -144,6 +158,24 @@ pub fn serve(port: u16) -> Result<()> {
 fn frontend_dist_dir() -> Option<PathBuf> {
     let candidate = PathBuf::from("web").join("dist");
     candidate.is_dir().then_some(candidate)
+}
+
+/// Mirror the TUI event loop's session persistence: apply every agent event
+/// to the web backend's transcript, and write the session scope back at the
+/// same lifecycle points (conversation update, stop, finish). Runs until the
+/// process exits.
+async fn session_recorder_loop(
+    mut events: tokio::sync::broadcast::Receiver<crate::core::agent::AgentEvent>,
+    state: web::state::WebState,
+    storage: Storage,
+) {
+    loop {
+        match events.recv().await {
+            Ok(event) => state.record_agent_event(&event, &storage),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 /// The web backend's replacement for the TUI event loop: drain the watcher,

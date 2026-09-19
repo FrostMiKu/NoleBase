@@ -17,7 +17,9 @@ use crate::core::agent::{
     PrivateTerminalInputRequest,
 };
 use crate::core::agent_service::AgentService;
-use crate::core::agent_session::{AgentConversation, TokenUsage};
+use crate::core::agent_session::{
+    AgentConversation, AgentPanelEntry, AgentSessionScope, TokenUsage,
+};
 use crate::core::storage::Storage;
 use crate::core::workspace::Workspace;
 use crate::core::workspace_watcher::WorkspaceEvent;
@@ -26,12 +28,16 @@ use crate::web::server;
 use crate::web::state::WebState;
 
 fn test_state() -> (WebState, tempfile::TempDir) {
+    test_state_with(AgentSessionScope::default())
+}
+
+fn test_state_with(restored: AgentSessionScope) -> (WebState, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
     let workspace = Arc::new(Workspace::open(storage).unwrap());
     let agent = Arc::new(AgentService::new(&workspace));
-    (WebState::new(workspace, agent), directory)
+    (WebState::new(workspace, agent, restored), directory)
 }
 
 /// Block until the document index publishes a snapshot, mirroring the core
@@ -764,4 +770,111 @@ fn urlencoding_encode(input: &str) -> String {
         }
     }
     output
+}
+
+#[tokio::test]
+async fn history_serves_the_restored_session_transcript() {
+    let conversation = AgentConversation::seeded_for_test();
+    let panel = vec![
+        AgentPanelEntry::Prompt {
+            text: "summarize".to_string(),
+            muted: false,
+        },
+        AgentPanelEntry::Thinking {
+            text: "reading notes".to_string(),
+            streaming: false,
+        },
+        AgentPanelEntry::Tool {
+            text: "Completed Read.".to_string(),
+            active: false,
+            preview: Some("3 lines".to_string()),
+        },
+        AgentPanelEntry::Assistant {
+            text: "Here you go".to_string(),
+            streaming: false,
+            final_output: true,
+        },
+        AgentPanelEntry::Error("Agent failed: boom".to_string()),
+    ];
+    let restored = AgentSessionScope::from_parts(
+        &conversation,
+        &panel,
+        TokenUsage::default(),
+        0,
+        Duration::ZERO,
+    );
+    let (state, _directory) = test_state_with(restored);
+
+    let (status, json, _) = get(&server::router(state), "/api/agent/history").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["message_count"], json!(1));
+    // Restored entries are settled snapshots: no streaming/active flags.
+    assert_eq!(
+        json["entries"],
+        json!([
+            {"kind": "prompt", "entry": {"text": "summarize"}},
+            {"kind": "thinking", "entry": {"text": "reading notes"}},
+            {"kind": "tool", "entry": {"text": "Completed Read.", "preview": "3 lines"}},
+            {"kind": "assistant", "entry": {"text": "Here you go"}},
+            {"kind": "error", "entry": "Agent failed: boom"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn run_echoes_the_prompt_into_the_history() {
+    let (state, _directory) = test_state();
+    let router = server::router(state.clone());
+    let (status, _, _) = post_json(&router, "/api/agent/run", json!({"prompt": "hello"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (_, json, _) = get(&router, "/api/agent/history").await;
+    assert_eq!(
+        json["entries"],
+        json!([{"kind": "prompt", "entry": {"text": "hello"}}])
+    );
+
+    // A rejected start must not leave a phantom prompt echo behind.
+    let (status, _, _) = post_json(&router, "/api/agent/run", json!({"prompt": ""})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, json, _) = get(&router, "/api/agent/history").await;
+    assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn agent_events_are_recorded_and_persisted_at_lifecycle_points() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+
+    state.record_agent_event(
+        &AgentEvent::ConversationUpdated(AgentConversation::seeded_for_test()),
+        &storage,
+    );
+    state.record_agent_event(
+        &AgentEvent::Usage(TokenUsage {
+            input_tokens: 5,
+            output_tokens: 2,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }),
+        &storage,
+    );
+    // A conversation update is itself a persistence point (like the TUI),
+    // so the scope is already on disk before the run settles.
+    let first = storage.load_agent_session().unwrap().unwrap();
+    assert_eq!(first.into_parts().0.messages.len(), 1);
+
+    state.record_agent_event(&AgentEvent::Finished(Err("boom".to_string())), &storage);
+
+    let persisted = storage.load_agent_session().unwrap().unwrap();
+    let (conversation, panel, usage, _, _) = persisted.into_parts();
+    // The conversation update was applied to the session before persisting.
+    assert_eq!(conversation.messages.len(), 1);
+    assert_eq!(usage.input_tokens, 5);
+    assert!(matches!(
+        panel.last(),
+        Some(AgentPanelEntry::Error(message)) if message == "Agent failed: boom"
+    ));
+    // The restored conversation continues the session's context.
+    assert_eq!(state.session.conversation().messages.len(), 1);
 }

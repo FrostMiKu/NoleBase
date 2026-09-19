@@ -1,4 +1,5 @@
 import type {
+  AgentHistoryEntry,
   AgentNotification,
   ApprovalRequest,
   AskUserRequest,
@@ -42,6 +43,12 @@ export interface AgentTurn {
   retries: number
   finished: { ok: boolean; text: string | null; error: string | null } | null
   stopReason: string | null
+  /**
+   * Seeded from the server transcript (`GET /api/agent/history`) rather
+   * than built from live events. Restored turns are closed: live events
+   * open fresh turns instead of appending to them.
+   */
+  restored: boolean
 }
 
 /**
@@ -106,6 +113,7 @@ function freshTurn(id: number, prompt: string | null): AgentTurn {
     retries: 0,
     finished: null,
     stopReason: null,
+    restored: false,
   }
 }
 
@@ -121,7 +129,7 @@ function appendTurn(state: AgentState, prompt: string | null): AgentState {
 }
 
 function turnClosed(turn: AgentTurn): boolean {
-  return turn.finished !== null || turn.stopReason !== null
+  return turn.finished !== null || turn.stopReason !== null || turn.restored
 }
 
 /**
@@ -369,35 +377,6 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       return upsertJob(state, event.id, label, event.failed ? 'failed' : 'finished')
     }
 
-
-    case 'job_settled':
-      return withLastTurn(state, (turn) => {
-        const key = `job:${event.id}`
-        if (findToolKey(turn.tools, (tool) => tool.key === key) === null) {
-          return {
-            ...turn,
-            tools: [
-              ...turn.tools,
-              {
-                key,
-                kind: 'job',
-                id: event.id,
-                status: event.failed ? 'failed' : 'finished',
-                label: 'background job',
-                detail: null,
-              },
-            ],
-          }
-        }
-        return {
-          ...turn,
-          tools: updateTool(turn.tools, key, (tool) => ({
-            ...tool,
-            status: event.failed ? 'failed' : 'finished',
-          })),
-        }
-      })
-
     case 'buffered_input_consumed':
       return withOpenTurn(state, (turn) => ({
         ...turn,
@@ -518,4 +497,69 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       return state
     }
   }
+}
+
+/**
+ * Seed the transcript from the server's persisted history
+ * (`GET /api/agent/history`). A `prompt` entry starts a turn; content
+ * entries attach to the newest turn, mirroring how live events accumulate.
+ *
+ * Restored turns are closed so subsequent live events open fresh turns —
+ * except the newest one while the agent is still running, which stays open
+ * so its streaming deltas keep appending to it.
+ */
+export function seedAgentHistory(
+  state: AgentState,
+  entries: AgentHistoryEntry[],
+  running: boolean,
+  messageCount: number,
+): AgentState {
+  const turns: AgentTurn[] = []
+  let seq = 0
+  const openTurn = (prompt: string | null): AgentTurn => {
+    seq += 1
+    const turn: AgentTurn = { ...freshTurn(seq, prompt), restored: true }
+    turns.push(turn)
+    return turn
+  }
+  const lastTurn = (): AgentTurn | undefined => turns[turns.length - 1]
+
+  for (const { kind, entry } of entries) {
+    switch (kind) {
+      case 'prompt':
+        openTurn(entry.text)
+        break
+      case 'assistant':
+        (lastTurn() ?? openTurn(null)).assistantText = entry.text
+        break
+      case 'thinking': {
+        const turn = lastTurn() ?? openTurn(null)
+        turn.thinkingText =
+          turn.thinkingText === '' ? entry.text : `${turn.thinkingText}\n\n${entry.text}`
+        break
+      }
+      case 'tool': {
+        const turn = lastTurn() ?? openTurn(null)
+        turn.tools.push({
+          key: `history:${turn.tools.length}`,
+          kind: 'tool',
+          id: null,
+          status: 'finished',
+          label: entry.text,
+          detail: entry.preview,
+        })
+        break
+      }
+      case 'error':
+        (lastTurn() ?? openTurn(null)).finished = { ok: false, text: null, error: entry }
+        break
+    }
+  }
+
+  const bounded = turns.length > MAX_TURNS ? turns.slice(turns.length - MAX_TURNS) : turns
+  if (running) {
+    const newest = bounded[bounded.length - 1]
+    if (newest !== undefined) newest.restored = false
+  }
+  return { ...state, turns: bounded, turnSeq: seq, messageCount }
 }

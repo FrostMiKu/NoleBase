@@ -3,6 +3,7 @@
 //! terminal presentation crates; rendering and input live under `tui`.
 
 pub mod agent;
+pub mod agent_panel;
 pub mod agent_service;
 pub mod agent_session;
 pub mod attachment;

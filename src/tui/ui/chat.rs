@@ -396,6 +396,7 @@ mod tests {
 
     use super::*;
     use crate::core::agent::JobKind;
+    use crate::core::agent_panel::AgentPanel;
     use crate::core::agent_session::{AgentPanelEntry, TokenUsage};
     use crate::core::storage::Storage;
 
@@ -461,7 +462,7 @@ mod tests {
     fn chat_renders_prompt_bar_plain_text_and_tool_rows() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
-        app.agent_panel = vec![
+        app.agent_panel = AgentPanel::from_entries(vec![
             Arc::new(AgentPanelEntry::Prompt {
                 text: "hello user".to_string(),
                 muted: false,
@@ -478,7 +479,7 @@ mod tests {
                 streaming: true,
                 final_output: false,
             }),
-        ];
+        ]);
         app.ai_running = true;
         app.agent_scroll = 0;
 
@@ -757,7 +758,7 @@ mod tests {
     fn chat_replaces_the_agent_panel_with_session_statistics() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
-        app.agent_panel = vec![
+        app.agent_panel = AgentPanel::from_entries(vec![
             Arc::new(AgentPanelEntry::Prompt {
                 text: "private prompt text".to_string(),
                 muted: false,
@@ -777,7 +778,7 @@ mod tests {
                 active: false,
                 preview: None,
             }),
-        ];
+        ]);
         app.agent_usage = TokenUsage {
             input_tokens: 800,
             output_tokens: 200,
@@ -1057,7 +1058,7 @@ mod tests {
 
         assert!(app.input.is_empty());
         assert!(matches!(
-            app.agent_panel.last().map(|entry| entry.as_ref()),
+            app.agent_panel.entries().last().map(|entry| entry.as_ref()),
             Some(AgentPanelEntry::Prompt { text, muted: true }) if text == "answer this"
         ));
     }
@@ -1067,11 +1068,11 @@ mod tests {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
         app.ai_running = true;
-        app.agent_panel = vec![Arc::new(AgentPanelEntry::Tool {
+        app.agent_panel = AgentPanel::from_entries(vec![Arc::new(AgentPanelEntry::Tool {
             text: "Calling Read File...\ndata/Note.md".to_string(),
             active: true,
             preview: None,
-        })];
+        })]);
         app.agent_scroll = 0;
         let terminal = render(&mut app, 180, 30);
         let screen = area_text(&terminal, Rect::new(0, 0, 180, 30));
@@ -1088,14 +1089,16 @@ mod tests {
     fn chat_streaming_preserves_manual_scroll_position() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
-        app.agent_panel = (0..40)
-            .map(|index| {
-                Arc::new(AgentPanelEntry::Thinking {
-                    text: format!("Thinking round {index}"),
-                    streaming: false,
+        app.agent_panel = AgentPanel::from_entries(
+            (0..40)
+                .map(|index| {
+                    Arc::new(AgentPanelEntry::Thinking {
+                        text: format!("Thinking round {index}"),
+                        streaming: false,
+                    })
                 })
-            })
-            .collect();
+                .collect::<Vec<Arc<AgentPanelEntry>>>(),
+        );
 
         let _ = render(&mut app, 180, 30);
         let bottom = app.agent_scroll;
@@ -1106,10 +1109,11 @@ mod tests {
         let settled = app.agent_scroll;
         assert!(!app.agent_follow_tail);
 
-        app.agent_panel.push(Arc::new(AgentPanelEntry::Thinking {
-            text: "New streamed thought".to_string(),
-            streaming: true,
-        }));
+        app.agent_panel
+            .push_entry(Arc::new(AgentPanelEntry::Thinking {
+                text: "New streamed thought".to_string(),
+                streaming: true,
+            }));
         let _ = render(&mut app, 180, 30);
 
         assert_eq!(app.agent_scroll, settled);
@@ -1129,18 +1133,21 @@ mod tests {
         // height (7) was clipped whenever the measure budget cut it from a frame;
         // the estimate must match the rendered rows so unmeasured frames still show
         // the body and its outer blank row.
-        app.agent_panel = (0..48)
-            .map(|index| {
-                Arc::new(AgentPanelEntry::Thinking {
-                    text: format!("Earlier thought {index}"),
-                    streaming: false,
+        app.agent_panel = AgentPanel::from_entries(
+            (0..48)
+                .map(|index| {
+                    Arc::new(AgentPanelEntry::Thinking {
+                        text: format!("Earlier thought {index}"),
+                        streaming: false,
+                    })
                 })
-            })
-            .collect();
-        app.agent_panel.push(Arc::new(AgentPanelEntry::Thinking {
-            text: "Streamed thought".to_string(),
-            streaming: true,
-        }));
+                .collect::<Vec<Arc<AgentPanelEntry>>>(),
+        );
+        app.agent_panel
+            .push_entry(Arc::new(AgentPanelEntry::Thinking {
+                text: "Streamed thought".to_string(),
+                streaming: true,
+            }));
         app.agent_follow_tail = true;
 
         let terminal = render(&mut app, 180, 60);
@@ -1166,7 +1173,7 @@ mod tests {
         open_chat(&mut app);
         // The running tool is volatile: measured at the active height and
         // held outside the cache, so its allocation follows the active entry.
-        app.agent_panel.push(Arc::new(AgentPanelEntry::Tool {
+        app.agent_panel.push_entry(Arc::new(AgentPanelEntry::Tool {
             text: "Calling Read File...\ndata/Note.md".to_string(),
             active: true,
             preview: None,
@@ -1178,8 +1185,8 @@ mod tests {
 
         // Completing the tool mutates the entry in place (`Arc::make_mut` keeps
         // the pointer because the volatile entry has an uncached Arc reference).
-        let before = Arc::as_ptr(&app.agent_panel[0]);
-        let entry = &mut app.agent_panel[0];
+        let before = Arc::as_ptr(&app.agent_panel.entries()[0]);
+        let entry = &mut app.agent_panel.entries_mut()[0];
         if let AgentPanelEntry::Tool {
             text,
             active,
@@ -1190,7 +1197,7 @@ mod tests {
             *active = false;
             *preview = Some("first line of the note".to_string());
         }
-        assert_eq!(Arc::as_ptr(&app.agent_panel[0]), before);
+        assert_eq!(Arc::as_ptr(&app.agent_panel.entries()[0]), before);
 
         // The next frame must invalidate the stale active measurement and
         // re-measure the completed entry, or its result preview row and the
@@ -1229,7 +1236,7 @@ mod tests {
                 final_output: false,
             }),
         ];
-        app.agent_panel = entries;
+        app.agent_panel = AgentPanel::from_entries(entries);
         app.agent_scroll = 0;
 
         const WIDTH: usize = 120;
@@ -1238,6 +1245,7 @@ mod tests {
         let (visible, _, _) = crate::tui::ui::agent::visible_agent_lines(&mut app, 0, 60);
         let expected = app
             .agent_panel
+            .entries()
             .iter()
             .flat_map(|entry| render_chat_entry(entry, WIDTH, app.theme).0)
             .map(|line| line.to_string())

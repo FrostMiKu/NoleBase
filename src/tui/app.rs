@@ -1,6 +1,5 @@
 //! Application state and event handling.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -16,10 +15,9 @@ use crate::core::agent::{
     AskUserRequest, AskUserResponse, PermissionMode, PrivateTerminalInputDecision,
     PrivateTerminalInputRequest,
 };
+use crate::core::agent_panel::AgentPanel;
 use crate::core::agent_service::AgentService;
-use crate::core::agent_session::{
-    AgentPanelEntry, AgentSession, AgentSessionScope, AgentSessionStart, TokenUsage,
-};
+use crate::core::agent_session::{AgentSession, AgentSessionScope, AgentSessionStart, TokenUsage};
 use crate::core::attachment::AttachmentId;
 use crate::core::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
 use crate::core::export::ExportFormat;
@@ -370,9 +368,7 @@ pub struct App {
     terminal_return_dialog: Option<DialogState>,
     active_agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     pub ai_running: bool,
-    pub agent_panel: Vec<Arc<AgentPanelEntry>>,
-    preparing_agent_tools: HashMap<usize, usize>,
-    active_agent_tools: HashMap<String, usize>,
+    pub agent_panel: AgentPanel,
     pub(crate) agent_vlist: AgentVirtualList,
     pub agent_scroll: u16,
     /// Scroll offset of the Agent statistics panel's job list, clamped by the
@@ -459,7 +455,7 @@ impl App {
             crate::core::agent_session::AgentSession::new(agent.clone(), agent_conversation, false);
         let agent_follow_tail = !agent_panel.is_empty();
         let agent_scroll = 0;
-        let agent_panel = agent_panel.into_iter().map(Arc::new).collect();
+        let agent_panel = AgentPanel::from_entries(agent_panel);
         let daily_notes = workspace.daily_notes()?;
         let selected = daily_notes.len().saturating_sub(1);
         let note_files = workspace.note_files()?;
@@ -587,8 +583,6 @@ impl App {
             active_agent_events: None,
             ai_running: false,
             agent_panel,
-            preparing_agent_tools: HashMap::new(),
-            active_agent_tools: HashMap::new(),
             agent_vlist: AgentVirtualList::default(),
             agent_scroll,
             agent_stats_scroll: 0,
