@@ -814,10 +814,22 @@ MBDown and its terminal widgets (`mbdown`, `mbtui`) are published as
 standalone crates on crates.io and pulled in as ordinary dependencies, so no
 separate workspace checkout is needed.
 
+The web UI (`nole web`) is a React app under `web/`, built with pnpm. A
+production build in `web/dist` is compiled into the binary
+(`cfg(embed_web_ui)`), so release binaries serve the UI with no surrounding
+files; a fresh checkout without a frontend build still compiles and serves
+the API only. A `web/dist` directory next to where you launch `nole web`
+always wins over the embedded copy, so a rebuilt frontend shows up without
+recompiling Rust.
+
 ```bash
+pnpm --dir web install --frozen-lockfile
+pnpm --dir web run build # produce web/dist; cargo embeds it on the next build
+
 cargo run -q
 cargo build --release
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+pnpm --dir web test
 ```

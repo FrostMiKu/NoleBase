@@ -11,7 +11,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(date) = self.pending_daily_date.take() {
                     let note = self.daily_note_clone(date);
-                    match self.storage().remove_daily(&date.to_string()) {
+                    match self.workspace.delete_daily_note(&date.to_string()) {
                         Ok(true) => {
                             if let Some(note) = note {
                                 self.record_undo(UndoOp::Delete(note));
@@ -122,17 +122,10 @@ impl App {
                     let skill = self.document.as_ref().is_some_and(|document| {
                         matches!(&document.kind, DocumentKind::Skill(open) if open == &path)
                     });
-                    let archived = self
-                        .note_files
-                        .iter()
-                        .find(|file| file.path == path)
-                        .is_some_and(|file| file.archived);
                     let result = if skill {
                         self.storage().delete_skill(&path)
-                    } else if archived {
-                        self.storage().delete_archived_file(&path)
                     } else {
-                        self.storage().delete_file(&path)
+                        self.workspace.delete_note(&path)
                     };
                     match result {
                         Ok(()) => {

@@ -24,6 +24,14 @@ export interface EditorDocumentState {
    * the conflict is resolved through the banner/dialog actions.
    */
   movedTo: string | null
+  /**
+   * The workspace-relative path a document lifecycle mutation (rename,
+   * archive, restore, delete, daily move) currently owns, or null. While a
+   * path is blocked neither autosave nor the explicit save command may PUT
+   * to it; the lifecycle flow flushes through `persistDocument` directly.
+   * Retargeting (`loadDocument` to a new path, `close`) releases the block.
+   */
+  autosaveBlock: string | null
 }
 
 interface EditorStore {
@@ -40,6 +48,10 @@ interface EditorStore {
   markMoved: (to: string) => void
   clearMoved: () => void
   discard: () => void
+  /** Stop every automatic save for `path` while a lifecycle mutation runs. */
+  blockAutosave: (path: string) => void
+  /** End the block (flush failed, mutation failed); `undefined` = any path. */
+  releaseAutosaveBlock: (path?: string) => void
   /** No document is open (the editor surface unmounted). */
   close: () => void
 }
@@ -51,6 +63,7 @@ const initial: EditorDocumentState = {
   saving: false,
   externalChangePending: false,
   movedTo: null,
+  autosaveBlock: null,
 }
 
 let state: EditorDocumentState = initial
@@ -77,7 +90,17 @@ export const editorStore: EditorStore = {
   getState: () => state,
 
   loadDocument(path, source) {
-    set({ path, baselineSource: source, dirty: false, saving: false, externalChangePending: false, movedTo: null })
+    set({
+      path,
+      baselineSource: source,
+      dirty: false,
+      saving: false,
+      externalChangePending: false,
+      movedTo: null,
+      // Retargeting ends any lifecycle block: the editor now belongs to a
+      // different document than the one the mutation locked down.
+      autosaveBlock: state.autosaveBlock === path ? state.autosaveBlock : null,
+    })
   },
 
   setLiveDirty(dirty) {
@@ -118,6 +141,16 @@ export const editorStore: EditorStore = {
     set({ dirty: false, externalChangePending: false, movedTo: null })
   },
 
+  blockAutosave(path) {
+    set({ autosaveBlock: path })
+  },
+
+  releaseAutosaveBlock(path) {
+    if (path === undefined || state.autosaveBlock === path) {
+      set({ autosaveBlock: null })
+    }
+  },
+
   close() {
     set({
       path: null,
@@ -126,6 +159,7 @@ export const editorStore: EditorStore = {
       saving: false,
       externalChangePending: false,
       movedTo: null,
+      autosaveBlock: null,
     })
   },
 }

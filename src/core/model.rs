@@ -91,6 +91,23 @@ pub struct NoteFile {
     pub archived: bool,
 }
 
+/// A document lifecycle mutation refused because its destination state makes
+/// it unsafe to complete: the target name already exists, or a rename would
+/// have to migrate backlinks whose ambiguous spelling cannot be attributed to
+/// one file. Core call sites raise it through `anyhow` so result types stay
+/// `anyhow::Result`; transport boundaries classify it as a conflict (HTTP
+/// 409) by downcast, never by parsing message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationConflict(pub String);
+
+impl std::fmt::Display for MutationConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MutationConflict {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileGroup {
     Notes,

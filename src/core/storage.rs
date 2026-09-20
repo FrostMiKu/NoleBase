@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::core::agent_session::AgentSessionScope;
 use crate::core::export::{ExportDiagnostic, ExportFormat};
-use crate::core::model::{DailyNote, NoteFile, TodoItem};
+use crate::core::model::{DailyNote, MutationConflict, NoteFile, TodoItem};
 
 mod atomic;
 mod theme;
@@ -25,6 +25,7 @@ mod theme;
 pub(crate) use theme::DEFAULT_THEME_TOML;
 
 pub(crate) use atomic::replace_file_atomically;
+pub(crate) use atomic::stage_replacement;
 
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
@@ -59,12 +60,23 @@ const SKILLS_DIR: &str = "skills";
 pub(crate) const ATTACHMENTS_DIR: &str = "attachments";
 pub(crate) const WORKSPACE_DIR: &str = "workspace";
 
+/// An append that succeeded on disk, in the exact form needed to undo it: the
+/// file, its length before the append, the bytes appended, and whether the
+/// append created the file. Opaque outside storage; workspace-level appends
+/// hand it back to callers that keep an undo stack.
 #[derive(Debug, Clone)]
-pub(crate) struct AppendReceipt {
+pub struct AppendReceipt {
     path: PathBuf,
     original_len: u64,
     appended: Vec<u8>,
     created: bool,
+}
+
+impl AppendReceipt {
+    /// The file the receipt's append touched.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1708,10 +1720,12 @@ fn validate_direct_note(directory: &Path, target: &Path, label: &str) -> Result<
 
 fn move_without_overwrite(from: &Path, to: &Path) -> Result<()> {
     match fs::symlink_metadata(to) {
-        Ok(_) => bail!(
-            "a file named {} already exists",
-            to.file_name().unwrap_or_default().to_string_lossy()
-        ),
+        Ok(_) => {
+            return Err(anyhow::Error::new(MutationConflict(format!(
+                "a file named {} already exists",
+                to.file_name().unwrap_or_default().to_string_lossy()
+            ))));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).with_context(|| format!("checking {}", to.display())),
     }

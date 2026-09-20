@@ -70,6 +70,13 @@ export interface DocumentDto {
   source: string
 }
 
+/** Shared lifecycle-mutation response (`POST /api/notes`,
+ * `/api/document/{rename,archive,restore}`, `/api/daily/{date}/move`): the
+ * canonical workspace-relative path as the workspace produced it. */
+export interface DocumentMutation {
+  path: string
+}
+
 /** `GET /api/backlinks?path=` */
 export interface BacklinksResponse {
   path: string

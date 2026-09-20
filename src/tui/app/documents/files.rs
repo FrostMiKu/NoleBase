@@ -332,9 +332,9 @@ impl App {
             KeyCode::Enter => {
                 let name = self.new_file_input.clone();
                 let created = if self.new_note_from_template {
-                    self.storage().create_named_file_from_template(&name)
+                    self.workspace.create_note_from_template(&name)
                 } else {
-                    self.storage().create_named_file(&name)
+                    self.workspace.create_note(&name)
                 };
                 match created {
                     Ok(path) => {
@@ -413,10 +413,10 @@ impl App {
                     let result = if skill {
                         self.storage().rename_skill(&from, &self.rename_input)
                     } else if archived {
-                        self.storage()
-                            .rename_archived_file(&from, &self.rename_input)
+                        self.workspace
+                            .rename_archived_note(&from, &self.rename_input)
                     } else {
-                        self.storage().rename_file(&from, &self.rename_input)
+                        self.workspace.rename_note(&from, &self.rename_input)
                     };
                     match result {
                         Ok(to) => {
@@ -565,7 +565,7 @@ impl App {
             self.set_status("Select a note to archive");
             return;
         }
-        match self.storage().archive_note(&path) {
+        match self.workspace.archive_note(&path) {
             Ok(to) => {
                 self.retarget_open_document(&path, &to);
                 self.selected_file = Some(to);
@@ -590,7 +590,7 @@ impl App {
             self.set_status("Select an archived note to restore");
             return;
         }
-        match self.storage().restore_archived_note(&path) {
+        match self.workspace.restore_note(&path) {
             Ok(to) => {
                 self.retarget_open_document(&path, &to);
                 self.selected_file = Some(to);
@@ -623,7 +623,7 @@ impl App {
             self.set_status("Daily note not found");
             return;
         };
-        match self.storage().move_to_markdown(path, &note) {
+        match self.workspace.move_daily_to_note(path, &note) {
             Ok(appended) => {
                 self.record_undo(UndoOp::Move {
                     daily_note: note,

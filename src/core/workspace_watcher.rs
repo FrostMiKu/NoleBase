@@ -3,7 +3,7 @@
 //! events. It never touches terminal events, layout, or UI state.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
@@ -69,13 +69,13 @@ impl WatchContext {
     /// Rewrite a canonicalized event path back onto the storage's lexical
     /// root spelling. Paths outside the canonical root pass through
     /// unchanged.
-    pub(crate) fn normalize(&self, path: &PathBuf) -> PathBuf {
+    pub(crate) fn normalize(&self, path: &Path) -> PathBuf {
         match &self.canonical_root {
             Some(canonical) => path
                 .strip_prefix(canonical)
                 .map(|relative| self.lexical_root.join(relative))
-                .unwrap_or_else(|_| path.clone()),
-            None => path.clone(),
+                .unwrap_or_else(|_| path.to_path_buf()),
+            None => path.to_path_buf(),
         }
     }
 }
@@ -310,7 +310,7 @@ mod tests {
                 .unwrap_or("link")
         );
         let lexical_root = canonical_directory.parent().unwrap().join(&link_name);
-        symlink(&directory.path(), &lexical_root).unwrap();
+        symlink(directory.path(), &lexical_root).unwrap();
         let storage = Storage::new(&lexical_root).unwrap();
 
         let context = WatchContext::from_storage(&storage);

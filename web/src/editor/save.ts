@@ -10,10 +10,12 @@ import { currentEditorSource } from './editor-bridge'
  * Persist the current document through `PUT /api/document`. Explicit save
  * only (Cmd/Ctrl+S, toolbar button, command palette); no autosave. On
  * failure the dirty flag stands and the local text is never rolled back.
+ * Refuses the path while a lifecycle mutation owns it (§ editor/lifecycle).
  */
 export async function saveCurrentDocument(): Promise<boolean> {
   const { path, saving, movedTo } = editorStore.getState()
   if (path === null || saving) return false
+  if (editorStore.getState().autosaveBlock === path) return false
   const source = currentEditorSource()
   if (source === null) return false
   if (movedTo !== null) {
@@ -28,7 +30,7 @@ export async function saveDocumentTo(path: string, source: string): Promise<bool
   return persistDocument(path, source)
 }
 
-async function persistDocument(path: string, source: string): Promise<boolean> {
+export async function persistDocument(path: string, source: string): Promise<boolean> {
   editorStore.beginSave()
   try {
     await workspaceApi.writeDocument(path, source)

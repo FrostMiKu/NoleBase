@@ -20,11 +20,13 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use anyhow::{bail, Result};
 use mbdown::{Event, Node};
 
-use crate::core::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
+use crate::core::document_index::{
+    aggregate_references, document_group, index_file, DocumentIndex, ReferenceEntry,
+};
 use crate::core::markup::visit_markdown;
-#[cfg(test)]
 use crate::core::storage::Storage;
 
 /// Derived wiki-link index: wiki target -> referencing notes.
@@ -129,6 +131,32 @@ impl WikiLinkIndex {
         backlinks.sort();
         backlinks
     }
+
+    /// Refresh the index in place for `paths`: managed paths are re-parsed and
+    /// replaced, removed files are dropped, and the aggregated references are
+    /// rebuilt. Used after synchronous mutations so wiki/backlink queries are
+    /// correct before the background indexer reconverges.
+    pub(crate) fn refresh_paths(&mut self, storage: &Storage, paths: Vec<PathBuf>) {
+        let mut changed = false;
+        for path in paths.into_iter().collect::<HashSet<_>>() {
+            if document_group(storage, &path).is_none() {
+                continue;
+            }
+            match index_file(storage, &path) {
+                Ok(Some(document)) => {
+                    changed = true;
+                    self.files.insert(path, document.wiki_links);
+                }
+                Ok(None) => changed |= self.files.remove(&path).is_some(),
+                // Preserve the last valid snapshot across transient I/O
+                // failures; a later watcher event will retry the read.
+                Err(_) => {}
+            }
+        }
+        if changed {
+            self.references = aggregate_references(&self.files);
+        }
+    }
 }
 
 /// Whether `path`'s file name or stem matches `requested`, case-insensitively —
@@ -160,6 +188,17 @@ impl WikiLinkIndexHandle {
         let current = self.0.read().ok()?;
         current.as_ref().map(f)
     }
+
+    /// Refresh the latest index snapshot in place for `paths` (when one has
+    /// been published). Synchronous mutations use this so backlink queries
+    /// never observe the pre-mutation state.
+    pub fn refresh_paths(&self, storage: &Storage, paths: Vec<PathBuf>) {
+        if let Ok(mut current) = self.0.write() {
+            if let Some(index) = current.as_mut() {
+                index.refresh_paths(storage, paths);
+            }
+        }
+    }
 }
 
 /// Source spans of every `[[target]]` whose target equals `from`
@@ -187,6 +226,49 @@ fn collect_matching_wiki_link_spans(nodes: &[Node<'_>], from: &str, spans: &mut 
             }
         }
     });
+}
+
+/// Source spans of every `[[target]]` that resolves to the note at `path` —
+/// target equal to the file name or stem, case-insensitively, exactly the
+/// rule [`WikiLinkIndex::backlinks`] and the renderer apply. Renames use this
+/// to rewrite precisely the links that pointed at the renamed note, in either
+/// spelling (`[[foo]]` and `[[foo.md]]`), without touching prose, code,
+/// embeds, or links to other notes.
+pub fn matching_note_wiki_link_spans(source: &str, note: &Path) -> Vec<Range<usize>> {
+    let Ok(document) = mbdown::parse(source) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    visit_markdown(document.nodes(), &mut |markdown| {
+        for event in markdown.events() {
+            if let Event::WikiLink(target) = &event.event {
+                if wiki_name_matches(note, target) {
+                    let offset = markdown.source_span().start;
+                    spans.push(offset + event.span.start..offset + event.span.end);
+                }
+            }
+        }
+    });
+    spans.sort_by_key(|span| span.start);
+    spans
+}
+
+/// Reject `target` unless it is a legal `[[wikilink]]` target for MBDown:
+/// non-empty, free of surrounding whitespace, and without brackets or
+/// newlines. A target containing `[`, `]`, `\n`, or `\r` would terminate or
+/// inject markup into the `[[...]]` span rather than name one wiki target,
+/// so such targets are rejected before any file is written.
+pub(crate) fn validate_wiki_target(target: &str) -> Result<()> {
+    if target.is_empty() {
+        bail!("wiki targets must not be empty");
+    }
+    if target.trim() != target {
+        bail!("wiki target must not have leading or trailing whitespace");
+    }
+    if target.contains(['[', ']', '\n', '\r']) {
+        bail!("wiki target must not contain brackets or newlines");
+    }
+    Ok(())
 }
 
 /// Replace every span in `spans` (the full `[[...]]` region) with `[[to]]`,

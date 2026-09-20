@@ -83,6 +83,18 @@ async fn put_json(router: &Router, uri: &str, body: Value) -> (StatusCode, Value
     .await
 }
 
+async fn delete(router: &Router, uri: &str) -> (StatusCode, Value, String) {
+    request(
+        router,
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
 async fn post_json(router: &Router, uri: &str, body: Value) -> (StatusCode, Value, String) {
     request(
         router,
@@ -320,6 +332,47 @@ async fn static_serving_serves_the_spa_and_keeps_api_404s() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// The embedded UI mirrors the on-disk SPA contract: the shell at `/` and
+/// deep client routes, real hashed assets byte-for-byte, and untouched API
+/// 404s. Only compiled when the build script embedded a frontend.
+#[cfg(embed_web_ui)]
+#[tokio::test]
+async fn embedded_serving_serves_the_spa_assets_and_keeps_api_404s() {
+    let (state, _directory) = test_state();
+    let router = server::router_with_frontend(state, server::Frontend::Embedded);
+
+    // The SPA root answers with the shell.
+    let (status, _, root) = get(&router, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        root.contains("<!doctype html") || root.contains("<html"),
+        "index.html body: {root:?}"
+    );
+
+    // A real hashed asset round-trips its bytes.
+    let asset = crate::web::assets::Assets::iter()
+        .find(|path| path.starts_with("assets/"))
+        .expect("a built frontend ships hashed assets");
+    let expected = String::from_utf8_lossy(
+        &crate::web::assets::Assets::get(asset.as_ref())
+            .unwrap()
+            .data,
+    )
+    .into_owned();
+    let (status, _, text) = get(&router, &format!("/{asset}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, expected);
+
+    // A deep client route falls back to the shell, and unknown API paths
+    // still answer with the API error model, never index.html.
+    let (status, _, text) = get(&router, "/not-a-route").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, root);
+    let (status, json, _) = get(&router, "/api/not-found").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+}
+
 #[tokio::test]
 async fn unknown_document_reads_return_stable_not_found() {
     let (state, _directory) = test_state();
@@ -402,6 +455,569 @@ async fn document_write_round_trips_and_rejects_traversal() {
         .join("scratch.md")
         .exists());
     assert!(!directory.path().join("evil.md").exists());
+}
+
+// -----------------------------------------------------------------------
+// Document lifecycle mutations over the real router
+// -----------------------------------------------------------------------
+
+/// Settle the index over files written straight to disk, mirroring the core
+/// index tests' refresh pattern.
+fn settle_index(state: &WebState, paths: Vec<std::path::PathBuf>) {
+    assert!(wait_for_index(state), "index must settle");
+    state.workspace.refresh_documents(paths);
+    assert!(wait_for_index(state), "refreshed index must settle");
+}
+
+#[tokio::test]
+async fn create_note_creates_lists_and_opens_over_http() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    let router = server::router(state.clone());
+
+    let (status, json, _) = post_json(&router, "/api/notes", json!({"name": "My Note"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(json, json!({"path": "data/My Note.md"}));
+    assert!(storage.data_dir.join("My Note.md").is_file());
+
+    // Listed and openable through the existing read endpoints.
+    let (status, notes, _) = get(&router, "/api/notes").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(notes.as_array().unwrap().len(), 1);
+    assert_eq!(notes[0]["path"], json!("data/My Note.md"));
+    assert_eq!(notes[0]["name"], json!("My Note"));
+    let (status, document, _) = get(&router, "/api/document?path=data/My%20Note.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document["source"], json!("# My Note\n\n"));
+}
+
+#[tokio::test]
+async fn create_note_from_template_uses_the_workspace_template() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    std::fs::write(&storage.template_path, "# Template\n\nseeded body\n").unwrap();
+    let router = server::router(state);
+
+    let (status, json, _) = post_json(
+        &router,
+        "/api/notes",
+        json!({"name": "foo", "from_template": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(json["path"], json!("data/foo.md"));
+    assert_eq!(
+        std::fs::read_to_string(storage.data_dir.join("foo.md")).unwrap(),
+        "# Template\n\nseeded body\n"
+    );
+}
+
+#[tokio::test]
+async fn rename_note_over_http_rewrites_wikilinks_and_refreshes_state() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    let foo = storage.data_dir.join("foo.md");
+    let a = storage.data_dir.join("a.md");
+    std::fs::write(&foo, "the target\n").unwrap();
+    std::fs::write(&a, "see [[foo]] today\n").unwrap();
+    settle_index(&state, vec![foo.clone(), a.clone()]);
+
+    let router = server::router(state.clone());
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "data/foo.md", "new_name": "bar"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, json!({"path": "data/bar.md"}));
+    assert!(!foo.exists());
+    assert!(storage.data_dir.join("bar.md").is_file());
+
+    // The new state is visible over HTTP without any poll or refresh.
+    let (status, document, _) = get(&router, "/api/document?path=data/a.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document["source"], json!("see [[bar]] today\n"));
+    let (status, json, _) = get(&router, "/api/backlinks?path=data/bar.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["backlinks"], json!(["data/a.md"]));
+    let (status, _, _) = get(&router, "/api/document?path=data/foo.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, notes, _) = get(&router, "/api/notes").await;
+    assert_eq!(status, StatusCode::OK);
+    let paths: Vec<&str> = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|note| note["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"data/bar.md"));
+    assert!(!paths.contains(&"data/foo.md"));
+}
+
+#[tokio::test]
+async fn rename_archive_over_http_keeps_it_in_archives() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    std::fs::write(storage.archives_dir.join("foo.md"), "old body\n").unwrap();
+    std::fs::write(storage.data_dir.join("a.md"), "see [[foo]]\n").unwrap();
+    let old = storage.archives_dir.join("foo.md");
+    settle_index(&state, vec![old.clone(), storage.data_dir.join("a.md")]);
+
+    let router = server::router(state);
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "archives/foo.md", "new_name": "bar"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, json!({"path": "archives/bar.md"}));
+    assert!(!old.exists());
+    assert!(storage.archives_dir.join("bar.md").is_file());
+    // The resolver treats archived notes as targets, so links follow.
+    assert_eq!(
+        std::fs::read_to_string(storage.data_dir.join("a.md")).unwrap(),
+        "see [[bar]]\n"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_rename_over_http_conflicts_and_changes_nothing() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    let foo = storage.data_dir.join("foo.md");
+    let twin = storage.archives_dir.join("foo.md");
+    let a = storage.data_dir.join("a.md");
+    std::fs::write(&foo, "the target\n").unwrap();
+    std::fs::write(&twin, "the other target\n").unwrap();
+    std::fs::write(&a, "see [[foo]]\n").unwrap();
+    settle_index(&state, vec![foo.clone(), twin.clone(), a.clone()]);
+    let root = directory.path().to_str().unwrap().to_string();
+
+    let router = server::router(state.clone());
+    let (status, json, text) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "data/foo.md", "new_name": "bar"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error_code(&json), "conflict");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ambiguous")),
+        "message must state the ambiguity: {json}"
+    );
+    assert!(!text.contains(&root), "no absolute paths: {text}");
+
+    // Every file and the index state are untouched.
+    assert!(foo.is_file());
+    assert!(twin.is_file());
+    assert!(!storage.data_dir.join("bar.md").exists());
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "see [[foo]]\n");
+    let (status, json, _) = get(&router, "/api/backlinks?path=data/foo.md").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["backlinks"], json!(["data/a.md"]));
+}
+
+#[tokio::test]
+async fn archive_note_over_http_moves_and_lists_as_archived() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    let foo = storage.data_dir.join("foo.md");
+    std::fs::write(&foo, "needle\n").unwrap();
+
+    let router = server::router(state.clone());
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/archive",
+        json!({"path": "data/foo.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, json!({"path": "archives/foo.md"}));
+    assert!(!foo.exists());
+    assert!(storage.archives_dir.join("foo.md").is_file());
+
+    let (status, notes, _) = get(&router, "/api/notes").await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|note| note["path"] == json!("archives/foo.md"))
+        .expect("archived note must be listed");
+    assert_eq!(entry["archived"], json!(true));
+}
+
+#[tokio::test]
+async fn restore_note_over_http_round_trips() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    std::fs::write(storage.data_dir.join("foo.md"), "needle\n").unwrap();
+
+    let router = server::router(state.clone());
+    let (status, _, _) = post_json(
+        &router,
+        "/api/document/archive",
+        json!({"path": "data/foo.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/restore",
+        json!({"path": "archives/foo.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, json!({"path": "data/foo.md"}));
+    assert!(storage.data_dir.join("foo.md").is_file());
+    assert!(!storage.archives_dir.join("foo.md").exists());
+
+    let (status, notes, _) = get(&router, "/api/notes").await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|note| note["path"] == json!("data/foo.md"))
+        .expect("restored note must be listed");
+    assert_eq!(entry["archived"], json!(false));
+}
+
+#[tokio::test]
+async fn delete_document_over_http_removes_notes_and_archives() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    std::fs::write(storage.data_dir.join("foo.md"), "note\n").unwrap();
+    std::fs::write(storage.archives_dir.join("old.md"), "archived\n").unwrap();
+    let router = server::router(state.clone());
+
+    let (status, _, _) = delete(&router, "/api/document?path=data/foo.md").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!storage.data_dir.join("foo.md").exists());
+    let (status, json, _) = get(&router, "/api/document?path=data/foo.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+
+    let (status, _, _) = delete(&router, "/api/document?path=archives/old.md").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!storage.archives_dir.join("old.md").exists());
+    let (status, _, _) = get(&router, "/api/document?path=archives/old.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn daily_delete_over_http_removes_the_day_and_404s_the_unknown() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    state
+        .workspace
+        .append_daily("2026-01-15", "day body")
+        .unwrap();
+    assert!(storage.daily_dir.join("2026-01-15.md").is_file());
+    let router = server::router(state.clone());
+
+    let (status, _, _) = delete(&router, "/api/daily/2026-01-15").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!storage.daily_dir.join("2026-01-15.md").exists());
+    let (status, daily, _) = get(&router, "/api/daily").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(daily.as_array().unwrap().len(), 0);
+
+    // Deleting the same day again is a stable 404; malformed dates are 400s.
+    let (status, json, _) = delete(&router, "/api/daily/2026-01-15").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+    let (status, json, _) = delete(&router, "/api/daily/not-a-date").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&json), "bad_request");
+}
+
+#[tokio::test]
+async fn daily_move_over_http_files_the_day_into_the_target() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    state
+        .workspace
+        .append_daily("2026-01-15", "filed idea")
+        .unwrap();
+    std::fs::write(storage.data_dir.join("project.md"), "# project\n").unwrap();
+    let router = server::router(state.clone());
+
+    let (status, json, _) = post_json(
+        &router,
+        "/api/daily/2026-01-15/move",
+        json!({"target_path": "data/project.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json, json!({"path": "data/project.md"}));
+
+    // The daily file is gone and no longer listed; the target carries the
+    // same dated section the TUI's move writes.
+    assert!(!storage.daily_dir.join("2026-01-15.md").exists());
+    let (status, daily, _) = get(&router, "/api/daily").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(daily.as_array().unwrap().len(), 0);
+    let (status, document, _) = get(&router, "/api/document?path=data/project.md").await;
+    assert_eq!(status, StatusCode::OK);
+    let source = document["source"].as_str().unwrap();
+    assert!(source.contains("## 2026-01-15"), "dated section: {source}");
+    assert!(source.contains("filed idea"), "daily body: {source}");
+}
+
+#[tokio::test]
+async fn invalid_transitions_are_client_errors() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    std::fs::write(storage.data_dir.join("foo.md"), "note\n").unwrap();
+    std::fs::write(storage.archives_dir.join("old.md"), "archived\n").unwrap();
+    state
+        .workspace
+        .append_daily("2026-01-15", "day body")
+        .unwrap();
+    let router = server::router(state.clone());
+
+    // Illegal kinds are 400s whatever their spelling of the path.
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "daily/2026-01-15.md", "new_name": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&json), "bad_request");
+
+    for uri_body in [
+        (
+            "/api/document/archive",
+            json!({"path": "archives/old.md"}),
+            "archive(archived)",
+        ),
+        (
+            "/api/document/archive",
+            json!({"path": "daily/2026-01-15.md"}),
+            "archive(daily)",
+        ),
+        (
+            "/api/document/restore",
+            json!({"path": "data/foo.md"}),
+            "restore(normal)",
+        ),
+    ] {
+        let (status, json, _) = post_json(&router, uri_body.0, uri_body.1).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", uri_body.2);
+        assert_eq!(error_code(&json), "bad_request", "{}", uri_body.2);
+    }
+
+    // Daily documents are deleted by date, never through /api/document.
+    let (status, json, _) = delete(&router, "/api/document?path=daily/2026-01-15.md").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&json), "bad_request");
+    assert!(storage.daily_dir.join("2026-01-15.md").is_file());
+
+    // A move target outside data/ is refused by the workspace's rules.
+    let (status, json, _) = post_json(
+        &router,
+        "/api/daily/2026-01-15/move",
+        json!({"target_path": "archives/old.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&json), "bad_request");
+    assert!(storage.daily_dir.join("2026-01-15.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(storage.archives_dir.join("old.md")).unwrap(),
+        "archived\n"
+    );
+}
+
+#[tokio::test]
+async fn missing_sources_are_stable_not_founds() {
+    let (state, _directory) = test_state();
+    let router = server::router(state.clone());
+
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "data/missing.md", "new_name": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+
+    for (uri, body) in [
+        ("/api/document/archive", json!({"path": "data/missing.md"})),
+        (
+            "/api/document/restore",
+            json!({"path": "archives/missing.md"}),
+        ),
+    ] {
+        let (status, json, _) = post_json(&router, uri, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(error_code(&json), "not_found", "{uri}");
+    }
+
+    let (status, json, _) = delete(&router, "/api/document?path=data/missing.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+
+    // A move with a missing day or a missing target is a 404 either way.
+    state
+        .workspace
+        .append_daily("2026-01-15", "day body")
+        .unwrap();
+    let (status, json, _) = post_json(
+        &router,
+        "/api/daily/2026-02-02/move",
+        json!({"target_path": "data/project.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+    let (status, json, _) = post_json(
+        &router,
+        "/api/daily/2026-01-15/move",
+        json!({"target_path": "data/missing.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&json), "not_found");
+    assert!(
+        state
+            .workspace
+            .storage()
+            .daily_dir
+            .join("2026-01-15.md")
+            .is_file(),
+        "the day survives a failed move"
+    );
+}
+
+#[tokio::test]
+async fn mutation_collisions_are_conflicts() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    std::fs::write(storage.data_dir.join("foo.md"), "note\n").unwrap();
+    std::fs::write(storage.data_dir.join("bar.md"), "collision\n").unwrap();
+    std::fs::write(storage.archives_dir.join("twin.md"), "archive twin\n").unwrap();
+    std::fs::write(storage.data_dir.join("twin.md"), "data twin\n").unwrap();
+    let router = server::router(state.clone());
+
+    // Creating a second note with an existing name never overwrites.
+    let (status, json, _) = post_json(&router, "/api/notes", json!({"name": "foo"})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error_code(&json), "conflict");
+    assert_eq!(
+        std::fs::read_to_string(storage.data_dir.join("foo.md")).unwrap(),
+        "note\n"
+    );
+
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "data/foo.md", "new_name": "bar"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error_code(&json), "conflict");
+    assert!(storage.data_dir.join("foo.md").is_file());
+
+    // Archiving onto an existing archive name, and restoring onto an
+    // existing data name, both refuse.
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/archive",
+        json!({"path": "data/twin.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error_code(&json), "conflict");
+    assert!(storage.data_dir.join("twin.md").is_file());
+
+    let (status, json, _) = post_json(
+        &router,
+        "/api/document/restore",
+        json!({"path": "archives/twin.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error_code(&json), "conflict");
+    assert!(storage.archives_dir.join("twin.md").is_file());
+}
+
+#[tokio::test]
+async fn mutation_endpoints_reject_traversal_and_never_leak_paths() {
+    let (state, directory) = test_state();
+    let storage = Storage::new(directory.path()).unwrap();
+    state
+        .workspace
+        .append_daily("2026-01-15", "day body")
+        .unwrap();
+    std::fs::write(storage.data_dir.join("foo.md"), "note\n").unwrap();
+    let secret = directory.path().join("secret.md");
+    std::fs::write(&secret, "outside").unwrap();
+    let root = directory.path().to_str().unwrap().to_string();
+    let router = server::router(state.clone());
+
+    // Traversal in a note name is rejected by the workspace's naming rules.
+    for name in ["../evil", "/abs", "a\\b"] {
+        let (status, json, _) = post_json(&router, "/api/notes", json!({"name": name})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "name: {name}");
+        assert_eq!(error_code(&json), "bad_request");
+    }
+
+    for path in [
+        "../evil.md",
+        "/etc/passwd",
+        "data\\x.md",
+        "data/../../evil.md",
+    ] {
+        let (status, json, text) = post_json(
+            &router,
+            "/api/document/rename",
+            json!({"path": path, "new_name": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "rename path: {path}");
+        assert_eq!(error_code(&json), "bad_request");
+        assert!(!text.contains(&root), "rename leaked {root}: {text}");
+
+        let (status, json, _) =
+            post_json(&router, "/api/document/archive", json!({"path": path})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "archive path: {path}");
+        assert_eq!(error_code(&json), "bad_request");
+
+        let (status, json, _) =
+            post_json(&router, "/api/document/restore", json!({"path": path})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "restore path: {path}");
+        assert_eq!(error_code(&json), "bad_request");
+
+        let (status, json, _) = post_json(
+            &router,
+            "/api/daily/2026-01-15/move",
+            json!({"target_path": path}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "move path: {path}");
+        assert_eq!(error_code(&json), "bad_request");
+
+        let uri = format!("/api/document?path={}", urlencoding_encode(path));
+        let (status, json, _) = delete(&router, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "delete path: {path}");
+        assert_eq!(error_code(&json), "bad_request");
+    }
+
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "outside");
+    assert!(!directory.path().join("evil.md").exists());
+    assert!(!directory.path().join("etc").exists());
+    assert!(storage.data_dir.join("foo.md").is_file());
+    assert!(storage.daily_dir.join("2026-01-15.md").is_file());
 }
 
 #[tokio::test]
@@ -544,6 +1160,126 @@ async fn watcher_pipeline_refreshes_index_after_external_write() {
             crate::core::model::SearchHit::FileLine { path, .. } if path.ends_with("live.md"))),
         "index must contain the externally written file; hits: {hits:?}"
     );
+}
+
+/// HTTP mutations reuse the storage-layer file operations the watcher
+/// observes, so every lifecycle endpoint must broadcast through the same
+/// `ContentChanged` pipeline external writes do — no mutation-specific
+/// WebSocket protocol exists or is needed.
+#[tokio::test]
+async fn http_mutations_broadcast_through_the_workspace_watcher() {
+    use crate::core::nole::Nole;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path()).unwrap();
+    storage.ensure_files().unwrap();
+    let mut nole = Nole::open(storage).unwrap();
+    let state = WebState::new(
+        nole.workspace().clone(),
+        nole.agent().clone(),
+        AgentSessionScope::default(),
+    );
+    // Drain the initial snapshot like the web watcher loop does.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !state.workspace.poll_index_update() {
+        assert!(
+            Instant::now() < deadline,
+            "initial index snapshot must settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let router = server::router(state.clone());
+    state
+        .workspace
+        .append_daily("2026-01-15", "day body")
+        .unwrap();
+    std::fs::write(
+        nole.workspace().storage().data_dir.join("project.md"),
+        "# p\n",
+    )
+    .unwrap();
+
+    // Block until watcher batches have reported a managed-content change
+    // mentioning every needle, draining like the web watcher loop. One
+    // mutation can touch several files in one batch, so needles accumulate
+    // across drains.
+    async fn saw_content_changes(nole: &mut Nole, needles: &[&str]) {
+        let mut seen = vec![false; needles.len()];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for event in nole.poll_workspace() {
+                if let WorkspaceEvent::ContentChanged { markdown_paths } = event {
+                    for path in markdown_paths {
+                        for (index, needle) in needles.iter().enumerate() {
+                            if path.to_string_lossy().contains(needle) {
+                                seen[index] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if seen.iter().all(|value| *value) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watcher must observe the mutations of {needles:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let (status, _, _) = post_json(&router, "/api/notes", json!({"name": "watched"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    saw_content_changes(&mut nole, &["watched.md"]).await;
+
+    let (status, _, _) = post_json(
+        &router,
+        "/api/document/rename",
+        json!({"path": "data/watched.md", "new_name": "renamed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    saw_content_changes(&mut nole, &["renamed.md"]).await;
+
+    let (status, _, _) = post_json(
+        &router,
+        "/api/document/archive",
+        json!({"path": "data/renamed.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    saw_content_changes(&mut nole, &["renamed.md"]).await;
+
+    let (status, _, _) = post_json(
+        &router,
+        "/api/document/restore",
+        json!({"path": "archives/renamed.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    saw_content_changes(&mut nole, &["renamed.md"]).await;
+
+    let (status, _, _) = delete(&router, "/api/document?path=data/renamed.md").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    saw_content_changes(&mut nole, &["renamed.md"]).await;
+
+    state
+        .workspace
+        .append_daily("2026-02-02", "another day")
+        .unwrap();
+    let (status, _, _) = delete(&router, "/api/daily/2026-02-02").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    saw_content_changes(&mut nole, &["2026-02-02.md"]).await;
+
+    let (status, _, _) = post_json(
+        &router,
+        "/api/daily/2026-01-15/move",
+        json!({"target_path": "data/project.md"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    saw_content_changes(&mut nole, &["project.md", "2026-01-15.md"]).await;
 }
 
 #[tokio::test]

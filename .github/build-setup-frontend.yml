@@ -1,0 +1,16 @@
+# Injected by dist into every build job (github-build-setup): build the
+# React UI before cargo runs, so web/dist exists and the build script
+# embeds it into the binary (cfg(embed_web_ui)).
+- name: Install pnpm
+  uses: pnpm/action-setup@v4
+  with:
+    version: 10
+- name: Install Node for the web UI build
+  uses: actions/setup-node@v4
+  with:
+    node-version: 22
+- name: Build the web UI
+  shell: bash
+  run: |
+    pnpm --dir web install --frozen-lockfile
+    pnpm --dir web run build

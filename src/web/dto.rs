@@ -97,6 +97,45 @@ pub struct DocumentWriteRequest {
     pub source: String,
 }
 
+/// `POST /api/notes` request: the user-entered note name, optionally seeded
+/// from the workspace template instead of the default heading.
+#[derive(Deserialize)]
+pub struct CreateNoteRequest {
+    pub name: String,
+    #[serde(default)]
+    pub from_template: bool,
+}
+
+/// `POST /api/document/rename` request. `new_name` is a bare file name; the
+/// workspace owns normalization, collision checks, and wikilink migration.
+#[derive(Deserialize)]
+pub struct RenameDocumentRequest {
+    pub path: String,
+    pub new_name: String,
+}
+
+/// `POST /api/document/archive` and `POST /api/document/restore` request: the
+/// managed document addressed by workspace-relative path.
+#[derive(Deserialize)]
+pub struct DocumentPathRequest {
+    pub path: String,
+}
+
+/// `POST /api/daily/{date}/move` request: the note the day's content is
+/// filed into, addressed by workspace-relative path.
+#[derive(Deserialize)]
+pub struct MoveDailyRequest {
+    pub target_path: String,
+}
+
+/// Shared mutation response: the canonical workspace-relative path of the
+/// affected document as produced by the workspace — clients never guess file
+/// extensions, directories, or daily file naming.
+#[derive(Serialize)]
+pub struct DocumentMutationDto {
+    pub path: String,
+}
+
 /// Token usage embedded in the agent `usage` event.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenUsageDto {

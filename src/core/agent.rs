@@ -1892,10 +1892,10 @@ fn externalize_tool_output_with(
     mut output: ToolOutput,
 ) -> Result<ToolOutput> {
     let text = &output.content;
-    if should_externalize_text(&text, token_cap) {
-        let stored = normalize_stored_result(&text);
+    if should_externalize_text(text, token_cap) {
+        let stored = normalize_stored_result(text);
         let uri = results.store(&stored)?;
-        let reference = result_reference_message(&uri, &text, &stored);
+        let reference = result_reference_message(&uri, text, &stored);
         output.content = reference;
     }
     Ok(output)

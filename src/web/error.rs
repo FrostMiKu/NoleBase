@@ -8,7 +8,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::web::dto::HealthDto;
+use crate::core::model::MutationConflict;
+use crate::core::workspace::Workspace;
+use crate::web::dto::{scrub_workspace_paths, HealthDto};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -51,15 +53,29 @@ impl IntoResponse for ApiError {
 
 impl ApiError {
     /// Classify a core document error for the HTTP boundary: a missing file
-    /// (io NotFound anywhere in the chain) is a stable 404, pure validation
-    /// failures are 400, and everything else is internal.
+    /// (io NotFound anywhere in the chain) is a stable 404, a domain-raised
+    /// conflict marker or a create collision (io AlreadyExists) is 409, pure
+    /// validation failures are 400, and everything else is internal.
     pub fn from_document_error(error: anyhow::Error) -> Self {
+        if let Some(conflict) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<MutationConflict>())
+        {
+            return Self::Conflict(conflict.0.clone());
+        }
         if error.chain().any(|cause| {
             cause
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
         }) {
             return Self::NotFound("Document not found".to_string());
+        }
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+        }) {
+            return Self::Conflict("A document with that name already exists".to_string());
         }
         if error
             .chain()
@@ -68,6 +84,19 @@ impl ApiError {
             return Self::Internal(error);
         }
         Self::BadRequest(error.to_string())
+    }
+
+    /// Classify like [`ApiError::from_document_error`], then scrub
+    /// workspace-root prefixes from client-facing messages: core validation
+    /// text names absolute paths, and the wire must stay workspace-relative.
+    pub fn from_workspace_error(workspace: &Workspace, error: anyhow::Error) -> Self {
+        match Self::from_document_error(error) {
+            Self::BadRequest(message) => {
+                Self::BadRequest(scrub_workspace_paths(workspace, &message))
+            }
+            Self::Conflict(message) => Self::Conflict(scrub_workspace_paths(workspace, &message)),
+            other => other,
+        }
     }
 
     pub fn internal(error: impl Into<anyhow::Error>) -> Self {

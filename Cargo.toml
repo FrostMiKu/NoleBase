@@ -24,6 +24,8 @@ crossterm = "0.29"
 mbdown = "0.1.4"
 mbtui = "0.1.4"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+rust-embed = "8.12"
+mime_guess = "2"
 clipboard-rs = { version = "0.3.5", features = ["image"] }
 base64 = "0.23"
 brush-builtins = "0.2.0"

@@ -134,11 +134,10 @@ impl JobState {
         let now = Instant::now();
         let before = self.entries.len();
         self.entries.retain(|entry| {
-            let keep = entry.status == JobStatus::Running
+            entry.status == JobStatus::Running
                 || entry
                     .settled
-                    .is_none_or(|settled| now.duration_since(settled) < SETTLED_RETENTION);
-            keep
+                    .is_none_or(|settled| now.duration_since(settled) < SETTLED_RETENTION)
         });
         if self.entries.len() != before {
             self.revision += 1;

@@ -13,6 +13,8 @@
 //!   [`error`].
 
 pub mod agent;
+#[cfg(embed_web_ui)]
+pub mod assets;
 pub mod dto;
 pub mod error;
 pub mod server;

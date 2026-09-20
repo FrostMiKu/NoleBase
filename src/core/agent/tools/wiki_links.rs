@@ -9,76 +9,10 @@ use super::util::{
     display_path, limited_diff, required_string, truncate_with_marker, MAX_DIFF_BYTES,
 };
 use crate::core::agent::{ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy};
-use crate::core::storage::Storage;
+use crate::core::storage::{stage_replacement, Storage};
 use crate::core::wiki_link_index::{
-    matching_wiki_link_spans, replace_wiki_link_spans, WikiLinkIndexHandle,
+    matching_wiki_link_spans, replace_wiki_link_spans, validate_wiki_target, WikiLinkIndexHandle,
 };
-
-/// Reject `target` unless it is a legal `[[wikilink]]` target for MBDown:
-/// non-empty, free of surrounding whitespace, and without brackets or
-/// newlines. A target containing `[`, `]`, `\n`, or `\r` would terminate or
-/// inject markup into the `[[...]]` span rather than rename one wiki link, so
-/// such targets are rejected before any diff is shown or file is written.
-fn validate_wiki_target(target: &str) -> Result<()> {
-    if target.is_empty() {
-        bail!("wiki targets must not be empty");
-    }
-    if target.trim() != target {
-        bail!("wiki target must not have leading or trailing whitespace");
-    }
-    if target.contains(['[', ']', '\n', '\r']) {
-        bail!("wiki target must not contain brackets or newlines");
-    }
-    Ok(())
-}
-
-/// Create a unique hidden temp file next to `target` (same directory, same
-/// filesystem) and write `content` into it, so the commit phase can atomically
-/// rename it over the target. Mirrors the export staging convention;
-/// `create_new` guarantees a coincidental file is never clobbered.
-fn stage_replacement(target: &Path, content: &str) -> Result<PathBuf> {
-    use std::io::Write as _;
-
-    let parent = target
-        .parent()
-        .context("wiki rename target has no parent directory")?;
-    let name = target
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("wiki-note");
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    for attempt in 0..16u32 {
-        let temp_name = format!(
-            ".{name}.nole-rename-{}-{nonce}-{attempt}.tmp",
-            std::process::id()
-        );
-        let temp = parent.join(temp_name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        match options.open(&temp) {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(content.as_bytes()) {
-                    let _ = std::fs::remove_file(&temp);
-                    return Err(error)
-                        .with_context(|| format!("writing staged file {}", temp.display()));
-                }
-                return Ok(temp);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("creating staged file next to {}", target.display()))
-            }
-        }
-    }
-    bail!(
-        "could not allocate a staged wiki rename file next to {}",
-        target.display()
-    )
-}
 
 /// Resolve `target` to the managed notes it names, returning the distinct
 /// paths sorted. Empty when the wiki index has not published yet.

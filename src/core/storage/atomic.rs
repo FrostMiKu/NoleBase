@@ -2,7 +2,10 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use anyhow::{bail, Context, Result};
 
 /// Publish `staged` at `destination` as one filesystem operation.
 ///
@@ -44,6 +47,56 @@ pub(crate) fn replace_file_atomically(staged: &Path, destination: &Path) -> io::
             Ok(())
         }
     }
+}
+
+/// Create a unique hidden temp file next to `target` (same directory, same
+/// filesystem) and write `content` into it, so a caller can later publish it
+/// atomically with [`replace_file_atomically`]. `create_new` guarantees a
+/// coincidental file is never clobbered. Multi-file rewrites stage every
+/// replacement first so an ordinary write failure (full disk, permissions)
+/// leaves every original untouched.
+pub(crate) fn stage_replacement(target: &Path, content: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+
+    let parent = target
+        .parent()
+        .context("staged replacement has no parent directory")?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("nole-note");
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16u32 {
+        let temp_name = format!(
+            ".{name}.nole-rename-{}-{nonce}-{attempt}.tmp",
+            std::process::id()
+        );
+        let temp = parent.join(temp_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&temp) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(content.as_bytes()) {
+                    let _ = fs::remove_file(&temp);
+                    return Err(error)
+                        .with_context(|| format!("writing staged file {}", temp.display()));
+                }
+                return Ok(temp);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating staged file next to {}", target.display()))
+            }
+        }
+    }
+    bail!(
+        "could not allocate a staged file next to {}",
+        target.display()
+    )
 }
 
 #[cfg(test)]

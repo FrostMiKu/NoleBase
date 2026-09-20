@@ -72,7 +72,7 @@ impl App {
                         }),
                 );
                 if candidates.is_empty() {
-                    match self.storage().create_named_file(&requested) {
+                    match self.workspace.create_note(&requested) {
                         Ok(path) => {
                             self.reload_files();
                             self.open_file_document(&path, DocumentReturn::Daily);

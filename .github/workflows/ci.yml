@@ -48,6 +48,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The frontend build also flips the build script's cfg(embed_web_ui),
+      # so cargo test exercises the embedded-UI serving on every platform.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the web UI
+        run: |
+          pnpm --dir web install --frozen-lockfile
+          pnpm --dir web run build
+
+      - name: Run web UI tests
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: pnpm --dir web test
+
       - name: Run tests
         if: matrix.test
         run: cargo test --locked --target ${{ matrix.target }}

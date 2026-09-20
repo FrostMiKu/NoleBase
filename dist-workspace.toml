@@ -19,3 +19,6 @@ install-path = "CARGO_HOME"
 publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = true
+# Steps injected into every build job: build the React UI so the build
+# script embeds it (cfg(embed_web_ui)) into the released binaries.
+github-build-setup = "../build-setup-frontend.yml"
