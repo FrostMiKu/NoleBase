@@ -17,6 +17,7 @@ pub mod agent;
 pub mod assets;
 pub mod dto;
 pub mod error;
+pub mod preview;
 pub mod server;
 pub mod state;
 pub mod workspace;

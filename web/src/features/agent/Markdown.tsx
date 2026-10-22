@@ -1,4 +1,5 @@
 import ReactMarkdown from 'react-markdown'
+import { remarkNoteLinks } from '@/features/documents/note-links'
 import remarkGfm from 'remark-gfm'
 import type { ComponentProps } from 'react'
 
@@ -13,14 +14,20 @@ type Components = ComponentProps<typeof ReactMarkdown>['components']
 const components: Components = {
   h1: ({ children }) => <h1 className="mt-2 mb-1 text-[14px] font-semibold text-fg">{children}</h1>,
   h2: ({ children }) => <h2 className="mt-2 mb-1 text-[13px] font-semibold text-fg">{children}</h2>,
-  h3: ({ children }) => <h3 className="mt-1.5 mb-1 text-[12px] font-semibold text-fg">{children}</h3>,
-  h4: ({ children }) => <h4 className="mt-1.5 mb-1 text-[12px] font-semibold text-fg">{children}</h4>,
+  h3: ({ children }) => (
+    <h3 className="mt-1.5 mb-1 text-[12px] font-semibold text-fg">{children}</h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="mt-1.5 mb-1 text-[12px] font-semibold text-fg">{children}</h4>
+  ),
   p: ({ children }) => <p className="my-1 leading-[1.5]">{children}</p>,
   ul: ({ children }) => <ul className="my-1 list-disc pl-4">{children}</ul>,
   ol: ({ children }) => <ol className="my-1 list-decimal pl-4">{children}</ol>,
   li: ({ children }) => <li className="my-px leading-[1.5]">{children}</li>,
   blockquote: ({ children }) => (
-    <blockquote className="my-1 border-l-2 border-border-strong pl-2 text-muted">{children}</blockquote>
+    <blockquote className="my-1 border-l-2 border-border-strong pl-2 text-muted">
+      {children}
+    </blockquote>
   ),
   a: ({ children, href }) => (
     <a
@@ -38,9 +45,13 @@ const components: Components = {
     </div>
   ),
   th: ({ children }) => (
-    <th className="border border-border bg-panel px-1.5 py-0.5 text-left font-semibold text-fg">{children}</th>
+    <th className="border border-border bg-panel px-1.5 py-0.5 text-left font-semibold text-fg">
+      {children}
+    </th>
   ),
-  td: ({ children }) => <td className="border border-border px-1.5 py-0.5 align-top">{children}</td>,
+  td: ({ children }) => (
+    <td className="border border-border px-1.5 py-0.5 align-top">{children}</td>
+  ),
   pre: ({ children }) => (
     <pre className="my-1.5 overflow-x-auto rounded-sm border border-border bg-bg px-2 py-1.5 font-mono text-[11px] leading-[1.5] text-fg">
       {children}
@@ -60,10 +71,45 @@ const components: Components = {
   hr: () => <hr className="my-2 border-border" />,
 }
 
-export function Markdown({ text }: { text: string }) {
+export function Markdown({
+  text,
+  noteLinks = false,
+  onFollowLink,
+}: {
+  text: string
+  noteLinks?: boolean
+  onFollowLink?: (href: string) => boolean
+}) {
+  const renderedComponents: Components = {
+    ...components,
+    a: ({ children, href }) => (
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        className="text-accent underline decoration-accent/40 hover:decoration-accent"
+        onClick={(event) => {
+          if (href && onFollowLink?.(href)) event.preventDefault()
+        }}
+      >
+        {children}
+      </a>
+    ),
+    img: ({ src, alt }) => (
+      <img
+        src={src}
+        alt={alt ?? ''}
+        loading="lazy"
+        className="my-3 max-h-96 max-w-full rounded object-contain"
+      />
+    ),
+  }
   return (
-    <div className="text-[12px] text-fg">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+    <div className="min-w-0 text-[13px] break-words text-fg [overflow-wrap:anywhere]">
+      <ReactMarkdown
+        remarkPlugins={noteLinks ? [remarkGfm, remarkNoteLinks] : [remarkGfm]}
+        components={renderedComponents}
+      >
         {text}
       </ReactMarkdown>
     </div>

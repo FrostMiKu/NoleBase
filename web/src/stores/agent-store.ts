@@ -20,6 +20,7 @@ import {
  * text never enters TanStack Query.
  */
 export interface AgentStore extends AgentState {
+  runSubmitting: boolean
   connection: AgentConnectionState
 
   dispatchEvent: (event: AgentEvent) => void
@@ -40,6 +41,7 @@ export interface AgentStore extends AgentState {
 export const useAgentStore = create<AgentStore>()((set) => ({
   ...initialAgentState(),
   connection: 'connecting',
+  runSubmitting: false,
 
   dispatchEvent: (event) => set((state) => reduceAgentEvent(state, event)),
   beginRun: (prompt) => set((state) => beginAgentRun(state, prompt)),

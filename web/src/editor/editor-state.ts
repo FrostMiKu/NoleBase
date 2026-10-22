@@ -16,6 +16,9 @@ export interface EditorDocumentState {
   baselineSource: string
   dirty: boolean
   saving: boolean
+  saveError: boolean
+  editVersion: number
+  documentVersion: number
   /** Disk changed while the editor had unsaved edits. */
   externalChangePending: boolean
   /**
@@ -41,7 +44,7 @@ interface EditorStore {
   setLiveDirty: (dirty: boolean) => void
   /** Current text no longer matches what the store last saw (e.g. after an undo). */
   beginSave: () => void
-  saveSucceeded: (savedSource: string) => void
+  saveSucceeded: (savedSource: string, liveSource?: string) => void
   saveFailed: () => void
   markExternalChange: () => void
   clearExternalChange: () => void
@@ -61,6 +64,9 @@ const initial: EditorDocumentState = {
   baselineSource: '',
   dirty: false,
   saving: false,
+  saveError: false,
+  editVersion: 0,
+  documentVersion: 0,
   externalChangePending: false,
   movedTo: null,
   autosaveBlock: null,
@@ -95,6 +101,8 @@ export const editorStore: EditorStore = {
       baselineSource: source,
       dirty: false,
       saving: false,
+      saveError: false,
+      documentVersion: state.documentVersion + 1,
       externalChangePending: false,
       movedTo: null,
       // Retargeting ends any lifecycle block: the editor now belongs to a
@@ -104,19 +112,24 @@ export const editorStore: EditorStore = {
   },
 
   setLiveDirty(dirty) {
-    set({ dirty })
+    set({ dirty, saveError: false, editVersion: state.editVersion + 1 })
   },
 
   beginSave() {
-    set({ saving: true })
+    set({ saving: true, saveError: false })
   },
 
-  saveSucceeded(savedSource) {
-    set({ baselineSource: savedSource, dirty: false, saving: false, externalChangePending: false })
+  saveSucceeded(savedSource, liveSource = savedSource) {
+    set({
+      baselineSource: savedSource,
+      dirty: liveSource !== savedSource,
+      saving: false,
+      saveError: false,
+    })
   },
 
   saveFailed() {
-    set({ saving: false })
+    set({ saving: false, saveError: true })
   },
 
   markExternalChange() {
@@ -157,6 +170,8 @@ export const editorStore: EditorStore = {
       baselineSource: '',
       dirty: false,
       saving: false,
+      saveError: false,
+      documentVersion: state.documentVersion + 1,
       externalChangePending: false,
       movedTo: null,
       autosaveBlock: null,

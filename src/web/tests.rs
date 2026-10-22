@@ -1614,3 +1614,86 @@ fn agent_events_are_recorded_and_persisted_at_lifecycle_points() {
     // The restored conversation continues the session's context.
     assert_eq!(state.session.conversation().messages.len(), 1);
 }
+
+#[tokio::test]
+async fn document_preview_renders_unsaved_mbdown_and_managed_images_without_writing() {
+    let (state, _directory) = test_state();
+    let original = "# Original\n";
+    let path = state.workspace.storage().data_dir.join("preview.mb");
+    std::fs::write(&path, original).unwrap();
+    let image_path = state.workspace.storage().data_dir.join("tiny.png");
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+        .save(&image_path)
+        .unwrap();
+    let image = state
+        .workspace
+        .attachments()
+        .import_bytes(&std::fs::read(image_path).unwrap(), Some("tiny.png"))
+        .unwrap();
+    let uri = crate::core::attachment::AttachmentUri::from_id(image.id).to_string();
+    let app = server::router(state);
+    let (status, body, _) = post_json(&app, "/api/document/preview", json!({
+        "path": "data/preview.mb",
+        "source": format!("[box title=Preview]\nUnsaved content\n[/box]\n\n![Managed]({uri})\n\n<script>alert(1)</script>\n")
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let html = body["html"].as_str().unwrap();
+    assert!(html.contains("nole-box"));
+    assert!(html.contains("Unsaved content"));
+    assert!(html.contains("data:image/png;base64,"));
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    assert_eq!(body["warnings"], json!([]));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn document_preview_rejects_unmanaged_paths_and_large_source() {
+    let (state, _directory) = test_state();
+    std::fs::write(state.workspace.storage().data_dir.join("note.md"), "note").unwrap();
+    let app = server::router(state);
+    for path in ["../outside.md", "config/AGENTS.md", "/tmp/private.md"] {
+        let (status, _, _) = post_json(
+            &app,
+            "/api/document/preview",
+            json!({
+                "path": path, "source": "# Preview"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    let (status, _, _) = post_json(
+        &app,
+        "/api/document/preview",
+        json!({
+            "path": "data/missing.md", "source": "# Preview"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = post_json(
+        &app,
+        "/api/document/preview",
+        json!({
+            "path": "data/note.md", "source": "x".repeat(1024 * 1024 + 1)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn document_preview_reports_unavailable_images_without_exposing_external_bytes() {
+    let (state, directory) = test_state();
+    std::fs::write(state.workspace.storage().data_dir.join("note.md"), "note").unwrap();
+    let app = server::router(state);
+    let (status, body, _) = post_json(&app, "/api/document/preview", json!({
+        "path": "data/note.md", "source": "![Private](../config/ai.toml)\n\n![Missing](missing.png)"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["warnings"].as_array().unwrap().len(), 2);
+    assert!(!body
+        .to_string()
+        .contains(directory.path().to_str().unwrap()));
+}

@@ -10,6 +10,7 @@ import {
   resetSharedState,
   stubApi,
 } from '@/test/sidebar-harness'
+import { editorStore } from '@/editor/editor-state'
 import type { DailyNote, NoteSummary } from '@/types/workspace'
 
 const NOTES: NoteSummary[] = [
@@ -118,4 +119,13 @@ describe('LeftSidebar context menus', () => {
     await waitFor(() => expect(router.state.location.pathname).toBe('/document'))
     expect(router.state.location.search).toEqual({ path: 'data/foo.md' })
   })
+})
+
+it('marks the full selected row with the shared indicator', async () => {
+  stubApi(readOnlyApi({ notes: () => NOTES, daily: () => DAILY }))
+  editorStore.loadDocument('data/foo.md', '')
+  await renderSidebarApp({ notes: NOTES, daily: DAILY })
+  const row = screen.getByRole('button', { name: 'foo' })
+  expect(row).toHaveAttribute('aria-current', 'page')
+  expect(row).toHaveClass('selection-row')
 })

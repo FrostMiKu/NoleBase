@@ -822,6 +822,34 @@ the API only. A `web/dist` directory next to where you launch `nole web`
 always wins over the embedded copy, so a rebuilt frontend shows up without
 recompiling Rust.
 
+The Web workspace provides a quick-capture home, Daily cards, recent files,
+content search, tags, tasks, and the Agent conversation. The top toolbar exposes
+new-note creation, file and task panels, and the command palette (`Cmd/Ctrl+K`).
+On narrow screens the panels open as drawers; layout preferences survive reloads.
+
+Documents support Edit, Read, Split, and Full preview views, idle autosave, explicit Save
+(`Cmd/Ctrl+S`), original-source download, rename, archive/restore, and deletion
+with confirmation. Search results open at the matching source line. Reading
+supports Markdown/GFM, clickable `[[wikilinks]]`, `#tags`, and relative Markdown
+note links. Ambiguous wiki links show a chooser. Full preview uses the shared offline
+export renderer for MBDown containers, Mermaid, math, syntax highlighting, and
+local/managed images, and offers a standalone HTML download. Its sandbox keeps
+the rendered content isolated from the workspace; use Read mode for note-link
+navigation. Rendering warnings are visible above the preview.
+
+Daily and Agent composer drafts survive navigation and reloads in the same
+browser tab. Enter submits and Shift+Enter inserts a newline; Daily completion
+supports all notes, archives, daily dates, and tags with a clamped eight-row
+selection window. Failed saves preserve the draft. File conflicts pause
+saving until resolved, and edits typed during an in-flight save remain unsaved.
+The Agent has a Send button, preserves scroll position while reading history,
+and masks private terminal input. Provider configuration still comes from the
+workspace configuration files.
+
+For frontend development, start `nole web` (port 38121), then run
+`pnpm --dir web dev`. For a production UI, build the frontend before starting
+`nole web` from the repository root or before compiling the release binary.
+
 ```bash
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web run build # produce web/dist; cargo embeds it on the next build

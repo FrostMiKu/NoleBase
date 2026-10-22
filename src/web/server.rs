@@ -80,6 +80,7 @@ pub fn router_with_frontend(state: web::state::WebState, frontend: Frontend) -> 
         .route("/api/tags", get(web::workspace::tags))
         .route("/api/tags/{tag}", get(web::workspace::tag_documents))
         .route("/api/backlinks", get(web::workspace::backlinks))
+        .route("/api/document/preview", post(web::preview::render))
         .route(
             "/api/document",
             get(web::workspace::read_document)

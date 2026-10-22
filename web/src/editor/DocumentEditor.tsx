@@ -1,9 +1,10 @@
+import { Compartment, EditorState, StateEffect } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { useEffect, useRef } from 'react'
 
 import { attachEditorView, detachEditorView, replaceEditorSource } from './editor-bridge'
 import { createEditorState } from './extensions'
-import { editorStore } from './editor-state'
+import { editorStore, useEditorState } from './editor-state'
 import { saveCurrentDocument } from './save'
 
 interface DocumentEditorProps {
@@ -11,6 +12,7 @@ interface DocumentEditorProps {
   path: string
   /** Latest known disk content for `path` (undefined while loading). */
   source: string | undefined
+  line?: number
 }
 
 /**
@@ -19,7 +21,9 @@ interface DocumentEditorProps {
  * (a) creates/destroys the view, (b) swaps documents on `path` change, and
  * (c) applies external reloads when the editor is clean.
  */
-export function DocumentEditor({ path, source }: DocumentEditorProps) {
+export function DocumentEditor({ path, source, line }: DocumentEditorProps) {
+  const { saving, autosaveBlock } = useEditorState()
+  const editable = useRef(new Compartment())
   const containerRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
 
@@ -41,6 +45,7 @@ export function DocumentEditor({ path, source }: DocumentEditorProps) {
       ),
       parent: container,
     })
+    view.dispatch({ effects: StateEffect.appendConfig.of(editable.current.of([])) })
     viewRef.current = view
     attachEditorView(view)
     return () => {
@@ -51,19 +56,45 @@ export function DocumentEditor({ path, source }: DocumentEditorProps) {
     }
   }, [])
 
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: editable.current.reconfigure([
+        EditorState.readOnly.of(autosaveBlock === path),
+        EditorView.editable.of(autosaveBlock !== path),
+      ]),
+    })
+  }, [autosaveBlock, path])
+
   // Document switch / external reload reconciliation.
   useEffect(() => {
-    if (source === undefined) return
+    if (source === undefined || saving) return
     const state = editorStore.getState()
     if (state.path === path && state.baselineSource === source) return
     if (state.path === path && state.dirty) {
-      // External change while dirty: the watcher handler has already
-      // flagged it; never clobber the user's text here.
+      // A fetched disk version differs from the baseline. Preserve local
+      // edits and let the conflict banner own the resolution.
+      editorStore.markExternalChange()
       return
     }
     editorStore.loadDocument(path, source)
     replaceEditorSource(source)
-  }, [path, source])
+  }, [path, source, saving])
 
-  return <div ref={containerRef} className="h-full w-full overflow-hidden" data-testid="document-editor" />
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view || line === undefined || source === undefined) return
+    const target = view.state.doc.line(Math.max(1, Math.min(line, view.state.doc.lines)))
+    view.dispatch({
+      selection: { anchor: target.from },
+      effects: EditorView.scrollIntoView(target.from, { y: 'center' }),
+    })
+  }, [path, line, source !== undefined])
+
+  return (
+    <div
+      ref={containerRef}
+      className="h-full w-full overflow-hidden"
+      data-testid="document-editor"
+    />
+  )
 }

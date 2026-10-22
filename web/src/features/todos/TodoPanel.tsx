@@ -25,7 +25,12 @@ export function TodoPanel() {
           {todosQuery.error instanceof Error ? todosQuery.error.message : 'Failed to load'}
         </p>
       )}
-      <ul className="space-y-0.5 px-3 pb-3">
+      {todosQuery.isSuccess && todos.length === 0 && (
+        <p className="px-3 py-1 text-xs text-muted">
+          No tasks yet. Add a - [ ] task to a daily note.
+        </p>
+      )}
+      <ul className="space-y-0.5 px-3 pb-2">
         {todos.map((todo, index) => (
           <li key={index} className="flex items-start gap-2 py-0.5">
             <input

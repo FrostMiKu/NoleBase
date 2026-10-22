@@ -8,9 +8,13 @@ export const workspaceKeys = {
   root: ['workspace'] as const,
   summary: () => [...workspaceKeys.root, 'summary'] as const,
   notes: () => [...workspaceKeys.root, 'notes'] as const,
+  appendToday: () => [...workspaceKeys.root, 'append-today'] as const,
   daily: () => [...workspaceKeys.root, 'daily'] as const,
   todos: () => [...workspaceKeys.root, 'todos'] as const,
   document: (path: string) => [...workspaceKeys.root, 'document', path] as const,
+  preview: (path: string, source: string) =>
+    [...workspaceKeys.root, 'preview', path, source] as const,
+  previewFamily: () => [...workspaceKeys.root, 'preview'] as const,
   backlinks: (path: string) => [...workspaceKeys.root, 'backlinks', path] as const,
   search: (query: string) => [...workspaceKeys.root, 'search', query] as const,
   searchFamily: () => [...workspaceKeys.root, 'search'] as const,

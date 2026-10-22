@@ -8,24 +8,32 @@ import { useBacklinks } from '@/queries/workspace'
  * Backlinks for the current document, shown in a popover from the editor
  * toolbar (never a permanent column).
  */
-export function BacklinksPopover({ path }: { path: string }) {
+export function BacklinksPopover({ path, compact = false }: { path: string; compact?: boolean }) {
   const backlinksQuery = useBacklinks(path)
   const navigate = useNavigate()
   const backlinks = backlinksQuery.data?.backlinks ?? []
 
   /** Bare note name: strip the directory and the extension. */
   const displayName = (source: string) =>
-    source.split('/').pop()?.replace(/\.[^.]+$/, '') ?? source
+    source
+      .split('/')
+      .pop()
+      ?.replace(/\.[^.]+$/, '') ?? source
 
   return (
     <Popover>
       <PopoverTrigger
-        className="inline-flex h-6 items-center gap-1 rounded-sm border border-border-strong bg-raised px-2 text-[11px] text-fg transition-colors hover:bg-overlay disabled:cursor-not-allowed disabled:opacity-50"
+        className={
+          compact
+            ? 'toolbar-button'
+            : 'inline-flex h-6 items-center gap-1 rounded-sm border border-border-strong bg-raised px-2 text-[11px] text-fg transition-colors hover:bg-overlay disabled:cursor-not-allowed disabled:opacity-50'
+        }
         disabled={backlinksQuery.isLoading}
         title="Backlinks"
+        aria-label={`Backlinks${backlinks.length > 0 ? ` (${backlinks.length})` : ''}`}
       >
-        <Link2 size={11} />
-        Backlinks{backlinks.length > 0 ? ` (${backlinks.length})` : ''}
+        <Link2 size={compact ? 15 : 11} />
+        {!compact && <>Backlinks{backlinks.length > 0 ? ` (${backlinks.length})` : ''}</>}
       </PopoverTrigger>
       <PopoverContent align="end">
         <p className="mb-1.5 text-[10px] font-semibold tracking-wide text-faint uppercase">
@@ -33,7 +41,9 @@ export function BacklinksPopover({ path }: { path: string }) {
         </p>
         {backlinksQuery.isError && (
           <p className="px-1 py-2 text-[11px] text-danger">
-            {backlinksQuery.error instanceof Error ? backlinksQuery.error.message : 'Failed to load'}
+            {backlinksQuery.error instanceof Error
+              ? backlinksQuery.error.message
+              : 'Failed to load'}
           </p>
         )}
         {!backlinksQuery.isError && backlinks.length === 0 && (

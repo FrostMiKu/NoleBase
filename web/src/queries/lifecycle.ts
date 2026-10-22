@@ -7,6 +7,7 @@ import { editorStore } from '@/editor/editor-state'
 import {
   cancelEditsForLifecycleDeletion,
   flushBeforeLifecycleMutation,
+  waitForSaveToSettle,
 } from '@/editor/lifecycle'
 import { permitNavigationOnce } from '@/editor/navigation-guard'
 import type { DailyNote } from '@/types/workspace'
@@ -59,8 +60,7 @@ export function useCreateNote() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   return useMutation({
-    mutationFn: (input: CreateNoteInput) =>
-      workspaceApi.createNote(input.name, input.fromTemplate),
+    mutationFn: (input: CreateNoteInput) => workspaceApi.createNote(input.name, input.fromTemplate),
     onSuccess: async (result) => {
       await invalidateNotesLists(queryClient)
       // Push: a brand-new note is a new history entry. The path comes from
@@ -138,9 +138,7 @@ function useRetargetingPathMutation(
     },
     onError: (error, path) => {
       editorStore.releaseAutosaveBlock(path)
-      toast.error(
-        `${label} failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-      )
+      toast.error(`${label} failed: ${error instanceof Error ? error.message : 'unknown error'}`)
     },
   })
 }
@@ -162,6 +160,7 @@ export function useDeleteDocument() {
         // Confirmed permanent deletion: pending edits are cancelled, not
         // flushed — the content is about to disappear with the file.
         cancelEditsForLifecycleDeletion(path)
+        await waitForSaveToSettle()
       }
       return workspaceApi.deleteDocument(path)
     },
@@ -191,6 +190,7 @@ export function useDeleteDaily() {
     mutationFn: async (note: DailyNote) => {
       if (editorStore.getState().path === note.path) {
         cancelEditsForLifecycleDeletion(note.path)
+        await waitForSaveToSettle()
       }
       return workspaceApi.deleteDaily(note.date)
     },

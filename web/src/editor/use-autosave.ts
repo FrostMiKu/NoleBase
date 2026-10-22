@@ -28,8 +28,9 @@ export function cancelScheduledAutosave(): void {
 export function useAutoSave(): void {
   useEffect(() => {
     const schedule = () => {
+      cancelScheduledAutosave()
       const state = editorStore.getState()
-      if (!state.dirty || state.path === null || state.saving) return
+      if (!state.dirty || state.path === null || state.saving || state.saveError) return
       // Conflict states are user decisions, not autosave moments.
       if (state.externalChangePending || state.movedTo !== null) return
       if (state.autosaveBlock === state.path) {

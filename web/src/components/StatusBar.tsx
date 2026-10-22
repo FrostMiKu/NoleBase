@@ -1,13 +1,13 @@
-import { useEditorState } from '@/editor/editor-state'
 import { useUiStore } from '@/stores/ui-store'
 
-function ConnectionDot({ state, label }: { state: 'connecting' | 'connected' | 'disconnected'; label: string }) {
-  const color =
-    state === 'connected'
-      ? 'bg-ok'
-      : state === 'connecting'
-        ? 'bg-warn'
-        : 'bg-danger'
+function ConnectionDot({
+  state,
+  label,
+}: {
+  state: 'connecting' | 'connected' | 'disconnected'
+  label: string
+}) {
+  const color = state === 'connected' ? 'bg-ok' : state === 'connecting' ? 'bg-warn' : 'bg-danger'
   return (
     <span className="inline-flex items-center gap-1.5" title={`WS: ${state}`}>
       <span className={`inline-block h-1.5 w-1.5 rounded-full ${color}`} />
@@ -16,12 +16,14 @@ function ConnectionDot({ state, label }: { state: 'connecting' | 'connected' | '
   )
 }
 
-/** The single dense status strip at the bottom of the shell. */
+/** Reserve a status strip only when the workspace needs attention. */
 export function StatusBar() {
   const workspaceConnection = useUiStore((state) => state.workspaceConnection)
   const watcherError = useUiStore((state) => state.watcherError)
   const workspaceResyncing = useUiStore((state) => state.workspaceResyncing)
-  const { dirty, saving } = useEditorState()
+  if (workspaceConnection === 'connected' && !workspaceResyncing && watcherError === null) {
+    return null
+  }
 
   return (
     <footer
@@ -29,20 +31,17 @@ export function StatusBar() {
       data-testid="status-bar"
     >
       <ConnectionDot state={workspaceConnection} label="WS" />
+      {workspaceConnection !== 'connected' && (
+        <span role="status" className="truncate text-warn">
+          {workspaceConnection === 'connecting' ? 'Connecting…' : 'Disconnected — reconnecting…'}
+        </span>
+      )}
       {workspaceResyncing && <span className="text-warn">Resyncing…</span>}
       {watcherError !== null && (
         <span className="text-danger" title={watcherError}>
           Workspace watcher error
         </span>
       )}
-      <span className="ml-auto inline-flex items-center gap-2">
-        {dirty && (
-          <span className="flex items-center gap-1 text-warn">
-            <span className="inline-block h-1.5 w-1.5 rounded-full bg-warn" />
-            {saving ? 'Saving' : 'Modified'}
-          </span>
-        )}
-      </span>
     </footer>
   )
 }

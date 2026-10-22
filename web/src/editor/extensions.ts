@@ -37,6 +37,7 @@ const highlightStyle = HighlightStyle.define([
 ])
 
 const extensions = [
+  EditorView.contentAttributes.of({ 'aria-label': 'Document source' }),
   lineNumbers(),
   highlightActiveLineGutter(),
   highlightSpecialChars(),
@@ -75,7 +76,11 @@ export function saveKeymap(onSave: () => void): Extension {
   ])
 }
 
-export function createEditorState(initialSource: string, onSave: () => void, onDocChanged: () => void): EditorState {
+export function createEditorState(
+  initialSource: string,
+  onSave: () => void,
+  onDocChanged: () => void,
+): EditorState {
   return EditorState.create({
     doc: initialSource,
     extensions: [

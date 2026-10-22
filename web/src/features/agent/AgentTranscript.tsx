@@ -26,7 +26,7 @@ export function AgentTranscript() {
   const notifications = useAgentStore((state) => state.notifications)
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2" data-testid="agent-transcript">
+    <div className="shrink-0 px-3 py-2" data-testid="agent-transcript">
       {turns.length === 0 && notifications.length === 0 && (
         <p className="text-[11px] text-faint">No agent activity yet. Send a prompt below.</p>
       )}
@@ -35,7 +35,7 @@ export function AgentTranscript() {
         <TurnBlock key={turn.id} turn={turn} />
       ))}
 
-      {(contextWindow !== null || messageCount !== null) && (
+      {(contextWindow !== null || (messageCount !== null && messageCount > 0)) && (
         <p className="mt-1.5 font-mono text-[10px] text-faint">
           {contextWindow !== null &&
             `ctx ${contextWindow.capacity > 0 ? Math.round((contextWindow.tokens / contextWindow.capacity) * 100) : 0}%`}
@@ -64,17 +64,17 @@ function TurnBlock({ turn }: { turn: AgentTurn }) {
         ? { tone: 'text-ok', label: '✓ Finished' }
         : {
             tone: 'text-danger',
-            label:
-              turn.finished.error !== null
-                ? `✗ Failed: ${turn.finished.error}`
-                : '✗ Failed',
+            label: turn.finished.error !== null ? `✗ Failed: ${turn.finished.error}` : '✗ Failed',
           }
       : turn.stopReason !== null
         ? { tone: 'text-warn', label: `■ Stopped: ${turn.stopReason}` }
         : null
 
   return (
-    <div className="mb-2 border-b border-border pb-1.5 last:border-b-0" data-testid={`agent-turn-${turn.id}`}>
+    <div
+      className="mb-2 border-b border-border pb-1.5 last:border-b-0"
+      data-testid={`agent-turn-${turn.id}`}
+    >
       {turn.prompt !== null && (
         <p className="flex items-start gap-1.5 text-[11px] text-muted">
           <span className="mt-px shrink-0 text-faint">›</span>
@@ -114,7 +114,10 @@ function ThinkingSection({ text }: { text: string }) {
   return (
     <Collapsible className="my-1" data-testid="agent-thinking">
       <CollapsibleTrigger className="group flex items-center gap-1 text-[10px] font-semibold tracking-wider text-faint uppercase hover:text-muted">
-        <ChevronRight size={10} className="transition-transform group-data-[state=open]:rotate-90" />
+        <ChevronRight
+          size={10}
+          className="transition-transform group-data-[state=open]:rotate-90"
+        />
         Thinking
       </CollapsibleTrigger>
       <CollapsibleContent>

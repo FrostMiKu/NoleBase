@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { RadioTower, Square } from 'lucide-react'
+import { ArrowDown, RadioTower, SendHorizontal, Square } from 'lucide-react'
 import { toast } from 'sonner'
+
+import { clearSubmittedDraft, useDraft } from '@/hooks/use-draft'
+import { acknowledgeAgentRun } from './agent-reducer'
 
 import { buttonStyles } from '@/components/ui/dialog'
 import { agentApi } from '@/api/agent'
@@ -31,19 +34,15 @@ export function AgentPanel() {
   const running = useAgentStore((state) => state.running)
   const streamInterrupted = useAgentStore((state) => state.streamInterrupted)
   const dismissInterruption = useAgentStore((state) => state.dismissInterruption)
-  const beginRun = useAgentStore((state) => state.beginRun)
   const agentFocusTick = useUiStore((state) => state.agentFocusTick)
-  const [prompt, setPrompt] = useState('')
-  const [sending, setSending] = useState(false)
+  const [prompt, setPrompt] = useDraft('agent')
+  const [following, setFollowing] = useState(true)
+  const followingRef = useRef(true)
+  const connection = useAgentStore((state) => state.connection)
+  const sending = useAgentStore((state) => state.runSubmitting)
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null)
-  const lastTurnId = useAgentStore((state) => state.turns[state.turns.length - 1]?.id)
-  const lastTurnTail =
-    useAgentStore((state) => {
-      const turn = state.turns[state.turns.length - 1]
-      if (turn === undefined) return 0
-      return turn.assistantText.length + turn.thinkingText.length + turn.tools.length
-    })
+  const lastTurn = useAgentStore((state) => state.turns[state.turns.length - 1])
 
   // "Focus Agent" command.
   useEffect(() => {
@@ -54,27 +53,29 @@ export function AgentPanel() {
   // Keep the newest output visible while streaming.
   useEffect(() => {
     const container = transcriptScrollRef.current
-    if (container !== null) container.scrollTop = container.scrollHeight
-  }, [lastTurnId, lastTurnTail])
+    if (container !== null && followingRef.current) container.scrollTop = container.scrollHeight
+  }, [lastTurn])
 
   const send = () => {
     const trimmed = prompt.trim()
-    if (trimmed === '' || running || sending) return
-    setSending(true)
+    if (trimmed === '' || running || sending || connection !== 'connected') return
+    const previousSeq = useAgentStore.getState().turnSeq
+    followingRef.current = true
+    setFollowing(true)
+    useAgentStore.setState({ runSubmitting: true })
     agentApi
       .run(trimmed)
       .then(() => {
         // 202: the agent took the task; output arrives over the WS as a
         // new transcript turn — previous turns stay visible.
-        beginRun(trimmed)
-        setPrompt('')
+        useAgentStore.setState((state) => acknowledgeAgentRun(state, trimmed, previousSeq))
+        clearSubmittedDraft('agent', prompt)
       })
       .catch((error: unknown) => {
-        const message =
-          error instanceof Error ? error.message : 'the agent command failed'
+        const message = error instanceof Error ? error.message : 'the agent command failed'
         toast.error(`Run failed: ${message}`)
       })
-      .finally(() => setSending(false))
+      .finally(() => useAgentStore.setState({ runSubmitting: false }))
   }
 
   const cancel = () => {
@@ -121,10 +122,33 @@ export function AgentPanel() {
         </div>
       )}
 
-      <div ref={transcriptScrollRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+      <div
+        ref={transcriptScrollRef}
+        onScroll={() => {
+          const el = transcriptScrollRef.current
+          if (!el) return
+          followingRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48
+          setFollowing(followingRef.current)
+        }}
+        className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+      >
         <AgentTranscript />
       </div>
 
+      {!following && (
+        <button
+          type="button"
+          className="mx-auto my-1 flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-accent"
+          onClick={() => {
+            const el = transcriptScrollRef.current
+            if (el) el.scrollTop = el.scrollHeight
+            followingRef.current = true
+            setFollowing(true)
+          }}
+        >
+          <ArrowDown size={12} /> Latest output
+        </button>
+      )}
       <AgentInteractions />
 
       <div className="shrink-0 border-t border-border bg-panel p-2">
@@ -140,11 +164,30 @@ export function AgentPanel() {
               send()
             }
           }}
-          disabled={running}
-          placeholder={running ? 'Agent is running…' : 'Ask the agent…'}
+          aria-label="Agent prompt"
+          disabled={sending}
+          placeholder={running ? 'Draft your next question…' : 'Ask the agent…'}
           data-testid="agent-composer"
           className="max-h-48 w-full resize-none overflow-y-auto field-sizing-content rounded-sm border border-border-strong bg-bg px-2 py-1.5 text-[12px] text-fg outline-none placeholder:text-faint focus:border-accent disabled:opacity-60"
         />
+        <div className="mt-1 flex items-center justify-between gap-2">
+          <span className="text-[10px] text-faint">
+            {connection !== 'connected'
+              ? 'Reconnecting to Agent…'
+              : running
+                ? 'Agent is working'
+                : 'Enter to send · Shift+Enter for newline'}
+          </span>
+          <button
+            type="button"
+            className={buttonStyles.primary}
+            onClick={send}
+            disabled={sending || running || !prompt.trim() || connection !== 'connected'}
+          >
+            <SendHorizontal size={12} className="mr-1" />
+            {sending ? 'Sending…' : 'Send'}
+          </button>
+        </div>
       </div>
     </section>
   )

@@ -20,12 +20,11 @@ export const workspaceApi = {
   toggleTodo: (index: number) => apiPost<TodoItem[]>(`/api/todos/${index}/toggle`),
   search: (query: string) => apiGet<SearchResponse>(`/api/search?q=${encodeURIComponent(query)}`),
   tags: () => apiGet<TagSummary[]>('/api/tags'),
-  tagDocuments: (tag: string) =>
-    apiGet<TagDocument[]>(`/api/tags/${encodeURIComponent(tag)}`),
-  document: (path: string) =>
-    apiGet<DocumentDto>(`/api/document?path=${encodeURIComponent(path)}`),
-  writeDocument: (path: string, source: string) =>
-    apiPut<null>('/api/document', { path, source }),
+  tagDocuments: (tag: string) => apiGet<TagDocument[]>(`/api/tags/${encodeURIComponent(tag)}`),
+  document: (path: string) => apiGet<DocumentDto>(`/api/document?path=${encodeURIComponent(path)}`),
+  previewDocument: (path: string, source: string) =>
+    apiPost<{ html: string; warnings: string[] }>('/api/document/preview', { path, source }),
+  writeDocument: (path: string, source: string) => apiPut<null>('/api/document', { path, source }),
   appendToday: (body: string) => apiPost<DailyNote>('/api/daily/today', { body }),
   backlinks: (path: string) =>
     apiGet<BacklinksResponse>(`/api/backlinks?path=${encodeURIComponent(path)}`),
@@ -39,11 +38,9 @@ export const workspaceApi = {
   renameDocument: (path: string, newName: string) =>
     apiPost<DocumentMutation>('/api/document/rename', { path, new_name: newName }),
   /** `POST /api/document/archive` — moves a `data/` note into `archives/`. */
-  archiveDocument: (path: string) =>
-    apiPost<DocumentMutation>('/api/document/archive', { path }),
+  archiveDocument: (path: string) => apiPost<DocumentMutation>('/api/document/archive', { path }),
   /** `POST /api/document/restore` — moves an `archives/` note back to `data/`. */
-  restoreDocument: (path: string) =>
-    apiPost<DocumentMutation>('/api/document/restore', { path }),
+  restoreDocument: (path: string) => apiPost<DocumentMutation>('/api/document/restore', { path }),
   /** `DELETE /api/document?path=` — answers 204. */
   deleteDocument: (path: string) =>
     apiDelete<null>(`/api/document?path=${encodeURIComponent(path)}`),

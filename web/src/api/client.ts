@@ -30,6 +30,7 @@ export async function parseErrorResponse(response: Response): Promise<ApiError> 
   } catch {
     return fallback()
   }
+  if (typeof body !== 'object' || body === null) return fallback()
   const error = body.error
   if (typeof error !== 'object' || error === null) {
     return fallback()

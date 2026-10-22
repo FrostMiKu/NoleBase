@@ -12,20 +12,35 @@ export function DialogPortal(props: ComponentProps<typeof DialogPrimitive.Portal
   return <DialogPrimitive.Portal {...props} />
 }
 
-export function DialogOverlay({ className = '', ...props }: ComponentProps<typeof DialogPrimitive.Overlay>) {
+export function DialogOverlay({
+  className = '',
+  ...props
+}: ComponentProps<typeof DialogPrimitive.Overlay>) {
   return (
-    <DialogPrimitive.Overlay
-      className={`fixed inset-0 z-50 bg-black/55 ${className}`}
-      {...props}
-    />
+    <DialogPrimitive.Overlay className={`fixed inset-0 z-50 bg-black/55 ${className}`} {...props} />
   )
 }
 
-export function DialogContent({ className = '', children, ...props }: ComponentProps<typeof DialogPrimitive.Content>) {
+export function DialogContent({
+  className = '',
+  size = 'default',
+  padded = true,
+  children,
+  ...props
+}: ComponentProps<typeof DialogPrimitive.Content> & {
+  size?: 'default' | 'wide' | 'narrow' | 'drawer'
+  padded?: boolean
+}) {
+  const width = {
+    default: 'w-[min(440px,90vw)]',
+    wide: 'w-[min(540px,94vw)]',
+    narrow: 'w-[min(380px,90vw)]',
+    drawer: 'w-[min(400px,94vw)]',
+  }[size]
   return (
     <DialogPrimitive.Content
-      className={`fixed top-1/2 left-1/2 z-50 w-[min(440px,90vw)] -translate-x-1/2 -translate-y-1/2
-        rounded-md border border-border bg-overlay p-4 shadow-lg outline-none
+      className={`fixed top-1/2 left-1/2 z-50 ${width} -translate-x-1/2 -translate-y-1/2
+        max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-md border border-border bg-overlay ${padded ? 'p-4' : ''} shadow-lg outline-none
         data-[state=open]:animate-in ${className}`}
       {...props}
     >
@@ -40,9 +55,15 @@ export function DialogContent({ className = '', children, ...props }: ComponentP
   )
 }
 
-export function DialogTitle({ className = '', ...props }: ComponentProps<typeof DialogPrimitive.Title>) {
+export function DialogTitle({
+  className = '',
+  ...props
+}: ComponentProps<typeof DialogPrimitive.Title>) {
   return (
-    <DialogPrimitive.Title className={`text-[13px] font-semibold text-fg ${className}`} {...props} />
+    <DialogPrimitive.Title
+      className={`text-[13px] font-semibold text-fg ${className}`}
+      {...props}
+    />
   )
 }
 

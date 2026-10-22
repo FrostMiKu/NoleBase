@@ -46,6 +46,7 @@ export function useSearchResults(query: string) {
 export function useAppendToday() {
   const queryClient = useQueryClient()
   return useMutation({
+    mutationKey: workspaceKeys.appendToday(),
     mutationFn: (body: string) => workspaceApi.appendToday(body),
     onSuccess: (note) => {
       // The append may add tasks and always changes the daily set.
@@ -72,7 +73,9 @@ export function useToggleTodo() {
       void queryClient.invalidateQueries({ queryKey: workspaceKeys.daily() })
     },
     onError: (error) => {
-      toast.error(`Could not toggle task: ${error instanceof Error ? error.message : 'unknown error'}`)
+      toast.error(
+        `Could not toggle task: ${error instanceof Error ? error.message : 'unknown error'}`,
+      )
       // Indices are positional; resync the list in case it shifted.
       void queryClient.invalidateQueries({ queryKey: workspaceKeys.todos() })
     },

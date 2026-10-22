@@ -1,7 +1,13 @@
 import { useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 
-import { Dialog, DialogContent, DialogDescription, DialogTitle, buttonStyles } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  buttonStyles,
+} from '@/components/ui/dialog'
 import { currentEditorSource } from './editor-bridge'
 import { editorStore, useEditorState } from './editor-state'
 import { permitNavigationOnce } from './navigation-guard'
@@ -48,24 +54,29 @@ export function FileMovedConflict() {
       <Dialog
         open={dialogOpen}
         onOpenChange={(next) => {
-          if (!next) keepEditing()
+          if (!next && !busy) keepEditing()
         }}
       >
         <DialogContent
           onEscapeKeyDown={(event) => {
             event.preventDefault()
-            keepEditing()
+            if (!busy) keepEditing()
           }}
           onInteractOutside={(event) => event.preventDefault()}
           aria-describedby={undefined}
         >
           <DialogTitle>This file was moved on disk</DialogTitle>
           <DialogDescription>
-            “{path}” now lives at “{movedTo}”. Saving to the old path is disabled — carry your
-            edits to the new location or discard them.
+            “{path}” now lives at “{movedTo}”. Saving to the old path is disabled — carry your edits
+            to the new location or discard them.
           </DialogDescription>
           <div className="mt-4 flex items-center justify-end gap-2">
-            <button type="button" className={buttonStyles.secondary} onClick={keepEditing}>
+            <button
+              type="button"
+              className={buttonStyles.secondary}
+              onClick={keepEditing}
+              disabled={busy}
+            >
               Keep editing
             </button>
             <button
@@ -89,7 +100,7 @@ export function FileMovedConflict() {
       </Dialog>
       <FileMovedBanner
         movedTo={movedTo}
-        onOpenNew={openNewLocation}
+        onResolve={() => setDismissedFor(null)}
         hidden={dialogOpen}
       />
     </>
@@ -102,22 +113,22 @@ export function FileMovedConflict() {
  */
 function FileMovedBanner({
   movedTo,
-  onOpenNew,
+  onResolve,
   hidden,
 }: {
   movedTo: string
-  onOpenNew: () => void
+  onResolve: () => void
   hidden: boolean
 }) {
   if (hidden) return null
   return (
     <div className="flex items-center gap-2 border-b border-warn/40 bg-warn/10 px-3 py-1.5 text-[11px] text-warn">
       <span>
-        This file moved on disk to <span className="font-mono">{movedTo}</span>. Saving is
-        disabled until resolved.
+        This file moved on disk to <span className="font-mono">{movedTo}</span>. Saving is disabled
+        until resolved.
       </span>
-      <button type="button" className={`${buttonStyles.secondary} ml-auto`} onClick={onOpenNew}>
-        Discard edits, open new
+      <button type="button" className={`${buttonStyles.secondary} ml-auto`} onClick={onResolve}>
+        Resolve
       </button>
     </div>
   )

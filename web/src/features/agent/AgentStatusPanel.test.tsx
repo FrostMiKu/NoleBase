@@ -24,15 +24,12 @@ describe('AgentStatusPanel', () => {
     const text = screen.getByTestId('agent-status-panel').textContent ?? ''
     expect(text).toContain('explore arxiv')
     expect(text).toContain('index notes')
-    expect(text).toContain('1 active background job(s)')
-    expect(text).toContain('running')
+    expect(text).toContain('1 active · 2 total')
   })
 
   it('renders the empty state without jobs', () => {
     useAgentStore.setState({ jobs: [], running: false })
     render(<AgentStatusPanel />)
-    expect(screen.getByTestId('agent-status-panel').textContent).toContain(
-      'No background jobs yet',
-    )
+    expect(screen.getByTestId('agent-status-panel').textContent).toContain('No background jobs yet')
   })
 })

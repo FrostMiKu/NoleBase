@@ -1,85 +1,71 @@
 import { useNavigate } from '@tanstack/react-router'
-import { CalendarDays, Search } from 'lucide-react'
+import { FileText } from 'lucide-react'
+import { useNotes, useWorkspaceOverview } from '@/queries/workspace'
+import { DailyQuickInput } from './DailyQuickInput'
 
-import { useWorkspaceOverview } from '@/queries/workspace'
-
-/** The `/` default page: a compact workspace overview. */
 export function WorkspaceHome() {
   const overview = useWorkspaceOverview()
+  const notes = useNotes()
   const navigate = useNavigate()
-
+  const recent = [...(notes.data ?? [])]
+    .filter((note) => !note.archived)
+    .sort((a, b) => (b.modified ?? '').localeCompare(a.modified ?? ''))
+    .slice(0, 6)
   return (
-    <div className="flex h-full flex-col overflow-y-auto p-6 text-sm">
-      {/* Centered overview card: `my-auto` centers it in the spare middle
-          space and degrades to scrolling when the viewport is short. */}
-      <div className="mx-auto my-auto flex w-full max-w-md flex-col items-stretch gap-1 py-6">
-        <h1 className="text-[15px] font-semibold text-fg">Workspace</h1>
-        <p className="mb-3 text-xs text-muted">
-          Local-first knowledge workspace. Press <kbd className="font-mono">⌘K</kbd> for commands.
-        </p>
-
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-4xl space-y-4 p-4">
+        <header className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <h1 className="text-[15px] font-semibold">Workspace</h1>
+          <dl className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted">
+            {(
+              [
+                ['Notes', overview.data?.notes],
+                ['Archives', overview.data?.archives],
+                ['Daily notes', overview.data?.daily],
+                ['Tasks', overview.data?.todos],
+              ] as const
+            ).map(([label, count]) => (
+              <div key={label} className="flex gap-1">
+                <dd className="text-fg">{count ?? '–'}</dd>
+                <dt>{label}</dt>
+              </div>
+            ))}
+          </dl>
+        </header>
         {overview.isError && (
-          <p className="text-xs text-danger">
-            Workspace overview failed to load:{' '}
-            {overview.error instanceof Error ? overview.error.message : 'unknown error'}
-          </p>
+          <div role="alert" className="text-xs text-danger">
+            Could not load workspace.{' '}
+            <button type="button" className="underline" onClick={() => void overview.refetch()}>
+              Retry
+            </button>
+          </div>
         )}
-
-        <div className="grid grid-cols-2 gap-2">
-          <Stat label="Notes" value={overview.data?.notes} />
-          <Stat label="Archives" value={overview.data?.archives} />
-          <Stat label="Daily notes" value={overview.data?.daily} />
-          <Stat label="Open todos" value={overview.data?.todos} />
-        </div>
-        {overview.data !== undefined && (
-          <p className="mt-1 text-[11px] text-faint">
-            Index {overview.data.index_ready ? 'ready' : 'still building…'}
-          </p>
-        )}
-
-        <div className="mt-4 flex flex-col items-start gap-1">
-          <Shortcut
-            icon={<CalendarDays size={13} />}
-            label="Open Daily"
-            onClick={() => void navigate({ to: '/daily' })}
-          />
-          <Shortcut
-            icon={<Search size={13} />}
-            label="Search workspace"
-            onClick={() => void navigate({ to: '/search' })}
-          />
-        </div>
+        <section aria-label="Quick capture">
+          <h2 className="mb-2 text-sm font-semibold">Capture to today</h2>
+          <DailyQuickInput />
+        </section>
+        <section aria-label="Recent notes">
+          <h2 className="text-sm font-semibold">Recent notes</h2>
+          <div className="mt-1 space-y-0.5">
+            {recent.map((note) => (
+              <button
+                type="button"
+                key={note.path}
+                onClick={() => void navigate({ to: '/document', search: { path: note.path } })}
+                className="flex w-full items-center gap-3 rounded border border-transparent px-2 py-2 text-left text-sm hover:border-border hover:bg-panel"
+              >
+                <FileText size={15} className="text-accent" />
+                <span className="truncate">{note.name}</span>
+              </button>
+            ))}
+            {notes.isSuccess && recent.length === 0 && (
+              <p className="text-xs text-muted">
+                Create your first note, or start with a daily capture above.
+              </p>
+            )}
+          </div>
+        </section>
       </div>
     </div>
-  )
-}
-
-function Stat({ label, value }: { label: string; value: number | undefined }) {
-  return (
-    <div className="rounded-sm border border-border bg-panel px-3 py-2">
-      <p className="text-[10px] tracking-wider text-faint uppercase">{label}</p>
-      <p className="font-mono text-lg text-fg">{value ?? '–'}</p>
-    </div>
-  )
-}
-
-function Shortcut({
-  icon,
-  label,
-  onClick,
-}: {
-  icon: React.ReactNode
-  label: string
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="inline-flex items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted transition-colors hover:bg-raised hover:text-fg"
-    >
-      {icon}
-      {label}
-    </button>
   )
 }

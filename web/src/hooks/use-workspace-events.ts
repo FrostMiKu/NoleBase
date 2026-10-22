@@ -3,7 +3,6 @@ import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 
 import { reconnectDelayMs, wsUrl } from '@/api/websocket'
-import { editorStore } from '@/editor/editor-state'
 import { workspaceKeys } from '@/queries/keys'
 import { useUiStore } from '@/stores/ui-store'
 import type { WorkspaceEvent } from '@/types/events'
@@ -38,8 +37,7 @@ export function setCurrentDocumentPath(path: string | null): void {
  *   document only when the change touched it.
  * - `resync_required` (or a reconnect): refresh everything cached, without
  *   clearing the cache.
- * - `attachments_changed`: no attachment UI exists in this phase — the
- *   lists that could show attachments are unaffected.
+ * - `attachments_changed`: refresh full document previews with managed images.
  * - `agent_reads_dirty`: a TUI/agent read-cache concern; the web client
  *   keeps no such cache.
  * - `watcher_failed`: reported to the caller (toast + status bar).
@@ -57,8 +55,7 @@ export function applyWorkspaceEvent(
       return
     }
     case 'attachments_changed':
-      // No attachment surface yet; document lists don't depend on
-      // attachment files.
+      void deps.queryClient.invalidateQueries({ queryKey: workspaceKeys.previewFamily() })
       return
     case 'agent_reads_dirty':
       // The web client never caches file reads for the agent.
@@ -84,6 +81,7 @@ export function invalidateWorkspaceContent(
   },
 ): void {
   const { changedPaths, onExternalChange } = options
+  void queryClient.invalidateQueries({ queryKey: workspaceKeys.previewFamily() })
   void queryClient.invalidateQueries({ queryKey: workspaceKeys.summary() })
   void queryClient.invalidateQueries({ queryKey: workspaceKeys.notes() })
   void queryClient.invalidateQueries({ queryKey: workspaceKeys.daily() })
@@ -104,8 +102,11 @@ export function invalidateWorkspaceContent(
 /** Full resync: mark every workspace cache stale; the cache is preserved. */
 export async function resyncWorkspace(deps: WorkspaceEventDeps): Promise<void> {
   deps.onResyncStart()
-  await deps.queryClient.invalidateQueries({ queryKey: workspaceKeys.root })
-  deps.onResyncEnd()
+  try {
+    await deps.queryClient.invalidateQueries({ queryKey: workspaceKeys.root })
+  } finally {
+    deps.onResyncEnd()
+  }
 }
 
 const WORKSPACE_EVENT_TYPES = [
@@ -140,17 +141,9 @@ export function useWorkspaceEvents(): void {
         toast.error(`Workspace watcher error: ${message}`)
         useUiStore.getState().setWatcherError(message)
       },
-      onExternalChange: (path) => {
-        const state = editorStore.getState()
-        if (
-          state.path === path &&
-          state.dirty &&
-          !state.externalChangePending &&
-          state.movedTo === null
-        ) {
-          editorStore.markExternalChange()
-        }
-      },
+      // The editor compares the fetched source with its baseline before
+      // declaring a conflict. Watcher notifications also include our saves.
+      onExternalChange: () => {},
       onResyncStart: () => useUiStore.getState().setWorkspaceResyncing(true),
       onResyncEnd: () => useUiStore.getState().setWorkspaceResyncing(false),
     }

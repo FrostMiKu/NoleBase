@@ -8,25 +8,17 @@ import { useAgentStore } from '@/stores/agent-store'
  */
 export function AgentStatusPanel() {
   const jobs = useAgentStore((state) => state.jobs)
-  const running = useAgentStore((state) => state.running)
   const activeJobs = jobs.filter((job) => job.status === 'running')
 
   return (
     <div className="flex h-full flex-col overflow-y-auto" data-testid="agent-status-panel">
       <p className="flex items-center gap-1.5 px-3 pt-2.5 pb-1 text-[10px] font-semibold tracking-wider text-faint uppercase">
         <Sparkles size={11} />
-        Agents
+        Background jobs
         <span className="ml-auto font-mono text-[10px]">
-          {running ? 'running' : 'idle'}
-          {jobs.length > 0 && ` · ${jobs.length} job(s)`}
+          {jobs.length > 0 && `${activeJobs.length} active · ${jobs.length} total`}
         </span>
       </p>
-
-      {activeJobs.length > 0 && (
-        <p className="px-3 py-0.5 text-[11px] text-accent">
-          {activeJobs.length} active background job(s)
-        </p>
-      )}
 
       {jobs.length === 0 && (
         <p className="px-3 py-1 text-[11px] text-faint">
@@ -48,11 +40,16 @@ export function AgentStatusPanel() {
                       : 'bg-ok'
               }`}
             />
-            <span className={`truncate ${job.status === 'running' ? 'text-fg' : 'text-muted'}`} title={job.label}>
+            <span
+              className={`truncate ${job.status === 'running' ? 'text-fg' : 'text-muted'}`}
+              title={job.label}
+            >
               {job.label}
             </span>
             {job.turnId !== null && (
-              <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">#{job.turnId}</span>
+              <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">
+                #{job.turnId}
+              </span>
             )}
           </li>
         ))}

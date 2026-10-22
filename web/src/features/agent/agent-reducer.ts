@@ -218,6 +218,21 @@ export function beginAgentRun(state: AgentState, prompt: string): AgentState {
   }
 }
 
+/** WS output can arrive before the run HTTP response; attach the prompt
+ * to that turn without clearing output, approval, or its finished status. */
+export function acknowledgeAgentRun(
+  state: AgentState,
+  prompt: string,
+  previousSeq: number,
+): AgentState {
+  const streamed = state.turns.find((turn) => turn.id > previousSeq && turn.prompt === null)
+  if (!streamed) return beginAgentRun(state, prompt)
+  return {
+    ...state,
+    turns: state.turns.map((turn) => (turn.id === streamed.id ? { ...turn, prompt } : turn)),
+  }
+}
+
 function clearPendingInteractions(state: AgentState): AgentState {
   return { ...state, approval: null, askUser: null, terminalInput: null }
 }
@@ -530,7 +545,7 @@ export function seedAgentHistory(
         openTurn(entry.text)
         break
       case 'assistant':
-        (lastTurn() ?? openTurn(null)).assistantText = entry.text
+        ;(lastTurn() ?? openTurn(null)).assistantText = entry.text
         break
       case 'thinking': {
         const turn = lastTurn() ?? openTurn(null)
@@ -551,7 +566,7 @@ export function seedAgentHistory(
         break
       }
       case 'error':
-        (lastTurn() ?? openTurn(null)).finished = { ok: false, text: null, error: entry }
+        ;(lastTurn() ?? openTurn(null)).finished = { ok: false, text: null, error: entry }
         break
     }
   }

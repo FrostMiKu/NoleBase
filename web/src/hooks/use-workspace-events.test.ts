@@ -11,6 +11,10 @@ function makeDeps(currentPath: string | null) {
   })
   // Seed the queries the UI would have cached. No observers are attached,
   // so invalidation marks them stale without any network activity.
+  queryClient.setQueryData(workspaceKeys.preview('data/foo.md', 'source'), {
+    html: '',
+    warnings: [],
+  })
   queryClient.setQueryData(workspaceKeys.summary(), { notes: 0 })
   queryClient.setQueryData(workspaceKeys.notes(), [])
   queryClient.setQueryData(workspaceKeys.daily(), [])
@@ -119,10 +123,11 @@ describe('watcher_failed', () => {
   })
 })
 
-describe('no-op events', () => {
-  it('ignores attachments_changed and agent_reads_dirty explicitly', () => {
+describe('attachment and read-state events', () => {
+  it('refreshes previews for attachment updates without touching document source', () => {
     const { deps, isInvalidated, onWatcherError, onExternalChange } = makeDeps('data/foo.md')
     applyWorkspaceEvent(deps, { type: 'attachments_changed', paths: ['img.png'] })
+    expect(isInvalidated(workspaceKeys.preview('data/foo.md', 'source'))).toBe(true)
     applyWorkspaceEvent(deps, { type: 'agent_reads_dirty', paths: ['data/foo.md'] })
     expect(isInvalidated(workspaceKeys.summary())).toBe(false)
     expect(isInvalidated(workspaceKeys.notes())).toBe(false)

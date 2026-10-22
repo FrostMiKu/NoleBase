@@ -35,6 +35,9 @@ export function DirtyGuard() {
 
   const blocker = useBlocker({
     withResolver: true,
+    // Our dirty-only handler below owns tab close/reload. The router's
+    // default would warn even on a clean document or the home page.
+    enableBeforeUnload: false,
     shouldBlockFn: async ({ current, next }) => {
       if (consumeNavigationPermission()) return false
       const state = editorStore.getState()

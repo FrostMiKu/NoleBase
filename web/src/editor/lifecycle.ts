@@ -53,14 +53,19 @@ export async function flushBeforeLifecycleMutation(path: string): Promise<boolea
     return true
   }
   if (!state.dirty) return true
+  if (state.externalChangePending || state.movedTo !== null) {
+    editorStore.releaseAutosaveBlock(path)
+    return false
+  }
   const source = currentEditorSource()
   if (source === null) {
     editorStore.releaseAutosaveBlock(path)
     return false
   }
   const saved = await persistDocument(path, source)
-  if (!saved) editorStore.releaseAutosaveBlock(path)
-  return saved
+  const settled = saved && currentEditorSource() === source
+  if (!settled) editorStore.releaseAutosaveBlock(path)
+  return settled
 }
 
 /**
@@ -71,5 +76,4 @@ export async function flushBeforeLifecycleMutation(path: string): Promise<boolea
 export function cancelEditsForLifecycleDeletion(path: string): void {
   editorStore.blockAutosave(path)
   cancelScheduledAutosave()
-  editorStore.discard()
 }

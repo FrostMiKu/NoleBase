@@ -7,15 +7,16 @@ import { DailyQuickInput, detectCompletion } from './DailyQuickInput'
 import { workspaceKeys } from '@/queries/keys'
 import type { NoteSummary, TagSummary } from '@/types/workspace'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  sessionStorage.clear()
+})
 
-async function renderInput(data: {
-  tags?: TagSummary[]
-  notes?: NoteSummary[]
-}) {
+async function renderInput(data: { tags?: TagSummary[]; notes?: NoteSummary[] }) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
+  queryClient.setQueryData(workspaceKeys.daily(), [])
   queryClient.setQueryData(workspaceKeys.tags(), data.tags ?? [])
   queryClient.setQueryData(workspaceKeys.notes(), data.notes ?? [])
   return render(
@@ -69,7 +70,34 @@ describe('DailyQuickInput popup', () => {
     expect(popup.textContent).toContain('#rust')
 
     await user.keyboard('{Enter}')
-    expect((input as HTMLTextAreaElement).value).toBe('#rust ')
+    expect((input as HTMLTextAreaElement).value).toBe('#t-design ')
     expect(screen.queryByTestId('completion-popup')).toBeNull()
+  })
+})
+
+describe('completion viewport', () => {
+  it('reaches matches beyond the first eight, follows only at the edge, and never wraps', async () => {
+    const user = userEvent.setup()
+    await renderInput({
+      notes: Array.from({ length: 12 }, (_, index) => ({
+        name: `note-${String(index).padStart(2, '0')}`,
+        path: `data/n${index}.md`,
+        archived: false,
+        modified: null,
+      })),
+    })
+    await user.type(screen.getByTestId('daily-quick-input'), '[['.replaceAll('[', '{[}'))
+    await user.keyboard('{ArrowDown>9/}')
+    const popup = screen.getByTestId('completion-popup')
+    expect(popup).toHaveAttribute('data-viewport-start', '2')
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent('note-09')
+    await user.keyboard('{ArrowUp}')
+    expect(popup).toHaveAttribute('data-viewport-start', '2')
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent('note-08')
+    expect(screen.getByRole('option', { selected: true })).toHaveClass('selection-row')
+    await user.keyboard('{ArrowDown>20/}')
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent('note-11')
+    await user.keyboard('{ArrowUp>20/}')
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent('note-00')
   })
 })

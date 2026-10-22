@@ -3,7 +3,13 @@ import { ShieldAlert, TerminalSquare, UserRound } from 'lucide-react'
 
 import { buttonStyles } from '@/components/ui/dialog'
 import { useAgentStore } from '@/stores/agent-store'
-import { useAgentAnswer, useAgentApproval, useAgentCancelAnswer, useAgentCancelTerminalInput, useAgentTerminalInput } from '@/queries/agent'
+import {
+  useAgentAnswer,
+  useAgentApproval,
+  useAgentCancelAnswer,
+  useAgentCancelTerminalInput,
+  useAgentTerminalInput,
+} from '@/queries/agent'
 import type { ApprovalKind } from '@/types/agent'
 
 /**
@@ -20,11 +26,19 @@ export function AgentInteractions() {
   if (approval === null && askUser === null && terminalInput === null) return null
 
   return (
-    <div className="flex shrink-0 flex-col gap-2 border-t border-border bg-panel px-3 py-2">
-      {approval !== null && <ApprovalBox kind={approval.kind} title={approval.title} message={approval.message} />}
-      {askUser !== null && <AskUserBox question={askUser.question} options={askUser.options} />}
+    <div className="flex max-h-[60%] shrink-0 flex-col gap-2 overflow-y-auto border-t border-border bg-panel px-3 py-2">
+      {approval !== null && (
+        <ApprovalBox kind={approval.kind} title={approval.title} message={approval.message} />
+      )}
+      {askUser !== null && (
+        <AskUserBox key={askUser.question} question={askUser.question} options={askUser.options} />
+      )}
       {terminalInput !== null && (
-        <TerminalInputBox purpose={terminalInput.purpose} prompt={terminalInput.prompt} />
+        <TerminalInputBox
+          key={terminalInput.prompt}
+          purpose={terminalInput.purpose}
+          prompt={terminalInput.prompt}
+        />
       )}
     </div>
   )
@@ -51,7 +65,15 @@ function KindBadge({ kind }: { kind: ApprovalKind }) {
   )
 }
 
-function ApprovalBox({ kind, title, message }: { kind: ApprovalKind; title: string; message: string }) {
+function ApprovalBox({
+  kind,
+  title,
+  message,
+}: {
+  kind: ApprovalKind
+  title: string
+  message: string
+}) {
   const approval = useAgentApproval()
   const clearApproval = useAgentStore((state) => state.clearApproval)
 
@@ -78,6 +100,11 @@ function ApprovalBox({ kind, title, message }: { kind: ApprovalKind; title: stri
             <pre className="mt-1 overflow-x-auto font-mono text-[10px] text-muted">{kind.code}</pre>
           )}
         </div>
+      )}
+      {approval.isError && (
+        <p role="alert" className="mt-2 text-xs text-danger">
+          {approval.error.message}
+        </p>
       )}
       <div className="mt-2 flex justify-end gap-1.5">
         <button
@@ -109,7 +136,10 @@ function AskUserBox({ question, options }: { question: string; options: string[]
   const busy = answer.isPending || cancelAnswer.isPending
 
   return (
-    <section className="rounded-sm border border-accent/50 bg-accent/10 p-2" data-testid="agent-ask-user">
+    <section
+      className="rounded-sm border border-accent/50 bg-accent/10 p-2"
+      data-testid="agent-ask-user"
+    >
       <p className="flex items-center gap-1.5 text-[11px] font-semibold text-accent-strong">
         <UserRound size={12} />
         Agent question
@@ -132,6 +162,7 @@ function AskUserBox({ question, options }: { question: string; options: string[]
       )}
       <div className="mt-2 flex items-center gap-1.5">
         <input
+          aria-label="Your answer"
           type="text"
           value={value}
           autoFocus
@@ -146,6 +177,11 @@ function AskUserBox({ question, options }: { question: string; options: string[]
           className="h-6 w-full rounded-sm border border-border-strong bg-bg px-2 text-[11px] text-fg outline-none focus:border-accent"
         />
       </div>
+      {(answer.isError || cancelAnswer.isError) && (
+        <p role="alert" className="mt-2 text-xs text-danger">
+          {(answer.error ?? cancelAnswer.error)?.message}
+        </p>
+      )}
       <div className="mt-1.5 flex justify-end gap-1.5">
         <button
           type="button"
@@ -187,7 +223,10 @@ function TerminalInputBox({ purpose, prompt }: { purpose: string; prompt: string
       </p>
       <p className="mt-1 text-[11px] text-fg">{prompt}</p>
       <input
-        type="text"
+        type="password"
+        aria-label="Private terminal input"
+        autoComplete="off"
+        spellCheck={false}
         value={value}
         autoFocus
         onChange={(event) => setValue(event.target.value)}
@@ -200,6 +239,11 @@ function TerminalInputBox({ purpose, prompt }: { purpose: string; prompt: string
         placeholder="Terminal input…"
         className="mt-1.5 h-6 w-full rounded-sm border border-border-strong bg-bg px-2 font-mono text-[11px] text-fg outline-none focus:border-accent"
       />
+      {(terminalInput.isError || cancelTerminalInput.isError) && (
+        <p role="alert" className="mt-2 text-xs text-danger">
+          {(terminalInput.error ?? cancelTerminalInput.error)?.message}
+        </p>
+      )}
       <div className="mt-1.5 flex justify-end gap-1.5">
         <button
           type="button"

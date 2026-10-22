@@ -19,19 +19,22 @@ beforeEach(resetStores)
 afterEach(cleanup)
 
 describe('StatusBar', () => {
-  it('shows the workspace dot only, without agent status', () => {
+  it('does not reserve a status strip for a healthy workspace', () => {
     render(<StatusBar />)
-    expect(screen.getAllByTitle('WS: connected')).toHaveLength(1)
-    expect(screen.queryByTitle('WS: disconnected')).toBeNull()
-    expect(screen.getByTestId('status-bar').textContent).not.toContain('Agent')
+    expect(screen.queryByTestId('status-bar')).toBeNull()
   })
 
-  it('marks a dirty document as modified without showing its path', () => {
+  it('does not duplicate the document toolbar save status', () => {
     editorStore.loadDocument('data/foo.md', 'base')
     editorStore.setLiveDirty(true)
     render(<StatusBar />)
-    expect(screen.getByTestId('status-bar').textContent).toContain('Modified')
-    expect(screen.getByTestId('status-bar').textContent).not.toContain('data/foo.md')
+    expect(screen.queryByTestId('status-bar')).toBeNull()
+  })
+
+  it('shows resynchronization even while connected', () => {
+    useUiStore.setState({ workspaceResyncing: true })
+    render(<StatusBar />)
+    expect(screen.getByTestId('status-bar')).toHaveTextContent('Resyncing…')
   })
 
   it('surfaces a watcher error', () => {

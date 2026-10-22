@@ -11,12 +11,17 @@ export function PopoverTrigger(props: ComponentProps<typeof PopoverPrimitive.Tri
   return <PopoverPrimitive.Trigger {...props} />
 }
 
-export function PopoverContent({ className = '', sideOffset = 4, ...props }: ComponentProps<typeof PopoverPrimitive.Content>) {
+export function PopoverContent({
+  className = '',
+  sideOffset = 4,
+  compact = false,
+  ...props
+}: ComponentProps<typeof PopoverPrimitive.Content> & { compact?: boolean }) {
   return (
     <PopoverPrimitive.Portal>
       <PopoverPrimitive.Content
         sideOffset={sideOffset}
-        className={`z-60 w-72 rounded-md border border-border-strong bg-overlay p-2 shadow-lg outline-none ${className}`}
+        className={`z-60 ${compact ? 'w-52' : 'w-72'} max-w-[calc(100vw-1rem)] rounded-md border border-border-strong bg-overlay p-2 shadow-lg outline-none ${className}`}
         {...props}
       />
     </PopoverPrimitive.Portal>

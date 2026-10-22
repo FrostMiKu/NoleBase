@@ -37,11 +37,7 @@ function Section({ sectionKey, label, count, action, children }: SectionProps) {
   const expanded = useUiStore((state) => state.sidebarSections[sectionKey])
   const toggle = useUiStore((state) => state.toggleSidebarSection)
   return (
-    <Collapsible
-      open={expanded}
-      onOpenChange={() => toggle(sectionKey)}
-      data-section={sectionKey}
-    >
+    <Collapsible open={expanded} onOpenChange={() => toggle(sectionKey)} data-section={sectionKey}>
       <div className="flex items-center gap-1 px-2 pt-3 pb-1">
         <CollapsibleTrigger className="group flex min-w-0 flex-1 items-center gap-1 text-[10px] font-semibold tracking-wider text-faint uppercase transition-colors hover:text-muted">
           <ChevronRight
@@ -71,7 +67,8 @@ function Row({ active = false, onClick, children, ...rest }: RowProps) {
       type="button"
       onClick={onClick}
       {...rest}
-      className={`flex w-full items-center rounded-sm px-2 py-[3px] text-left text-[12px] transition-colors ${
+      aria-current={active ? 'page' : undefined}
+      className={`selection-row flex w-full items-center rounded-sm px-2 py-[3px] text-left text-[12px] transition-colors ${
         active ? 'bg-accent/20 text-accent-strong' : 'text-fg hover:bg-raised'
       }`}
     >
@@ -128,16 +125,31 @@ export function LeftSidebar() {
   const [deleteDailyTarget, setDeleteDailyTarget] = useState<DailyNote | null>(null)
   const [moveDailyTarget, setMoveDailyTarget] = useState<DailyNote | null>(null)
 
-  const notes = notesQuery.data ?? []
+  const [filter, setFilter] = useState('')
+  const notes = (notesQuery.data ?? []).filter((note) =>
+    note.name.toLowerCase().includes(filter.toLowerCase()),
+  )
   const activeNotes = notes.filter((note) => !note.archived)
   const archives = notes.filter((note) => note.archived)
   const daily = [...(dailyQuery.data ?? [])].reverse()
 
-  const openDocument = (path: string) =>
-    void navigate({ to: '/document', search: { path } })
+  const openDocument = (path: string) => void navigate({ to: '/document', search: { path } })
 
   return (
-    <nav className="flex h-full flex-col overflow-y-auto pb-2" data-testid="left-sidebar">
+    <nav
+      aria-label="Workspace files"
+      className="flex h-full flex-col overflow-y-auto pb-2"
+      data-testid="left-sidebar"
+    >
+      <div className="sticky top-0 z-10 bg-panel p-2">
+        <input
+          aria-label="Filter files"
+          placeholder="Filter files…"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          className="w-full rounded border border-border bg-bg px-2 py-1.5 text-xs outline-none focus:border-accent"
+        />
+      </div>
       <Section
         sectionKey="notes"
         label="Notes"
@@ -156,6 +168,11 @@ export function LeftSidebar() {
         }
       >
         {notesQuery.isLoading && <LoadingRow />}
+        {notesQuery.isSuccess && activeNotes.length === 0 && (
+          <p className="px-2 py-2 text-xs text-faint">
+            {filter ? 'No matching notes.' : 'No notes yet. Use + to create one.'}
+          </p>
+        )}
         {activeNotes.map((note) => (
           <ContextRow
             key={note.path}
@@ -211,24 +228,26 @@ export function LeftSidebar() {
       </Section>
 
       <Section sectionKey="daily" label="Daily" count={daily.length}>
-        {daily.map((note) => (
-          <ContextRow
-            key={note.path}
-            active={openPath === note.path}
-            title={note.path}
-            onOpen={() => openDocument(note.path)}
-            items={
-              <>
-                <ContextMenuItem onSelect={() => setMoveDailyTarget(note)}>Move</ContextMenuItem>
-                <ContextMenuItem destructive onSelect={() => setDeleteDailyTarget(note)}>
-                  Delete
-                </ContextMenuItem>
-              </>
-            }
-          >
-            <span className="font-mono text-[11px]">{note.date}</span>
-          </ContextRow>
-        ))}
+        {daily
+          .filter((note) => filter === '' || note.date.includes(filter))
+          .map((note) => (
+            <ContextRow
+              key={note.path}
+              active={openPath === note.path}
+              title={note.path}
+              onOpen={() => openDocument(note.path)}
+              items={
+                <>
+                  <ContextMenuItem onSelect={() => setMoveDailyTarget(note)}>Move</ContextMenuItem>
+                  <ContextMenuItem destructive onSelect={() => setDeleteDailyTarget(note)}>
+                    Delete
+                  </ContextMenuItem>
+                </>
+              }
+            >
+              <span className="font-mono text-[11px]">{note.date}</span>
+            </ContextRow>
+          ))}
       </Section>
 
       {createOpen && <CreateNoteDialog onClose={() => setCreateOpen(false)} />}

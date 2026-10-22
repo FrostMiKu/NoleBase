@@ -91,14 +91,14 @@ describe('flushBeforeLifecycleMutation', () => {
 })
 
 describe('cancelEditsForLifecycleDeletion', () => {
-  it('discards pending edits and blocks the path from saving', () => {
+  it('preserves pending edits while blocking the path from saving', () => {
     bridge.source = 'live text'
     editorStore.loadDocument('data/foo.md', 'base')
     editorStore.setLiveDirty(true)
 
     cancelEditsForLifecycleDeletion('data/foo.md')
 
-    expect(editorStore.getState().dirty).toBe(false)
+    expect(editorStore.getState().dirty).toBe(true)
     expect(editorStore.getState().autosaveBlock).toBe('data/foo.md')
   })
 })

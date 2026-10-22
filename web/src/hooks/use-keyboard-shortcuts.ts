@@ -7,7 +7,7 @@ import { editorStore } from '@/editor/editor-state'
 /** An overlay owns Escape (palette, dialogs, popovers, CM search). */
 function escapeIsClaimedByOverlay(): boolean {
   return (
-    document.querySelector('[role="dialog"], [cmdk-root], .cm-panels, [data-radix-popper-content-wrapper]') !==
+    document.querySelector('[role="dialog"], .cm-panels, [data-radix-popper-content-wrapper]') !==
     null
   )
 }

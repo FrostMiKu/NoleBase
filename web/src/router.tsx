@@ -1,15 +1,29 @@
-import { Outlet, createRootRoute, createRoute, createRouter, redirect } from '@tanstack/react-router'
+import { lazy, Suspense } from 'react'
+import { RouteError, RouteNotFound } from '@/components/RouteFallback'
+import {
+  Outlet,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  redirect,
+} from '@tanstack/react-router'
 
 import { AppShell } from '@/app/AppShell'
 import { AgentPage } from '@/features/agent/AgentPage'
-import { DocumentPage } from '@/editor/DocumentPage'
+const DocumentPage = lazy(() =>
+  import('@/editor/DocumentPage').then((module) => ({ default: module.DocumentPage })),
+)
 import { DailyPage } from '@/features/navigation/DailyPage'
 import { WorkspaceHome } from '@/features/navigation/WorkspaceHome'
 import { SearchPage } from '@/features/search/SearchPage'
 import { TagPage } from '@/features/tags/TagPage'
 import { TagsPage } from '@/features/tags/TagsPage'
 
-const rootRoute = createRootRoute({ component: AppShell })
+const rootRoute = createRootRoute({
+  component: AppShell,
+  notFoundComponent: RouteNotFound,
+  errorComponent: RouteError,
+})
 
 /** `/` — the workspace default page. */
 const indexRoute = createRoute({
@@ -23,13 +37,14 @@ const indexRoute = createRoute({
 const documentRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/document',
-  validateSearch: (search: Record<string, unknown>): { path?: string } => {
+  validateSearch: (search: Record<string, unknown>): { path?: string; line?: number } => {
     const path = search['path']
     if (path === undefined) return {}
     if (typeof path !== 'string' || path.trim() === '') {
       throw new Error('document path must be a non-empty string')
     }
-    return { path }
+    const line = Number(search['line'])
+    return { path, ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}) }
   },
   beforeLoad: ({ search }) => {
     if (search.path === undefined) {
@@ -41,7 +56,11 @@ const documentRoute = createRoute({
 
 function DocumentRoute() {
   const search = documentRoute.useSearch()
-  return <DocumentPage path={search.path ?? ''} />
+  return (
+    <Suspense fallback={<p className="p-4 text-sm text-muted">Loading editor…</p>}>
+      <DocumentPage path={search.path ?? ''} line={search.line} />
+    </Suspense>
+  )
 }
 
 /** `/search?q=...` */

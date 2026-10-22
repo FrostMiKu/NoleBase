@@ -15,8 +15,10 @@ export function TagsPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto p-4">
-      <h1 className="mb-1 text-[15px] font-semibold text-fg">Tags</h1>
-      <p className="mb-3 font-mono text-[11px] text-faint">{`${tags.length} tag(s)`}</p>
+      <header className="mb-3 flex items-center gap-3">
+        <h1 className="text-[15px] font-semibold text-fg">Tags</h1>
+        <span className="text-[11px] text-faint">{`${tags.length} tag(s)`}</span>
+      </header>
 
       {tagsQuery.isLoading && <p className="text-xs text-faint">Loading tags…</p>}
       {tagsQuery.isError && (
@@ -28,7 +30,12 @@ export function TagsPage() {
 
       <div>
         {tags.map((tag) => (
-          <TagGroup key={tag.name} name={tag.name} documents={tag.documents} mentions={tag.mentions} />
+          <TagGroup
+            key={tag.name}
+            name={tag.name}
+            documents={tag.documents}
+            mentions={tag.mentions}
+          />
         ))}
       </div>
     </div>
@@ -54,8 +61,10 @@ function TagGroup({
           size={11}
           className="text-faint transition-transform group-data-[state=open]:rotate-90"
         />
-        <span className="text-[13px] text-accent">#{name}</span>
-        <span className="ml-auto font-mono text-[10px] text-faint">
+        <span className="min-w-0 truncate text-[13px] text-accent" title={`#${name}`}>
+          #{name}
+        </span>
+        <span className="ml-auto shrink-0 font-mono text-[10px] text-faint">
           {documents} doc(s) · {mentions} mention(s)
         </span>
       </CollapsibleTrigger>

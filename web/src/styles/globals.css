@@ -135,3 +135,35 @@ body {
 [data-radix-popper-content-wrapper] {
   z-index: 60 !important;
 }
+
+/* Shared accessible controls and selection gutter. */
+button, a, input, textarea, select { -webkit-tap-highlight-color: transparent; }
+button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+button:not(:disabled), [role='option'] { cursor: pointer; }
+.toolbar-button {
+  display: inline-flex;
+  min-width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: var(--color-muted);
+}
+.toolbar-button:hover { background: var(--color-raised); color: var(--color-fg); }
+.selection-row { position: relative; }
+.selection-row[aria-selected='true']::before,
+.selection-row[aria-current='page']::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: var(--color-accent);
+}
+#root { height: 100dvh; }
+@media (max-width: 640px) {
+  input, textarea, .cm-editor { font-size: 16px !important; }
+  .toolbar-button { min-width: 36px; height: 36px; }
+}

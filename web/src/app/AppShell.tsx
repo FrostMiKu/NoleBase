@@ -19,6 +19,16 @@ import { AgentStatusPanel } from '@/features/agent/AgentStatusPanel'
 import { LeftSidebar } from '@/features/navigation/LeftSidebar'
 import { TodoPanel } from '@/features/todos/TodoPanel'
 import { useUiStore } from '@/stores/ui-store'
+import { useMediaQuery } from '@/hooks/use-media-query'
+import { CreateNoteDialog } from '@/features/documents/CreateNoteDialog'
+import {
+  Dialog,
+  DialogPortal,
+  DialogOverlay,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog'
 import { queryClient } from '@/queries/query-client'
 import { workspaceKeys } from '@/queries/keys'
 
@@ -34,6 +44,11 @@ function useCurrentDocumentPath(): string | null {
 export function AppShell() {
   const navigate = useNavigate()
   const currentPath = useCurrentDocumentPath()
+  const createOpen = useUiStore((state) => state.createNoteOpen)
+  const location = useRouterState({ select: (state) => state.location.href })
+  useEffect(() => {
+    useUiStore.getState().setMobilePanel(null)
+  }, [location])
 
   useWorkspaceEvents()
   useKeyboardShortcuts()
@@ -67,52 +82,82 @@ export function AppShell() {
       <CommandPalette />
       <DirtyGuard />
       <FileMovedConflict />
+      {createOpen && (
+        <CreateNoteDialog onClose={() => useUiStore.getState().setCreateNoteOpen(false)} />
+      )}
     </div>
   )
 }
 
 function MainPanels() {
+  const compact = useMediaQuery('(max-width: 1023px)')
+  const mobilePanel = useUiStore((state) => state.mobilePanel)
   const leftSidebarOpen = useUiStore((state) => state.leftSidebarOpen)
   const rightSidebarOpen = useUiStore((state) => state.rightSidebarOpen)
   const leftSidebarSize = useUiStore((state) => state.leftSidebarSize)
   const rightSidebarSize = useUiStore((state) => state.rightSidebarSize)
 
   return (
-    <SplitGroup orientation="horizontal" className="h-full">
-      {leftSidebarOpen && (
-        <>
-          <SplitPanel
-            id="left-sidebar"
-            defaultSize={`${leftSidebarSize}`}
-            minSize="14"
-            maxSize="40"
-            className="border-r border-border bg-panel"
-            onResize={(size) => useUiStore.getState().setLeftSidebarSize(size.asPercentage)}
-          >
-            <LeftSidebar />
-          </SplitPanel>
-          <SplitSeparator />
-        </>
-      )}
-      <SplitPanel id="main" className="bg-bg">
-        <Outlet />
-      </SplitPanel>
-      {rightSidebarOpen && (
-        <>
-          <SplitSeparator />
-          <SplitPanel
-            id="right-sidebar"
-            defaultSize={`${rightSidebarSize}`}
-            minSize="18"
-            maxSize="45"
-            className="border-l border-border bg-panel"
-            onResize={(size) => useUiStore.getState().setRightSidebarSize(size.asPercentage)}
-          >
-            <RightSidebar />
-          </SplitPanel>
-        </>
-      )}
-    </SplitGroup>
+    <>
+      <SplitGroup orientation="horizontal" className="h-full">
+        {!compact && leftSidebarOpen && (
+          <>
+            <SplitPanel
+              id="left-sidebar"
+              defaultSize={`${leftSidebarSize}%`}
+              minSize="14%"
+              maxSize="40%"
+              className="border-r border-border bg-panel"
+              onResize={(size) => useUiStore.getState().setLeftSidebarSize(size.asPercentage)}
+            >
+              <LeftSidebar />
+            </SplitPanel>
+            <SplitSeparator />
+          </>
+        )}
+        <SplitPanel id="main" className="bg-bg">
+          <Outlet />
+        </SplitPanel>
+        {!compact && rightSidebarOpen && (
+          <>
+            <SplitSeparator />
+            <SplitPanel
+              id="right-sidebar"
+              defaultSize={`${rightSidebarSize}%`}
+              minSize="18%"
+              maxSize="45%"
+              className="border-l border-border bg-panel"
+              onResize={(size) => useUiStore.getState().setRightSidebarSize(size.asPercentage)}
+            >
+              <RightSidebar />
+            </SplitPanel>
+          </>
+        )}
+      </SplitGroup>
+      <Dialog
+        open={compact && mobilePanel !== null}
+        onOpenChange={(open) => {
+          if (!open) useUiStore.getState().setMobilePanel(null)
+        }}
+      >
+        <DialogPortal>
+          <DialogOverlay />
+          <DialogContent size="drawer" padded={false} className="flex h-[85dvh] flex-col">
+            <DialogTitle className="flex h-10 shrink-0 items-center border-b border-border px-3 pr-10">
+              {mobilePanel === 'files' ? 'Files' : 'Tasks and Agent'}
+            </DialogTitle>
+            <DialogDescription className="sr-only">
+              {mobilePanel === 'files'
+                ? 'Browse and organize your notes.'
+                : 'Track tasks and work with the Agent.'}
+            </DialogDescription>
+            <div className="min-h-0 flex-1">
+              {mobilePanel === 'files' ? <LeftSidebar /> : <RightSidebar />}
+            </div>
+          </DialogContent>
+        </DialogPortal>
+      </Dialog>
+    </>
   )
 }
 
@@ -129,16 +174,16 @@ function RightSidebar() {
     <SplitGroup orientation="vertical" className="h-full">
       <SplitPanel
         id="todos-slot"
-        defaultSize={`${todoPanelSize}`}
-        minSize="15"
-        maxSize="80"
+        defaultSize={`${todoPanelSize}%`}
+        minSize="15%"
+        maxSize="80%"
         className="border-b border-border"
         onResize={(size) => useUiStore.getState().setTodoPanelSize(size.asPercentage)}
       >
         <TodoPanel />
       </SplitPanel>
       <SplitSeparator vertical />
-      <SplitPanel id="agent-slot" minSize="15">
+      <SplitPanel id="agent-slot" minSize="15%">
         {agentCentered ? <AgentStatusPanel /> : <AgentPanel />}
       </SplitPanel>
     </SplitGroup>
