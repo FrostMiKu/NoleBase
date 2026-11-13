@@ -1,9 +1,47 @@
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import { remarkNoteLinks } from '@/features/documents/note-links'
 import remarkGfm from 'remark-gfm'
-import type { ComponentProps } from 'react'
+import { useState, type ComponentProps } from 'react'
+import { useUiStore } from '@/stores/ui-store'
 
 type Components = ComponentProps<typeof ReactMarkdown>['components']
+
+/** Convert managed URIs before the Markdown renderer filters unknown schemes.
+ * All other URLs still pass through react-markdown's safe default policy. */
+function markdownUrl(url: string, key: string): string {
+  const attachment =
+    /^nole:\/\/attachment\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/.exec(
+      url,
+    )
+  if (attachment)
+    return `/api/attachments/${attachment[1]}${key === 'href' ? '?download=true' : ''}`
+  return defaultUrlTransform(url)
+}
+
+function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
+  const [failed, setFailed] = useState(false)
+  if (!src || failed) {
+    return (
+      <span className="inline-flex flex-wrap items-center gap-2 text-xs text-warn">
+        Image unavailable{alt ? `: ${alt}` : ''}
+        {src && (
+          <button type="button" className="underline" onClick={() => setFailed(false)}>
+            Retry
+          </button>
+        )}
+      </span>
+    )
+  }
+  return (
+    <img
+      src={src}
+      alt={alt ?? ''}
+      loading="lazy"
+      onError={() => setFailed(true)}
+      className="my-3 max-h-96 max-w-full rounded object-contain"
+    />
+  )
+}
 
 /**
  * Dense dark Markdown rendering for agent output. Agent text is plain
@@ -80,6 +118,7 @@ export function Markdown({
   noteLinks?: boolean
   onFollowLink?: (href: string) => boolean
 }) {
+  const attachmentRefreshTick = useUiStore((state) => state.attachmentRefreshTick)
   const renderedComponents: Components = {
     ...components,
     a: ({ children, href }) => (
@@ -96,17 +135,17 @@ export function Markdown({
       </a>
     ),
     img: ({ src, alt }) => (
-      <img
+      <MarkdownImage
+        key={src?.startsWith('/api/attachments/') ? `${src}:${attachmentRefreshTick}` : src}
         src={src}
-        alt={alt ?? ''}
-        loading="lazy"
-        className="my-3 max-h-96 max-w-full rounded object-contain"
+        alt={alt}
       />
     ),
   }
   return (
     <div className="min-w-0 text-[13px] break-words text-fg [overflow-wrap:anywhere]">
       <ReactMarkdown
+        urlTransform={markdownUrl}
         remarkPlugins={noteLinks ? [remarkGfm, remarkNoteLinks] : [remarkGfm]}
         components={renderedComponents}
       >

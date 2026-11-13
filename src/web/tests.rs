@@ -1698,3 +1698,155 @@ async fn document_preview_reports_unavailable_images_without_exposing_external_b
         .to_string()
         .contains(directory.path().to_str().unwrap()));
 }
+
+#[tokio::test]
+async fn attachment_images_stream_with_ranges_and_utf8_download_names() {
+    let (state, _directory) = test_state();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    let metadata = state
+        .workspace
+        .attachments()
+        .import_bytes(&png, Some("潜水照片.png"))
+        .unwrap();
+    let uri = format!("/api/attachments/{}", metadata.id);
+    let app = server::router(state);
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/png");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    let disposition = response.headers()["content-disposition"].to_str().unwrap();
+    assert!(disposition.starts_with("inline;"));
+    assert!(disposition.contains("filename*=UTF-8''%E6%BD%9C%E6%B0%B4%E7%85%A7%E7%89%87.png"));
+    assert_eq!(
+        &response.into_body().collect().await.unwrap().to_bytes()[..],
+        &png
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header("range", "bytes=0-7")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers()["content-range"],
+        format!("bytes 0-7/{}", png.len())
+    );
+    assert_eq!(
+        &response.into_body().collect().await.unwrap().to_bytes()[..],
+        &png[..8]
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("{uri}?download=true"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment;"));
+    assert!(response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn attachments_download_active_content_and_reflect_external_updates() {
+    let (state, _directory) = test_state();
+    let metadata = state
+        .workspace
+        .attachments()
+        .import_bytes(b"<script>alert(1)</script>", Some("report.html"))
+        .unwrap();
+    let path = state.workspace.attachments().open(metadata.id).unwrap();
+    let uri = format!("/api/attachments/{}", metadata.id);
+    let app = server::router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment;"));
+    assert!(response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .starts_with("sandbox;"));
+    std::fs::write(path, b"updated content").unwrap();
+    assert_eq!(get(&app, &uri).await.2, "updated content");
+    state.workspace.attachments().remove(metadata.id).unwrap();
+    assert_eq!(get(&app, &uri).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn attachment_routes_reject_invalid_ids_and_missing_files() {
+    let (state, _directory) = test_state();
+    let app = server::router(state);
+    for id in [
+        "not-a-uuid",
+        "%2E%2E%2Fconfig",
+        "CA24169F-9431-4645-8EB3-0A88C1DAE545",
+    ] {
+        assert_eq!(
+            get(&app, &format!("/api/attachments/{id}")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let missing = crate::core::attachment::AttachmentId::new();
+    let (status, body, _) = get(&app, &format!("/api/attachments/{missing}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["message"], "Attachment not found");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attachment_routes_reject_symlink_content_without_leaking_paths() {
+    let (state, directory) = test_state();
+    let metadata = state
+        .workspace
+        .attachments()
+        .import_bytes(b"original", Some("file.txt"))
+        .unwrap();
+    let path = state.workspace.attachments().open(metadata.id).unwrap();
+    let secret = directory.path().join("secret.txt");
+    std::fs::write(&secret, b"private bytes").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(secret, path).unwrap();
+    let (status, _, text) = get(
+        &server::router(state),
+        &format!("/api/attachments/{}", metadata.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!text.contains("private bytes"));
+    assert!(!text.contains(directory.path().to_str().unwrap()));
+}

@@ -15,6 +15,7 @@
 pub mod agent;
 #[cfg(embed_web_ui)]
 pub mod assets;
+mod attachments;
 pub mod dto;
 pub mod error;
 pub mod preview;

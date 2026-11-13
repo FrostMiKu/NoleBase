@@ -55,6 +55,7 @@ export function applyWorkspaceEvent(
       return
     }
     case 'attachments_changed':
+      useUiStore.getState().refreshAttachmentImages()
       void deps.queryClient.invalidateQueries({ queryKey: workspaceKeys.previewFamily() })
       return
     case 'agent_reads_dirty':
@@ -101,6 +102,7 @@ export function invalidateWorkspaceContent(
 
 /** Full resync: mark every workspace cache stale; the cache is preserved. */
 export async function resyncWorkspace(deps: WorkspaceEventDeps): Promise<void> {
+  useUiStore.getState().refreshAttachmentImages()
   deps.onResyncStart()
   try {
     await deps.queryClient.invalidateQueries({ queryKey: workspaceKeys.root })

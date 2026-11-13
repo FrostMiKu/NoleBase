@@ -797,6 +797,10 @@ local/managed images, and offers a standalone HTML download. Its sandbox keeps
 the rendered content isolated from the workspace; use Read mode for note-link
 navigation. Rendering warnings are visible above the preview.
 
+Read/Split views, Daily cards, and Agent Markdown render managed
+`nole://attachment/<uuid>` images and offer downloads for attachment links.
+Attachment updates refresh visible images; failed images show a retry action.
+
 Daily and Agent composer drafts survive navigation and reloads in the same
 browser tab. Enter submits and Shift+Enter inserts a newline; Daily completion
 supports all notes, archives, daily dates, and tags with a clamped eight-row

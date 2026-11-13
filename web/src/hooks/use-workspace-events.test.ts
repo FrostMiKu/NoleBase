@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { applyWorkspaceEvent, type WorkspaceEventDeps } from './use-workspace-events'
 import { workspaceKeys } from '@/queries/keys'
 import type { WorkspaceEvent } from '@/types/events'
+import { useUiStore } from '@/stores/ui-store'
 
 function makeDeps(currentPath: string | null) {
   const queryClient = new QueryClient({
@@ -126,7 +127,9 @@ describe('watcher_failed', () => {
 describe('attachment and read-state events', () => {
   it('refreshes previews for attachment updates without touching document source', () => {
     const { deps, isInvalidated, onWatcherError, onExternalChange } = makeDeps('data/foo.md')
+    const tick = useUiStore.getState().attachmentRefreshTick
     applyWorkspaceEvent(deps, { type: 'attachments_changed', paths: ['img.png'] })
+    expect(useUiStore.getState().attachmentRefreshTick).toBe(tick + 1)
     expect(isInvalidated(workspaceKeys.preview('data/foo.md', 'source'))).toBe(true)
     applyWorkspaceEvent(deps, { type: 'agent_reads_dirty', paths: ['data/foo.md'] })
     expect(isInvalidated(workspaceKeys.summary())).toBe(false)

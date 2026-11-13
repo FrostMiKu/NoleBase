@@ -32,6 +32,8 @@ export interface UiState {
 
   /** Incremented to request focus on the agent composer. */
   agentFocusTick: number
+  /** Remount managed images after attachment changes or a reconnect. */
+  attachmentRefreshTick: number
 }
 
 export interface UiActions {
@@ -48,6 +50,7 @@ export interface UiActions {
   setWorkspaceResyncing: (resyncing: boolean) => void
   setWatcherError: (message: string | null) => void
   requestAgentFocus: () => void
+  refreshAttachmentImages: () => void
 }
 
 export type UiStore = UiState & UiActions
@@ -76,6 +79,7 @@ export const useUiStore = create<UiStore>()(
       watcherError: null,
 
       agentFocusTick: 0,
+      attachmentRefreshTick: 0,
 
       setCreateNoteOpen: (open) => set({ createNoteOpen: open }),
       setMobilePanel: (mobilePanel) => set({ mobilePanel }),
@@ -93,6 +97,8 @@ export const useUiStore = create<UiStore>()(
       setWorkspaceResyncing: (resyncing) => set({ workspaceResyncing: resyncing }),
       setWatcherError: (watcherError) => set({ watcherError }),
       requestAgentFocus: () => set((state) => ({ agentFocusTick: state.agentFocusTick + 1 })),
+      refreshAttachmentImages: () =>
+        set((state) => ({ attachmentRefreshTick: state.attachmentRefreshTick + 1 })),
     }),
     {
       name: 'nole:layout',
