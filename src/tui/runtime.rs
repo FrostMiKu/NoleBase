@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
 };
 #[cfg(not(windows))]
 use crossterm::event::{
@@ -56,6 +56,7 @@ fn enter_tui() -> Result<()> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
+        EnableFocusChange,
     )?;
     // Crossterm's Windows event backend always uses the legacy Windows API,
     // where kitty keyboard progressive enhancement is unavailable. Windows
@@ -75,6 +76,7 @@ fn leave_tui() -> Result<()> {
     execute!(
         io::stdout(),
         DisableBracketedPaste,
+        DisableFocusChange,
         DisableMouseCapture,
         Show,
         LeaveAlternateScreen,
@@ -248,9 +250,12 @@ fn run(terminal: &mut Tui, app: &mut App, nole: &mut crate::core::nole::Nole) ->
             needs_draw = true;
         }
 
+        let old_sessions = app.agent_notes.clone();
         let was_ai_running = app.ai_running;
         let was_overlay = app.overlay;
+        app.terminal_focused = focused;
         app.poll_agent();
+        needs_draw |= old_sessions != app.agent_notes;
         app.poll_terminal();
         app.poll_export();
         needs_draw |= was_ai_running != app.ai_running || was_overlay != app.overlay;
@@ -409,7 +414,7 @@ pub fn run_app() -> Result<()> {
     let storage = resolve_storage()?;
     storage.ensure_files()?;
     let mut nole = crate::core::nole::Nole::open(storage)?;
-    let mut app = App::new(nole.workspace().clone(), nole.agent().clone())?;
+    let mut app = App::new(nole.workspace().clone(), nole.sessions().clone())?;
 
     enter_tui()?;
     let _guard = TerminalGuard;

@@ -3,14 +3,16 @@
 //! consumer receives a `resync_required` marker and keeps consuming the
 //! latest events instead of dragging the producer down.
 
+use crate::web::error::{ApiError, ApiResult};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::core::agent::AgentEvent;
-use crate::web::dto::{WebAgentEvent, WebWorkspaceEvent};
+use crate::web::dto::{AgentHistoryEntryDto, WebAgentEvent, WebWorkspaceEvent};
 use crate::web::state::WebState;
 
 /// `GET /api/ws/workspace` — workspace change events.
@@ -31,12 +33,40 @@ pub async fn workspace_events(
     })
 }
 
-/// `GET /api/ws/agent` — the shared agent event stream. The workspace handle
+/// `GET /api/agents/{id}/events` — the shared agent event stream. The workspace handle
 /// is only used to relativize paths in event DTOs.
-pub async fn agent_events(State(state): State<WebState>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| {
+pub async fn agent_events(
+    State(state): State<WebState>,
+    Path(id): Path<Uuid>,
+    upgrade: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let session = state
+        .sessions
+        .get(id)
+        .map_err(|_| ApiError::NotFound("Session not found".into()))?;
+    let (live_panel, scope, receiver) = session.attach();
+    let (conversation, panel, _, _, _) = scope.into_parts();
+    let (approval, question, private_input) = session.pending_interactions();
+    let interactions = [
+        approval.map(AgentEvent::Approval),
+        question.map(AgentEvent::AskUser),
+        private_input.map(AgentEvent::PrivateTerminalInput),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|event| WebAgentEvent::from_agent_event(&state.workspace, &event))
+    .collect::<Vec<_>>();
+    let snapshot = serde_json::json!({
+        "type": "session_snapshot", "entries": panel.iter().map(AgentHistoryEntryDto::from).collect::<Vec<_>>(),
+        "message_count": conversation.messages.len(), "live_tools": live_panel.live_tools(), "running": session.session.is_running(),
+        "permission": session.service.permission_mode(), "interactions": interactions,
+        "save_error": session.save_error(),
+    }).to_string();
+    Ok(upgrade.on_upgrade(move |mut socket| async move {
+        if socket.send(Message::Text(snapshot.into())).await.is_err() {
+            return;
+        }
         let workspace = state.workspace.clone();
-        let receiver = state.agent.subscribe();
         forward_broadcast(socket, receiver, move |event: AgentEvent| {
             let web_event = WebAgentEvent::from_agent_event(&workspace, &event);
             serde_json::to_string(&web_event).unwrap_or_else(|_| {
@@ -47,7 +77,8 @@ pub async fn agent_events(State(state): State<WebState>, upgrade: WebSocketUpgra
                 .to_string()
             })
         })
-    })
+        .await
+    }))
 }
 
 /// Pump a broadcast receiver into a WebSocket as JSON text frames.

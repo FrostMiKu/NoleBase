@@ -10,7 +10,8 @@ use crate::core::provider::{ImageBlock, Message, ToolResult};
 ///
 /// The mode is shared with the UI through an [`std::sync::Arc`]`<AtomicU8>`
 /// using the stable codes from [`PermissionMode::code`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum PermissionMode {
     /// Ask the user for every approval request.

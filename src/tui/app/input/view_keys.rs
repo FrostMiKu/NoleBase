@@ -221,7 +221,7 @@ impl App {
                 self.open_workspace_views();
                 None
             }
-            KeyCode::Char('C') => self.execute_app_command(AppCommand::ClearAgentSession),
+            KeyCode::Char('C') => self.execute_app_command(AppCommand::NewAgentSession),
             KeyCode::Char('c') if self.ai_running => {
                 self.execute_app_command(AppCommand::InterruptAgent)
             }
@@ -262,7 +262,7 @@ impl App {
 
     pub(in crate::tui::app) fn handle_agent(&mut self, key: KeyEvent) -> Option<Command> {
         match key.code {
-            KeyCode::Char('C') => self.execute_app_command(AppCommand::ClearAgentSession),
+            KeyCode::Char('C') => self.execute_app_command(AppCommand::NewAgentSession),
             code if is_cancel_key(code) || is_left_key(code) => {
                 self.focus = Focus::Center;
                 None

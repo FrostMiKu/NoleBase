@@ -56,38 +56,41 @@ impl App {
     pub fn poll_agent(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
-        if let Some(run_events) = &mut self.active_agent_events {
-            loop {
-                match run_events.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        disconnected = true;
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                        self.agent_session.cancel();
-                        events.push(AgentEvent::Finished(Err(
-                            "Agent event stream lagged; task cancelled".to_string(),
-                        )));
-                        break;
-                    }
-                }
+        let selected_session = self.selected_agent_session();
+        self.agent_notes = self.sessions.list();
+        if let Some(id) = selected_session {
+            if let Some(row) = self
+                .visible_file_rows()
+                .iter()
+                .position(|row| *row == FileListRow::Agent(id))
+            {
+                self.file_row = row;
             }
         }
-        // Jobs can settle while no run is active, and without an active run
-        // there is no observable to poll above — a settled job's delivery
-        // would sit queued forever. The permanent subscription fills that
-        // gap; every other event it sees is a duplicate of the run's own
-        // stream and is dropped.
-        let idle = self.active_agent_events.is_none();
+        if self.terminal_focused
+            && (self.center_view == CenterView::Chat || self.focus == Focus::Agent)
+        {
+            if let Err(error) = self.session_note.mark_read() {
+                self.set_error(format!("Session save failed: {error}"));
+            }
+        }
         loop {
             match self.agent_events_rx.try_recv() {
-                Ok(event @ AgentEvent::JobSettled { .. }) if idle => events.push(event),
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Ok(event) => events.push(event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    disconnected = true;
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    let (_, panel, usage, tokens, duration) =
+                        self.session_note.scope().into_parts();
+                    self.agent_panel = AgentPanel::from_entries(panel);
+                    self.agent_usage = usage;
+                    self.agent_timed_output_tokens = tokens;
+                    self.agent_response_duration = duration;
+                    events.clear();
+                }
             }
         }
         for event in events {
@@ -161,9 +164,6 @@ impl App {
                     });
                     // Idle settlement: no run will drain the delivery, so
                     // start the wake-up run through the session capability.
-                    if !self.ai_cancelling {
-                        self.adopt_delivery_run();
-                    }
                 }
                 AgentEvent::JobDelivered(ids) => {
                     self.set_status(format!(
@@ -190,6 +190,7 @@ impl App {
                     self.agent_panel.apply_retry();
                 }
                 AgentEvent::Round { current } => {
+                    self.ai_running = true;
                     self.agent_round = current;
                     if !self.agent_panel.has_active_tools() {
                         self.set_status("AI is working...");
@@ -199,7 +200,7 @@ impl App {
                     // Apply before persisting: the supervisor syncs the
                     // session's copy asynchronously, but the TUI's own
                     // stream order is deterministic for persistence.
-                    self.agent_session.replace_conversation(conversation);
+                    let _ = conversation;
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
                     }
@@ -246,7 +247,6 @@ impl App {
                     self.set_overlay(Overlay::PrivateTerminalInput);
                 }
                 AgentEvent::Stopped(reason) => {
-                    self.active_agent_events = None;
                     self.agent_panel.deactivate_tools();
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
@@ -267,26 +267,14 @@ impl App {
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
                     }
-                    let pending = self.agent.take_buffered_prompts();
-                    if !pending.is_empty() {
-                        self.mark_buffered_prompts_consumed(pending.len());
-                        self.start_agent_worker(pending.join("\n\n"));
-                    }
-                    // A job that settled during the denied stop needs its
-                    // wake-up run too; one started above drains the rest.
-                    if !self.ai_running && !self.ai_cancelling {
-                        self.adopt_delivery_run();
-                    }
                 }
                 AgentEvent::Finished(result) => {
-                    self.active_agent_events = None;
                     self.agent_panel.deactivate_tools();
                     self.agent_panel.drop_unclaimed_preparations();
                     if self.ai_cancelling {
                         self.ai_cancelling = false;
                         continue;
                     }
-                    let completed_successfully = result.is_ok();
                     self.ai_running = false;
                     match result {
                         Ok(_) => {
@@ -305,21 +293,6 @@ impl App {
                     self.reload_workspace();
                     if let Err(error) = self.persist_agent_session() {
                         self.set_error(format!("Agent session save error: {error}"));
-                    }
-                    if completed_successfully {
-                        let pending = self.agent.take_buffered_prompts();
-                        if !pending.is_empty() {
-                            self.mark_buffered_prompts_consumed(pending.len());
-                            self.start_agent_worker(pending.join("\n\n"));
-                        }
-                    }
-                    // A job that settled while the final answer streamed (or
-                    // while a denied run unwound) has a queued delivery no
-                    // run will drain anymore: only the paths below can reach
-                    // it. A run started for buffered input drains the rest
-                    // itself at its first round boundary.
-                    if !self.ai_running && !self.ai_cancelling {
-                        self.adopt_delivery_run();
                     }
                 }
             }
@@ -373,6 +346,7 @@ impl App {
     }
 
     pub fn mark_agent_reads_dirty(&mut self, paths: &[PathBuf]) {
+        self.sessions.mark_reads_dirty(paths);
         if let Err(error) = self.agent.mark_reads_dirty(paths) {
             self.set_error(format!("Agent read-state error: {error:#}"));
         }
@@ -493,7 +467,9 @@ impl App {
     }
 
     pub(super) fn buffer_agent_prompt(&mut self, prompt: String, display_prompt: String) -> bool {
-        let queued = self.agent.buffer_prompt(prompt);
+        let queued = self
+            .session_note
+            .buffer_prompt(prompt, display_prompt.clone());
         if !queued {
             self.set_error("Agent input buffer is unavailable");
             return false;
@@ -570,11 +546,13 @@ impl App {
         self.ai_running = true;
         self.agent_round = 0;
         self.set_status("AI is working...");
-        match self.agent_session.start(prompt) {
-            Ok(AgentSessionStart::Started(events)) => {
-                self.active_agent_events = Some(events);
-                true
-            }
+        if let Err(error) = self.sessions.retain(self.session_note.clone()) {
+            self.ai_running = false;
+            self.set_error(format!("Session save failed: {error}"));
+            return false;
+        }
+        match self.session_note.start(prompt) {
+            Ok(AgentSessionStart::Started(_)) => true,
             Ok(AgentSessionStart::AlreadyRunning) => {
                 self.ai_running = false;
                 self.set_status("AI is already working");
@@ -597,29 +575,6 @@ impl App {
     /// gone idle: an idle settlement (no run to observe it), or a delivery
     /// that settled while the previous run was already finishing its last
     /// answer. A delivery left queued here would strand its job's result
-    /// until an unrelated future run.
-    pub(super) fn adopt_delivery_run(&mut self) -> bool {
-        if self.ai_running || self.ai_cancelling {
-            return false;
-        }
-        let Ok(Some(delivery)) = self.agent_session.deliver_jobs_if_idle() else {
-            return false;
-        };
-        self.reload_thinking_display_config();
-        self.reload_agent_effort();
-        self.agent.clear_buffered_prompts();
-        self.ai_running = true;
-        self.agent_round = 0;
-        self.set_status("AI is working...");
-        self.agent_panel.push_prompt(delivery.echo, true);
-        self.active_agent_events = Some(delivery.events);
-        true
-    }
-
-    pub(super) fn mark_buffered_prompts_consumed(&mut self, count: usize) {
-        self.agent_panel.apply_buffered_input_consumed(count);
-    }
-
     pub(super) fn cancel_agent(&mut self) {
         if !self.ai_running {
             self.set_status("Agent is not running");
@@ -642,59 +597,13 @@ impl App {
         self.set_status("Agent task cancelled");
     }
 
-    pub(super) fn clear_agent_session(&mut self) {
-        let was_running = self.ai_running;
-        if was_running {
-            self.cancel_agent();
-        }
-        // Terminate the agent terminal sessions and cancel jobs that belong
-        // to the session being cleared; the Agent workspace itself persists
-        // and keeps its files.
-        self.agent.terminate_session();
-        let had_saved_session = match self.storage().clear_agent_session() {
-            Ok(had_saved_session) => had_saved_session,
-            Err(error) => {
-                self.set_error(format!("Agent session clear error: {error}"));
-                return;
-            }
-        };
-        let had_history = self.agent_session.clear_conversation();
-        if let Err(error) = self.agent.clear_read_state() {
-            self.set_error(format!("Agent state clear error: {error:#}"));
-        }
-        let had_panel_content = !self.agent_panel.is_empty();
-        self.agent_panel.clear();
-        self.agent.clear_buffered_prompts();
-        self.agent_scroll = 0;
-        self.agent_stats_scroll = 0;
-        self.agent_follow_tail = false;
-        self.agent_usage = TokenUsage::default();
-        self.agent_context_window = 0;
-        self.agent_context_capacity = 0;
-        self.agent_timed_output_tokens = 0;
-        self.agent_response_duration = Duration::ZERO;
-        self.agent_retry_count = 0;
-        self.agent_round = 0;
-        if was_running || had_saved_session || had_history || had_panel_content {
-            self.set_status("Agent session cleared");
-        } else {
-            self.set_status("Agent session is already empty");
-        }
-    }
-
     pub(super) fn persist_agent_session(&self) -> anyhow::Result<()> {
-        let session = AgentSessionScope::from_parts(
-            &self.agent_session.conversation(),
-            &self.agent_panel.snapshot(),
-            self.agent_usage,
-            self.agent_timed_output_tokens,
-            self.agent_response_duration,
-        );
-        self.storage().write_agent_session(&session)
+        self.session_note.persist()
     }
 
     pub(super) fn send_user_response(&mut self, response: AskUserResponse) -> anyhow::Result<()> {
         self.agent.respond_user(response.clone())?;
+        self.session_note.clear_question();
         if let AskUserResponse::Answer(answer) = &response {
             self.agent_panel.apply_ask_answer(answer);
         }
@@ -738,6 +647,7 @@ impl App {
             self.clear_private_terminal_input();
             return Err(error.context("sending private input to Agent"));
         }
+        self.session_note.clear_private_input();
         self.set_status(if submit {
             "Private input submitted to Agent terminal"
         } else {
@@ -765,6 +675,7 @@ impl App {
 
     pub(super) fn send_approval(&mut self, decision: ApprovalDecision) -> anyhow::Result<()> {
         self.agent.respond_approval(decision)?;
+        self.session_note.clear_approval();
         self.set_status(match decision {
             ApprovalDecision::Approve => "Change approved",
             ApprovalDecision::Deny => "Change denied",
@@ -787,6 +698,9 @@ impl App {
     pub(super) fn toggle_permission_mode(&mut self) {
         let mode = self.agent.permission_mode().cycled();
         self.agent.set_permission_mode(mode);
+        if let Err(error) = self.session_note.persist() {
+            self.set_error(error.to_string());
+        }
         // Entering YOLO approves whatever approval is currently waiting.
         // AUTO and APPROVE leave a pending request at the gate for its user
         // decision; YOLO approves the request currently shown by the overlay.

@@ -112,12 +112,14 @@ impl std::error::Error for MutationConflict {}
 pub enum FileGroup {
     Notes,
     Archives,
+    Agents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileListRow {
     Group(FileGroup),
     File(usize),
+    Agent(uuid::Uuid),
 }
 
 /// A `- [ ]` / `- [x]` task parsed from the daily notes.

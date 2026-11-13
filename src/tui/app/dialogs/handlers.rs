@@ -16,6 +16,9 @@ impl App {
             return None;
         };
         match dialog.purpose {
+            DialogPurpose::NewAgentSession
+            | DialogPurpose::RenameAgentSession
+            | DialogPurpose::DeleteAgentSession => return self.handle_session_dialog(key),
             DialogPurpose::DeleteDaily => return self.handle_delete_daily_overlay(key),
             DialogPurpose::DeleteFile => return self.handle_delete_file_overlay(key),
             DialogPurpose::DeleteAttachment => return self.handle_delete_attachment_overlay(key),

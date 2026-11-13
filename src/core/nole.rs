@@ -1,4 +1,4 @@
-//! The application bootstrap: owns the workspace, agent, and watcher
+//! The application bootstrap: owns the workspace, Session notes, and watcher
 //! services as one lifecycle object so a client (the TUI today, other
 //! clients later) starts Nole with a single call instead of assembling
 //! storage, indexes, agent channels, and the filesystem watcher itself.
@@ -7,28 +7,27 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::core::agent_service::AgentService;
+use crate::core::agent_sessions::AgentSessions;
 use crate::core::storage::Storage;
 use crate::core::workspace::Workspace;
 use crate::core::workspace_watcher::{WorkspaceEvent, WorkspaceWatcher};
 
 pub struct Nole {
     workspace: Arc<Workspace>,
-    agent: Arc<AgentService>,
+    sessions: Arc<AgentSessions>,
     watcher: WorkspaceWatcher,
 }
 
 impl Nole {
     /// Open the application: register the filesystem watcher, open the
-    /// workspace (spawning the document indexer), and start the agent
-    /// worker on top of the workspace's shared handles.
+    /// workspace and Session catalog. Session workers start as notes are opened.
     pub fn open(storage: Storage) -> Result<Self> {
         let watcher = WorkspaceWatcher::new(&storage)?;
         let workspace = Arc::new(Workspace::open(storage)?);
-        let agent = Arc::new(AgentService::new(&workspace));
+        let sessions = AgentSessions::open(workspace.clone())?;
         Ok(Self {
             workspace,
-            agent,
+            sessions,
             watcher,
         })
     }
@@ -37,8 +36,8 @@ impl Nole {
         &self.workspace
     }
 
-    pub fn agent(&self) -> &Arc<AgentService> {
-        &self.agent
+    pub fn sessions(&self) -> &Arc<AgentSessions> {
+        &self.sessions
     }
 
     /// Drain filesystem changes: refresh the workspace indexes and return
@@ -70,7 +69,8 @@ mod tests {
         assert!(workspace.todos().unwrap().is_empty());
 
         // Agent events subscribe standalone.
-        let mut events = nole.agent().subscribe();
+        let session = nole.sessions().create("Test").unwrap();
+        let mut events = session.subscribe();
         assert!(events.try_recv().is_err());
 
         // The watcher polls without a terminal event loop.

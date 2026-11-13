@@ -8,7 +8,11 @@ import { initialAgentState } from './agent-reducer'
 import { AgentPanel } from './AgentPanel'
 import { AgentInteractions } from './AgentInteractions'
 vi.mock('./PermissionSelect', () => ({ PermissionSelect: () => null }))
-beforeEach(() => useAgentStore.setState({ ...initialAgentState(), connection: 'connected' }))
+beforeEach(() => {
+  useAgentStore.setState({ ...initialAgentState(), activeSessionId: 'session-a', connection: 'connected' })
+  vi.spyOn(agentApi, 'list').mockResolvedValue({ sessions: [] })
+  vi.spyOn(agentApi, 'read').mockResolvedValue(null)
+})
 afterEach(() => {
   cleanup()
   sessionStorage.clear()
@@ -66,4 +70,26 @@ it('masks private terminal input and leaves it out of draft storage', async () =
   expect(input).toHaveAttribute('type', 'password')
   await user.type(input, 'test secret')
   expect(sessionStorage.length).toBe(0)
+})
+
+it('keeps Session drafts separate while an earlier request completes after switching', async () => {
+  const user = userEvent.setup()
+  let resolve!: (value: null) => void
+  vi.spyOn(agentApi, 'run').mockImplementation(() => new Promise((done) => { resolve = done }))
+  mount()
+  await user.type(screen.getByLabelText('Agent prompt'), 'Question A')
+  await user.click(screen.getByRole('button', { name: 'Send' }))
+  act(() => {
+    useAgentStore.getState().selectSession('session-b')
+    useAgentStore.getState().setConnection('connected')
+  })
+  await user.type(screen.getByLabelText('Agent prompt'), 'Draft B')
+  await act(async () => resolve(null))
+  expect(screen.getByLabelText('Agent prompt')).toHaveValue('Draft B')
+  expect(useAgentStore.getState().turns).toEqual([])
+  act(() => {
+    useAgentStore.getState().selectSession('session-a')
+    useAgentStore.getState().setConnection('connected')
+  })
+  expect(screen.getByLabelText('Agent prompt')).toHaveValue('')
 })

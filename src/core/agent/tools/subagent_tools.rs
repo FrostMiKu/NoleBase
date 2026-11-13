@@ -18,6 +18,7 @@ use crate::core::workspace_index::WorkspaceIndexHandle;
 pub(super) fn register_read_only_tools(
     runner: &mut SubagentRunner,
     root: &Path,
+    session_directory: &Path,
     workspace_index: WorkspaceIndexHandle,
     wiki_links: WikiLinkIndexHandle,
     client: reqwest::Client,
@@ -25,7 +26,8 @@ pub(super) fn register_read_only_tools(
     skills: &[crate::core::skill::Skill],
 ) -> Result<()> {
     let reads = Arc::new(SnapshotStore::default());
-    let mut read = Read::new(root, reads, client.clone())?;
+    let mut read =
+        Read::new(root, reads, client.clone())?.with_session_directory(session_directory);
     read.register(SkillParser::new(skills));
     runner.register(read);
     runner.register(Notes::new(root)?);

@@ -30,6 +30,7 @@ pub struct AgentService {
     cancelled: Arc<AtomicBool>,
     terminal: AgentTerminalHandle,
     jobs: AgentJobsHandle,
+    collaborators: crate::core::agent::collaboration::CollaboratorsHandle,
 }
 
 impl AgentService {
@@ -37,8 +38,20 @@ impl AgentService {
     /// share the workspace's index and attachment-usage handles with the
     /// agent runtime and its tools.
     pub fn new(workspace: &Workspace) -> Self {
+        Self::in_directory(
+            workspace,
+            workspace
+                .storage()
+                .root
+                .join("agents")
+                .join(uuid::Uuid::new_v4().to_string()),
+        )
+    }
+
+    pub fn in_directory(workspace: &Workspace, directory: PathBuf) -> Self {
+        let collaborators = crate::core::agent::collaboration::CollaboratorsHandle::new(&directory);
         let storage = workspace.storage();
-        let terminal = AgentTerminalHandle::default();
+        let terminal = AgentTerminalHandle::in_directory(&directory);
         let input_buffer = Arc::new(Mutex::new(Vec::new()));
         let permission_mode_atomic = Arc::new(AtomicU8::new(PermissionMode::Approve.code()));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -59,6 +72,8 @@ impl AgentService {
                 permission_mode_atomic.clone(),
                 cancelled.clone(),
             )
+            .with_collaborators(collaborators.clone())
+            .with_session_directory(directory)
             .with_terminal(terminal.clone())
             .with_jobs(jobs.clone())
             .with_workspace_index(workspace.workspace_index().clone())
@@ -76,6 +91,7 @@ impl AgentService {
             cancelled,
             terminal,
             jobs,
+            collaborators,
         }
     }
 
@@ -89,6 +105,10 @@ impl AgentService {
         self.worker.run(prompt, conversation)
     }
 
+    pub(crate) fn emit(&self, event: AgentEvent) {
+        let _ = self.events.send(event);
+    }
+
     /// Subscribe a new receiver to the shared agent event stream. Every
     /// client (TUI today, other clients later) can observe the same events.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
@@ -99,6 +119,7 @@ impl AgentService {
     /// shared flag; the active run's observable cancellation token must be
     /// cancelled separately by its owner.
     pub fn cancel(&self) {
+        self.collaborators.cancel_all();
         self.cancelled.store(true, Ordering::Relaxed);
     }
 
@@ -224,7 +245,12 @@ impl AgentService {
     }
 
     /// Terminate the agent's embedded terminal sessions and background jobs.
+    pub(crate) fn collaborators(&self) -> &crate::core::agent::collaboration::CollaboratorsHandle {
+        &self.collaborators
+    }
+
     pub fn terminate_session(&self) {
+        self.collaborators.terminate();
         self.terminal.terminate();
         self.jobs.terminate();
     }

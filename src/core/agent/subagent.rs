@@ -9,8 +9,8 @@ use anyhow::{bail, Context, Result};
 use futures_util::stream::{self, StreamExt};
 
 use super::{
-    images::DISABLED_IMAGE_ERROR, prompt_with_datetime, wait_for_provider_retry, AgentConfig,
-    AgentEvent, AgentEventSender, RegisteredTool, Tool, ToolCallOutput, ToolConcurrencyLimits,
+    images::DISABLED_IMAGE_ERROR, wait_for_provider_retry, AgentConfig, AgentEvent,
+    AgentEventSender, RegisteredTool, Tool, ToolCallOutput, ToolConcurrencyLimits,
     ToolExecutionPolicy, MAX_PROVIDER_REQUEST_ATTEMPTS,
 };
 use crate::core::agent_session::TokenUsage;
@@ -34,6 +34,17 @@ pub(crate) struct SubagentRuntime {
 }
 
 impl SubagentRuntime {
+    pub(crate) fn ensure_active(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Relaxed),
+            "Agent task cancelled"
+        );
+        Ok(())
+    }
+    pub(crate) fn with_cancellation(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = cancelled;
+        self
+    }
     pub(crate) fn new(
         config: &AgentConfig,
         provider: Arc<dyn Provider>,
@@ -126,13 +137,25 @@ impl SubagentRunner {
             .insert(name, Arc::new(RegisteredTool::new(tool, &schema)));
     }
 
+    #[cfg(test)]
     pub(crate) async fn run(&self, task: &str) -> Result<String> {
-        let mut messages = vec![Message::user(prompt_with_datetime(
+        let mut messages = vec![Message::user(super::prompt_with_datetime(
             task,
             chrono::Local::now(),
         ))];
+        self.run_conversation(&mut messages, None).await
+    }
+
+    pub(crate) async fn run_conversation(
+        &self,
+        messages: &mut Vec<Message>,
+        mailbox: Option<&super::collaboration::Collaborator>,
+    ) -> Result<String> {
         for round in 0..self.runtime.max_subagent_rounds {
             self.ensure_active()?;
+            if let Some(mailbox) = mailbox {
+                mailbox.checkpoint(messages)?;
+            }
             let final_round = round.saturating_add(1) == self.runtime.max_subagent_rounds;
             if final_round {
                 messages.push(Message::user(self.profile.final_round_prompt.clone()));
@@ -145,6 +168,11 @@ impl SubagentRunner {
             }
             if calls.is_empty() {
                 if !text.trim().is_empty() && response.stop_reason != StopReason::Length {
+                    if let Some(mailbox) = mailbox {
+                        if !final_round && mailbox.has_pending() && mailbox.checkpoint(messages)? {
+                            continue;
+                        }
+                    }
                     return Ok(text);
                 }
                 if final_round {

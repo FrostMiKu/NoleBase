@@ -1277,23 +1277,8 @@
         );
         assert_eq!(tool_display_name("daily"), "Add Daily Entry");
 
-        let explore = json!({
-            "name": "explore",
-            "input": {"task": "Find every note about context compaction"}
-        });
-        assert_eq!(
-            tool_start_activity(&explore),
-            "Calling Explore...\nFind every note about context compaction"
-        );
-
-        let review = json!({
-            "name": "review",
-            "input": {"task": "Critique the draft migration plan"}
-        });
-        assert_eq!(
-            tool_start_activity(&review),
-            "Calling Review...\nCritique the draft migration plan"
-        );
+        let collaborator = json!({"name": "agents", "input": {"action": "spawn", "name": "Research"}});
+        assert_eq!(tool_start_activity(&collaborator), "Calling Agents...\nResearch");
 
         let wait = json!({"name": "wait", "input": {"seconds": 300}});
         assert_eq!(tool_start_activity(&wait), "Calling Wait...\n300 seconds");

@@ -2,7 +2,7 @@ use std::sync::{mpsc, Arc};
 
 use crate::core::agent::{CommandApproval, AGENT_STREAM_BUFFER};
 use crate::core::agent_panel::AgentPanel;
-use crate::core::agent_session::{AgentConversation, AgentPanelEntry};
+use crate::core::agent_session::AgentPanelEntry;
 use crate::core::attachment::AttachmentStore;
 use crate::core::workspace_index::WorkspaceIndex;
 
@@ -19,7 +19,7 @@ use std::fs;
 
 fn install_agent_observable(app: &mut App) -> tokio::sync::broadcast::Sender<AgentEvent> {
     let (sender, events) = tokio::sync::broadcast::channel(AGENT_STREAM_BUFFER);
-    app.active_agent_events = Some(events);
+    app.agent_events_rx = events;
     sender
 }
 
@@ -190,54 +190,6 @@ fn command_palette_names_mouse_support_action_for_the_next_state() {
 }
 
 #[test]
-fn command_palette_filters_and_clears_the_agent_session() {
-    let (mut app, _directory) = make_app();
-    app.agent_session
-        .replace_conversation(AgentConversation::seeded_for_test());
-    app.agent_panel
-        .push_entry(Arc::new(AgentPanelEntry::Prompt {
-            text: "Previous prompt".to_string(),
-            muted: false,
-        }));
-    app.persist_agent_session().unwrap();
-    assert!(app.storage().agent_session_path.exists());
-
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-    assert_eq!(app.overlay, Some(Overlay::Dialog));
-    assert_eq!(
-        app.dialog.as_ref().map(|dialog| dialog.purpose),
-        Some(DialogPurpose::CommandPalette)
-    );
-    assert_eq!(
-        app.command_matches.len(),
-        APP_COMMANDS
-            .iter()
-            .filter(|command| app.command_available(command.id))
-            .count()
-    );
-
-    app.handle_paste("clear");
-    assert_eq!(
-        app.command_matches.first(),
-        Some(&AppCommand::ClearAgentSession)
-    );
-    assert_eq!(
-        app.dialog
-            .as_ref()
-            .and_then(DialogState::selected_option)
-            .map(|option| option.label.as_str()),
-        Some("Agent: Clear session")
-    );
-    app.handle_key(key(KeyCode::Enter));
-
-    assert_eq!(app.overlay, None);
-    assert!(!app.agent_session.clear_conversation());
-    assert!(app.agent_panel.is_empty());
-    assert!(!app.storage().agent_session_path.exists());
-    assert_eq!(app.status, "Agent session cleared");
-}
-
-#[test]
 fn copy_last_agent_output_command_uses_latest_visible_assistant_text() {
     let (mut app, _directory) = make_app();
     assert!(!app.command_available(AppCommand::CopyLastAgentOutput));
@@ -285,198 +237,6 @@ fn copy_last_agent_output_command_uses_latest_visible_assistant_text() {
             .map(|option| option.label.as_str()),
         Some("Agent: Copy last output")
     );
-}
-
-#[test]
-fn app_restores_the_single_agent_session() {
-    let directory = tempfile::tempdir().unwrap();
-    let storage = Storage::new(directory.path()).unwrap();
-    storage.ensure_files().unwrap();
-    let conversation = AgentConversation::seeded_for_test();
-    let panel = vec![Arc::new(AgentPanelEntry::Assistant {
-        text: "Persisted answer".to_string(),
-        streaming: false,
-        final_output: true,
-    })];
-    storage
-        .write_agent_session(&AgentSessionScope::from_parts(
-            &conversation,
-            &panel
-                .iter()
-                .map(|entry| entry.as_ref().clone())
-                .collect::<Vec<_>>(),
-            TokenUsage {
-                input_tokens: 10,
-                output_tokens: 4,
-                cache_creation_input_tokens: 2,
-                cache_read_input_tokens: 3,
-            },
-            4,
-            Duration::from_secs(2),
-        ))
-        .unwrap();
-
-    let app = App::new_for_tests(storage).unwrap();
-
-    assert!(app.agent_session.clear_conversation());
-    assert_eq!(app.agent_panel.entries(), panel);
-    assert_eq!(app.agent_scroll, 0);
-    assert!(app.agent_follow_tail);
-    assert_eq!(app.agent_usage.input_tokens, 10);
-    assert_eq!(app.agent_timed_output_tokens, 4);
-    assert_eq!(app.agent_response_duration, Duration::from_secs(2));
-}
-
-#[test]
-fn conversation_update_overwrites_the_saved_agent_session() {
-    let (mut app, _directory) = make_app();
-    app.agent_panel
-        .push_entry(Arc::new(AgentPanelEntry::Assistant {
-            text: "Completed answer".to_string(),
-            streaming: false,
-            final_output: true,
-        }));
-    let sender = install_agent_observable(&mut app);
-
-    sender
-        .send(AgentEvent::ConversationUpdated(
-            AgentConversation::seeded_for_test(),
-        ))
-        .unwrap();
-    app.poll_agent();
-
-    let (mut conversation, panel, _, _, _) = app
-        .storage()
-        .load_agent_session()
-        .unwrap()
-        .unwrap()
-        .into_parts();
-    assert!(conversation.clear());
-    assert_eq!(
-        panel,
-        app.agent_panel
-            .entries()
-            .iter()
-            .map(|entry| entry.as_ref().clone())
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn settled_background_job_wakes_the_idle_agent() {
-    let (mut app, _directory) = make_app();
-    assert!(!app.ai_running);
-    let started = app
-        .agent
-        .jobs()
-        .start_background(crate::core::agent::JobKind::Shell, "sleep 1 && echo done")
-        .unwrap();
-    // Settles while idle: with no active run there is no observable to poll,
-    // so only the permanent subscription can observe the settlement and
-    // start the delivery run.
-    app.agent.jobs().settle(
-        &started.id,
-        Ok(crate::core::agent::ToolOutput::text("done".to_string())),
-    );
-    app.poll_agent();
-
-    assert!(app.ai_running, "a settled job must wake the idle agent");
-    assert!(app.agent_panel.entries().iter().any(|entry| {
-        matches!(
-            entry.as_ref(),
-            AgentPanelEntry::Prompt { text, muted: true, .. } if text.starts_with("Job completed")
-        )
-    }));
-    assert!(app.agent.jobs().take_deliveries().is_empty());
-}
-
-#[test]
-fn settled_job_during_a_run_does_not_start_a_second_run() {
-    let (mut app, _directory) = make_app();
-    app.ai_running = true;
-    let sender = install_agent_observable(&mut app);
-    let started = app
-        .agent
-        .jobs()
-        .start_background(crate::core::agent::JobKind::Shell, "sleep 1")
-        .unwrap();
-    app.agent.jobs().settle(
-        &started.id,
-        Ok(crate::core::agent::ToolOutput::text("done".to_string())),
-    );
-    // The run's own stream reports the settlement; its loop drains the
-    // delivery at the next round boundary.
-    sender
-        .send(AgentEvent::JobSettled {
-            id: started.id.clone(),
-            failed: false,
-        })
-        .unwrap();
-    app.poll_agent();
-
-    // The delivery stays queued for the run loop and the permanent
-    // subscription must not have started a duplicate delivery run.
-    assert!(!app.agent.jobs().take_deliveries().is_empty());
-    assert!(app
-        .agent_panel
-        .entries()
-        .iter()
-        .all(|entry| { !matches!(entry.as_ref(), AgentPanelEntry::Prompt { muted: true, .. }) }));
-}
-
-#[test]
-fn delivery_settled_during_the_final_answer_still_wakes_the_agent() {
-    let (mut app, _directory) = make_app();
-    app.ai_running = true;
-    let sender = install_agent_observable(&mut app);
-    let started = app
-        .agent
-        .jobs()
-        .start_background(crate::core::agent::JobKind::Shell, "sleep 1 && echo done")
-        .unwrap();
-    // The job settles while the model streams its final answer: the run's
-    // loop has already passed its last delivery drain, so only the Finished
-    // handler can start the wake-up run for the queued delivery.
-    app.agent.jobs().settle(
-        &started.id,
-        Ok(crate::core::agent::ToolOutput::text("done".to_string())),
-    );
-    sender
-        .send(AgentEvent::Finished(Ok("final answer".to_string())))
-        .unwrap();
-    app.poll_agent();
-
-    assert!(
-        app.ai_running,
-        "the queued delivery must start a wake-up run"
-    );
-    assert!(app.agent_panel.entries().iter().any(|entry| {
-        matches!(
-            entry.as_ref(),
-            AgentPanelEntry::Prompt { text, muted: true, .. } if text.starts_with("Job completed")
-        )
-    }));
-    assert!(app.agent.jobs().take_deliveries().is_empty());
-}
-
-#[test]
-fn failed_session_delete_keeps_the_in_memory_session() {
-    let (mut app, _directory) = make_app();
-    app.agent_session
-        .replace_conversation(AgentConversation::seeded_for_test());
-    install_agent_terminal_snapshot(&mut app);
-    fs::write(
-        app.storage().agent_session_path.parent().unwrap(),
-        "blocked",
-    )
-    .unwrap();
-
-    app.clear_agent_session();
-
-    assert!(app.agent_session.clear_conversation());
-    assert!(!app.agent.terminal().is_running());
-    assert!(app.status.starts_with("Agent session clear error:"));
-    assert!(app.notifications.visible().is_some());
 }
 
 #[test]
@@ -1616,8 +1376,16 @@ fn private_terminal_input_is_masked_and_sent_only_on_its_private_channel() {
         .entries()
         .iter()
         .any(|entry| format!("{entry:?}").contains(secret)));
+    app.sessions.retain(app.session_note.clone()).unwrap();
     app.persist_agent_session().unwrap();
-    let persisted = fs::read_to_string(&app.storage().agent_session_path).unwrap();
+    let persisted = fs::read_to_string(
+        app.storage()
+            .root
+            .join("agents")
+            .join(app.session_note.summary().id.to_string())
+            .join("session.json"),
+    )
+    .unwrap();
     assert!(!persisted.contains(secret));
 
     app.handle_key(key(KeyCode::Enter));
@@ -2577,7 +2345,7 @@ fn agent_open_file_event_displays_the_note_in_the_tui() {
 fn c_cancels_a_running_agent_only_from_the_agent_panel() {
     let (mut app, _directory) = make_app();
     let (_sender, events) = tokio::sync::broadcast::channel(1);
-    app.active_agent_events = Some(events);
+    app.agent_events_rx = events;
     app.ai_running = true;
     app.agent_panel.push_entry(Arc::new(AgentPanelEntry::Tool {
         text: "Fetching Web...".to_string(),
@@ -2643,38 +2411,23 @@ fn agent_statistics_panel_keys_scroll_the_job_list() {
 }
 
 #[test]
-fn uppercase_c_cancels_work_and_clears_the_agent_session() {
+fn uppercase_c_opens_a_new_session_dialog_while_the_current_session_keeps_working() {
     let (mut app, _directory) = make_app();
+    app.sessions.retain(app.session_note.clone()).unwrap();
+    let original = app.session_note.summary().id;
     app.ai_running = true;
-    app.agent_panel = AgentPanel::from_entries(vec![
-        Arc::new(AgentPanelEntry::Prompt {
-            text: "Current prompt".to_string(),
-            muted: false,
-        }),
-        Arc::new(AgentPanelEntry::Tool {
-            text: "Searching Web...".to_string(),
-            active: true,
-            preview: None,
-        }),
-        Arc::new(AgentPanelEntry::Assistant {
-            text: "Looking for sources.".to_string(),
-            streaming: true,
-            final_output: false,
-        }),
-    ]);
-    app.agent_session
-        .replace_conversation(AgentConversation::seeded_for_test());
     app.focus = Focus::Agent;
-    install_agent_terminal_snapshot(&mut app);
-
     app.handle_key(key(KeyCode::Char('C')));
-
-    assert!(app.agent.is_cancel_requested());
-    assert!(!app.ai_running);
-    assert!(!app.agent_session.clear_conversation());
-    assert!(app.agent_panel.is_empty());
-    assert!(!app.agent.terminal().is_running());
-    assert_eq!(app.status, "Agent session cleared");
+    assert_eq!(
+        app.dialog.as_ref().unwrap().purpose,
+        DialogPurpose::NewAgentSession
+    );
+    app.handle_paste("Research");
+    app.handle_key(key(KeyCode::Enter));
+    assert_ne!(app.session_note.summary().id, original);
+    assert_eq!(app.session_note.summary().title, "Research");
+    assert_eq!(app.sessions.list().len(), 2);
+    assert!(app.sessions.get(original).is_ok());
 }
 
 #[test]
@@ -3166,7 +2919,7 @@ fn files_search_uses_note_files_without_duplicate_lists() {
         .into_iter()
         .filter_map(|row| match row {
             FileListRow::File(index) => Some(index),
-            FileListRow::Group(_) => None,
+            FileListRow::Group(_) | FileListRow::Agent(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(visible.len(), 1);
@@ -4249,7 +4002,7 @@ fn move_targets_list_managed_data_notes() {
                 .file_stem()
                 .and_then(|name| name.to_str())
                 .map(str::to_string),
-            FileListRow::Group(_) => None,
+            FileListRow::Group(_) | FileListRow::Agent(_) => None,
         })
         .collect();
     assert_eq!(names, vec!["Work"]);

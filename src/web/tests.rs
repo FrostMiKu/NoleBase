@@ -16,10 +16,10 @@ use crate::core::agent::{
     AgentEvent, AgentStopReason, ApprovalKind, ApprovalRequest, AskUserRequest, CommandApproval,
     PrivateTerminalInputRequest,
 };
-use crate::core::agent_service::AgentService;
 use crate::core::agent_session::{
     AgentConversation, AgentPanelEntry, AgentSessionScope, TokenUsage,
 };
+use crate::core::agent_sessions::AgentSessions;
 use crate::core::storage::Storage;
 use crate::core::workspace::Workspace;
 use crate::core::workspace_watcher::WorkspaceEvent;
@@ -36,8 +36,10 @@ fn test_state_with(restored: AgentSessionScope) -> (WebState, tempfile::TempDir)
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
     let workspace = Arc::new(Workspace::open(storage).unwrap());
-    let agent = Arc::new(AgentService::new(&workspace));
-    (WebState::new(workspace, agent, restored), directory)
+    let sessions = AgentSessions::open(workspace.clone()).unwrap();
+    let runtime = sessions.create("Test").unwrap();
+    runtime.restore_scope_for_test(restored);
+    (WebState::new(workspace, sessions), directory)
 }
 
 /// Block until the document index publishes a snapshot, mirroring the core
@@ -62,20 +64,38 @@ async fn request(router: &Router, request: Request<Body>) -> (StatusCode, Value,
     (status, json, text)
 }
 
+async fn scoped_uri(router: &Router, uri: &str) -> String {
+    if !uri.contains("$session") {
+        return uri.to_string();
+    }
+    let (_, list, _) = request(
+        router,
+        Request::builder()
+            .uri("/api/agents")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let id = list["sessions"][0]["id"].as_str().unwrap();
+    uri.replace("$session", id)
+}
+
 async fn get(router: &Router, uri: &str) -> (StatusCode, Value, String) {
+    let uri = scoped_uri(router, uri).await;
     request(
         router,
-        Request::builder().uri(uri).body(Body::empty()).unwrap(),
+        Request::builder().uri(&uri).body(Body::empty()).unwrap(),
     )
     .await
 }
 
 async fn put_json(router: &Router, uri: &str, body: Value) -> (StatusCode, Value, String) {
+    let uri = scoped_uri(router, uri).await;
     request(
         router,
         Request::builder()
             .method("PUT")
-            .uri(uri)
+            .uri(&uri)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -84,11 +104,12 @@ async fn put_json(router: &Router, uri: &str, body: Value) -> (StatusCode, Value
 }
 
 async fn delete(router: &Router, uri: &str) -> (StatusCode, Value, String) {
+    let uri = scoped_uri(router, uri).await;
     request(
         router,
         Request::builder()
             .method("DELETE")
-            .uri(uri)
+            .uri(&uri)
             .body(Body::empty())
             .unwrap(),
     )
@@ -96,11 +117,12 @@ async fn delete(router: &Router, uri: &str) -> (StatusCode, Value, String) {
 }
 
 async fn post_json(router: &Router, uri: &str, body: Value) -> (StatusCode, Value, String) {
+    let uri = scoped_uri(router, uri).await;
     request(
         router,
         Request::builder()
             .method("POST")
-            .uri(uri)
+            .uri(&uri)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -1075,36 +1097,46 @@ async fn agent_commands_validate_input() {
     let (state, _directory) = test_state();
     let router = server::router(state.clone());
 
-    let (status, json, _) = post_json(&router, "/api/agent/run", json!({"prompt": ""})).await;
+    let (status, json, _) =
+        post_json(&router, "/api/agents/$session/run", json!({"prompt": ""})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&json), "bad_request");
-    let (status, _json, _) = post_json(&router, "/api/agent/run", json!({})).await;
+    let (status, _json, _) = post_json(&router, "/api/agents/$session/run", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let (status, json, _) = post_json(
         &router,
-        "/api/agent/approval",
+        "/api/agents/$session/approval",
         json!({"decision": "whatever"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&json), "bad_request");
-    let (status, _json, _) = post_json(&router, "/api/agent/answer", json!({})).await;
+    let (status, _json, _) = post_json(&router, "/api/agents/$session/answer", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _json, _) = post_json(&router, "/api/agent/terminal-input", json!({})).await;
+    let (status, _json, _) =
+        post_json(&router, "/api/agents/$session/terminal-input", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, _json, _) =
-        put_json(&router, "/api/agent/permission", json!({"mode": "banana"})).await;
+    let (status, _json, _) = put_json(
+        &router,
+        "/api/agents/$session/permission",
+        json!({"mode": "banana"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, json, _) =
-        put_json(&router, "/api/agent/permission", json!({"mode": "auto"})).await;
+    let (status, json, _) = put_json(
+        &router,
+        "/api/agents/$session/permission",
+        json!({"mode": "auto"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["mode"], json!("auto"));
-    let (status, json, _) = get(&router, "/api/agent/permission").await;
+    let (status, json, _) = get(&router, "/api/agents/$session/permission").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["mode"], json!("auto"));
-    let (status, json, _) = get(&router, "/api/agent").await;
+    let (status, json, _) = get(&router, "/api/agents/$session").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["running"], json!(false));
 }
@@ -1174,11 +1206,7 @@ async fn http_mutations_broadcast_through_the_workspace_watcher() {
     let storage = Storage::new(directory.path()).unwrap();
     storage.ensure_files().unwrap();
     let mut nole = Nole::open(storage).unwrap();
-    let state = WebState::new(
-        nole.workspace().clone(),
-        nole.agent().clone(),
-        AgentSessionScope::default(),
-    );
+    let state = WebState::new(nole.workspace().clone(), nole.sessions().clone());
     // Drain the initial snapshot like the web watcher loop does.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !state.workspace.poll_index_update() {
@@ -1286,7 +1314,12 @@ async fn http_mutations_broadcast_through_the_workspace_watcher() {
 async fn agent_run_is_accepted_and_reports_conflict_while_active() {
     let (state, _directory) = test_state();
     let router = server::router(state.clone());
-    let (status, _, _) = post_json(&router, "/api/agent/run", json!({"prompt": "hello"})).await;
+    let (status, _, _) = post_json(
+        &router,
+        "/api/agents/$session/run",
+        json!({"prompt": "hello"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     // The temporary workspace has no provider configuration, so the run
     // settles with an error quickly; either a second conflict (still
@@ -1295,14 +1328,14 @@ async fn agent_run_is_accepted_and_reports_conflict_while_active() {
     // below.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (_, json, _) = get(&router, "/api/agent").await;
+        let (_, json, _) = get(&router, "/api/agents/$session").await;
         if json["running"] == json!(false) {
             break;
         }
         assert!(Instant::now() < deadline, "agent run must settle");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let (status, _, _) = post_json(&router, "/api/agent/cancel", json!({})).await;
+    let (status, _, _) = post_json(&router, "/api/agents/$session/cancel", json!({})).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
@@ -1541,7 +1574,7 @@ async fn history_serves_the_restored_session_transcript() {
     );
     let (state, _directory) = test_state_with(restored);
 
-    let (status, json, _) = get(&server::router(state), "/api/agent/history").await;
+    let (status, json, _) = get(&server::router(state), "/api/agents/$session/history").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["message_count"], json!(1));
     // Restored entries are settled snapshots: no streaming/active flags.
@@ -1561,58 +1594,34 @@ async fn history_serves_the_restored_session_transcript() {
 async fn run_echoes_the_prompt_into_the_history() {
     let (state, _directory) = test_state();
     let router = server::router(state.clone());
-    let (status, _, _) = post_json(&router, "/api/agent/run", json!({"prompt": "hello"})).await;
+    let (status, _, _) = post_json(
+        &router,
+        "/api/agents/$session/run",
+        json!({"prompt": "hello"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED);
 
-    let (_, json, _) = get(&router, "/api/agent/history").await;
+    let (_, json, _) = get(&router, "/api/agents/$session/history").await;
     assert_eq!(
-        json["entries"],
-        json!([{"kind": "prompt", "entry": {"text": "hello"}}])
+        json["entries"][0],
+        json!({"kind": "prompt", "entry": {"text": "hello"}})
     );
 
     // A rejected start must not leave a phantom prompt echo behind.
-    let (status, _, _) = post_json(&router, "/api/agent/run", json!({"prompt": ""})).await;
+    let (status, _, _) =
+        post_json(&router, "/api/agents/$session/run", json!({"prompt": ""})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (_, json, _) = get(&router, "/api/agent/history").await;
-    assert_eq!(json["entries"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn agent_events_are_recorded_and_persisted_at_lifecycle_points() {
-    let (state, directory) = test_state();
-    let storage = Storage::new(directory.path()).unwrap();
-
-    state.record_agent_event(
-        &AgentEvent::ConversationUpdated(AgentConversation::seeded_for_test()),
-        &storage,
+    let (_, json, _) = get(&router, "/api/agents/$session/history").await;
+    assert_eq!(
+        json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "prompt")
+            .count(),
+        1
     );
-    state.record_agent_event(
-        &AgentEvent::Usage(TokenUsage {
-            input_tokens: 5,
-            output_tokens: 2,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        }),
-        &storage,
-    );
-    // A conversation update is itself a persistence point (like the TUI),
-    // so the scope is already on disk before the run settles.
-    let first = storage.load_agent_session().unwrap().unwrap();
-    assert_eq!(first.into_parts().0.messages.len(), 1);
-
-    state.record_agent_event(&AgentEvent::Finished(Err("boom".to_string())), &storage);
-
-    let persisted = storage.load_agent_session().unwrap().unwrap();
-    let (conversation, panel, usage, _, _) = persisted.into_parts();
-    // The conversation update was applied to the session before persisting.
-    assert_eq!(conversation.messages.len(), 1);
-    assert_eq!(usage.input_tokens, 5);
-    assert!(matches!(
-        panel.last(),
-        Some(AgentPanelEntry::Error(message)) if message == "Agent failed: boom"
-    ));
-    // The restored conversation continues the session's context.
-    assert_eq!(state.session.conversation().messages.len(), 1);
 }
 
 #[tokio::test]
@@ -1849,4 +1858,66 @@ async fn attachment_routes_reject_symlink_content_without_leaking_paths() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(!text.contains("private bytes"));
     assert!(!text.contains(directory.path().to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn agents_are_managed_independently_from_notes_and_from_each_other() {
+    let (state, _directory) = test_state();
+    let first = state.sessions.list()[0].id;
+    let router = server::router(state.clone());
+    let (status, created, _) =
+        post_json(&router, "/api/agents", json!({"title": "Research"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let second = created["id"].as_str().unwrap();
+    assert_ne!(second, first.to_string());
+    let (status, notes, _) = get(&router, "/api/notes").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(notes.as_array().unwrap().is_empty());
+    let (_, list, _) = get(&router, "/api/agents").await;
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 2);
+    let path = format!("/api/agents/{second}");
+    assert_eq!(
+        put_json(&router, &path, json!({"title": "Renamed"}))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(get(&router, &path).await.1["session"]["title"], "Renamed");
+    assert_eq!(
+        put_json(
+            &router,
+            &format!("{path}/permission"),
+            json!({"mode": "yolo"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let first_path = format!("/api/agents/{first}");
+    assert_eq!(
+        get(&router, &format!("{first_path}/permission")).await.1["mode"],
+        "approve"
+    );
+    state
+        .sessions
+        .get(second.parse().unwrap())
+        .unwrap()
+        .observe(&AgentEvent::Finished(Ok("Done".into())));
+    assert_eq!(get(&router, &path).await.1["session"]["unread"], true);
+    assert_eq!(
+        post_json(&router, &format!("{path}/read"), json!({}))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(get(&router, &path).await.1["session"]["unread"], false);
+    assert_eq!(delete(&router, &path).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(get(&router, &path).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(get(&router, &first_path).await.0, StatusCode::OK);
+    assert_eq!(
+        post_json(&router, "/api/agents", json!({"title": "  "}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
 }

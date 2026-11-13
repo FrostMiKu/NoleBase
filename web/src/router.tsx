@@ -9,6 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { AppShell } from '@/app/AppShell'
+import { useAgentStore } from '@/stores/agent-store'
 import { AgentPage } from '@/features/agent/AgentPage'
 const DocumentPage = lazy(() =>
   import('@/editor/DocumentPage').then((module) => ({ default: module.DocumentPage })),
@@ -106,6 +107,8 @@ const tagsRoute = createRoute({
 const agentRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/agent',
+  validateSearch: (search: Record<string, unknown>): { session?: string } => typeof search['session'] === 'string' ? { session: search['session'] } : {},
+  beforeLoad: ({ search }) => { if (search.session) useAgentStore.getState().selectSession(search.session) },
   component: AgentPage,
 })
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -251,7 +252,7 @@ pub enum AgentSessionStart {
 /// active run handle, and the idle background-job delivery both
 /// presentations previously reimplemented on their own.
 ///
-/// A supervisor thread keeps the conversation in sync from
+/// The Session note recorder keeps the conversation in sync from
 /// `ConversationUpdated` events, marks the session idle on
 /// `Finished`/`Stopped`, and — when a background job settles while no run
 /// is active — starts a continuation run with the queued results, the
@@ -261,22 +262,9 @@ pub struct AgentSession {
     service: Arc<AgentService>,
     conversation: Mutex<AgentConversation>,
     run: Mutex<Option<CancellationToken>>,
-    /// Whether the supervisor thread starts continuation runs on its own
-    /// (web/headless clients). The TUI keeps delivery triggering inside its
-    /// event loop for buffered-input priority and calls the capability
-    /// directly instead.
+    halted: AtomicBool,
+    /// Enable automatic continuation when background results arrive.
     auto_deliver_jobs: bool,
-}
-
-/// A wake-up run carrying settled background-job results: the framed prompt
-/// echo for presentation layers, and the run's own event stream for clients
-/// that drain events directly (the TUI).
-pub struct JobDeliveryRun {
-    /// Framed prompt for the model (what the wake-up run receives).
-    pub prompt: String,
-    /// Human-readable summary for the presentation layer's transcript.
-    pub echo: String,
-    pub events: tokio::sync::broadcast::Receiver<AgentEvent>,
 }
 
 impl AgentSession {
@@ -286,21 +274,60 @@ impl AgentSession {
     /// its own; otherwise the presentation layer triggers delivery via
     /// [`AgentSession::deliver_jobs_if_idle`] at its own point in the event
     /// loop.
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         service: Arc<AgentService>,
         conversation: AgentConversation,
         auto_deliver_jobs: bool,
     ) -> Arc<Self> {
-        let session = Arc::new(Self {
-            service,
-            conversation: Mutex::new(conversation),
-            run: Mutex::new(None),
-            auto_deliver_jobs,
-        });
+        let session = Self::recorded(service, conversation, auto_deliver_jobs);
         session.spawn_supervisor();
         session
     }
 
+    pub(crate) fn recorded(
+        service: Arc<AgentService>,
+        conversation: AgentConversation,
+        auto_deliver_jobs: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            service,
+            conversation: Mutex::new(conversation),
+            run: Mutex::new(None),
+            halted: AtomicBool::new(false),
+            auto_deliver_jobs,
+        })
+    }
+
+    pub(crate) fn observe(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ConversationUpdated(conversation) => {
+                self.replace_conversation(conversation.clone())
+            }
+            AgentEvent::Finished(_) | AgentEvent::Stopped(_) => {
+                let mut run = self.run.lock().unwrap();
+                *run = None;
+                if self.halted.load(Ordering::Relaxed) {
+                    return;
+                }
+                let prompts = self.service.take_buffered_prompts();
+                if !prompts.is_empty() {
+                    self.service
+                        .emit(AgentEvent::BufferedInputConsumed(prompts.len()));
+                    if let Err(error) = self.start_locked(prompts.join("\n\n"), &mut run) {
+                        eprintln!("[nole] Session continuation failed: {error:#}");
+                    }
+                } else {
+                    drop(run);
+                    self.auto_deliver();
+                }
+            }
+            AgentEvent::JobSettled { .. } => self.auto_deliver(),
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
     fn spawn_supervisor(self: &Arc<Self>) {
         let supervisor = Arc::downgrade(self);
         let mut events = self.service.subscribe();
@@ -315,27 +342,7 @@ impl AgentSession {
                 let Some(supervisor) = supervisor.upgrade() else {
                     break;
                 };
-                match event {
-                    AgentEvent::ConversationUpdated(conversation) => {
-                        if let Ok(mut current) = supervisor.conversation.lock() {
-                            *current = conversation;
-                        }
-                    }
-                    // A finished or stopped run frees the session; a job
-                    // that settled during the final round would otherwise
-                    // strand its result until an unrelated future run.
-                    AgentEvent::Finished(_) | AgentEvent::Stopped(_) => {
-                        if let Ok(mut run) = supervisor.run.lock() {
-                            *run = None;
-                        }
-                        supervisor.auto_deliver();
-                    }
-                    AgentEvent::JobSettled { .. } => {
-                        supervisor.auto_deliver();
-                    }
-                    AgentEvent::JobDelivered(_) => {}
-                    _ => {}
-                }
+                supervisor.observe(&event);
             })
             .expect("spawning the agent session supervisor");
     }
@@ -391,10 +398,19 @@ impl AgentSession {
         if run.is_some() {
             return Ok(AgentSessionStart::AlreadyRunning);
         }
+        self.halted.store(false, Ordering::Relaxed);
+        self.start_locked(prompt, &mut run)
+    }
+
+    fn start_locked(
+        &self,
+        prompt: String,
+        run: &mut Option<CancellationToken>,
+    ) -> anyhow::Result<AgentSessionStart> {
         let conversation = self
             .conversation
             .lock()
-            .map_err(|_| anyhow::anyhow!("agent session lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("Session lock poisoned"))?
             .clone();
         let observable = self.service.run(prompt, conversation)?;
         *run = Some(observable.cancel.clone());
@@ -404,11 +420,12 @@ impl AgentSession {
     /// Request cancellation of the active run. The session returns to idle
     /// when the worker confirms via `Stopped`/`Finished`.
     pub fn cancel(&self) {
+        let run = self.run.lock().unwrap();
+        self.halted.store(true, Ordering::Relaxed);
+        self.service.clear_buffered_prompts();
         self.service.cancel();
-        if let Ok(run) = self.run.lock() {
-            if let Some(cancel) = run.as_ref() {
-                cancel.cancel();
-            }
+        if let Some(cancel) = run.as_ref() {
+            cancel.cancel();
         }
     }
 
@@ -428,8 +445,11 @@ impl AgentSession {
         }
     }
 
-    pub fn deliver_jobs_if_idle(&self) -> anyhow::Result<Option<JobDeliveryRun>> {
-        if self.is_running() {
+    pub fn deliver_jobs_if_idle(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::broadcast::Receiver<AgentEvent>>> {
+        let mut run = self.run.lock().unwrap();
+        if run.is_some() || self.halted.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let deliveries = self.service.jobs().take_deliveries();
@@ -437,19 +457,8 @@ impl AgentSession {
             return Ok(None);
         }
         let prompt = crate::core::agent::format_job_deliveries(&deliveries);
-        let echo = match (deliveries.first(), deliveries.len()) {
-            (Some(first), 1) if first.status == crate::core::agent::JobStatus::Failed => {
-                format!("Job failed: {}", first.label)
-            }
-            (Some(first), _) => format!("Job completed: {}", first.label),
-            (None, _) => return Ok(None),
-        };
-        match self.start(prompt.clone())? {
-            AgentSessionStart::Started(events) => Ok(Some(JobDeliveryRun {
-                prompt,
-                echo,
-                events,
-            })),
+        match self.start_locked(prompt.clone(), &mut run)? {
+            AgentSessionStart::Started(events) => Ok(Some(events)),
             AgentSessionStart::AlreadyRunning => Ok(None),
         }
     }
@@ -525,11 +534,10 @@ mod tests {
             .deliver_jobs_if_idle()
             .unwrap()
             .expect("queued deliveries must start a wake-up run");
-        assert_eq!(delivery.echo, "Job completed: index build");
         // The temporary workspace has no provider configuration, so the
         // wake-up run settles with an error quickly; its event stream must
         // still carry the run's Finished marker.
-        let mut events = delivery.events;
+        let mut events = delivery;
         let finished = wait_for_finished(&mut events);
         assert!(finished.is_err());
         wait_idle(&session);
@@ -592,8 +600,7 @@ mod tests {
             &started.id,
             Ok(crate::core::agent::ToolOutput::text("done".to_string())),
         );
-        // The TUI mode triggers delivery from its own event loop; the
-        // supervisor must leave the session idle here.
+        // With automatic delivery disabled the caller triggers continuation.
         std::thread::sleep(Duration::from_millis(300));
         assert!(!session.is_running());
         assert!(!session.service().jobs().take_deliveries().is_empty());

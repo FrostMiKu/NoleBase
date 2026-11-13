@@ -308,7 +308,7 @@ fn command_palette_is_fixed_width_and_renders_query_and_commands() {
     assert!(screen.contains("/ agent"));
     assert!(screen.contains("Agent: Interrupt task"));
     assert!(screen.contains("Stop the active Agent task"));
-    assert!(screen.contains("Agent: Clear session"));
+    assert!(screen.contains("Agent: New session"));
     let palette = app.layout.overlay.unwrap();
     assert_eq!(palette.width, 80);
     assert_eq!(
@@ -3941,4 +3941,113 @@ fn wiki_completion_popup_selection_leads_list_follows() {
         !row_has_indicator(selected_row + 1),
         "the row below the selection (Item 09) is not the selected row"
     );
+}
+
+#[test]
+fn agents_category_uses_animation_unread_dot_and_full_row_selection_without_changing_note_counts() {
+    use crate::core::agent_sessions::SessionSummary;
+    use chrono::TimeZone;
+    let updated_at = Local
+        .with_ymd_and_hms(2026, 11, 13, 14, 35, 0)
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    let (mut app, _directory) = make_app();
+    let running = uuid::Uuid::new_v4();
+    let unread = uuid::Uuid::new_v4();
+    let plain = uuid::Uuid::new_v4();
+    app.agent_notes = vec![
+        SessionSummary {
+            id: running,
+            title: "Research".into(),
+            updated_at,
+            running: true,
+            unread: true,
+        },
+        SessionSummary {
+            id: unread,
+            title: "Writing".into(),
+            updated_at,
+            running: false,
+            unread: true,
+        },
+        SessionSummary {
+            id: plain,
+            title: "Planning".into(),
+            updated_at,
+            running: false,
+            unread: false,
+        },
+    ];
+    app.focus = Focus::Files;
+    app.file_row = app
+        .visible_file_rows()
+        .iter()
+        .position(|row| *row == FileListRow::Agent(unread))
+        .unwrap();
+    let terminal = render(&mut app, 170, 30);
+    assert!(app.note_files.is_empty());
+    let buffer = terminal.backend().buffer();
+    let group = app
+        .file_group_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.group == FileGroup::Agents)
+        .unwrap()
+        .area;
+    let area = |id| {
+        app.agent_session_hitboxes
+            .iter()
+            .find(|(item, _)| *item == id)
+            .unwrap()
+            .1
+    };
+    let running_area = area(running);
+    let unread_area = area(unread);
+    let plain_area = area(plain);
+    assert_eq!(
+        running_area.y,
+        group.y + 2,
+        "first Session begins after its shared blank row"
+    );
+    let row_text = |area: Rect| {
+        (area.x..area.right())
+            .map(|x| buffer[(x, area.y)].symbol())
+            .collect::<String>()
+    };
+    assert!(row_text(running_area).contains(spinner_frame(app.animation_tick)));
+    assert!(!row_text(running_area).contains('●'));
+    assert!(row_text(unread_area).contains('●'));
+    assert_eq!(row_text(plain_area).trim(), "Planning");
+    for area in [running_area, unread_area, plain_area] {
+        let date = (area.x..area.right())
+            .map(|x| buffer[(x, area.y + 1)].symbol())
+            .collect::<String>();
+        assert!(
+            date.contains("26/11/13 14:35"),
+            "each Session shows its local update date on the second row: {date:?}"
+        );
+        assert_eq!(
+            area.height, 2,
+            "the title and date form the clickable content"
+        );
+    }
+    let dot = (unread_area.x..unread_area.right())
+        .find(|x| buffer[(*x, unread_area.y)].symbol() == "●")
+        .unwrap();
+    assert_eq!(buffer[(dot, unread_area.y)].fg, Color::Green);
+    for y in unread_area.y - 1..=unread_area.y + 2 {
+        assert_eq!(
+            buffer[(unread_area.x, y)].symbol(),
+            "▌",
+            "selection indicator covers the complete selected area"
+        );
+    }
+    assert!(animations_active(&app, true));
+    app.animation_tick += 1;
+    app.agent_notes[0].title = "Long Session name ".repeat(20);
+    let next = render(&mut app, 170, 30);
+    let next_text = (running_area.x..running_area.right())
+        .map(|x| next.backend().buffer()[(x, running_area.y)].symbol())
+        .collect::<String>();
+    assert!(next_text.contains(spinner_frame(app.animation_tick)));
 }

@@ -6,6 +6,7 @@ pub mod agent;
 pub mod agent_panel;
 pub mod agent_service;
 pub mod agent_session;
+pub mod agent_sessions;
 pub mod attachment;
 pub mod attachment_index;
 pub mod attachment_usage;

@@ -17,7 +17,7 @@ use crate::core::agent::{
 };
 use crate::core::agent_panel::AgentPanel;
 use crate::core::agent_service::AgentService;
-use crate::core::agent_session::{AgentSession, AgentSessionScope, AgentSessionStart, TokenUsage};
+use crate::core::agent_session::{AgentSession, AgentSessionStart, TokenUsage};
 use crate::core::attachment::AttachmentId;
 use crate::core::embedded_terminal::{EmbeddedTerminal, TerminalSnapshot};
 use crate::core::export::ExportFormat;
@@ -47,6 +47,7 @@ mod document;
 mod documents;
 mod input;
 mod model;
+mod sessions;
 #[cfg(test)]
 mod skill_tests;
 mod terminal;
@@ -231,6 +232,12 @@ pub struct App {
     /// ask-user / private-input channels, permission mode, and buffered
     /// prompts. The TUI is a consumer; it does not wire these channels.
     pub agent: Arc<AgentService>,
+    pub sessions: Arc<crate::core::agent_sessions::AgentSessions>,
+    pub session_note: Arc<crate::core::agent_sessions::SessionNoteRuntime>,
+    pub agent_notes: Vec<crate::core::agent_sessions::SessionSummary>,
+    pub agents_expanded: bool,
+    pub agent_session_hitboxes: Vec<(uuid::Uuid, Rect)>,
+    pending_agent_session: Option<uuid::Uuid>,
     pub theme: crate::tui::theme::Theme,
     pub theme_selection: String,
     pub active_theme: String,
@@ -338,6 +345,7 @@ pub struct App {
     pub help_scroll: u16,
     pub status: String,
     pub animation_tick: u64,
+    pub terminal_focused: bool,
     pub mouse_captured: bool,
     pub layout: LayoutSnapshot,
 
@@ -366,7 +374,6 @@ pub struct App {
     terminal: Option<EmbeddedTerminal>,
     terminal_return_overlay: Option<Overlay>,
     terminal_return_dialog: Option<DialogState>,
-    active_agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     pub ai_running: bool,
     pub agent_panel: AgentPanel,
     pub(crate) agent_vlist: AgentVirtualList,
@@ -387,9 +394,7 @@ pub struct App {
     /// worker at run start; `None` until the first run announces it.
     pub agent_effort: Option<String>,
     pub(crate) agent_session: Arc<AgentSession>,
-    /// Permanent subscription to the agent event channel. Runs deliver their
-    /// stream through their own subscription in `active_agent`; this one only
-    /// exists so `JobSettled` can still be observed while the agent is idle.
+    /// Ordered events from the selected Session note recorder.
     agent_events_rx: tokio::sync::broadcast::Receiver<AgentEvent>,
     pub ai_prompt_input: String,
     pub ai_prompt_cursor: usize,
@@ -433,26 +438,21 @@ struct CodeCopyFeedback {
 }
 
 impl App {
-    pub fn new(workspace: Arc<Workspace>, agent: Arc<AgentService>) -> anyhow::Result<Self> {
-        // One agent service, one session: the presentation layer only ever
-        // observes events and forwards commands.
+    pub fn new(
+        workspace: Arc<Workspace>,
+        sessions: Arc<crate::core::agent_sessions::AgentSessions>,
+    ) -> anyhow::Result<Self> {
         let storage = workspace.storage();
         let loaded_theme = crate::tui::theme::load_theme(storage, None)?;
-        let (
-            agent_conversation,
-            agent_panel,
-            agent_usage,
-            agent_timed_output_tokens,
-            agent_response_duration,
-        ) = storage
-            .load_agent_session()?
-            .unwrap_or_default()
-            .into_parts();
-        // The session owns the conversation from here on: the supervisor
-        // thread keeps it current from `ConversationUpdated` events and
-        // starts idle background-job delivery runs on `JobSettled`.
-        let agent_session =
-            crate::core::agent_session::AgentSession::new(agent.clone(), agent_conversation, false);
+        let session_note = match sessions.list().first() {
+            Some(note) => sessions.get(note.id)?,
+            None => sessions.draft("New session")?,
+        };
+        let agent = session_note.service.clone();
+        let agent_session = session_note.session.clone();
+        let (_, agent_panel, agent_usage, agent_timed_output_tokens, agent_response_duration) =
+            session_note.scope().into_parts();
+        let agent_notes = sessions.list();
         let agent_follow_tail = !agent_panel.is_empty();
         let agent_scroll = 0;
         let agent_panel = AgentPanel::from_entries(agent_panel);
@@ -466,7 +466,7 @@ impl App {
         let file_row = usize::from(first_note.is_some());
         let todo_items = workspace.todos()?;
         let images = crate::tui::media::ImageService::new(&storage.root);
-        let agent_events_rx = agent_session.service().subscribe();
+        let agent_events_rx = session_note.subscribe();
         let show_full_thinking = storage.show_full_thinking().unwrap_or(false);
         let mut agent_effort = None;
         if let Ok(effort) = AgentConfig::load_effort(&storage.ai_config_path) {
@@ -477,6 +477,12 @@ impl App {
         Ok(Self {
             workspace,
             agent,
+            sessions,
+            session_note,
+            agent_notes,
+            agents_expanded: true,
+            agent_session_hitboxes: Vec::new(),
+            pending_agent_session: None,
             theme: loaded_theme.theme,
             theme_selection: loaded_theme.requested,
             active_theme: loaded_theme.active,
@@ -558,6 +564,7 @@ impl App {
             help_scroll: 0,
             status: String::new(),
             animation_tick: 0,
+            terminal_focused: true,
             mouse_captured: true,
             layout: LayoutSnapshot::default(),
             hitboxes: Vec::new(),
@@ -580,7 +587,6 @@ impl App {
             terminal: None,
             terminal_return_overlay: None,
             terminal_return_dialog: None,
-            active_agent_events: None,
             ai_running: false,
             agent_panel,
             agent_vlist: AgentVirtualList::default(),
@@ -675,8 +681,8 @@ impl App {
     #[cfg(test)]
     pub(crate) fn new_for_tests(storage: Storage) -> anyhow::Result<Self> {
         let workspace = Arc::new(Workspace::open(storage)?);
-        let agent = Arc::new(crate::core::agent_service::AgentService::new(&workspace));
-        Self::new(workspace, agent)
+        let sessions = crate::core::agent_sessions::AgentSessions::open(workspace.clone())?;
+        Self::new(workspace, sessions)
     }
 
     pub(super) fn reload_thinking_display_config(&mut self) {

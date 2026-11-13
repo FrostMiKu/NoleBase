@@ -265,10 +265,12 @@ config/         # private application configuration
   ai.toml       # LLM provider and optional Tavily configuration
   settings.toml # theme, default export directory, editor, and terminal shell
   AGENTS.md      # user-authored Agent instructions
-agent-session/  # current Agent conversation and its temporary tool results
-  session.json  # conversation; the whole directory is absent when empty
-  results/      # oversized UTF-8 tool results, readable as nole://result/<id>
-    <id>
+agents/         # Agent Session notes, managed in the separate Agents category
+  <session-id>/
+    session.json  # name, conversation, usage, and unread state
+    collaborators/  # retained collaborator conversations and mailboxes
+    results/      # oversized tool results belonging to this Session
+    pty/          # this Session’s terminal output
 themes/         # Agent-editable application and Markdown themes
   default.toml   # generated current default colors
   <name>.toml    # additional custom themes
@@ -287,8 +289,7 @@ workspace/      # Agent-owned scratch files; agent-maintained, persists across s
 
 The Agent may create, edit, move, and delete files freely inside
 `workspace/`. The workspace is the Agent's default home for task intermediate
-artifacts and is never cleared automatically — not even when the Agent session
-is cleared; the Agent maintains it itself. Moving a source from elsewhere
+artifacts and persists when a Session is deleted; the Agent maintains it itself. Moving a source from elsewhere
 remains approval-gated because it transfers user-owned data. The
 `http` tool's `save_to` option streams any http(s) URL into a new file
 under `workspace/` (see below). Generic file
@@ -388,8 +389,7 @@ intermediate text, and final responses; Todo uses the upper third.
 While a long `write`, `edit`, or `append` input is still streaming, its tool activity row
 shows the target, decoded line/byte progress, and latest non-empty content line;
 the complete JSON is still validated before approval or execution.
-`max_subagent_rounds` is the request-round budget for each `explore` and
-`review` invocation; each response may call several tools within that budget.
+`max_subagent_rounds` is the request-round budget for each collaborator assignment; each response may call several tools within that budget.
 The main Agent conversation has no round limit — the user watches the timeline
 and interrupts directly. On an `explore` or `review` subagent's last allowed
 request, Nole appends its finalization prompt and removes all tools. Subagent
@@ -457,12 +457,11 @@ API text is streamed into the current Agent entry and rendered as Markdown. The
 panel header shows request rounds, session-cumulative input/output, timed
 main-stream throughput, and provider-confirmed cache reads as a share of total
 input; cache writes appear when reported. Only final replies count as Agent
-turns. Token and throughput statistics reset when the Agent session is cleared;
+turns. Each Session retains its own token and throughput statistics;
 the retry count covers the current application run. Multiple tool calls returned
 in one model response still count as one round.
 Consecutive read-only calls in one response execute as a concurrent wave. This
-includes local reads and searches, web search/fetch, and multiple `explore` or
-`review` subagents. Mutation, approval, and TUI interaction tools are exclusive
+includes local reads and searches and web search/fetch. Collaborators run independently. Mutation, approval, and TUI interaction tools are exclusive
 barriers: Nole finishes the preceding wave before running one, then starts a new
 wave.
 Filesystem-backed Agent reads use Tokio's asynchronous filesystem APIs rather
@@ -473,7 +472,7 @@ settings above adjust these limits. Tool results are returned to the model in
 its original call order even when completion order differs.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
-task, copy its latest visible output, clear its saved session, create or manage
+task, copy its latest visible output, create an Agent Session, create or manage
 notes, or open `template.md`, `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the
 configured editor.
 `File: Export…` is available when Center is previewing a file, Skill, or Daily
@@ -485,27 +484,30 @@ PTY-backed floating terminal. Its shell starts in the active Nole directory
 retains its single shell session; exiting the shell closes and discards it.
 Set `shell` in `config/settings.toml` to an executable name or path; when it is
 unset or blank, Nole uses the system login shell.
-The existing `c` and `C` Agent-panel shortcuts invoke those same commands.
-Agent conversations and their visible panel history persist in
-`agent-session/session.json` across prompts and application restarts. Each
-completed conversation update atomically replaces that file; the application
-maintains one session. Oversized UTF-8 tool-result bodies are stored under the
-same directory and returned to the Agent as `nole://result/<id>` references;
-status and other compact metadata remain inline, while the `read` tool pages
-the stored body by line range. References report character and line counts,
-not storage byte counts. Clearing the Agent session removes the conversation
-and all of its stored results together. Continue in the compose box with
-`Ctrl+Enter`; the Agent receives the completed conversation history.
-One Agent worker lives for the lifetime of the application. It reuses its HTTP
-connection pool, tool instances, precomputed tool definitions, and unchanged
-file-read snapshots across prompts. Before each task it checks the actual
-contents of `ai.toml`, `AGENTS.md`, and `MEMORY.md`, rebuilding the Agent only
-when one changed. Versioned file-read snapshots remain valid across prompts;
-successful edits immediately record the new tag while retaining recent versions
-for conservative line-level recovery when unrelated content drifts. Workspace
-file events mark only affected paths as dirty; the next edit compares the actual
-identity, preserving delayed events from the Agent's own writes while rejecting
-real external changes. Clearing the Agent session clears snapshots and registers.
+The `c` Agent-panel shortcut stops the selected Session’s task.
+
+Each Agent Session is a separate note in the **Agents** sidebar category, with
+its own name, conversation, permissions, collaborators, terminal, and tool
+results under `agents/<session-id>/`. Create, open, rename, or delete Sessions
+from Agents. Multiple Sessions can work at the same time; changing the visible
+Session keeps the others running. The TUI marks running Sessions with the shared
+braille animation and completed unread Sessions with a green dot. Opening a
+Session clears its unread marker; a read, inactive Session shows its name alone.
+Agents have a separate count from Notes and Archives. `C` opens the new Session
+dialog; `r` and `d` manage the selected Session in Agents. Deleting a Session
+cancels its work and removes its conversation and stored results while preserving
+the shared workspace.
+
+The `agents` tool creates explore and review collaborators inside the current
+Session. It supports spawn, send, list, wait, and stop. A collaborator retains its
+conversation, receives messages between rounds, and can be woken for another
+assignment. Completed reports wake the parent through background delivery.
+Session and collaborator histories persist across application restarts; send a
+new message to continue a restored conversation.
+
+Each active Session reuses its HTTP client, tools, and read snapshots across
+prompts. Configuration and instructions are refreshed before each run, and
+workspace changes invalidate affected snapshots across active Sessions.
 Tool definitions are emitted in fixed registration order instead of hash-map
 iteration order. Messages requests use four explicit prompt-cache breakpoints:
 the final tool, the stable base system block, the skill catalog after project
@@ -516,27 +518,12 @@ stable prefix. The current timestamp remains in the newest user message.
 The Agent can inspect the same shared tag index with `tags` and
 `search_tag`. Its `rename_tag` tool follows the active permission policy before
 changing exact Hashtag source spans across a multi-file diff.
-Broad exploration, discovery, comparison, and research run through the
-`explore` tool. It starts an isolated read-only agent with file, note, tag, and
-web lookup tools, with read-only capabilities for mutation, interaction, and
-recursive-agent operations. Its
-search calls, source excerpts, and intermediate reasoning stay in a private
-conversation; the main Agent session stores only the `explore` call and its
-concise evidence-based report. Independent critical evaluation runs through the
-`review` tool. It starts the same kind of isolated read-only agent with the same
-capabilities, while the main Agent's task supplies the artifact, intended goals
-and constraints, and the standards or concerns to evaluate. The reviewer does
-uses the task's domain criteria, grounds findings in
-available evidence, prioritizes them by impact, and returns one self-contained
-review while preserving the artifact. Targeted reads and lookups use the
-corresponding tools directly. Independent `explore` and `review`
-calls run concurrently, as do independent read, search, and fetch calls within
-each subagent, subject to the shared limits above. Isolated agents share a
-reusable task-scoped runtime; each profile supplies its own instructions,
-completion contract, and registered tool capabilities. `explore` and `review`
-are the built-in read-only profiles rather than special-purpose agent loops,
-and unregistered mutation, interaction, or recursive-agent capabilities are
-unavailable to them.
+Explore collaborators gather evidence; review collaborators independently evaluate
+artifacts against the assignment’s goals and constraints. Both profiles use
+inspection tools and retain their own tool history and intermediate reasoning.
+The parent sees their reports and can send additional instructions at any time.
+Independent collaborators and their read/search/fetch calls share the Session’s
+concurrency limits. The parent Agent handles file changes and user interaction.
 You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
 An in-flight concurrent wave is allowed to finish, while later unstarted calls

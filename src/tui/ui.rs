@@ -129,6 +129,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Position> {
 /// page-specific animation exceptions. Any future animated widget belongs in
 /// this decision alongside its rendering condition.
 pub(crate) fn animations_active(app: &App, focused: bool) -> bool {
+    if focused && app.agent_notes.iter().any(|note| note.running) {
+        return true;
+    }
     focused
         && (app.has_code_copy_feedback()
             || app.ai_running
@@ -163,6 +166,7 @@ fn clear_hitboxes(app: &mut App) {
     app.wiki_link_hitboxes.clear();
     app.dialog_hitboxes.clear();
     app.file_hitboxes.clear();
+    app.agent_session_hitboxes.clear();
     app.file_group_hitboxes.clear();
     app.todo_hitboxes.clear();
     app.workspace_view_hitboxes.clear();

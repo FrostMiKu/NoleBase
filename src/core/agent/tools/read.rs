@@ -124,6 +124,7 @@ pub(crate) struct ParseContext {
     pub(crate) client: reqwest::Client,
     pub(crate) attachments: AttachmentStore,
     documents: DocumentCache,
+    session_directory: PathBuf,
 }
 
 pub(crate) enum ReadPayload {
@@ -158,6 +159,7 @@ impl Read {
         let root = canonical_root(root)?;
         let attachments = AttachmentStore::new(root.join(ATTACHMENTS_DIR));
         let ctx = ParseContext {
+            session_directory: root.join("agents/scratch"),
             root,
             reads,
             client,
@@ -175,6 +177,11 @@ impl Read {
             Box::new(TextFileParser),
         ];
         Ok(Self { ctx, parsers })
+    }
+
+    pub(crate) fn with_session_directory(mut self, directory: &Path) -> Self {
+        self.ctx.session_directory = directory.to_path_buf();
+        self
     }
 
     /// Registers a parser ahead of built-in file parsers so callers can
@@ -315,11 +322,12 @@ fn render_read_fields(fields: &serde_json::Map<String, Value>) -> String {
 async fn resolve_target(ctx: &ParseContext, input: &Value) -> Result<Target> {
     let requested = required_string(input, "path")?;
     if let Some(id) = crate::core::agent::parse_result_id(requested)? {
-        let root = ctx.root.clone();
-        let path =
-            tokio::task::spawn_blocking(move || crate::core::agent::resolve_result_path(&root, id))
-                .await
-                .context("joining session result resolution")??;
+        let directory = ctx.session_directory.clone();
+        let path = tokio::task::spawn_blocking(move || {
+            crate::core::agent::resolve_result_in(&directory, id)
+        })
+        .await
+        .context("joining session result resolution")??;
         return Ok(Target::Result {
             uri: requested.to_string(),
             path,
@@ -523,7 +531,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
-        let results = directory.path().join("agent-session/results");
+        let results = directory.path().join("agents/scratch/results");
         fs::create_dir_all(&results).unwrap();
         let private = directory.path().join("config/ai.toml");
         fs::create_dir_all(private.parent().unwrap()).unwrap();

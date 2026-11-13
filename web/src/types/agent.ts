@@ -6,13 +6,13 @@
 
 export type PermissionMode = 'approve' | 'auto' | 'yolo'
 
-/** `GET /api/agent` */
+/** `GET /api/agents/{id}` */
 export interface AgentStatus {
   running: boolean
   permission_mode: PermissionMode
 }
 
-/** `GET /api/agent/permission` / `PUT /api/agent/permission` */
+/** `GET /api/agents/{id}/permission` / `PUT /api/agents/{id}/permission` */
 export interface PermissionState {
   mode: PermissionMode
 }
@@ -57,7 +57,7 @@ export interface TerminalInputRequest {
 
 export type ToolStatus = 'preparing' | 'running' | 'finished' | 'failed'
 
-/** One background job row from `GET /api/agent/jobs`. */
+/** One background job row from `GET /api/agents/{id}/jobs`. */
 export interface AgentJobRow {
   id: string
   label: string
@@ -92,7 +92,7 @@ export interface ResponseTimingInfo {
 
 export type AgentConnectionState = 'connecting' | 'connected' | 'disconnected'
 
-/** One settled transcript entry from `GET /api/agent/history` (mirrors
+/** One settled transcript entry from `GET /api/agents/{id}/history` (mirrors
  * `AgentHistoryEntryDto` in `src/web/dto.rs`; history entries are persisted
  * snapshots, so live-only flags like `streaming`/`active` are absent). */
 export type AgentHistoryEntry =
@@ -102,8 +102,23 @@ export type AgentHistoryEntry =
   | { kind: 'tool'; entry: { text: string; preview: string | null } }
   | { kind: 'error'; entry: string }
 
-/** `GET /api/agent/history` */
+/** `GET /api/agents/{id}/history` */
 export interface AgentHistory {
   entries: AgentHistoryEntry[]
   message_count: number
+}
+
+export interface AgentSessionSummary {
+  id: string
+  title: string
+  updated_at: number
+  running: boolean
+  unread: boolean
+}
+
+/** Tool identities retained while attaching to a running Session. */
+export interface AgentLiveTool {
+  id: string | null
+  preparation_index: number | null
+  active: boolean
 }

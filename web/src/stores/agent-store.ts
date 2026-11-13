@@ -20,13 +20,15 @@ import {
  * text never enters TanStack Query.
  */
 export interface AgentStore extends AgentState {
+  activeSessionId: string | null
+  selectSession: (id: string | null) => void
   runSubmitting: boolean
   connection: AgentConnectionState
 
   dispatchEvent: (event: AgentEvent) => void
   beginRun: (prompt: string) => void
   /** Replace the transcript with the server's persisted history. */
-  seedHistory: (entries: AgentHistoryEntry[], running: boolean, messageCount: number) => void
+  seedHistory: (entries: AgentHistoryEntry[], running: boolean, messageCount: number, liveTools?: import('@/types/agent').AgentLiveTool[]) => void
   /** Replace the session job registry from a server snapshot. */
   setJobs: (jobs: JobRun[]) => void
   setConnection: (connection: AgentConnectionState) => void
@@ -40,13 +42,15 @@ export interface AgentStore extends AgentState {
 
 export const useAgentStore = create<AgentStore>()((set) => ({
   ...initialAgentState(),
+  activeSessionId: null,
+  selectSession: (id) => set((state) => state.activeSessionId === id ? state : ({ ...initialAgentState(), activeSessionId: id, connection: 'connecting', runSubmitting: false })),
   connection: 'connecting',
   runSubmitting: false,
 
   dispatchEvent: (event) => set((state) => reduceAgentEvent(state, event)),
   beginRun: (prompt) => set((state) => beginAgentRun(state, prompt)),
-  seedHistory: (entries, running, messageCount) =>
-    set((state) => seedAgentHistory(state, entries, running, messageCount)),
+  seedHistory: (entries, running, messageCount, liveTools) =>
+    set((state) => seedAgentHistory(state, entries, running, messageCount, liveTools)),
   setJobs: (jobs) => set({ jobs }),
   setConnection: (connection) => set({ connection }),
   setRunning: (running) => set({ running }),
@@ -56,3 +60,15 @@ export const useAgentStore = create<AgentStore>()((set) => ({
   clearTerminalInput: () => set({ terminalInput: null }),
   dismissInterruption: () => set({ streamInterrupted: false }),
 }))
+
+// Mounted conversation views determine whether incoming completion has been read.
+const sessionViews = new Map<string, number>()
+export function observeSessionView(id: string): () => void {
+  sessionViews.set(id, (sessionViews.get(id) ?? 0) + 1)
+  return () => {
+    const remaining = (sessionViews.get(id) ?? 1) - 1
+    if (remaining > 0) sessionViews.set(id, remaining)
+    else sessionViews.delete(id)
+  }
+}
+export function isSessionVisible(id: string): boolean { return (sessionViews.get(id) ?? 0) > 0 }

@@ -56,8 +56,13 @@ pub(crate) struct SessionResultStore {
 }
 
 impl SessionResultStore {
+    #[cfg(test)]
     pub(crate) fn new(nole_root: &Path) -> Result<Self> {
-        let root = nole_root.join("agent-session").join("results");
+        Self::in_directory(&nole_root.join("agents/scratch"))
+    }
+
+    pub(crate) fn in_directory(directory: &Path) -> Result<Self> {
+        let root = directory.join("results");
         let next_id = next_result_id(&root)?;
         Ok(Self {
             root,
@@ -122,17 +127,8 @@ pub(crate) fn parse_result_id(value: &str) -> Result<Option<u64>> {
     Ok(Some(id))
 }
 
-pub(crate) fn result_path(nole_root: &Path, id: u64) -> PathBuf {
-    nole_root
-        .join("agent-session")
-        .join("results")
-        .join(id.to_string())
-}
-
-/// Resolve a result owned by this session without allowing a filesystem link
-/// to turn the opaque result URI into an arbitrary-file read primitive.
-pub(crate) fn resolve_result_path(nole_root: &Path, id: u64) -> Result<PathBuf> {
-    let path = result_path(nole_root, id);
+pub(crate) fn resolve_result_in(directory: &Path, id: u64) -> Result<PathBuf> {
+    let path = directory.join("results").join(id.to_string());
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("reading session result {RESULT_URI_PREFIX}{id}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {

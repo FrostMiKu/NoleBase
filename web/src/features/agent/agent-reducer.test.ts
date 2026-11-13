@@ -508,3 +508,14 @@ describe('seeding from persisted server history', () => {
     expect(lastTurn(next).assistantText).toBe('partial answer')
   })
 })
+
+it('attaches to a running Session and updates the existing active tool when it completes', () => {
+  const restored = seedAgentHistory(initialAgentState(), [
+    { kind: 'prompt', entry: { text: 'Research' } },
+    { kind: 'tool', entry: { text: 'Reading', preview: null } },
+  ], true, 1, [{ id: 'read-1', preparation_index: null, active: true }])
+  const finished = reduceAgentEvent(restored, { type: 'tool_finished', id: 'read-1', message: 'Read complete', preview: 'Evidence' })
+  expect(finished.turns).toHaveLength(1)
+  expect(finished.turns[0]?.tools).toHaveLength(1)
+  expect(finished.turns[0]?.tools[0]).toMatchObject({ id: 'read-1', status: 'finished', label: 'Read complete' })
+})

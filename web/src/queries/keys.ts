@@ -25,6 +25,7 @@ export const workspaceKeys = {
 
 export const agentKeys = {
   root: ['agent'] as const,
-  state: () => [...agentKeys.root, 'state'] as const,
-  permission: () => [...agentKeys.root, 'permission'] as const,
+  sessions: () => [...agentKeys.root, 'sessions'] as const,
+  state: (id: string | null) => [...agentKeys.root, id, 'state'] as const,
+  permission: (id: string | null) => [...agentKeys.root, id, 'permission'] as const,
 }

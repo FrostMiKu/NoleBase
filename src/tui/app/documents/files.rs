@@ -44,6 +44,17 @@ impl App {
                 rows.extend(archives.into_iter().map(FileListRow::File));
             }
         }
+        let agents = self
+            .agent_notes
+            .iter()
+            .filter(|note| fuzzy_match(&note.title, &self.file_query))
+            .collect::<Vec<_>>();
+        if !searching || !agents.is_empty() {
+            rows.push(FileListRow::Group(FileGroup::Agents));
+            if self.agents_expanded || searching {
+                rows.extend(agents.into_iter().map(|note| FileListRow::Agent(note.id)));
+            }
+        }
         rows
     }
 
@@ -62,6 +73,10 @@ impl App {
     }
 
     pub(in crate::tui::app) fn open_selected_file(&mut self, return_to: DocumentReturn) {
+        if let Some(id) = self.selected_agent_session() {
+            self.open_agent_session(id);
+            return;
+        }
         if let Some(path) = self.selected_file.clone() {
             self.open_file_document(&path, return_to);
         }
@@ -184,6 +199,7 @@ impl App {
                     match group {
                         FileGroup::Notes => self.notes_expanded = false,
                         FileGroup::Archives => self.archives_expanded = false,
+                        FileGroup::Agents => self.agents_expanded = false,
                     }
                 } else if let Some(file) = self.note_files.get(self.file_index) {
                     let group = if file.archived {
@@ -218,6 +234,10 @@ impl App {
                 None
             }
             KeyCode::Char('r') => {
+                if let Some(id) = self.selected_agent_session() {
+                    self.rename_agent_session(id);
+                    return None;
+                }
                 if let Some(path) = self.selected_file.clone() {
                     self.rename_input = path
                         .file_stem()
@@ -232,6 +252,10 @@ impl App {
                 None
             }
             KeyCode::Char('d') => {
+                if let Some(id) = self.selected_agent_session() {
+                    self.delete_agent_session(id);
+                    return None;
+                }
                 if let Some(path) = self.selected_file.clone() {
                     self.pending_file = Some(path);
                     self.set_overlay(Overlay::ConfirmDeleteFile);
@@ -306,6 +330,13 @@ impl App {
     }
 
     pub(in crate::tui::app) fn begin_new_note(&mut self) {
+        if self.focus == Focus::Files
+            && (self.selected_file_group() == Some(FileGroup::Agents)
+                || self.selected_agent_session().is_some())
+        {
+            self.begin_new_agent_session();
+            return;
+        }
         self.begin_new_note_with_template(false);
     }
 
@@ -531,7 +562,7 @@ impl App {
                 self.file_index = index;
                 self.selected_file = self.note_files.get(index).map(|file| file.path.clone());
             }
-            FileListRow::Group(_) => self.selected_file = None,
+            FileListRow::Group(_) | FileListRow::Agent(_) => self.selected_file = None,
         }
     }
 
@@ -540,7 +571,7 @@ impl App {
             .get(self.file_row)
             .and_then(|row| match row {
                 FileListRow::Group(group) => Some(*group),
-                FileListRow::File(_) => None,
+                FileListRow::File(_) | FileListRow::Agent(_) => None,
             })
     }
 
@@ -548,6 +579,7 @@ impl App {
         match group {
             FileGroup::Notes => self.notes_expanded = !self.notes_expanded,
             FileGroup::Archives => self.archives_expanded = !self.archives_expanded,
+            FileGroup::Agents => self.agents_expanded = !self.agents_expanded,
         }
         self.ensure_visible_file_selection();
     }

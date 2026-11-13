@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware'
 
 export type WorkspaceConnectionState = 'connecting' | 'connected' | 'disconnected'
 
-export type SidebarSectionKey = 'notes' | 'archives' | 'daily'
+export type SidebarSectionKey = 'notes' | 'archives' | 'daily' | 'agents'
 
 /**
  * Pure UI/layout state. Server data (notes, documents, tags, ...) belongs
@@ -67,7 +67,7 @@ export const useUiStore = create<UiStore>()(
 
       // The file list opens with Notes visible; Archives and Daily collapsed
       // (the daily river in the center view remains the browsing surface).
-      sidebarSections: { notes: true, archives: false, daily: false },
+      sidebarSections: { notes: true, archives: false, daily: false, agents: true },
 
       commandPaletteOpen: false,
       createNoteOpen: false,

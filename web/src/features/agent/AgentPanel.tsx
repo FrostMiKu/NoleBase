@@ -7,10 +7,12 @@ import { acknowledgeAgentRun } from './agent-reducer'
 
 import { buttonStyles } from '@/components/ui/dialog'
 import { agentApi } from '@/api/agent'
-import { useAgentStore } from '@/stores/agent-store'
+import { useAgentStore, observeSessionView } from '@/stores/agent-store'
 import { useUiStore } from '@/stores/ui-store'
 import { AgentInteractions } from './AgentInteractions'
 import { AgentTranscript } from './AgentTranscript'
+import { SessionDialog } from './SessionDialog'
+import { useAgentSessions } from '@/queries/agent'
 import { PermissionSelect } from './PermissionSelect'
 
 function ConnectionDot() {
@@ -31,11 +33,18 @@ function ConnectionDot() {
  * Enter sends; Shift+Enter inserts a newline.
  */
 export function AgentPanel() {
+  const sessionId = useAgentStore((state) => state.activeSessionId)
+  const sessions = useAgentSessions()
+  const currentSession = sessions.data?.sessions.find((session) => session.id === sessionId)
+  const title = currentSession?.title ?? 'Agent'
+  const [createOpen, setCreateOpen] = useState(false)
+  const draftKey = `agent:${sessionId ?? 'new'}`
   const running = useAgentStore((state) => state.running)
+  const working = running || currentSession?.running === true
   const streamInterrupted = useAgentStore((state) => state.streamInterrupted)
   const dismissInterruption = useAgentStore((state) => state.dismissInterruption)
   const agentFocusTick = useUiStore((state) => state.agentFocusTick)
-  const [prompt, setPrompt] = useDraft('agent')
+  const [prompt, setPrompt] = useDraft(draftKey)
   const [following, setFollowing] = useState(true)
   const followingRef = useRef(true)
   const connection = useAgentStore((state) => state.connection)
@@ -43,6 +52,13 @@ export function AgentPanel() {
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null)
   const lastTurn = useAgentStore((state) => state.turns[state.turns.length - 1])
+
+  useEffect(() => {
+    if (sessionId === null) return
+    const release = observeSessionView(sessionId)
+    if (document.visibilityState !== 'hidden') void agentApi.read(sessionId).catch(() => {})
+    return release
+  }, [sessionId])
 
   // "Focus Agent" command.
   useEffect(() => {
@@ -64,26 +80,32 @@ export function AgentPanel() {
     setFollowing(true)
     useAgentStore.setState({ runSubmitting: true })
     agentApi
-      .run(trimmed)
+      .run(sessionId, trimmed)
       .then(() => {
+        clearSubmittedDraft(draftKey, prompt)
+        if (useAgentStore.getState().activeSessionId !== sessionId) return;
         // 202: the agent took the task; output arrives over the WS as a
         // new transcript turn — previous turns stay visible.
         useAgentStore.setState((state) => acknowledgeAgentRun(state, trimmed, previousSeq))
-        clearSubmittedDraft('agent', prompt)
       })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : 'the agent command failed'
         toast.error(`Run failed: ${message}`)
       })
-      .finally(() => useAgentStore.setState({ runSubmitting: false }))
+      .finally(() => { if (useAgentStore.getState().activeSessionId === sessionId) useAgentStore.setState({ runSubmitting: false }) })
   }
 
   const cancel = () => {
     // Do not assume the run finished; wait for stopped/finished events.
-    agentApi.cancel().catch((error: unknown) => {
+    agentApi.cancel(sessionId).catch((error: unknown) => {
       toast.error(`Cancel failed: ${error instanceof Error ? error.message : 'unknown error'}`)
     })
   }
+
+  if (sessionId === null) return <div className="p-4 text-xs text-muted">
+    <button className={buttonStyles.primary} onClick={() => setCreateOpen(true)}>New Agent session</button>
+    {createOpen && <SessionDialog kind="create" onClose={() => setCreateOpen(false)} />}
+  </div>
 
   return (
     <section className="flex h-full flex-col" data-testid="agent-panel">
@@ -91,11 +113,11 @@ export function AgentPanel() {
         <ConnectionDot />
         <span className="flex items-center gap-1 text-[10px] font-semibold tracking-wider text-faint uppercase">
           <RadioTower size={11} />
-          Agent
+          {title}
         </span>
         <div className="ml-auto flex items-center gap-1.5">
           <PermissionSelect />
-          {running && (
+          {working && (
             <button
               type="button"
               className={`${buttonStyles.danger} h-6 px-2`}
@@ -149,7 +171,7 @@ export function AgentPanel() {
           <ArrowDown size={12} /> Latest output
         </button>
       )}
-      <AgentInteractions />
+      <AgentInteractions key={sessionId} />
 
       <div className="shrink-0 border-t border-border bg-panel p-2">
         <textarea

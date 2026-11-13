@@ -103,6 +103,7 @@ export function readOnlyApi(options: {
   documents?: Record<string, string>
 }): (call: ApiCall) => ApiResponse {
   return ({ method, url }) => {
+    if (method === 'GET' && url === '/api/agents') return ok({ sessions: [] })
     if (method === 'GET' && url.startsWith('/api/notes')) return ok(options.notes())
     if (method === 'GET' && url.startsWith('/api/daily')) return ok(options.daily?.() ?? [])
     if (method === 'GET' && url.startsWith('/api/document')) {
@@ -202,7 +203,7 @@ export async function renderSidebarApp(options: {
 export function resetSharedState(): void {
   cleanup()
   editorStore.close()
-  useUiStore.setState({ sidebarSections: { notes: true, archives: false, daily: false } })
+  useUiStore.setState({ sidebarSections: { notes: true, archives: false, daily: false, agents: true } })
 }
 
 /** Open a collapsed sidebar section by clicking its header. */

@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use serde_json::json;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::core::agent_service::AgentService;
+use crate::core::agent_sessions::AgentSessions;
 use crate::core::nole::Nole;
 use crate::core::storage::Storage;
 use crate::core::workspace::Workspace;
@@ -101,20 +101,36 @@ pub fn router_with_frontend(state: web::state::WebState, frontend: Frontend) -> 
             post(web::workspace::restore_document),
         )
         .route("/api/ws/workspace", get(web::ws::workspace_events))
-        .route("/api/ws/agent", get(web::ws::agent_events))
-        .route("/api/agent", get(web::agent::status))
-        .route("/api/agent/history", get(web::agent::history))
-        .route("/api/agent/run", post(web::agent::run))
-        .route("/api/agent/cancel", post(web::agent::cancel))
-        .route("/api/agent/jobs", get(web::agent::jobs))
-        .route("/api/agent/approval", post(web::agent::approval))
-        .route("/api/agent/answer", post(web::agent::answer))
+        .route("/api/agents/{id}/events", get(web::ws::agent_events))
         .route(
-            "/api/agent/terminal-input",
+            "/api/agents",
+            get(web::agent::list).post(web::agent::create),
+        )
+        .route(
+            "/api/agents/{id}",
+            get(web::agent::status)
+                .put(web::agent::rename)
+                .delete(web::agent::delete),
+        )
+        .route("/api/agents/{id}/read", post(web::agent::mark_read))
+        .route("/api/agents/{id}/history", get(web::agent::history))
+        .route("/api/agents/{id}/run", post(web::agent::run))
+        .route("/api/agents/{id}/cancel", post(web::agent::cancel))
+        .route("/api/agents/{id}/jobs", get(web::agent::jobs))
+        .route("/api/agents/{id}/approval", post(web::agent::approval))
+        .route("/api/agents/{id}/answer", post(web::agent::answer))
+        .route(
+            "/api/agents/{id}/terminal-input",
             post(web::agent::terminal_input),
         )
-        .route("/api/agent/permission", get(web::agent::get_permission))
-        .route("/api/agent/permission", put(web::agent::put_permission))
+        .route(
+            "/api/agents/{id}/permission",
+            get(web::agent::get_permission),
+        )
+        .route(
+            "/api/agents/{id}/permission",
+            put(web::agent::put_permission),
+        )
         // Registered API endpoints above take precedence; anything else
         // under /api must answer with the API error model, never the SPA
         // fallback's index.html.
@@ -149,13 +165,7 @@ pub fn serve(port: u16) -> Result<()> {
     let storage = Storage::resolve_root().context("resolving Nole storage")?;
     storage.ensure_files().context("preparing Nole workspace")?;
     let nole = Nole::open(storage.clone()).context("opening Nole application")?;
-    // Same restore the TUI performs: the persisted conversation continues
-    // the agent's context and the persisted panel seeds the transcript.
-    let restored = storage
-        .load_agent_session()
-        .context("loading the persisted agent session")?
-        .unwrap_or_default();
-    let state = web::state::WebState::new(nole.workspace().clone(), nole.agent().clone(), restored);
+    let state = web::state::WebState::new(nole.workspace().clone(), nole.sessions().clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -166,14 +176,7 @@ pub fn serve(port: u16) -> Result<()> {
             nole,
             state.workspace_events.clone(),
             state.workspace.clone(),
-            state.agent.clone(),
-        ));
-        // The session recorder: the web backend's replacement for the TUI
-        // event loop's persistence duty, keeping `session.json` current.
-        tokio::spawn(session_recorder_loop(
-            state.agent.subscribe(),
-            state.clone(),
-            storage,
+            state.sessions.clone(),
         ));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
@@ -225,24 +228,6 @@ fn frontend_dist_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-/// Mirror the TUI event loop's session persistence: apply every agent event
-/// to the web backend's transcript, and write the session scope back at the
-/// same lifecycle points (conversation update, stop, finish). Runs until the
-/// process exits.
-async fn session_recorder_loop(
-    mut events: tokio::sync::broadcast::Receiver<crate::core::agent::AgentEvent>,
-    state: web::state::WebState,
-    storage: Storage,
-) {
-    loop {
-        match events.recv().await {
-            Ok(event) => state.record_agent_event(&event, &storage),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        }
-    }
-}
-
 /// The web backend's replacement for the TUI event loop: drain the watcher,
 /// apply its domain events to the workspace/agent services exactly as the
 /// TUI does, publish the web DTOs to WebSocket subscribers, and settle the
@@ -251,7 +236,7 @@ async fn watcher_loop(
     mut nole: Nole,
     events: tokio::sync::broadcast::Sender<web::dto::WebWorkspaceEvent>,
     workspace: Arc<Workspace>,
-    agent: Arc<AgentService>,
+    sessions: Arc<AgentSessions>,
 ) {
     let mut interval = tokio::time::interval(WATCHER_POLL_INTERVAL);
     loop {
@@ -261,9 +246,7 @@ async fn watcher_loop(
             // UI-facing reload (which the web client does itself from the
             // broadcast event).
             if let WorkspaceEvent::AgentReadsDirty { paths } = &event {
-                if let Err(error) = agent.mark_reads_dirty(paths) {
-                    eprintln!("[nole web] agent read-state error: {error:#}");
-                }
+                sessions.mark_reads_dirty(paths);
             }
             let web_event = web::dto::WebWorkspaceEvent::from_workspace_event(&workspace, &event);
             let _ = events.send(web_event);

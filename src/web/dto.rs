@@ -156,7 +156,7 @@ impl From<TokenUsage> for TokenUsageDto {
     }
 }
 
-/// One settled transcript entry in `GET /api/agent/history`. History entries
+/// One settled transcript entry in `GET /api/agents/{id}/history`. History entries
 /// are persisted snapshots, so the live-only fields (`streaming`, `active`)
 /// of `AgentPanelEntry` are dropped from the wire shape.
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -193,7 +193,7 @@ impl From<&AgentPanelEntry> for AgentHistoryEntryDto {
     }
 }
 
-/// `GET /api/agent/history` — the persisted session transcript for
+/// `GET /api/agents/{id}/history` — the persisted session transcript for
 /// (re)connecting clients, plus the conversation length so the client can
 /// show session context without a `conversation_updated` event.
 #[derive(Serialize)]
@@ -269,7 +269,7 @@ impl WebWorkspaceEvent {
     }
 }
 
-/// The agent event stream (`/api/ws/agent`). Every [`AgentEvent`] variant is
+/// The agent event stream (`/api/agents/{id}/events`). Every [`AgentEvent`] variant is
 /// mapped; none is silently dropped. [`AgentEvent::ConversationUpdated`]
 /// carries the full provider-message conversation for caller-side
 /// continuation, which is deliberately not a web contract — the web layer

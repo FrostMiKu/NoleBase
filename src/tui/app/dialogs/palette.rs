@@ -67,7 +67,7 @@ impl App {
         match command {
             AppCommand::InterruptAgent => self.cancel_agent(),
             AppCommand::CopyLastAgentOutput => return self.copy_last_agent_output(),
-            AppCommand::ClearAgentSession => self.clear_agent_session(),
+            AppCommand::NewAgentSession => self.begin_new_agent_session(),
             AppCommand::OpenTerminal => self.toggle_terminal(),
             AppCommand::ToggleMouseSupport => {
                 self.mouse_captured = !self.mouse_captured;
@@ -114,7 +114,7 @@ impl App {
         match command {
             AppCommand::InterruptAgent => true,
             AppCommand::CopyLastAgentOutput => self.last_agent_output().is_some(),
-            AppCommand::ClearAgentSession
+            AppCommand::NewAgentSession
             | AppCommand::OpenTerminal
             | AppCommand::ToggleMouseSupport
             | AppCommand::NewNote

@@ -23,7 +23,7 @@ pub(super) fn draw_chat(
     }
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "AI Chat",
+            app.session_note.summary().title,
             Style::default()
                 .fg(app.theme.ui_page_heading)
                 .add_modifier(Modifier::BOLD),

@@ -44,7 +44,7 @@ export interface AgentTurn {
   finished: { ok: boolean; text: string | null; error: string | null } | null
   stopReason: string | null
   /**
-   * Seeded from the server transcript (`GET /api/agent/history`) rather
+   * Seeded from the server transcript (`GET /api/agents/{id}/history`) rather
    * than built from live events. Restored turns are closed: live events
    * open fresh turns instead of appending to them.
    */
@@ -207,7 +207,7 @@ function findToolKey(tools: ToolRun[], predicate: (tool: ToolRun) => boolean): s
 }
 
 /**
- * A new run started (the `POST /api/agent/run` returned 202). Appends a
+ * A new run started (the `POST /api/agents/{id}/run` returned 202). Appends a
  * turn carrying the prompt; pending interactions clear; the interruption
  * notice clears with the fresh run. Notifications are kept, capped.
  */
@@ -238,7 +238,7 @@ function clearPendingInteractions(state: AgentState): AgentState {
 }
 
 /**
- * Pure reducer for the `/api/ws/agent` event stream. Exhaustive over
+ * Pure reducer for the `/api/agents/{id}/events` event stream. Exhaustive over
  * `AgentEvent`; the `default` branch is unreachable for known events and
  * exists only so TypeScript flags any future unhandled variant.
  */
@@ -516,7 +516,7 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
 
 /**
  * Seed the transcript from the server's persisted history
- * (`GET /api/agent/history`). A `prompt` entry starts a turn; content
+ * (`GET /api/agents/{id}/history`). A `prompt` entry starts a turn; content
  * entries attach to the newest turn, mirroring how live events accumulate.
  *
  * Restored turns are closed so subsequent live events open fresh turns —
@@ -528,6 +528,7 @@ export function seedAgentHistory(
   entries: AgentHistoryEntry[],
   running: boolean,
   messageCount: number,
+  liveTools: import('@/types/agent').AgentLiveTool[] = [],
 ): AgentState {
   const turns: AgentTurn[] = []
   let seq = 0
@@ -539,6 +540,7 @@ export function seedAgentHistory(
   }
   const lastTurn = (): AgentTurn | undefined => turns[turns.length - 1]
 
+  let toolOrdinal = 0
   for (const { kind, entry } of entries) {
     switch (kind) {
       case 'prompt':
@@ -555,11 +557,12 @@ export function seedAgentHistory(
       }
       case 'tool': {
         const turn = lastTurn() ?? openTurn(null)
+        const live = liveTools[toolOrdinal++]
         turn.tools.push({
-          key: `history:${turn.tools.length}`,
+          key: live?.id ? `tool:${live.id}` : live?.preparation_index != null ? `preparing:${live.preparation_index}` : `history:${turn.tools.length}`,
           kind: 'tool',
-          id: null,
-          status: 'finished',
+          id: live?.id ?? null,
+          status: live?.active ? (live.preparation_index !== null ? 'preparing' : 'running') : 'finished',
           label: entry.text,
           detail: entry.preview,
         })

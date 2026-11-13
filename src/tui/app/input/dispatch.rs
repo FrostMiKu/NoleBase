@@ -105,6 +105,8 @@ impl App {
                     DialogPurpose::AgentPrompt
                         | DialogPurpose::AskUser
                         | DialogPurpose::PrivateTerminalInput
+                        | DialogPurpose::NewAgentSession
+                        | DialogPurpose::RenameAgentSession
                         | DialogPurpose::NewFile
                         | DialogPurpose::RenameFile
                         | DialogPurpose::ExportDestination

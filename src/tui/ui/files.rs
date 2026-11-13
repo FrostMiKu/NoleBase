@@ -94,6 +94,9 @@ pub(super) fn draw_files(
             let has_visible_children = match group {
                 FileGroup::Notes => (app.notes_expanded || searching) && notes_count > 0,
                 FileGroup::Archives => (app.archives_expanded || searching) && archives_count > 0,
+                FileGroup::Agents => {
+                    (app.agents_expanded || searching) && !app.agent_notes.is_empty()
+                }
             };
             if has_visible_children {
                 2
@@ -101,7 +104,7 @@ pub(super) fn draw_files(
                 1
             }
         }
-        FileListRow::File(_) => 3u16,
+        FileListRow::File(_) | FileListRow::Agent(_) => 3u16,
     };
     let selected_row = app.file_row.min(rows.len().saturating_sub(1));
     let row_heights = rows
@@ -135,11 +138,12 @@ pub(super) fn draw_files(
         } else {
             Style::default()
         };
-        let selection_area = if selected && matches!(row, FileListRow::File(_)) {
-            Some(shared_selection_area(list_area, y, layout_height))
-        } else {
-            None
-        };
+        let selection_area =
+            if selected && matches!(row, FileListRow::File(_) | FileListRow::Agent(_)) {
+                Some(shared_selection_area(list_area, y, layout_height))
+            } else {
+                None
+            };
         if let Some(selection_area) = selection_area {
             frame.render_widget(Block::default().style(row_style), selection_area);
         }
@@ -147,6 +151,11 @@ pub(super) fn draw_files(
             FileListRow::Group(group) => {
                 let (label, expanded, count) = match group {
                     FileGroup::Notes => ("Notes", app.notes_expanded || searching, notes_count),
+                    FileGroup::Agents => (
+                        "Agents",
+                        app.agents_expanded || searching,
+                        app.agent_notes.len(),
+                    ),
                     FileGroup::Archives => (
                         "Archives",
                         app.archives_expanded || searching,
@@ -199,6 +208,55 @@ pub(super) fn draw_files(
                     });
                 }
             }
+            FileListRow::Agent(id) => {
+                let Some(note) = app.agent_notes.iter().find(|note| note.id == id) else {
+                    continue;
+                };
+                let marker = if note.running {
+                    Some((
+                        super::agent::spinner_frame(app.animation_tick),
+                        app.theme.ui_activity_marker,
+                    ))
+                } else if note.unread {
+                    Some(('●', ratatui::style::Color::Green))
+                } else {
+                    None
+                };
+                let label_width =
+                    list_area
+                        .width
+                        .saturating_sub(if marker.is_some() { 2 } else { 0 });
+                frame.render_widget(
+                    Paragraph::new(format!("  {}", note.title)).style(row_style),
+                    Rect::new(list_area.x, y, label_width, 1),
+                );
+                if let Some((symbol, color)) = marker {
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(symbol.to_string(), row_style.fg(color))),
+                        Rect::new(list_area.right().saturating_sub(1), y, 1, 1),
+                    );
+                }
+                let content_height = 2.min(layout_height);
+                if let Some(modified) = DateTime::from_timestamp_millis(note.updated_at) {
+                    draw_modified_date(
+                        frame,
+                        Rect::new(list_area.x, y, list_area.width, content_height),
+                        modified.with_timezone(&Local),
+                        selected,
+                        row_style,
+                        app.theme,
+                    );
+                }
+                if interactive {
+                    app.agent_session_hitboxes.push((
+                        id,
+                        Rect::new(list_area.x, y, list_area.width, content_height),
+                    ));
+                }
+                if let Some(area) = selection_area {
+                    draw_selection_indicator(frame, area, app.theme);
+                }
+            }
             FileListRow::File(absolute_index) => {
                 let Some(file) = app.note_files.get(absolute_index) else {
                     continue;
@@ -220,23 +278,14 @@ pub(super) fn draw_files(
                     Rect::new(list_area.x, y, list_area.width, 1),
                 );
                 let content_height = 2.min(layout_height);
-                if content_height > 1 {
-                    let modified: DateTime<Local> = file.modified.into();
-                    frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            format!("  {}", modified.format("%y/%m/%d %H:%M")),
-                            if selected {
-                                Style::default()
-                                    .fg(app.theme.selection_foreground)
-                                    .add_modifier(Modifier::DIM)
-                            } else {
-                                Style::default().fg(app.theme.text_muted)
-                            },
-                        )))
-                        .style(row_style),
-                        Rect::new(list_area.x, y + 1, list_area.width, 1),
-                    );
-                }
+                draw_modified_date(
+                    frame,
+                    Rect::new(list_area.x, y, list_area.width, content_height),
+                    file.modified.into(),
+                    selected,
+                    row_style,
+                    app.theme,
+                );
                 if interactive {
                     app.file_hitboxes.push(FileHitbox {
                         path: file.path.clone(),
@@ -250,4 +299,32 @@ pub(super) fn draw_files(
         }
         y = y.saturating_add(layout_height);
     }
+}
+
+fn draw_modified_date(
+    frame: &mut Frame,
+    area: Rect,
+    modified: DateTime<Local>,
+    selected: bool,
+    row_style: Style,
+    theme: Theme,
+) {
+    if area.height < 2 {
+        return;
+    }
+    let date_style = if selected {
+        Style::default()
+            .fg(theme.selection_foreground)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(theme.text_muted)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {}", modified.format("%y/%m/%d %H:%M")),
+            date_style,
+        )))
+        .style(row_style),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
 }

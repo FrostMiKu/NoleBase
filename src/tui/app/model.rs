@@ -24,7 +24,7 @@ pub enum Command {
 pub(super) enum AppCommand {
     InterruptAgent,
     CopyLastAgentOutput,
-    ClearAgentSession,
+    NewAgentSession,
     OpenTerminal,
     ToggleMouseSupport,
     NewNote,
@@ -56,6 +56,12 @@ pub(super) struct AppCommandDefinition {
 
 pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
     AppCommandDefinition {
+        id: AppCommand::NewAgentSession,
+        label: "Agent: New session",
+        description: "Create a new Agent conversation",
+        keywords: "agent new session chat conversation",
+    },
+    AppCommandDefinition {
         id: AppCommand::InterruptAgent,
         label: "Agent: Interrupt task",
         description: "Stop the active Agent task",
@@ -66,12 +72,6 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
         label: "Agent: Copy last output",
         description: "Copy the latest Agent response to the clipboard",
         keywords: "agent copy last latest output response clipboard",
-    },
-    AppCommandDefinition {
-        id: AppCommand::ClearAgentSession,
-        label: "Agent: Clear session",
-        description: "Delete the saved conversation and panel history",
-        keywords: "agent clear reset new session context conversation",
     },
     AppCommandDefinition {
         id: AppCommand::OpenTerminal,

@@ -7,7 +7,7 @@
 
 mod attachment_ops;
 mod calculator;
-mod explore;
+mod collaborate;
 mod file_edit;
 mod file_ops;
 mod file_patch;
@@ -16,7 +16,6 @@ mod interactive;
 mod jobs;
 mod notes_tags;
 pub(crate) mod read;
-mod review;
 mod shell;
 mod subagent_tools;
 mod todo;
@@ -28,7 +27,7 @@ mod workspace_quota;
 mod write_policy;
 
 pub use self::{
-    attachment_ops::*, calculator::*, explore::*, file_ops::*, file_patch::*, grep::*,
-    interactive::*, jobs::*, notes_tags::*, read::*, review::*, shell::*, todo::*, wait::*, web::*,
+    attachment_ops::*, calculator::*, collaborate::*, file_ops::*, file_patch::*, grep::*,
+    interactive::*, jobs::*, notes_tags::*, read::*, shell::*, todo::*, wait::*, web::*,
     wiki_links::*,
 };

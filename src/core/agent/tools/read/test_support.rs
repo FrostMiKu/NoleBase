@@ -16,6 +16,7 @@ use crate::core::storage::ATTACHMENTS_DIR;
 
 pub(crate) fn attachment_ctx(directory: &Path) -> ParseContext {
     ParseContext {
+        session_directory: directory.join("agents/scratch"),
         root: directory.to_path_buf(),
         reads: Arc::new(SnapshotStore::default()),
         client: reqwest::Client::new(),

@@ -17,7 +17,7 @@ use crate::core::agent_session::AgentPanelEntry;
 
 /// The display transcript of one agent session, with the bookkeeping that
 /// keeps stream events pointing at the right entry.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AgentPanel {
     entries: Vec<Arc<AgentPanelEntry>>,
     /// `ToolPreparing` stream index → entries index, until the preparation
@@ -27,7 +27,37 @@ pub struct AgentPanel {
     active_tools: HashMap<String, usize>,
 }
 
+#[derive(serde::Serialize)]
+pub struct LiveTool {
+    pub id: Option<String>,
+    pub preparation_index: Option<usize>,
+    pub active: bool,
+}
+
 impl AgentPanel {
+    pub fn live_tools(&self) -> Vec<LiveTool> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_index, entry)| {
+                let AgentPanelEntry::Tool { active, .. } = entry.as_ref() else {
+                    return None;
+                };
+                Some(LiveTool {
+                    id: self
+                        .active_tools
+                        .iter()
+                        .find_map(|(id, index)| (*index == entry_index).then(|| id.clone())),
+                    preparation_index: self
+                        .preparing_tools
+                        .iter()
+                        .find_map(|(index, entry)| (*entry == entry_index).then_some(*index)),
+                    active: *active,
+                })
+            })
+            .collect()
+    }
+
     /// Build a panel over restored entries (a persisted session's panel).
     pub fn from_entries(
         entries: impl IntoIterator<Item = impl Into<Arc<AgentPanelEntry>>>,

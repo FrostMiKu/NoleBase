@@ -119,8 +119,7 @@ pub(crate) fn tool_activity_target(call: &Value) -> Option<String> {
             .filter(|value| !value.is_empty())
     };
     match name {
-        "explore" => text("task"),
-        "review" => text("task"),
+        "agents" => text("name").or_else(|| text("action")),
         "calculate" => text("expression"),
         "wait" => input
             .get("seconds")

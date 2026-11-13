@@ -240,6 +240,23 @@ impl App {
             return None;
         }
 
+        if let Some((id, _)) = self
+            .agent_session_hitboxes
+            .iter()
+            .find(|(_, area)| point_in_rect(column, row, *area))
+            .copied()
+        {
+            if let Some(row) = self
+                .visible_file_rows()
+                .iter()
+                .position(|item| *item == FileListRow::Agent(id))
+            {
+                self.select_file_row(row);
+            }
+            self.open_agent_session(id);
+            return None;
+        }
+
         if let Some(path) = self
             .file_hitboxes
             .iter()

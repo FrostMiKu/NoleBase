@@ -82,9 +82,16 @@ struct AgentTerminalState {
 #[derive(Clone, Default)]
 pub struct AgentTerminalHandle {
     inner: Arc<Mutex<AgentTerminalState>>,
+    output_directory: Option<PathBuf>,
 }
 
 impl AgentTerminalHandle {
+    pub(crate) fn in_directory(directory: &Path) -> Self {
+        Self {
+            inner: Arc::default(),
+            output_directory: Some(directory.join("pty")),
+        }
+    }
     pub(crate) fn is_running(&self) -> bool {
         let Ok(state) = self.inner.lock() else {
             return false;
@@ -129,7 +136,11 @@ impl AgentTerminalHandle {
         state.next_id = state.next_id.saturating_add(1);
         let id = format!("terminal-{}", state.next_id);
         let helper = shell_helper_command(nole_root)?;
-        let output_path = nole_root.join("agent-session").join("pty").join(&id);
+        let output_path = self
+            .output_directory
+            .clone()
+            .unwrap_or_else(|| nole_root.join("agents/scratch/pty"))
+            .join(&id);
         let mut terminal = EmbeddedTerminal::spawn_command_with_raw_log(root, helper, output_path)?;
         terminal.resize(AGENT_TERMINAL_ROWS, AGENT_TERMINAL_INITIAL_COLS)?;
         let mut bytes = command.as_bytes().to_vec();
@@ -387,7 +398,11 @@ impl AgentTerminalHandle {
         let mut command = portable_pty::CommandBuilder::new("/bin/sh");
         command.arg("-c");
         command.arg(script);
-        let output_path = root.join("agent-session").join("pty").join(&id);
+        let output_path = self
+            .output_directory
+            .clone()
+            .unwrap_or_else(|| root.join("agents/scratch/pty"))
+            .join(&id);
         let mut terminal =
             EmbeddedTerminal::spawn_command_with_raw_log(root, command, output_path)?;
         terminal.resize(AGENT_TERMINAL_ROWS, AGENT_TERMINAL_INITIAL_COLS)?;
