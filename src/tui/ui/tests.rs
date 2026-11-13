@@ -3550,6 +3550,52 @@ fn document_code_block_renders_and_exposes_a_clickable_copy_button() {
 }
 
 #[test]
+fn code_block_padding_keeps_its_background_in_chat_and_daily_cards() {
+    let source = "```python\nfrom datasets import load_dataset\nds = load_dataset(\"TwinStarT/AISHELL-1\", split=\"test\")\n```";
+    let theme = Theme::default();
+    let note = crate::core::model::DailyNote {
+        date: NaiveDate::from_ymd_opt(2026, 11, 14).unwrap(),
+        body: source.into(),
+    };
+    let chat = super::render_chat_plain_text(source, 100, theme).0;
+    let daily = render_daily_note(&note, "2026-11-14".into(), 100).lines;
+    for lines in [chat, daily] {
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(lines.clone()), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<_> = (0..25)
+            .filter(|y| {
+                (0..100).any(|x| buffer[(x, *y)].bg == theme.markdown_code_block_background)
+            })
+            .collect();
+        assert_eq!(rows.len(), 6);
+        assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        let left = (0..100)
+            .find(|x| buffer[(*x, rows[0])].bg == theme.markdown_code_block_background)
+            .unwrap();
+        let right = (0..100)
+            .rfind(|x| buffer[(*x, rows[0])].bg == theme.markdown_code_block_background)
+            .unwrap();
+        for y in &rows {
+            for x in left..=right {
+                assert_eq!(buffer[(x, *y)].bg, theme.markdown_code_block_background);
+            }
+            assert_eq!(buffer[(left, *y)].symbol(), " ");
+            assert_eq!(buffer[(left + 1, *y)].symbol(), " ");
+            assert_eq!(buffer[(right, *y)].symbol(), " ");
+            assert_eq!(buffer[(right - 1, *y)].symbol(), " ");
+        }
+        for y in [rows[0], rows[2], *rows.last().unwrap()] {
+            assert!((left..=right).all(|x| buffer[(x, y)].symbol() == " "));
+        }
+        assert_eq!(buffer[(left + 2, rows[1])].symbol(), "p");
+        assert_eq!(buffer[(left + 2, rows[3])].symbol(), "1");
+    }
+}
+
+#[test]
 fn daily_vlist_only_renders_visible_cards_and_invalidates_changed_content() {
     let (mut app, _directory) = make_app();
     let first_date = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();

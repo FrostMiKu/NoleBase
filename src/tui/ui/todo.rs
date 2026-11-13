@@ -119,29 +119,9 @@ pub(super) fn draw_todo(
         let Some(item) = app.todo_items.get(index) else {
             continue;
         };
-        let checked = if item.checked { "[x]" } else { "[ ]" };
         let item_selected = app.focus == Focus::Center && index == selected;
-        let marker_style = if item_selected {
-            Style::default()
-                .fg(app.theme.selection_foreground)
-                .add_modifier(Modifier::BOLD)
-        } else if item.checked {
-            Style::default()
-                .fg(app.theme.ui_task_done)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(app.theme.ui_task_open)
-        };
-        let mut text_style = if item.checked {
-            Style::default().add_modifier(Modifier::CROSSED_OUT)
-        } else {
-            Style::default()
-        };
-        if item_selected {
-            text_style = text_style
-                .fg(app.theme.selection_foreground)
-                .bg(app.theme.selection_background);
-        }
+        let marker = crate::tui::task::marker(item.checked, item_selected, app.theme);
+        let text_style = crate::tui::task::text_style(item.checked, item_selected, app.theme);
         let wrapped = wrap_spans_to_width(
             &[Span::styled(item.text.replace('\n', " "), text_style)],
             text_width,
@@ -167,7 +147,7 @@ pub(super) fn draw_todo(
             .enumerate()
         {
             let mut line = if row == 0 {
-                vec![Span::styled(format!("  {checked} "), marker_style)]
+                vec![Span::raw("  "), marker.clone(), Span::raw(" ")]
             } else {
                 vec![Span::raw("      ")]
             };

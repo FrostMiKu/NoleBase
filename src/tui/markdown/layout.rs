@@ -7,7 +7,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 pub(super) fn render(events: &[SpannedEvent<'_>], width: usize, theme: Theme) -> RenderedMarkup {
     let mut layout = Layout {
@@ -22,6 +22,7 @@ pub(super) fn render(events: &[SpannedEvent<'_>], width: usize, theme: Theme) ->
         theme,
         styles: vec![Style::default()],
         lists: Vec::new(),
+        items: Vec::new(),
         quote: 0,
         prefix: String::new(),
         table: None,
@@ -45,6 +46,14 @@ pub(super) fn render(events: &[SpannedEvent<'_>], width: usize, theme: Theme) ->
     {
         layout.output.lines.pop();
     }
+    // Presentations compose these rows from spans, so every span carries its
+    // complete style, including the background of padding-only rows.
+    for line in &mut layout.output.lines {
+        for span in &mut line.spans {
+            span.style = line.style.patch(span.style);
+        }
+        line.style = Style::default();
+    }
     layout.output
 }
 
@@ -55,14 +64,25 @@ struct Layout {
     theme: Theme,
     styles: Vec<Style>,
     lists: Vec<Option<u64>>,
+    items: Vec<ListItem>,
     quote: usize,
     prefix: String,
     table: Option<Table>,
 }
 
+struct ListItem {
+    content_indent: usize,
+    task: Option<bool>,
+    paragraph_started: bool,
+}
+
 impl Layout {
     fn style(&self) -> Style {
-        *self.styles.last().unwrap()
+        let style = *self.styles.last().unwrap();
+        match self.items.last().and_then(|item| item.task) {
+            Some(checked) => style.patch(crate::tui::task::text_style(checked, false, self.theme)),
+            None => style,
+        }
     }
     fn push_style(&mut self, style: Style) {
         self.styles.push(self.style().patch(style));
@@ -90,8 +110,27 @@ impl Layout {
             self.output.lines.push(Line::default());
         }
     }
+    fn start_line(&mut self, indent: usize) {
+        if !self.line.spans.is_empty() || self.table.is_some() {
+            return;
+        }
+        let prefix = format!("{}{}", self.prefix, " ".repeat(indent));
+        let budget = self.width.saturating_sub(1);
+        if budget > 0 && !prefix.is_empty() {
+            self.line.spans.extend(
+                super::wrap::line(
+                    &Line::styled(prefix, Style::default().fg(self.theme.markdown_quote)),
+                    budget,
+                )
+                .remove(0)
+                .spans,
+            );
+        }
+    }
+    fn continuation_indent(&self) -> usize {
+        self.items.last().map_or(0, |item| item.content_indent)
+    }
     fn emit(&mut self, text: &str, style: Style) {
-        // Neither raw HTML nor prose can inject terminal controls.
         let clean: String = text
             .chars()
             .filter(|c| !c.is_control() || *c == '\n')
@@ -100,36 +139,29 @@ impl Layout {
             if index > 0 {
                 self.flush();
             }
+            self.start_line(self.continuation_indent());
+            let span = Span::styled(part, style);
             let mut chunk = String::new();
             let mut used = self.line.width();
-            if used == 0 && !self.prefix.is_empty() && self.table.is_none() {
-                let prefix = self
-                    .prefix
-                    .chars()
-                    .take(self.width.saturating_sub(1))
-                    .collect::<String>();
-                self.line.spans.push(Span::styled(
-                    prefix,
-                    Style::default().fg(self.theme.markdown_quote),
-                ));
-                used = self.line.width();
-            }
-            for ch in part.chars() {
-                let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if self.table.is_none()
-                    && used + cells > self.width
-                    && (used > 0 || !chunk.is_empty())
-                {
+            for grapheme in span.styled_graphemes(Style::default()) {
+                let size = UnicodeWidthStr::width(grapheme.symbol);
+                if self.table.is_none() && used + size > self.width && used > 0 {
                     if !chunk.is_empty() {
                         self.line
                             .spans
                             .push(Span::styled(std::mem::take(&mut chunk), style));
                     }
                     self.flush();
-                    used = 0;
+                    self.start_line(self.continuation_indent());
+                    used = self.line.width();
                 }
-                chunk.push(ch);
-                used += cells;
+                if self.table.is_none() && size > self.width.saturating_sub(used) {
+                    chunk.push('�');
+                    used += 1;
+                } else {
+                    chunk.push_str(grapheme.symbol);
+                    used += size;
+                }
             }
             if !chunk.is_empty() {
                 self.line.spans.push(Span::styled(chunk, style));
@@ -215,19 +247,23 @@ impl Layout {
         } else {
             "• ".to_owned()
         };
-        let marker = task.map_or(list_marker, |done| {
-            if done {
-                "☑ ".to_owned()
-            } else {
-                "☐ ".to_owned()
-            }
-        });
-        let indent = " ".repeat(1 + self.lists.len().saturating_sub(1) * 3);
-        self.emit(
-            &format!("{indent}{marker}"),
-            Style::default().fg(self.theme.markdown_list),
+        let marker = task.map_or_else(
+            || Span::styled(list_marker, Style::default().fg(self.theme.markdown_list)),
+            |checked| {
+                let marker = crate::tui::task::marker(checked, false, self.theme);
+                Span::styled(format!("{} ", marker.content), marker.style)
+            },
         );
+        let indent = self.items.last().map_or(1, |item| item.content_indent + 1);
+        self.start_line(indent);
+        self.emit(&marker.content, marker.style);
+        self.items.push(ListItem {
+            content_indent: indent + marker.width(),
+            task,
+            paragraph_started: false,
+        });
     }
+
     fn link_style(&self, color: ratatui::style::Color) -> Style {
         self.style()
             .fg(color)
@@ -301,7 +337,13 @@ impl Layout {
                     });
                 }
                 Tag::Paragraph => {
-                    if self.lists.is_empty() {
+                    if let Some(item) = self.items.last_mut() {
+                        let continuation = item.paragraph_started;
+                        item.paragraph_started = true;
+                        if continuation {
+                            self.blank();
+                        }
+                    } else {
                         self.flush();
                     }
                 }
@@ -345,8 +387,10 @@ impl Layout {
                     self.blank();
                 }
                 TagEnd::Paragraph => {
-                    if self.lists.is_empty() {
+                    if self.items.is_empty() {
                         self.blank();
+                    } else {
+                        self.flush();
                     }
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
@@ -358,7 +402,10 @@ impl Layout {
                     self.prefix = "  ▌ ".repeat(self.quote);
                     self.styles.pop();
                 }
-                TagEnd::Item => self.flush(),
+                TagEnd::Item => {
+                    self.flush();
+                    self.items.pop();
+                }
                 TagEnd::List(_) => {
                     self.flush();
                     self.lists.pop();

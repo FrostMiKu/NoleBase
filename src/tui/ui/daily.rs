@@ -396,12 +396,10 @@ pub(super) fn render_note_card_content(
         })
         .collect();
     for markdown_line in markdown.lines {
-        for body in wrap_spans_to_width(&markdown_line.spans, body_width) {
-            let mut spans = Vec::with_capacity(body.len() + 1);
-            spans.push(Span::raw(" ".repeat(body_start)));
-            spans.extend(body);
-            lines.push(line_with_background(spans, width, card_style));
-        }
+        let mut spans = Vec::with_capacity(markdown_line.spans.len() + 1);
+        spans.push(Span::raw(" ".repeat(body_start)));
+        spans.extend(markdown_line.spans);
+        lines.push(line_with_background(spans, width, card_style));
     }
     NoteCardRender {
         body_start,

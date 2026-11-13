@@ -9,6 +9,7 @@ pub mod media;
 pub mod model;
 pub mod notification;
 pub mod runtime;
+pub(crate) mod task;
 pub mod terminal_keys;
 pub mod theme;
 pub mod ui;

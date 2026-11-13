@@ -449,13 +449,67 @@ mod tests {
         assert_eq!(
             output.lines().collect::<Vec<_>>(),
             [
-                " ☐ first",
-                " ☑ second",
+                " [ ] first",
+                " [x] second",
                 " • regular",
-                "    ☐ nested",
-                " ☐ loose"
+                "    [ ] nested",
+                " [ ] loose"
             ]
         );
+    }
+
+    #[test]
+    fn list_continuations_align_with_text_for_each_marker_width() {
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789";
+        for (marker, indent) in [("-", 3), ("12.", 5), ("- [ ]", 5), ("- [x]", 5)] {
+            let rendered = render_at_width(&format!("{marker} **{text}**"), 18);
+            assert!(rendered.lines.len() > 1);
+            let mut recovered = String::new();
+            for (index, line) in rendered.lines.iter().enumerate() {
+                let row = line.to_string();
+                if index > 0 {
+                    assert!(row.starts_with(&" ".repeat(indent)), "{marker}: {row:?}");
+                }
+                recovered.extend(row.chars().skip(indent));
+                assert!(line.width() <= 18);
+            }
+            assert_eq!(recovered, text);
+        }
+    }
+
+    #[test]
+    fn nested_lists_and_explicit_breaks_preserve_their_text_columns() {
+        let output = text(&to_lines_at_width(
+            "- parent\n  1. first\n     second  \n     third\n- sibling",
+            40,
+        ));
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                " • parent",
+                "    1. first",
+                "       second",
+                "       third",
+                " • sibling"
+            ]
+        );
+        let loose = text(&to_lines_at_width("- first\n\n  second paragraph", 40));
+        assert_eq!(
+            loose.lines().collect::<Vec<_>>(),
+            [" • first", "", "   second paragraph"]
+        );
+    }
+
+    #[test]
+    fn task_markers_use_todo_colors_and_completed_text_style() {
+        let lines = to_lines_at_width("- [ ] open\n- [x] finished", 40);
+        let theme = Theme::default();
+        assert_eq!(span_with(&lines, "[ ]").style.fg, Some(theme.ui_task_open));
+        assert_eq!(span_with(&lines, "[x]").style.fg, Some(theme.ui_task_done));
+        assert!(span_with(&lines, "finished")
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
     }
 
     #[test]

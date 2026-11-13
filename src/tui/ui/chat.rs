@@ -245,16 +245,14 @@ fn render_chat_prompt_bar(
         .collect();
     for (index, markdown_line) in markdown.lines.into_iter().enumerate() {
         let lead = if index == 0 { prefix } else { "  " };
-        for body in wrap_spans_to_width(&markdown_line.spans, body_width) {
-            let mut spans = Vec::with_capacity(body.len() + 1);
-            spans.push(Span::raw(" ".repeat(CHAT_BLOCK_PAD)));
-            spans.push(Span::styled(
-                lead,
-                Style::default().fg(theme.selection_indicator),
-            ));
-            spans.extend(body);
-            lines.push(line_with_background(spans, width, style));
-        }
+        let mut spans = Vec::with_capacity(markdown_line.spans.len() + 2);
+        spans.push(Span::raw(" ".repeat(CHAT_BLOCK_PAD)));
+        spans.push(Span::styled(
+            lead,
+            Style::default().fg(theme.selection_indicator),
+        ));
+        spans.extend(markdown_line.spans);
+        lines.push(line_with_background(spans, width, style));
     }
     lines.push(line_with_background(Vec::new(), width, style));
     lines.push(Line::default());
