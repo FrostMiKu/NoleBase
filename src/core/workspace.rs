@@ -83,8 +83,7 @@ impl Workspace {
         })
     }
 
-    /// Transitional accessor for code that still talks to storage directly;
-    /// new code should prefer the workspace-level operations below.
+    /// Workspace configuration and filesystem locations.
     pub fn storage(&self) -> &Storage {
         &self.storage
     }
@@ -206,28 +205,6 @@ impl Workspace {
     pub fn read_document(&self, relative: &str) -> Result<String> {
         let target = self.document_path(relative)?;
         self.storage.read_document_file(&target)
-    }
-
-    /// Render an editor snapshot with the same offline, path-safe renderer
-    /// used by exports. The source stays unsaved; only existing managed
-    /// documents may supply the base path for local images and attachments.
-    pub(crate) fn render_document_preview(
-        &self,
-        relative: &str,
-        source: &str,
-    ) -> Result<crate::core::export::RenderedExport> {
-        self.read_document(relative)?;
-        let target = self.document_path(relative)?;
-        crate::core::export::render_html(
-            source,
-            target
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Note"),
-            &self.storage.root,
-            &target,
-            &self.attachments,
-        )
     }
 
     /// Write the source of a managed document addressed by its

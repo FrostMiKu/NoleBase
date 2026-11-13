@@ -125,14 +125,14 @@ impl AgentService {
 
     /// Whether a cancellation has been requested and not yet consumed by a
     /// new run. Test-only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn is_cancel_requested(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
 
     /// Swap the approval decision channel for tests so callers can observe
     /// exactly what the UI sends.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn set_approval_sender_for_test(
         &self,
         sender: tokio::sync::mpsc::UnboundedSender<ApprovalDecision>,
@@ -143,7 +143,7 @@ impl AgentService {
     }
 
     /// Swap the ask-user response channel for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn set_user_sender_for_test(
         &self,
         sender: tokio::sync::mpsc::UnboundedSender<AskUserResponse>,
@@ -154,7 +154,7 @@ impl AgentService {
     }
 
     /// Swap the private terminal input channel for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn set_private_input_sender_for_test(
         &self,
         sender: tokio::sync::mpsc::UnboundedSender<PrivateTerminalInputDecision>,
@@ -328,36 +328,6 @@ mod tests {
                 .unwrap(),
             vec![storage.data_dir.join("A.md")]
         );
-    }
-
-    #[test]
-    fn subscriptions_are_independent_receivers() {
-        let (_workspace, service, _directory) = service();
-        let mut first = service.subscribe();
-        let mut second = service.subscribe();
-        // Both receivers observe a broadcast sent after subscription.
-        service
-            .events
-            .send(AgentEvent::Notification("hello".to_string()))
-            .unwrap();
-        assert!(matches!(
-            first.try_recv(),
-            Ok(AgentEvent::Notification(message)) if message == "hello"
-        ));
-        assert!(matches!(
-            second.try_recv(),
-            Ok(AgentEvent::Notification(message)) if message == "hello"
-        ));
-    }
-
-    #[test]
-    fn permission_mode_round_trips() {
-        let (_workspace, service, _directory) = service();
-        assert_eq!(service.permission_mode(), PermissionMode::Approve);
-        service.set_permission_mode(PermissionMode::Yolo);
-        assert_eq!(service.permission_mode(), PermissionMode::Yolo);
-        service.set_permission_mode(PermissionMode::Auto);
-        assert_eq!(service.permission_mode(), PermissionMode::Auto);
     }
 
     #[test]

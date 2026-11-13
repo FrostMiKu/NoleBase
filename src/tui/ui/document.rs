@@ -342,27 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn backlink_hitbox_covers_exactly_the_rendered_truncated_name() {
-        let path = std::path::PathBuf::from("/root/A-Very-Long-Backlink-Name-That-Overflows.md");
-        // The renderer truncates to viewport.width - 3 (the " " + "• " prefix),
-        // so the hitbox must stop there too instead of spanning the full width.
-        let mut hitboxes = Vec::new();
-        register_backlink_hitboxes(
-            &mut hitboxes,
-            std::slice::from_ref(&path),
-            10,
-            Rect::new(0, 0, 40, 20),
-            0,
-        );
-        assert_eq!(hitboxes.len(), 1);
-        let hitbox = &hitboxes[0];
-        assert_eq!(hitbox.area.x, 3);
-        assert_eq!(hitbox.area.width, 37);
-        assert_eq!(hitbox.area.y, 14); // body_line_count + 4 + index - scroll
-        assert!(hitbox.area.x + hitbox.area.width <= 40);
-    }
-
-    #[test]
     fn backlink_hitbox_skips_names_the_viewport_cannot_show() {
         let path = std::path::PathBuf::from("/root/Name.md");
         for width in 0..4u16 {

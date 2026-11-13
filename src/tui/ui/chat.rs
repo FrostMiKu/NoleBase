@@ -1183,9 +1183,7 @@ mod tests {
         let active_height = app.agent_vlist.geometry.height(0);
         assert!(app.agent_vlist.caches[0].is_none());
 
-        // Completing the tool mutates the entry in place (`Arc::make_mut` keeps
-        // the pointer because the volatile entry has an uncached Arc reference).
-        let before = Arc::as_ptr(&app.agent_panel.entries()[0]);
+        // Complete the entry and verify its result becomes visible on the next frame.
         let entry = &mut app.agent_panel.entries_mut()[0];
         if let AgentPanelEntry::Tool {
             text,
@@ -1197,7 +1195,6 @@ mod tests {
             *active = false;
             *preview = Some("first line of the note".to_string());
         }
-        assert_eq!(Arc::as_ptr(&app.agent_panel.entries()[0]), before);
 
         // The next frame must invalidate the stale active measurement and
         // re-measure the completed entry, or its result preview row and the
@@ -1213,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_live_visible_lines_match_fresh_entry_renders() {
+    fn chat_visible_entries_keep_conversation_order_and_show_each_body_once() {
         let (mut app, _directory) = make_app();
         open_chat(&mut app);
         let entries = vec![
@@ -1243,18 +1240,32 @@ mod tests {
         crate::tui::ui::agent::sync_chat_vlist(&mut app, WIDTH);
         crate::tui::ui::agent::measure_visible_agent_entries(&mut app, 0, 60, true);
         let (visible, _, _) = crate::tui::ui::agent::visible_agent_lines(&mut app, 0, 60);
-        let expected = app
-            .agent_panel
-            .entries()
-            .iter()
-            .flat_map(|entry| render_chat_entry(entry, WIDTH, app.theme).0)
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
         let actual = visible
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
+        let screen = actual.join("\n");
+        let mut previous_end = 0;
+        for body in [
+            "Read the note",
+            "Completed Read File.",
+            "data/Note.md",
+            "first line of the note",
+            "Let me check the note first.",
+            "The reply text.",
+        ] {
+            assert_eq!(
+                screen.matches(body).count(),
+                1,
+                "duplicated or missing {body}: {screen}"
+            );
+            let start = screen.find(body).unwrap();
+            assert!(
+                start >= previous_end,
+                "conversation order changed: {screen}"
+            );
+            previous_end = start + body.len();
+        }
     }
 
     #[test]

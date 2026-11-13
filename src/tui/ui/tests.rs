@@ -122,8 +122,6 @@ fn vs16_continuation_cells_are_not_emitted_by_the_buffer_diff() {
         .any(|(x, _, cell)| *x == 2 && cell.symbol() == "x"));
 }
 
-use crate::tui::theme::catppuccin as ctp;
-
 fn animated_activity_lines(text: &str, width: usize, tick: u64) -> Vec<Line<'static>> {
     super::animated_activity_lines(text, width, tick, Theme::default())
 }
@@ -313,7 +311,7 @@ fn command_palette_is_fixed_width_and_renders_query_and_commands() {
     assert_eq!(palette.width, 80);
     assert_eq!(
         terminal.backend().buffer()[(palette.x, palette.y)].fg,
-        ctp::GREEN
+        app.theme.ui_focus_border
     );
     assert!(app.dialog_hitboxes.len() >= 4);
     let selected = &app.dialog_hitboxes[0].area;
@@ -325,7 +323,7 @@ fn command_palette_is_fixed_width_and_renders_query_and_commands() {
     );
     assert_eq!(
         terminal.backend().buffer()[(selected.x, selected.y - 1)].bg,
-        ctp::SURFACE_1
+        app.theme.selection_background
     );
     assert_eq!(
         terminal.backend().buffer()[(selected.x, selected.y)].symbol(),
@@ -342,7 +340,7 @@ fn command_palette_is_fixed_width_and_renders_query_and_commands() {
     );
     assert_eq!(
         terminal.backend().buffer()[(selected.x, selected.y + 2)].bg,
-        ctp::SURFACE_1,
+        app.theme.selection_background,
         "selection should include the shared blank row"
     );
     assert!(terminal.backend().buffer()[(selected.x + 2, selected.y)]
@@ -808,14 +806,14 @@ fn animated_activity_respects_terminal_cell_width() {
             .spans
             .iter()
             .skip(1)
-            .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
+            .filter(|span| span.style.fg != Some(crate::tui::theme::Theme::default().text_muted))
             .count(),
         6
     );
     assert!(lines[0]
         .spans
         .iter()
-        .filter(|span| span.style.fg != Some(ctp::OVERLAY_0))
+        .filter(|span| span.style.fg != Some(crate::tui::theme::Theme::default().text_muted))
         .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
 }
 
@@ -850,10 +848,13 @@ fn yolo_mode_animates_in_the_footer_and_daily_advertises_commands() {
     let surface_x = approve_footer.find("DAILY").unwrap() as u16;
     let approve_byte = approve_footer.find("APPROVE").unwrap();
     let approve_x = approve_footer[..approve_byte].width() as u16;
-    assert_eq!(approve.backend().buffer()[(surface_x, 23)].bg, ctp::BLUE);
+    assert_eq!(
+        approve.backend().buffer()[(surface_x, 23)].bg,
+        app.theme.surface_status_context
+    );
     assert_eq!(
         approve.backend().buffer()[(approve_x, 23)].bg,
-        ctp::SAPPHIRE
+        app.theme.surface_status_mode
     );
 
     app.agent.set_permission_mode(PermissionMode::Yolo);
@@ -872,7 +873,7 @@ fn yolo_mode_animates_in_the_footer_and_daily_advertises_commands() {
         .iter()
         .all(|color| matches!(color, Color::Rgb(..))));
     assert!((yolo_x..yolo_x + "YOLO".width() as u16)
-        .all(|x| first.backend().buffer()[(x, footer_y)].bg == ctp::CRUST));
+        .all(|x| first.backend().buffer()[(x, footer_y)].bg == app.theme.surface_overlay));
 
     app.animation_tick = 1;
     let second = render(&mut app, 170, 24);
@@ -883,7 +884,7 @@ fn yolo_mode_animates_in_the_footer_and_daily_advertises_commands() {
 }
 
 #[test]
-fn virtual_line_window_clones_only_visible_rows() {
+fn line_window_returns_the_requested_rows_and_handles_the_end() {
     let lines = (0..10_000)
         .map(|index| Line::from(format!("row {index}")))
         .collect::<Vec<_>>();
@@ -929,7 +930,7 @@ fn narrow_files_and_todo_page_each_use_the_full_body_without_duplicates() {
 }
 
 #[test]
-fn sidebars_use_mantle_background_with_square_ui_borders() {
+fn sidebars_use_the_panel_theme_and_square_borders() {
     let (mut app, _directory) = make_app();
     let terminal = render(&mut app, 170, 24);
     let buffer = terminal.backend().buffer();
@@ -940,7 +941,7 @@ fn sidebars_use_mantle_background_with_square_ui_borders() {
 
     for area in [files, views, agent] {
         assert_eq!(buffer[(area.x, area.y)].symbol(), "┌");
-        assert_eq!(buffer[(area.x + 2, area.y + 1)].bg, ctp::MANTLE);
+        assert_eq!(buffer[(area.x + 2, area.y + 1)].bg, app.theme.surface_panel);
     }
     assert_eq!(buffer[(center.x, center.y)].bg, Color::Reset);
 }
@@ -967,7 +968,7 @@ fn selected_file_background_covers_name_and_modified_time_rows() {
     let buffer = terminal.backend().buffer();
     for y in selected_area.y..selected_area.y + selected_area.height {
         for x in selected_area.x..selected_area.x + selected_area.width {
-            assert_eq!(buffer[(x, y)].bg, ctp::SURFACE_1);
+            assert_eq!(buffer[(x, y)].bg, app.theme.selection_background);
         }
     }
     assert_eq!(
@@ -1034,18 +1035,18 @@ fn file_selection_includes_both_shared_spacing_lines() {
         .expect("selected file");
     assert_eq!(
         buffer[(selected.area.x, selected.area.y.saturating_sub(1))].bg,
-        ctp::SURFACE_1,
+        app.theme.selection_background,
         "selected background must include the upper shared spacing"
     );
     assert_eq!(
         buffer[(selected.area.x, selected.area.y + 2)].bg,
-        ctp::SURFACE_1,
+        app.theme.selection_background,
         "selected background must include the lower shared spacing"
     );
     for rail_y in selected.area.y.saturating_sub(1)..=selected.area.y + 2 {
         let cell = &buffer[(selected.area.x, rail_y)];
         assert_eq!(cell.symbol(), "▌");
-        assert_eq!(cell.fg, ctp::MAUVE);
+        assert_eq!(cell.fg, app.theme.selection_indicator);
         assert!(!cell.modifier.contains(Modifier::BOLD));
         assert!(!cell.modifier.contains(Modifier::DIM));
     }
@@ -1068,10 +1069,10 @@ fn file_groups_use_teal_markers_and_muted_counts() {
         .expect("Notes group hitbox")
         .area;
     let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(notes.x, notes.y)].fg, ctp::TEAL);
+    assert_eq!(buffer[(notes.x, notes.y)].fg, app.theme.ui_group_marker);
     assert_eq!(
         buffer[(notes.x + notes.width - 1, notes.y)].fg,
-        ctp::OVERLAY_0
+        app.theme.text_muted
     );
 }
 
@@ -1093,7 +1094,7 @@ fn file_name_inputs_render_as_modals_while_search_stays_inline() {
     let modal = app.layout.overlay.unwrap();
     assert_eq!(
         terminal.backend().buffer()[(modal.x + 1, modal.y + 1)].bg,
-        ctp::MANTLE,
+        app.theme.surface_panel,
         "modal padding should have an opaque background"
     );
 
@@ -1111,7 +1112,7 @@ fn file_name_inputs_render_as_modals_while_search_stays_inline() {
     let files = app.layout.files.unwrap();
     let underline = &terminal.backend().buffer()[(files.x + 2, files.y + 2)];
     assert_eq!(underline.symbol(), "─");
-    assert_eq!(underline.fg, ctp::OVERLAY_0);
+    assert_eq!(underline.fg, app.theme.text_muted);
     assert!(app.layout.overlay.is_none());
 
     app.open_dialog(DialogState::new(
@@ -2775,14 +2776,14 @@ fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
             && line
                 .spans
                 .iter()
-                .all(|span| span.style.bg == Some(ctp::SURFACE_0))
+                .all(|span| span.style.bg == Some(app.theme.surface_message_user))
     }));
     assert!(agent_lines.iter().take(agent_lines.len() - 1).all(|line| {
         UnicodeWidthStr::width(line.to_string().as_str()) == 40
             && line
                 .spans
                 .iter()
-                .all(|span| span.style.bg == Some(ctp::BASE))
+                .all(|span| span.style.bg == Some(app.theme.surface_message_agent))
     }));
 
     let agent_area = app.layout.agent.unwrap();
@@ -2797,8 +2798,8 @@ fn agent_panel_shows_user_before_agent_with_source_backgrounds() {
         .unwrap();
     assert_eq!(agent_text_row - user_text_row, 6);
     for (needle, background) in [
-        ("Explain the selected note", ctp::SURFACE_0),
-        ("Here is the explanation", ctp::BASE),
+        ("Explain the selected note", app.theme.surface_message_user),
+        ("Here is the explanation", app.theme.surface_message_agent),
     ] {
         let y = rows.iter().position(|line| line.contains(needle)).unwrap() as u16;
         for x in agent_area.x + 1..agent_area.x + agent_area.width - 1 {
@@ -2892,11 +2893,17 @@ fn focused_compose_sits_below_the_document_with_an_animated_border() {
     let center = app.layout.center.expect("center area");
     let content = inset_horizontal(center_content_axis(center), 2);
     assert!(compose.x > content.x);
-    assert_eq!(buffer[(content.x, compose.y - 3)].bg, ctp::MANTLE);
+    assert_eq!(
+        buffer[(content.x, compose.y - 3)].bg,
+        app.theme.surface_panel
+    );
     assert_eq!(buffer[(content.x, compose.y - 2)].bg, Color::Reset);
     assert_eq!(buffer[(content.x, compose.y - 1)].bg, Color::Reset);
     assert_eq!(buffer[(content.x, compose.y + 1)].bg, Color::Reset);
-    assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::SURFACE_0);
+    assert_eq!(
+        buffer[(compose.x + 1, compose.y + 1)].bg,
+        app.theme.surface_compose
+    );
     let last_paragraph_y = (0..buffer.area().height)
         .find(|y| {
             (0..buffer.area().width)
@@ -2936,8 +2943,14 @@ fn document_paper_scrolls_behind_the_compose_while_content_remains() {
             .collect::<String>()
     };
     let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(content.x, compose.y + 1)].bg, ctp::MANTLE);
-    assert_eq!(buffer[(compose.x + 1, compose.y + 1)].bg, ctp::SURFACE_0);
+    assert_eq!(
+        buffer[(content.x, compose.y + 1)].bg,
+        app.theme.surface_panel
+    );
+    assert_eq!(
+        buffer[(compose.x + 1, compose.y + 1)].bg,
+        app.theme.surface_compose
+    );
     assert!(!buffer_row(buffer, paper_y).contains("paper line 0"));
     assert!(buffer_row(buffer, paper_y + 2).contains("paper line 0"));
 
@@ -3048,7 +3061,7 @@ fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
     );
     assert_eq!(
         terminal.backend().buffer()[(first.x, first.y + first.height - 1)].bg,
-        ctp::SURFACE_1,
+        app.theme.selection_background,
         "the selected background should include the shared blank row"
     );
     assert_eq!(
@@ -3061,7 +3074,7 @@ fn todo_items_share_a_blank_row_included_in_selection_and_hitbox() {
     );
     let last_margin = &terminal.backend().buffer()[(last.x + 1, last.y + last.height - 1)];
     assert_eq!(last_margin.symbol(), " ");
-    assert_eq!(last_margin.bg, ctp::SURFACE_1);
+    assert_eq!(last_margin.bg, app.theme.selection_background);
     assert!(!last_margin.modifier.contains(Modifier::CROSSED_OUT));
     assert!(!terminal.backend().buffer()[(last.x, last.y - 1)]
         .modifier
@@ -3163,7 +3176,9 @@ fn chat_renders_block_markdown_on_colored_cards() {
     );
     assert!(
         buffer.content().iter().any(|cell| {
-            cell.symbol() == "H" && cell.modifier.contains(Modifier::BOLD) && cell.bg == ctp::MANTLE
+            cell.symbol() == "H"
+                && cell.modifier.contains(Modifier::BOLD)
+                && cell.bg == app.theme.surface_panel
         }),
         "selection should not alter the Markdown body background"
     );
@@ -3335,10 +3350,22 @@ fn single_line_daily_card_spaces_date_body_and_buttons() {
     let center = app.layout.center.expect("center area");
     let sample_x = center.x + center.width / 2;
     assert!(date_row >= 2);
-    assert_eq!(buffer[(sample_x, date_row as u16 - 1)].bg, ctp::MANTLE);
-    assert_eq!(buffer[(sample_x, date_row as u16 - 2)].bg, ctp::MANTLE);
-    assert_eq!(buffer[(sample_x, button_row as u16 + 1)].bg, ctp::MANTLE);
-    assert_eq!(buffer[(sample_x, button_row as u16 + 2)].bg, ctp::MANTLE);
+    assert_eq!(
+        buffer[(sample_x, date_row as u16 - 1)].bg,
+        app.theme.surface_panel
+    );
+    assert_eq!(
+        buffer[(sample_x, date_row as u16 - 2)].bg,
+        app.theme.surface_panel
+    );
+    assert_eq!(
+        buffer[(sample_x, button_row as u16 + 1)].bg,
+        app.theme.surface_panel
+    );
+    assert_eq!(
+        buffer[(sample_x, button_row as u16 + 2)].bg,
+        app.theme.surface_panel
+    );
     let card_left = inset_horizontal(center_content_axis(center), 2).x;
     assert_eq!(buffer[(card_left, date_row as u16 - 2)].symbol(), "┌");
     assert_eq!(buffer[(card_left, date_row as u16)].symbol(), "│");
@@ -3375,8 +3402,8 @@ fn document_view_uses_a_scrollable_page_margin_without_an_outer_border() {
         .map(|x| buffer[(x, 4)].symbol().to_string())
         .collect();
     assert!(first_document_row.contains("Heading"));
-    assert_eq!(buffer[(2, 2)].bg, ctp::MANTLE);
-    assert_eq!(buffer[(2, 3)].bg, ctp::MANTLE);
+    assert_eq!(buffer[(2, 2)].bg, app.theme.surface_panel);
+    assert_eq!(buffer[(2, 3)].bg, app.theme.surface_panel);
     let heading_x = first_document_row.find("Heading").unwrap() as u16;
     assert!(heading_x >= 2 + PAGE_PADDING_X as u16);
     assert!(buffer_string(&terminal).contains("needle"));

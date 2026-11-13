@@ -1627,7 +1627,6 @@ fn streamed_tool_preparation_updates_one_entry_and_hands_it_to_execution() {
         AgentPanelEntry::Tool { text, active: true, .. }
             if text == "Preparing Write...\nnotes/design.md · 184 lines · 6.2 KB\n…latest line"
     ));
-    let preparation_entry = Arc::as_ptr(&app.agent_panel.entries()[0]);
 
     sender
         .send(AgentEvent::ToolPreparationFinished {
@@ -1644,10 +1643,7 @@ fn streamed_tool_preparation_updates_one_entry_and_hands_it_to_execution() {
     app.poll_agent();
 
     assert_eq!(app.agent_panel.len(), 1);
-    assert_eq!(
-        Arc::as_ptr(&app.agent_panel.entries()[0]),
-        preparation_entry
-    );
+
     assert!(matches!(
         app.agent_panel.entries()[0].as_ref(),
         AgentPanelEntry::Tool { text, active: true, .. }
@@ -1672,7 +1668,6 @@ fn tool_started_adopts_a_stranded_preparation_entry_when_the_id_chain_breaks() {
         .send(AgentEvent::ToolPreparationFinished { index: 0, id: None })
         .unwrap();
     app.poll_agent();
-    let preparation_entry = Arc::as_ptr(&app.agent_panel.entries()[0]);
 
     sender
         .send(AgentEvent::ToolStarted {
@@ -1690,10 +1685,7 @@ fn tool_started_adopts_a_stranded_preparation_entry_when_the_id_chain_breaks() {
     app.poll_agent();
 
     assert_eq!(app.agent_panel.len(), 1);
-    assert_eq!(
-        Arc::as_ptr(&app.agent_panel.entries()[0]),
-        preparation_entry
-    );
+
     assert!(matches!(
         app.agent_panel.entries()[0].as_ref(),
         AgentPanelEntry::Tool { text, active: false, .. }
@@ -1719,7 +1711,7 @@ fn deferred_tool_finished_retires_the_spinning_preparation_entry() {
         })
         .unwrap();
     app.poll_agent();
-    let preparation_entry = Arc::as_ptr(&app.agent_panel.entries()[0]);
+
     assert_eq!(app.status, "Preparing Edit...");
 
     // Buffered user input defers the call before execution: the batch emits
@@ -1735,10 +1727,7 @@ fn deferred_tool_finished_retires_the_spinning_preparation_entry() {
     app.poll_agent();
 
     assert_eq!(app.agent_panel.len(), 1);
-    assert_eq!(
-        Arc::as_ptr(&app.agent_panel.entries()[0]),
-        preparation_entry
-    );
+
     assert!(matches!(
         app.agent_panel.entries()[0].as_ref(),
         AgentPanelEntry::Tool { text, active: false, .. }

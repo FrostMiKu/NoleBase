@@ -383,7 +383,6 @@ mod tests {
     use ratatui::style::Modifier;
 
     use super::*;
-    use crate::tui::theme::catppuccin as ctp;
 
     fn to_lines_at_width(source: &str, width: usize) -> Vec<Line<'static>> {
         super::to_lines_at_width(source, width, Theme::default())
@@ -682,9 +681,12 @@ mod tests {
     #[test]
     fn renders_hashtags_and_wikilinks() {
         let lines = to_lines_at_width("See #开发/日志 and [[项目计划]]", WIDTH);
-        assert_eq!(span_with(&lines, "#开发/日志").style.fg, Some(ctp::PINK));
+        assert_eq!(
+            span_with(&lines, "#开发/日志").style.fg,
+            Some(Theme::default().markdown_hashtag)
+        );
         let wikilink = span_with(&lines, "[[项目计划]]");
-        assert_eq!(wikilink.style.fg, Some(ctp::SKY));
+        assert_eq!(wikilink.style.fg, Some(Theme::default().markdown_wikilink));
         assert!(wikilink.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 

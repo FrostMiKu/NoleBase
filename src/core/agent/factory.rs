@@ -216,16 +216,18 @@ impl Agent {
             .unwrap_or_else(|| collaboration::CollaboratorsHandle::new(&session_directory));
         collaborators.load()?;
         agent.register(Collaborate::new(
-            nole_root,
-            &session_directory,
+            SubagentTools {
+                root: nole_root.into(),
+                session_directory: session_directory.clone(),
+                workspace_index,
+                wiki_links,
+                client,
+                tavily_api_key,
+                skills,
+            },
             subagent_runtime,
             collaborators,
             agent.jobs.clone(),
-            workspace_index,
-            wiki_links,
-            client,
-            tavily_api_key,
-            &skills,
             agent.config.max_concurrent_subagents,
         ));
         agent.register(ImportAttachment::new(nole_root)?);

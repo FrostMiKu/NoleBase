@@ -94,12 +94,16 @@ mod tests {
     }
 
     #[test]
-    fn load_returns_clone_and_leaves_register_intact() {
+    fn editing_loaded_lines_preserves_reusable_register_contents() {
         let bank = RegisterBank::default();
-        bank.store(Some("reg"), vec!["x".into()]).unwrap();
-        let first = bank.load(Some("reg")).unwrap().unwrap();
-        let second = bank.load(Some("reg")).unwrap().unwrap();
-        assert_eq!(first, second);
+        bank.store(Some("reg"), vec!["original".into()]).unwrap();
+        let mut loaded = bank.load(Some("reg")).unwrap().unwrap();
+        loaded[0] = "edited".into();
+        loaded.push("another line".into());
+        assert_eq!(
+            bank.load(Some("reg")).unwrap(),
+            Some(vec!["original".into()])
+        );
     }
 
     #[test]

@@ -63,16 +63,20 @@ mod tools;
 mod types;
 
 pub(crate) use self::activity::*;
+pub use self::config::AgentConfig;
 pub(crate) use self::config::*;
 pub(crate) use self::context::*;
 pub(crate) use self::hashline::*;
 pub(crate) use self::jobs::*;
+pub use self::jobs::{AgentJobsHandle, JobKind, JobRow, JobStatus};
 pub(crate) use self::prompts::*;
 pub(crate) use self::results::*;
+pub use self::shell_helper::run_shell_helper_if_requested;
 pub(crate) use self::shell_helper::*;
 pub(crate) use self::shell_policy::*;
 pub(crate) use self::snapshots::*;
 pub(crate) use self::terminal::*;
+pub use self::terminal::{AgentTerminalHandle, AgentTerminalSnapshot, AgentTerminalStatus};
 pub use self::types::*;
 
 use tool_stream::ToolCallStreamPreview;

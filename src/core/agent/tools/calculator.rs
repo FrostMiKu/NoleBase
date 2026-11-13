@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 
 use crate::core::agent::Tool;
 
+const MAX_EXPRESSION_CHARS: usize = 1000;
+
 pub struct Calculate;
 
 fn evaluate(expression: &str) -> std::result::Result<f64, fasteval::Error> {
@@ -93,7 +95,7 @@ impl Tool for Calculate {
                     "type": "string",
                     "description": "One expression, for example: sqrt(3^2 + 4^2)",
                     "minLength": 1,
-                    "maxLength": 1000
+                    "maxLength": MAX_EXPRESSION_CHARS
                 }
             },
             "required": ["expression"],
@@ -111,8 +113,8 @@ impl Tool for Calculate {
             if expression.is_empty() {
                 anyhow::bail!("expression must not be empty");
             }
-            if expression.chars().count() > 1000 {
-                anyhow::bail!("expression must not exceed 1000 characters");
+            if expression.chars().count() > MAX_EXPRESSION_CHARS {
+                anyhow::bail!("expression must not exceed {MAX_EXPRESSION_CHARS} characters");
             }
 
             let expression = normalize_leading_decimal(expression);
@@ -208,11 +210,25 @@ mod tests {
     }
 
     #[test]
-    fn schema_requires_one_bounded_expression() {
-        let schema = Calculate.input_schema();
-        assert_eq!(schema["required"], json!(["expression"]));
-        assert_eq!(schema["properties"]["expression"]["minLength"], 1);
-        assert_eq!(schema["properties"]["expression"]["maxLength"], 1000);
-        assert_eq!(schema["additionalProperties"], false);
+    fn registered_calculator_accepts_the_boundary_and_rejects_invalid_requests() {
+        let tool = crate::core::agent::RegisteredTool::new(Calculate, &Calculate.input_schema());
+        let runtime = crate::core::agent::test_support::test_runtime();
+        for invalid in [
+            json!({}),
+            json!({"expression": 42}),
+            json!({"expression": ""}),
+            json!({"expression": "1", "extra": true}),
+            json!({"expression": format!("1{}", " ".repeat(1000))}),
+        ] {
+            assert!(
+                runtime.block_on(tool.execute(&invalid)).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        let boundary = json!({"expression": format!("1{}", " ".repeat(999))});
+        assert_eq!(
+            runtime.block_on(tool.execute(&boundary)).unwrap().content,
+            "1"
+        );
     }
 }

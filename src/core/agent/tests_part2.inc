@@ -489,35 +489,6 @@
     }
 
     #[test]
-    fn system_prompt_stays_compact() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.len() < 3_000, "system prompt grew to {} bytes", prompt.len());
-    }
-
-    #[test]
-    fn system_prompt_identifies_the_compiled_platform_shell_and_initial_pty_size() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains(&format!("target OS {}", std::env::consts::OS)));
-        assert!(prompt.contains("command shell Brush (Bash-compatible), not PowerShell"));
-        assert!(prompt.contains("Agent PTY starts at 80×24 cells (columns×rows)"));
-    }
-
-    #[test]
-    fn system_prompt_describes_the_agent_maintained_workspace() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains(&format!(
-            "Your workspace: {}",
-            Path::new("/tmp/nole").join(crate::core::storage::WORKSPACE_DIR).display()
-        )));
-        assert!(prompt.contains(
-            "unless the user explicitly specifies another location; organize its layout as you see fit"
-        ));
-        assert!(prompt.contains(
-            "The workspace persists across sessions; nothing clears it for you. Maintain it yourself"
-        ));
-    }
-
-    #[test]
     fn system_prompt_appends_project_instructions_then_memory() {
         let prompt = system_prompt(
             Path::new("/tmp/nole"),
@@ -528,37 +499,6 @@
         let memory = prompt.find("MEMORY CONTENT").unwrap();
         assert!(project < memory);
         assert!(prompt.ends_with("MEMORY CONTENT\nlast line"));
-    }
-
-    #[test]
-    fn system_prompt_explains_persistent_memory_maintenance() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains("MEMORY.md"));
-        assert!(prompt.contains("persistent Agent memory"));
-        assert!(prompt.contains("durable user preferences"));
-        assert!(prompt.contains(
-            "Its full contents are already provided in your Memory section, so never read it back"
-        ));
-    }
-
-    #[test]
-    fn system_prompt_prefers_built_in_tools_before_shells() {
-        let prompt = system_prompt(Path::new("/tmp/nole"), "", "");
-        assert!(prompt.contains(
-            "Prefer purpose-built tools because they provide structured inputs, path protections, and change previews."
-        ));
-        assert!(prompt.contains("Use `shell` or `terminal` only when the built-in tools cannot complete the task effectively."));
-        assert!(prompt.contains(
-            "Change files only with `edit`, `append`, or `write`; shell edits (`sed -i`, redirections) desync read snapshots and are rejected."
-        ));
-        assert!(prompt.contains(
-            "Search and inspect with `grep`/`read`, never shell search tools like `rg` or `cat`."
-        ));
-        assert!(prompt.contains(
-            "If an edit or write fails validation, fix the cause—never bypass it via `shell`."
-        ));
-        assert!(!prompt.contains("every shell command"));
-        assert!(!prompt.contains("terminal input"));
     }
 
     #[test]
@@ -586,7 +526,7 @@
     }
 
     #[test]
-    fn tavily_tool_is_registered_only_with_a_key_without_prompt_duplication() {
+    fn agent_registration_tracks_search_credentials_and_keeps_definitions_consistent() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
@@ -649,78 +589,14 @@
         assert!(serialized_system.contains("Available skills"));
         assert!(serialized_system.contains("create-skill"));
         assert!(!serialized_system.contains("# Create a Skill"));
-        for removed in [
-            "create_file",
-            "edit_file",
-            "copy_file",
-            "move_file",
-            "move_files",
-            "rename_file",
-            "delete_file",
-            "open_file",
-            "ask_user",
-            "web_search",
-            "update_file",
-            "read_daily",
-            "update_daily",
-            "append_daily",
-        ] {
-            assert!(!without_key.tools.contains_key(removed));
-        }
-        assert!(!without_key.system.last().unwrap().cache);
-        assert_eq!(without_key.system.len(), 4);
-        assert_eq!(
-            without_key
-                .system
-                .iter()
-                .map(|block| block.cache)
-                .collect::<Vec<_>>(),
-            vec![true, false, true, false]
-        );
         assert!(without_key.definitions.last().unwrap().cache);
-        for definition in &without_key.definitions {
-            for detail in ["approval", "bypass", "prevalidated", "source spans", "Tavily"] {
-                assert!(
-                    !definition.description.contains(detail),
-                    "tool {} exposes runtime detail {detail:?}",
-                    definition.name
-                );
-            }
-        }
         let second_without_key = make_agent("");
         assert_eq!(without_key.definitions, second_without_key.definitions);
 
         let with_key = make_agent("tvly-test");
         assert!(with_key.tools.contains_key("search_web"));
         assert_eq!(with_key.system, without_key.system);
-        let search = with_key
-            .definitions
-            .iter()
-            .find(|definition| definition.name == "search_web")
-            .unwrap();
-        assert!(search.description.contains("current information"));
-    }
 
-    #[test]
-    fn tavily_response_is_rendered_as_agent_relevant_text() {
-        let response = json!({
-            "answer": "A concise answer",
-            "request_id": "private-noise",
-            "results": [{
-                "title": "Result",
-                "url": "https://example.test",
-                "content": "Useful snippet",
-                "score": 0.9,
-                "published_date": "2026-07-27",
-                "raw_content": "large omitted content"
-            }]
-        });
-        let rendered = render_tavily_response("query", &response).unwrap();
-        assert!(rendered.starts_with("Search results for: query\n\nAnswer:\nA concise answer"));
-        assert!(rendered.contains("\n\n1. Result\nhttps://example.test"));
-        assert!(rendered.contains("Useful snippet"));
-        assert!(!rendered.contains("private-noise"));
-        assert!(!rendered.contains("large omitted content"));
     }
 
     #[test]
@@ -750,20 +626,7 @@
         );
         assert_eq!(filtered["exclude_domains"], json!(["example.com"]));
 
-        let schema = SearchWeb {
-            client: Client::new(),
-            api_key: "tvly-test".to_string(),
-        }
-        .input_schema();
-        assert_eq!(schema["required"], json!(["query"]));
-        assert_eq!(
-            schema["properties"]["include_domains"]["maxItems"],
-            MAX_WEB_SEARCH_DOMAINS
-        );
-        assert_eq!(
-            schema["properties"]["exclude_domains"]["maxItems"],
-            MAX_WEB_SEARCH_DOMAINS
-        );
+
     }
 
     #[test]

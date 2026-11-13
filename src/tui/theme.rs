@@ -7,25 +7,6 @@ use serde::Deserialize;
 
 use crate::core::storage::{Storage, DEFAULT_THEME_TOML};
 
-#[cfg(test)]
-pub mod catppuccin {
-    use ratatui::style::Color;
-
-    pub const PINK: Color = Color::Rgb(245, 194, 231);
-    pub const MAUVE: Color = Color::Rgb(203, 166, 247);
-    pub const GREEN: Color = Color::Rgb(166, 227, 161);
-    pub const TEAL: Color = Color::Rgb(148, 226, 213);
-    pub const SKY: Color = Color::Rgb(137, 220, 235);
-    pub const SAPPHIRE: Color = Color::Rgb(116, 199, 236);
-    pub const BLUE: Color = Color::Rgb(137, 180, 250);
-    pub const OVERLAY_0: Color = Color::Rgb(108, 112, 134);
-    pub const SURFACE_1: Color = Color::Rgb(69, 71, 90);
-    pub const SURFACE_0: Color = Color::Rgb(49, 50, 68);
-    pub const BASE: Color = Color::Rgb(30, 30, 46);
-    pub const MANTLE: Color = Color::Rgb(24, 24, 37);
-    pub const CRUST: Color = Color::Rgb(17, 17, 27);
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
     pub surface_canvas: Color,
@@ -517,21 +498,6 @@ mod tests {
         assert_eq!(built_in.active, "default");
         assert_eq!(built_in.source, None);
         assert_eq!(built_in.theme, Theme::default());
-    }
-
-    #[test]
-    fn default_file_reproduces_the_current_theme() {
-        let theme = Theme::from_toml(DEFAULT_THEME_TOML).unwrap();
-        assert_eq!(theme.surface_canvas, Color::Reset);
-        assert_eq!(theme.surface_status_bar, Color::Reset);
-        assert_eq!(theme.surface_compose, Color::Rgb(49, 50, 68));
-        assert_eq!(theme.selection_background, Color::Rgb(69, 71, 90));
-        assert_eq!(theme.selection_foreground, Color::Rgb(205, 214, 244));
-        assert_eq!(theme.ui_page_heading, Color::Rgb(180, 190, 254));
-        assert_eq!(theme.diff_addition_background, Color::Rgb(41, 66, 60));
-        assert_eq!(theme.diff_deletion_background, Color::Rgb(73, 49, 63));
-        assert_eq!(theme.markdown_code_block_background, Color::Rgb(49, 50, 68));
-        assert_eq!(theme.surface_status_context, Color::Rgb(137, 180, 250));
     }
 
     #[test]

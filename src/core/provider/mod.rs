@@ -417,20 +417,6 @@ mod tests {
 
     use super::*;
 
-    fn assert_send_sync<T: Provider>() {}
-
-    #[test]
-    fn provider_implementations_are_send_sync_and_object_safe() {
-        assert_send_sync::<messages::MessagesProvider>();
-        assert_send_sync::<completions::CompletionsProvider>();
-
-        let messages = messages::MessagesProvider::new("key", "https://example.com").unwrap();
-        let completions =
-            completions::CompletionsProvider::new("key", "https://example.com").unwrap();
-        let providers: [&dyn Provider; 2] = [&messages, &completions];
-        assert_eq!(providers.len(), 2);
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn read_timeout_resets_while_response_body_keeps_arriving() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

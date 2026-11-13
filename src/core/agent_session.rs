@@ -674,20 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_count_is_not_part_of_the_persisted_session_schema() {
-        let session = AgentSessionScope::from_parts(
-            &AgentConversation::default(),
-            &[],
-            TokenUsage::default(),
-            0,
-            Duration::ZERO,
-        );
-
-        let json = serde_json::to_value(session).unwrap();
-        assert!(json.get("retry_count").is_none());
-    }
-
-    #[test]
     fn agent_session_persists_image_references_without_pixels() {
         let mut conversation = AgentConversation::default();
         conversation

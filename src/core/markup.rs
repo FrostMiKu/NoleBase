@@ -7,7 +7,7 @@ use std::{borrow::Cow, ops::Range, path::Path};
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug)]
-pub(crate) enum Event<'a> {
+pub enum Event<'a> {
     Markdown(MarkdownEvent<'a>),
     WikiLink(CowStr<'a>),
     Embed(CowStr<'a>),
@@ -15,14 +15,14 @@ pub(crate) enum Event<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SpannedEvent<'a> {
+pub struct SpannedEvent<'a> {
     pub event: Event<'a>,
     pub span: Range<usize>,
 }
 
 /// Parse standard Markdown first. Extensions only inspect literal prose;
 /// code, HTML, escaped characters and link destinations stay untouched.
-pub(crate) fn parse(source: &str) -> Vec<SpannedEvent<'_>> {
+pub fn parse(source: &str) -> Vec<SpannedEvent<'_>> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -145,7 +145,7 @@ fn prose<'a>(source: &'a str, span: Range<usize>, output: &mut Vec<SpannedEvent<
     }
 }
 
-pub(crate) fn expand_tabs(source: &str) -> Cow<'_, str> {
+pub fn expand_tabs(source: &str) -> Cow<'_, str> {
     if !source.contains('\t') {
         return Cow::Borrowed(source);
     }
@@ -173,17 +173,17 @@ pub(crate) fn expand_tabs(source: &str) -> Cow<'_, str> {
     Cow::Owned(expanded)
 }
 
-pub(crate) struct LinkSpec {
+pub struct LinkSpec {
     pub label: String,
     pub target: LinkTarget,
 }
 #[derive(Clone)]
-pub(crate) struct CodeBlockSpec {
+pub struct CodeBlockSpec {
     pub language: String,
     pub source: String,
 }
 
-pub(crate) fn code_block_specs(events: &[SpannedEvent<'_>]) -> Vec<CodeBlockSpec> {
+pub fn code_block_specs(events: &[SpannedEvent<'_>]) -> Vec<CodeBlockSpec> {
     let mut blocks = Vec::new();
     let mut current: Option<CodeBlockSpec> = None;
     for item in events {
@@ -216,7 +216,7 @@ pub(crate) fn code_block_specs(events: &[SpannedEvent<'_>]) -> Vec<CodeBlockSpec
     blocks
 }
 
-pub(crate) fn link_target(raw: &str) -> LinkTarget {
+pub fn link_target(raw: &str) -> LinkTarget {
     if AttachmentUri::is_attachment_uri(raw) {
         LinkTarget::Attachment(raw.to_string())
     } else if raw.is_empty()
@@ -230,7 +230,7 @@ pub(crate) fn link_target(raw: &str) -> LinkTarget {
     }
 }
 
-pub(crate) fn embed_link_target(raw: &str) -> LinkTarget {
+pub fn embed_link_target(raw: &str) -> LinkTarget {
     if AttachmentUri::is_attachment_uri(raw) {
         LinkTarget::Attachment(raw.to_string())
     } else {
@@ -238,7 +238,7 @@ pub(crate) fn embed_link_target(raw: &str) -> LinkTarget {
     }
 }
 
-pub(crate) fn link_specs(events: &[SpannedEvent<'_>]) -> Vec<LinkSpec> {
+pub fn link_specs(events: &[SpannedEvent<'_>]) -> Vec<LinkSpec> {
     let mut links = Vec::new();
     for (index, item) in events.iter().enumerate() {
         match &item.event {
@@ -268,7 +268,7 @@ pub(crate) fn link_specs(events: &[SpannedEvent<'_>]) -> Vec<LinkSpec> {
     links
 }
 
-pub(crate) fn visible_text(events: &[SpannedEvent<'_>]) -> String {
+pub fn visible_text(events: &[SpannedEvent<'_>]) -> String {
     let mut text = String::new();
     for item in events {
         match &item.event {

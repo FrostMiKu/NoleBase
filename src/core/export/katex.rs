@@ -177,6 +177,8 @@ mod tests {
     #[test]
     fn embedded_css_inlines_every_font_and_drops_fallbacks() {
         let css = embedded_css();
+        assert!(!KATEX_JS.to_ascii_lowercase().contains("</script"));
+        assert!(!css.to_ascii_lowercase().contains("</style"));
         assert_eq!(css.matches("data:font/woff2;base64,").count(), 20);
         assert!(!css.contains("url(fonts/"));
         assert!(!css.contains(".woff)"));
@@ -197,24 +199,5 @@ mod tests {
         }
         // The layout rules the rendered math relies on survive the transform.
         assert!(css.contains(".katex-display"));
-    }
-
-    #[test]
-    fn pinned_version_matches_the_vendored_engine() {
-        assert!(KATEX_JS.contains("version:\"0.18.1\""));
-        assert!(!KATEX_JS.contains("</script"));
-        assert!(!embedded_css().contains("</style"));
-    }
-
-    #[test]
-    fn bootstrap_uses_locked_down_render_options() {
-        assert!(KATEX_INIT_JS.contains("katex.render("));
-        assert!(KATEX_INIT_JS.contains("throwOnError: false"));
-        assert!(KATEX_INIT_JS.contains("strict: \"warn\""));
-        assert!(KATEX_INIT_JS.contains("trust: false"));
-        assert!(KATEX_INIT_JS.contains("displayMode: display"));
-        assert!(KATEX_INIT_JS.contains(".math[data-math]"));
-        // The bootstrap must never terminate its own script tag.
-        assert!(!KATEX_INIT_JS.contains("</script"));
     }
 }

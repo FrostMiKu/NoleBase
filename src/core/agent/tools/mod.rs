@@ -26,6 +26,8 @@ mod wiki_links;
 mod workspace_quota;
 mod write_policy;
 
+pub(crate) use subagent_tools::SubagentTools;
+
 pub use self::{
     attachment_ops::*, calculator::*, collaborate::*, file_ops::*, file_patch::*, grep::*,
     interactive::*, jobs::*, notes_tags::*, read::*, shell::*, todo::*, wait::*, web::*,

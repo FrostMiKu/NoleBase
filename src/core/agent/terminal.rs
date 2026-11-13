@@ -33,7 +33,7 @@ impl LimitedOutput {
 }
 
 impl AgentTerminalStatus {
-    pub(crate) fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             Self::Running => "running".to_string(),
             Self::Exited(code) => format!("exited {code}"),
@@ -42,10 +42,10 @@ impl AgentTerminalStatus {
 }
 
 #[derive(Clone)]
-pub(crate) struct AgentTerminalSnapshot {
-    pub(crate) title: String,
-    pub(crate) status: AgentTerminalStatus,
-    pub(crate) terminal: TerminalSnapshot,
+pub struct AgentTerminalSnapshot {
+    pub title: String,
+    pub status: AgentTerminalStatus,
+    pub terminal: TerminalSnapshot,
 }
 
 /// One watcher sample from a live Agent PTY session.
@@ -58,7 +58,7 @@ pub(crate) struct TerminalWatchSample {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AgentTerminalStatus {
+pub enum AgentTerminalStatus {
     Running,
     Exited(u32),
 }
@@ -92,7 +92,7 @@ impl AgentTerminalHandle {
             output_directory: Some(directory.join("pty")),
         }
     }
-    pub(crate) fn is_running(&self) -> bool {
+    pub fn is_running(&self) -> bool {
         let Ok(state) = self.inner.lock() else {
             return false;
         };
@@ -112,7 +112,7 @@ impl AgentTerminalHandle {
         }
     }
 
-    pub(crate) fn poll_monitor_change(&self) -> bool {
+    pub fn poll_monitor_change(&self) -> bool {
         let Ok(mut state) = self.inner.lock() else {
             return false;
         };
@@ -359,7 +359,7 @@ impl AgentTerminalHandle {
         }
     }
 
-    pub(crate) fn monitor_snapshot(&self, cols: u16) -> Option<AgentTerminalSnapshot> {
+    pub fn monitor_snapshot(&self, cols: u16) -> Option<AgentTerminalSnapshot> {
         let mut state = self.inner.lock().ok()?;
         #[cfg(test)]
         if let Some(snapshot) = &state.monitor_override {
@@ -378,7 +378,7 @@ impl AgentTerminalHandle {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn set_monitor_snapshot_for_test(&self, snapshot: AgentTerminalSnapshot) {
         if let Ok(mut state) = self.inner.lock() {
             state.monitor_override = Some(snapshot);

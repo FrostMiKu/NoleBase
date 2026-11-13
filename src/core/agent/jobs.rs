@@ -24,7 +24,7 @@ use super::{externalize_tool_output_with, render_tool_output, SessionResultStore
 const SETTLED_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JobKind {
+pub enum JobKind {
     Tool,
     Shell,
     Download,
@@ -32,7 +32,7 @@ pub(crate) enum JobKind {
 }
 
 impl JobKind {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Tool => "tool",
             Self::Shell => "shell",
@@ -43,7 +43,7 @@ impl JobKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JobStatus {
+pub enum JobStatus {
     Running,
     Done,
     Failed,
@@ -51,7 +51,7 @@ pub(crate) enum JobStatus {
 }
 
 impl JobStatus {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Done => "done",
@@ -60,19 +60,19 @@ impl JobStatus {
         }
     }
 
-    pub(crate) fn is_settled(self) -> bool {
+    pub fn is_settled(self) -> bool {
         !matches!(self, Self::Running)
     }
 }
 
 /// One listed background job row, for the `jobs` tool and the sidebar.
 #[derive(Clone, Debug)]
-pub(crate) struct JobRow {
-    pub(crate) id: String,
-    pub(crate) kind: JobKind,
-    pub(crate) label: String,
-    pub(crate) status: JobStatus,
-    pub(crate) elapsed: Duration,
+pub struct JobRow {
+    pub id: String,
+    pub kind: JobKind,
+    pub label: String,
+    pub status: JobStatus,
+    pub elapsed: Duration,
 }
 
 /// A settled job result waiting to be framed into the conversation.
@@ -459,7 +459,7 @@ impl AgentJobsHandle {
 
     /// Snapshot the listed background-job rows, newest first. Foreground
     /// raced jobs that have not been backgrounded yet are not listed.
-    pub(crate) fn rows(&self) -> Vec<JobRow> {
+    pub fn rows(&self) -> Vec<JobRow> {
         let Ok(mut state) = self.inner.lock() else {
             return Vec::new();
         };
@@ -475,7 +475,7 @@ impl AgentJobsHandle {
 
     /// Whether any *listed* background job is running; foreground raced jobs
     /// waiting inline do not count.
-    pub(crate) fn has_running(&self) -> bool {
+    pub fn has_running(&self) -> bool {
         self.inner.lock().is_ok_and(|state| {
             state
                 .entries
@@ -508,7 +508,7 @@ impl AgentJobsHandle {
     }
 
     /// UI change poll: true once per state mutation.
-    pub(crate) fn poll_change(&self) -> bool {
+    pub fn poll_change(&self) -> bool {
         self.inner
             .lock()
             .map(|mut state| {

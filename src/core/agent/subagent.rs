@@ -160,7 +160,7 @@ impl SubagentRunner {
             if final_round {
                 messages.push(Message::user(self.profile.final_round_prompt.clone()));
             }
-            let response = self.request(&messages, final_round).await?;
+            let response = self.request(messages, final_round).await?;
             let calls = response.message.tool_calls().cloned().collect::<Vec<_>>();
             let text = response.text();
             if !text.trim().is_empty() || !calls.is_empty() {

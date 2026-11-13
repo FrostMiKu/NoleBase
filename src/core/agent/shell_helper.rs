@@ -47,6 +47,16 @@ where
     }
 }
 
+/// Run an Agent shell subprocess when requested by the executable arguments.
+/// Client entry points call this before starting their UI and return the
+/// resulting exit code to the operating system.
+pub fn run_shell_helper_if_requested<I>(args: I) -> Result<Option<u8>>
+where
+    I: Iterator<Item = String>,
+{
+    shell_helper_mode(args).map(run_shell_helper).transpose()
+}
+
 pub(crate) fn shell_helper_command(nole_root: &Path) -> Result<portable_pty::CommandBuilder> {
     let executable = std::env::current_exe().context("locating the Nole executable")?;
     let mut command = portable_pty::CommandBuilder::new(executable);

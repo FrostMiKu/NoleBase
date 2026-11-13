@@ -178,18 +178,6 @@ impl SessionNoteRuntime {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn restore_scope_for_test(&self, scope: AgentSessionScope) {
-        let (conversation, panel, usage, output_tokens, duration) = scope.into_parts();
-        let mut state = self.lock();
-        self.session.replace_conversation(conversation.clone());
-        state.panel = AgentPanel::from_entries(panel);
-        state.usage = usage;
-        state.output_tokens = output_tokens;
-        state.duration = duration;
-        self.save(&mut state).unwrap();
-    }
-
     pub fn scope(&self) -> AgentSessionScope {
         let state = self.lock();
         AgentSessionScope::from_parts(

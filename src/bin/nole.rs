@@ -1,10 +1,18 @@
-//! Thin binary entry point; all logic lives in the `nole` library. The web
-//! backend and the TUI are peer presentation layers over the same core, so
-//! the binary dispatches between them without either depending on the other.
+//! Executable argument dispatch and process lifecycle.
 
-fn main() -> anyhow::Result<()> {
-    if nole::web::run_web_if_requested(std::env::args())? {
-        return Ok(());
+use anyhow::{bail, Result};
+
+fn main() -> Result<()> {
+    if let Some(code) = nole::core::agent::run_shell_helper_if_requested(std::env::args())? {
+        std::process::exit(i32::from(code));
     }
-    nole::tui::runtime::run_app()
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => println!("nole {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h") => {
+            println!("Nole\n\nUsage: nole [--version | --help]\n\nRun nole to open your workspace.")
+        }
+        Some(argument) => bail!("Unknown argument: {argument}. Run `nole --help` for usage."),
+        None => nole::tui::runtime::run_app()?,
+    }
+    Ok(())
 }

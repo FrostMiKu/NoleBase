@@ -83,7 +83,7 @@ impl Tool for Todo {
             "properties": {
                 "todos": {
                     "type": "array",
-                    "maxItems": 32,
+                    "maxItems": MAX_TODO_ITEMS,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -91,7 +91,7 @@ impl Tool for Todo {
                                 "type": "string",
                                 "description": "Imperative one-line task description",
                                 "minLength": 1,
-                                "maxLength": 160
+                                "maxLength": MAX_TODO_CONTENT_CHARS
                             },
                             "status": {
                                 "type": "string",
@@ -215,14 +215,46 @@ mod tests {
     }
 
     #[test]
-    fn schema_binds_the_contract() {
-        let schema = Todo::new(TodoHandle::default()).input_schema();
-        assert_eq!(schema["required"], json!(["todos"]));
-        assert_eq!(schema["properties"]["todos"]["maxItems"], 32);
-        assert_eq!(
-            schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
-            json!(["pending", "in_progress", "completed"])
+    fn registered_todo_rejects_invalid_requests_and_preserves_the_plan() {
+        let handle = TodoHandle::default();
+        write(
+            &handle,
+            json!([{"content": "Keep this plan", "status": "pending"}]),
+        )
+        .unwrap();
+        let original = handle.snapshot();
+        let tool = Todo::new(handle.clone());
+        let registered = crate::core::agent::RegisteredTool::new(
+            tool,
+            &Todo::new(handle.clone()).input_schema(),
         );
-        assert_eq!(schema["additionalProperties"], false);
+        let runtime = crate::core::agent::test_support::test_runtime();
+        for invalid in [
+            json!({}),
+            json!({"todos": "task"}),
+            json!({"todos": [], "extra": true}),
+            json!({"todos": [{"content": "task", "status": "queued"}]}),
+            json!({"todos": [{"status": "pending"}]}),
+            json!({"todos": [{"content": "task", "status": "pending", "extra": true}]}),
+            json!({"todos": [{"content": "x".repeat(161), "status": "pending"}]}),
+            json!({"todos": vec![json!({"content": "task", "status": "pending"}); 33]}),
+        ] {
+            assert!(
+                runtime.block_on(registered.execute(&invalid)).is_err(),
+                "accepted {invalid}"
+            );
+            assert_eq!(
+                handle.snapshot(),
+                original,
+                "changed the plan after {invalid}"
+            );
+        }
+        let boundary =
+            json!({"todos": vec![json!({"content": "x".repeat(160), "status": "completed"}); 32]});
+        runtime.block_on(registered.execute(&boundary)).unwrap();
+        assert_eq!(handle.snapshot().len(), 32);
+        assert!(handle.snapshot().iter().all(
+            |item| item.status == TodoStatus::Completed && item.content.chars().count() == 160
+        ));
     }
 }

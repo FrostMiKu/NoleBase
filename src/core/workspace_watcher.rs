@@ -144,7 +144,7 @@ impl WorkspaceWatcher {
 
     /// A watcher over an injected event stream, without a real filesystem
     /// watcher behind it. Test-only.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn from_parts(context: WatchContext, receiver: WatchEvents) -> Self {
         Self {
             watcher: None,

@@ -17,28 +17,40 @@ path = "src/lib.rs"
 [[bin]]
 name = "nole"
 path = "src/bin/nole.rs"
+required-features = ["tui"]
+
+[features]
+default = ["tui"]
+tui = [
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:mermaid-text",
+    "dep:txm",
+    "dep:strip-ansi-escapes",
+    "dep:syntect",
+    "dep:clipboard-rs",
+    "dep:ratatui-image",
+    "dep:open",
+]
 
 [dependencies]
-ratatui = "0.30.2"
-crossterm = "0.29"
+ratatui = { version = "0.30.2", optional = true }
+crossterm = { version = "0.29", optional = true }
 pulldown-cmark = { version = "0.13.6", default-features = false }
-mermaid-text = "0.58.0"
-txm = "0.1.6"
-strip-ansi-escapes = "0.2.1"
-syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+mermaid-text = { version = "0.58.0", optional = true }
+txm = { version = "0.1.6", optional = true }
+strip-ansi-escapes = { version = "0.2.1", optional = true }
+syntect = { optional = true, version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-rust-embed = "8.14"
-mime_guess = "2"
-clipboard-rs = { version = "0.3.5", features = ["image"] }
+clipboard-rs = { optional = true, version = "0.3.5", features = ["image"] }
 base64 = "0.23"
 brush-builtins = "0.2.0"
 brush-core = "0.5.0"
 brush-interactive = { version = "0.4.0", features = ["basic"] }
 brush-parser = "0.4.0"
-ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+ratatui-image = { optional = true, version = "11.1", default-features = false, features = ["crossterm"] }
 anyhow = "1"
 anydoc = "0.2.4"
-axum = { version = "0.8", features = ["ws"] }
 async-trait = "0.1"
 cap-std = "4.0.2"
 chrono = { version = "0.4", features = ["serde"] }
@@ -50,7 +62,7 @@ fasteval = "0.2.4"
 jsonschema = { version = "0.61.2", default-features = false }
 htmd = "0.5.6"
 notify = "8.2.2"
-open = "5"
+open = { version = "5", optional = true }
 portable-pty = "0.9"
 unicode-width = "0.2.3"
 zeroize = "1"
@@ -65,7 +77,6 @@ toml = "1"
 toml_edit = "0.25"
 tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
-tower-http = { version = "0.7.1", default-features = false, features = ["fs"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 eventsource-stream = "0.2"
@@ -77,8 +88,6 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [dev-dependencies]
 tempfile = "3"
 parking_lot = "0.12"
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 
 [profile.release]
 opt-level = "z"

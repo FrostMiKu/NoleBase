@@ -22,7 +22,6 @@ use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-use crate::core::agent;
 use crate::core::storage;
 use crate::core::workspace_watcher::WorkspaceEvent;
 use crate::tui::app::{self, App, Command};
@@ -360,26 +359,6 @@ fn flush_wheel(pending: &mut Option<(u16, u16, i32)>, app: &mut App) -> bool {
     true
 }
 
-fn resolve_storage() -> Result<storage::Storage> {
-    // NOLE_DIR overrides the default ~/.nole location - handy for testing or
-    // keeping multiple notebooks while preserving the real data directory.
-    match std::env::var("NOLE_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => storage::Storage::new(dir.trim()),
-        _ => storage::Storage::default_root(),
-    }
-}
-
-/// True when the first CLI argument is a version request. `nole --version`
-/// prints the version before workspace or terminal setup, keeping this path
-/// side-effect free.
-fn wants_version<I>(mut args: I) -> bool
-where
-    I: Iterator<Item = String>,
-{
-    args.next(); // program name
-    matches!(args.next().as_deref(), Some("--version" | "-V"))
-}
-
 fn should_query_image_capabilities(term_program: Option<&str>) -> bool {
     term_program != Some("nole")
 }
@@ -398,21 +377,9 @@ fn image_picker() -> ratatui_image::picker::Picker {
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
 }
 
-/// Binary entry: shell helper mode, version flag, then the TUI event loop.
+/// Open the workspace and run the TUI event loop.
 pub fn run_app() -> Result<()> {
-    if let Some(mode) = agent::shell_helper_mode(std::env::args()) {
-        let code = agent::run_shell_helper(mode).unwrap_or_else(|error| {
-            eprintln!("Nole shell helper error: {error:#}");
-            1
-        });
-        std::process::exit(i32::from(code));
-    }
-    if wants_version(std::env::args()) {
-        println!("nole {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    let storage = resolve_storage()?;
-    storage.ensure_files()?;
+    let storage = storage::Storage::resolve_root()?;
     let mut nole = crate::core::nole::Nole::open(storage)?;
     let mut app = App::new(nole.workspace().clone(), nole.sessions().clone())?;
 
@@ -464,20 +431,6 @@ mod tests {
     use notify::event::{EventKind, ModifyKind};
     use ratatui::backend::TestBackend;
 
-    #[test]
-    fn version_flag_is_detected() {
-        let args = |flags: &[&str]| {
-            std::iter::once("nole")
-                .chain(flags.iter().copied())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        };
-        assert!(wants_version(args(&["--version"]).into_iter()));
-        assert!(wants_version(args(&["-V"]).into_iter()));
-        assert!(!wants_version(args(&[]).into_iter()));
-        assert!(!wants_version(args(&["--verbose"]).into_iter()));
-        assert!(!wants_version(args(&["-vv"]).into_iter()));
-    }
     #[test]
     fn quit_is_deferred_while_export_is_running() {
         let directory = tempfile::tempdir().unwrap();

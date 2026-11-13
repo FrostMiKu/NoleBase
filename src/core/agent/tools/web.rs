@@ -819,6 +819,7 @@ mod tests {
     fn tavily_response_becomes_readable_text_instead_of_raw_json() {
         let response = json!({
             "answer": "Layer clothing.\nBring a shell.",
+            "request_id": "private request identifier",
             "results": [{
                 "title": "Travel guide",
                 "url": "https://example.com/guide",
@@ -835,6 +836,7 @@ mod tests {
         assert!(!output.starts_with('{'));
         assert!(!output.contains("raw_content"));
         assert!(!output.contains("must not leak"));
+        assert!(!output.contains("private request identifier"));
     }
     use crate::core::agent::test_support::TestFutureResultExt;
     use crate::core::storage::Storage;
@@ -1059,22 +1061,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn schema_requires_url_and_uses_network_policy() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn registered_http_rejects_invalid_requests_and_fetches_valid_urls() {
         let (_directory, root) = fresh_root();
         let tool = http_tool(&root);
         let schema = tool.input_schema();
-        let required = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(required, ["url"]);
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(tool.execution_policy(), ToolExecutionPolicy::Network);
-        assert!(schema["properties"].get("range").is_some());
-        assert!(schema["properties"].get("save_to").is_some());
+        let registered = crate::core::agent::RegisteredTool::new(tool, &schema);
+        for invalid in [
+            json!({}),
+            json!({"url": 42}),
+            json!({"url": ""}),
+            json!({"url": "https://example.test", "extra": true}),
+            json!({"url": "https://example.test", "save_to": 42}),
+        ] {
+            let error = registered.execute(&invalid).await.unwrap_err();
+            assert!(
+                error.to_string().contains("invalid input for tool http"),
+                "{error:#}"
+            );
+        }
+        let (url, server) = serve_response(
+            "200 OK",
+            vec![("Content-Type", "text/plain")],
+            b"registered request".to_vec(),
+        );
+        let result = registered.execute(&json!({"url": url})).await.unwrap();
+        server.join().unwrap();
+        assert!(result.content.contains("registered request"));
     }
 
     #[test]

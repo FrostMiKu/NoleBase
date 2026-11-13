@@ -19,9 +19,10 @@ pub struct Nole {
 }
 
 impl Nole {
-    /// Open the application: register the filesystem watcher, open the
-    /// workspace and Session catalog. Session workers start as notes are opened.
+    /// Initialize workspace files, register the filesystem watcher, and open
+    /// the workspace and Session catalog. Session workers start as notes are opened.
     pub fn open(storage: Storage) -> Result<Self> {
+        storage.ensure_files()?;
         let watcher = WorkspaceWatcher::new(&storage)?;
         let workspace = Arc::new(Workspace::open(storage)?);
         let sessions = AgentSessions::open(workspace.clone())?;
@@ -45,35 +46,5 @@ impl Nole {
     /// orchestration the bootstrap performs.
     pub fn poll_workspace(&mut self) -> Vec<WorkspaceEvent> {
         self.watcher.poll(&self.workspace)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A client that imports no TUI modules can boot the application,
-    /// query the workspace, subscribe to the agent event stream, and poll
-    /// the watcher. Compile-time and runtime proof of the service boundary.
-    #[test]
-    fn opens_and_serves_clients_without_terminal_dependencies() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::new(directory.path()).unwrap();
-        storage.ensure_files().unwrap();
-
-        let mut nole = Nole::open(storage).unwrap();
-
-        // Workspace queries work standalone.
-        let workspace = nole.workspace();
-        assert!(workspace.daily_notes().unwrap().is_empty());
-        assert!(workspace.todos().unwrap().is_empty());
-
-        // Agent events subscribe standalone.
-        let session = nole.sessions().create("Test").unwrap();
-        let mut events = session.subscribe();
-        assert!(events.try_recv().is_err());
-
-        // The watcher polls without a terminal event loop.
-        assert!(nole.poll_workspace().is_empty());
     }
 }

@@ -1,56 +1,34 @@
 //! Model-facing lifecycle operations for Session-scoped collaborators.
-use super::subagent_tools::register_read_only_tools;
+use super::subagent_tools::SubagentTools;
 use crate::core::agent::collaboration::CollaboratorsHandle;
 use crate::core::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
 use crate::core::agent::{AgentJobsHandle, Tool, ToolOutput};
-use crate::core::skill::Skill;
-use crate::core::wiki_link_index::WikiLinkIndexHandle;
-use crate::core::workspace_index::WorkspaceIndexHandle;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct Collaborate {
-    root: PathBuf,
-    session_directory: PathBuf,
+    tools: SubagentTools,
     runtime: SubagentRuntime,
     agents: CollaboratorsHandle,
     jobs: AgentJobsHandle,
-    workspace_index: WorkspaceIndexHandle,
-    wiki_links: WikiLinkIndexHandle,
-    client: reqwest::Client,
-    api_key: String,
-    skills: Vec<Skill>,
     maximum: usize,
 }
 
 impl Collaborate {
     pub(crate) fn new(
-        root: &Path,
-        session_directory: &Path,
+        tools: SubagentTools,
         runtime: SubagentRuntime,
         agents: CollaboratorsHandle,
         jobs: AgentJobsHandle,
-        workspace_index: WorkspaceIndexHandle,
-        wiki_links: WikiLinkIndexHandle,
-        client: reqwest::Client,
-        api_key: String,
-        skills: &[Skill],
         maximum: usize,
     ) -> Self {
         Self {
-            root: root.into(),
-            session_directory: session_directory.into(),
+            tools,
             runtime,
             agents,
             jobs,
-            workspace_index,
-            wiki_links,
-            client,
-            api_key,
-            skills: skills.to_vec(),
             maximum,
         }
     }
@@ -69,16 +47,7 @@ impl Collaborate {
             .clone()
             .with_cancellation(self.agents.cancellation(id)?);
         let mut runner = SubagentRunner::new(runtime, profile);
-        register_read_only_tools(
-            &mut runner,
-            &self.root,
-            &self.session_directory,
-            self.workspace_index.clone(),
-            self.wiki_links.clone(),
-            self.client.clone(),
-            self.api_key.clone(),
-            &self.skills,
-        )?;
+        self.tools.register(&mut runner)?;
         Ok(Arc::new(runner))
     }
 
