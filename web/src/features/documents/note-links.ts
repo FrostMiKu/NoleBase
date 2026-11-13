@@ -15,7 +15,7 @@ export function resolveNotePath(href: string, sourcePath: string): string | null
     } else if (part !== '.' && part !== '') parts.push(part)
   }
   const path = parts.join('/')
-  return /^(data|daily|archives)\/.+\.(md|mb)$/i.test(path) ? path : null
+  return /^(data|daily|archives)\/.+\.md$/i.test(path) ? path : null
 }
 
 type Node = { type: string; value?: string; url?: string; children?: Node[] }

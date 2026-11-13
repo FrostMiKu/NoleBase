@@ -74,7 +74,6 @@ code_label = "#7f849c"
 link = "#89b4fa"
 hashtag = "#f5c2e7"
 wikilink = "#89dceb"
-box_border = "#6c7086"
 
 [animation]
 gradient = ["#89dceb", "#89b4fa", "#cba6f7", "#f5c2e7", "#f9e2af", "#a6e3a1"]

@@ -29,7 +29,7 @@ pub(crate) enum Syntax {
 pub(crate) fn syntax_for_path(path: &Path) -> Syntax {
     let ext = path.extension().and_then(|e| e.to_str());
     match ext.map(str::to_ascii_lowercase).as_deref() {
-        Some("md" | "markdown" | "mdx" | "mb") => Syntax::Markdown,
+        Some("md" | "markdown" | "mdx") => Syntax::Markdown,
         Some(
             "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "go" | "java" | "js" | "jsx" | "ts"
             | "tsx" | "json" | "css" | "scss" | "kt" | "swift" | "php" | "scala" | "dart" | "zig"
@@ -773,8 +773,8 @@ serde = \"1\"
         assert_eq!(syntax_for_path(Path::new("a.rs")), Syntax::Braces);
         assert_eq!(syntax_for_path(Path::new("A.JSON")), Syntax::Braces);
         assert_eq!(syntax_for_path(Path::new("README.md")), Syntax::Markdown);
-        assert_eq!(syntax_for_path(Path::new("note.mb")), Syntax::Markdown);
-        assert_eq!(syntax_for_path(Path::new("NOTE.MB")), Syntax::Markdown);
+        assert_eq!(syntax_for_path(Path::new("note.md")), Syntax::Markdown);
+        assert_eq!(syntax_for_path(Path::new("NOTE.MD")), Syntax::Markdown);
         assert_eq!(syntax_for_path(Path::new("script.py")), Syntax::Indent);
         assert_eq!(syntax_for_path(Path::new("Cargo.toml")), Syntax::Indent);
         assert_eq!(syntax_for_path(Path::new("notes.txt")), Syntax::Unknown);

@@ -1,7 +1,7 @@
 //! Derived index of wiki-link targets referenced by managed notes.
 //!
-//! The index parses each managed Markdown/MBDown file (daily/, data/,
-//! archives/) with the same MBDown parser the renderer uses and records the
+//! The index parses each managed Markdown file (daily/, data/,
+//! archives/) with the same Markdown parser the renderer uses and records the
 //! `[[...]]` targets that appear as wiki-link events. Fenced or inline code,
 //! HTML comments, escaped text, and `![[...]]` embed bodies remain content
 //! because the renderer classifies those regions separately from wiki links.
@@ -20,13 +20,12 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::core::markup::{Event, SpannedEvent};
 use anyhow::{bail, Result};
-use mbdown::{Event, Node};
 
 use crate::core::document_index::{
     aggregate_references, document_group, index_file, DocumentIndex, ReferenceEntry,
 };
-use crate::core::markup::visit_markdown;
 use crate::core::storage::Storage;
 
 /// Derived wiki-link index: wiki target -> referencing notes.
@@ -206,26 +205,25 @@ impl WikiLinkIndexHandle {
 /// targets inside code, HTML comments, escaped text, or embeds remain outside
 /// the event stream and retain their source text.
 pub fn matching_wiki_link_spans(source: &str, from: &str) -> Vec<Range<usize>> {
-    let Ok(document) = mbdown::parse(source) else {
-        return Vec::new();
-    };
+    let document = crate::core::markup::parse(source);
     let mut spans = Vec::new();
-    collect_matching_wiki_link_spans(document.nodes(), from, &mut spans);
+    collect_matching_wiki_link_spans(&document, from, &mut spans);
     spans.sort_by_key(|span| span.start);
     spans
 }
 
-fn collect_matching_wiki_link_spans(nodes: &[Node<'_>], from: &str, spans: &mut Vec<Range<usize>>) {
-    visit_markdown(nodes, &mut |markdown| {
-        for event in markdown.events() {
-            if let Event::WikiLink(target) = &event.event {
-                if target.eq_ignore_ascii_case(from) {
-                    let offset = markdown.source_span().start;
-                    spans.push(offset + event.span.start..offset + event.span.end);
-                }
+fn collect_matching_wiki_link_spans(
+    events: &[SpannedEvent<'_>],
+    from: &str,
+    spans: &mut Vec<Range<usize>>,
+) {
+    for event in events {
+        if let Event::WikiLink(target) = &event.event {
+            if target.eq_ignore_ascii_case(from) {
+                spans.push(event.span.clone());
             }
         }
-    });
+    }
 }
 
 /// Source spans of every `[[target]]` that resolves to the note at `path` —
@@ -235,25 +233,21 @@ fn collect_matching_wiki_link_spans(nodes: &[Node<'_>], from: &str, spans: &mut 
 /// spelling (`[[foo]]` and `[[foo.md]]`), without touching prose, code,
 /// embeds, or links to other notes.
 pub fn matching_note_wiki_link_spans(source: &str, note: &Path) -> Vec<Range<usize>> {
-    let Ok(document) = mbdown::parse(source) else {
-        return Vec::new();
-    };
+    let document = crate::core::markup::parse(source);
     let mut spans = Vec::new();
-    visit_markdown(document.nodes(), &mut |markdown| {
-        for event in markdown.events() {
-            if let Event::WikiLink(target) = &event.event {
-                if wiki_name_matches(note, target) {
-                    let offset = markdown.source_span().start;
-                    spans.push(offset + event.span.start..offset + event.span.end);
-                }
+    for event in &document {
+        if let Event::WikiLink(target) = &event.event {
+            if wiki_name_matches(note, target) {
+                spans.push(event.span.clone());
             }
         }
-    });
+    }
+
     spans.sort_by_key(|span| span.start);
     spans
 }
 
-/// Reject `target` unless it is a legal `[[wikilink]]` target for MBDown:
+/// Reject `target` unless it is a legal `[[wikilink]]` target for Markdown:
 /// non-empty, free of surrounding whitespace, and without brackets or
 /// newlines. A target containing `[`, `]`, `\n`, or `\r` would terminate or
 /// inject markup into the `[[...]]` span rather than name one wiki target,
@@ -281,32 +275,24 @@ pub fn replace_wiki_link_spans(source: &str, spans: &[Range<usize>], to: &str) -
     output
 }
 
-/// Every wiki-link target in `text` that the MBDown renderer would render as
+/// Every wiki-link target in `text` that the Markdown renderer would render as
 /// a wiki link, in source order, including duplicates. Targets inside code,
 /// HTML comments, escaped text, or `![[...]]` embed bodies remain ordinary
-/// content because MBDown emits events for rendered wiki links.
+/// content because Markdown emits events for rendered wiki links.
 #[cfg(test)]
 pub fn find_wiki_links(text: &str) -> Vec<String> {
-    let Ok(document) = mbdown::parse(text) else {
-        return Vec::new();
-    };
-    collect_wiki_links(document.nodes())
+    let document = crate::core::markup::parse(text);
+    collect_wiki_links(&document)
 }
 
-pub(crate) fn collect_wiki_links(nodes: &[Node<'_>]) -> Vec<String> {
-    let mut links = Vec::new();
-    collect_node_wiki_links(nodes, &mut links);
-    links
-}
-
-fn collect_node_wiki_links(nodes: &[Node<'_>], links: &mut Vec<String>) {
-    visit_markdown(nodes, &mut |markdown| {
-        for item in markdown.events() {
-            if let Event::WikiLink(target) = &item.event {
-                links.push(target.to_string());
-            }
-        }
-    });
+pub(crate) fn collect_wiki_links(events: &[SpannedEvent<'_>]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|item| match &item.event {
+            Event::WikiLink(target) => Some(target.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -347,7 +333,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            storage.data_dir.join("Note.mb"),
+            storage.data_dir.join("Note.md"),
             "[[Project]] and [[Other]]\n",
         )
         .unwrap();
@@ -390,7 +376,7 @@ mod tests {
         fs::write(&note, "own [[Project]] self-link\n").unwrap();
         fs::write(storage.data_dir.join("A.md"), "[[Project]] exact\n").unwrap();
         fs::write(
-            storage.data_dir.join("B.mb"),
+            storage.data_dir.join("B.md"),
             "[[project]] case-insensitive\n",
         )
         .unwrap();
@@ -410,7 +396,7 @@ mod tests {
             index.backlinks(&note),
             vec![
                 storage.data_dir.join("A.md"),
-                storage.data_dir.join("B.mb"),
+                storage.data_dir.join("B.md"),
                 storage.data_dir.join("C.md"),
             ],
             "self-link excluded, stem and case-insensitive matches included, sorted"

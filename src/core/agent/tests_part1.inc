@@ -953,7 +953,7 @@
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         fs::write(directory.path().join("data/Alpha.md"), "one\ntwo\nthree\n").unwrap();
-        fs::write(directory.path().join("data/Beta.mb"), "one\n").unwrap();
+        fs::write(directory.path().join("data/Beta.md"), "one\n").unwrap();
         fs::write(directory.path().join("data/ignored.txt"), "ignored").unwrap();
         let list = Notes::new(directory.path()).unwrap();
 
@@ -971,7 +971,7 @@
         let by_name = list
                 .execute(&json!({"sort_by": "name", "order": "asc"}))
                 .unwrap();
-        assert!(by_name.content.find("Name: Alpha.md") < by_name.content.find("Name: Beta.mb"));
+        assert!(by_name.content.find("Name: Alpha.md") < by_name.content.find("Name: Beta.md"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use crate::core::markup::{self, Event as MarkupEvent, SpannedEvent};
+use anyhow::Result;
 use base64::Engine;
-use mbdown::{
-    Alignment as TableAlignment, BorderMode, ColumnWidth, Container, ContainerEnd, Event,
-    HeadingLevel, Node, WidthMode,
+use pulldown_cmark::{
+    Alignment as TableAlignment, CodeBlockKind, Event, HeadingLevel, Tag, TagEnd,
 };
 use sha2::{Digest, Sha256};
 
@@ -23,7 +23,7 @@ const CODE_FONT_STACK_CSS: &str = "\"ui-monospace\",\"SFMono-Regular\",\"Menlo\"
 /// [`render`] so [`FONT_STACK_CSS`] stays the single source of truth for PDF
 /// font preflight. `@media print` resets layout for paper: full width, black
 /// on white, and page-break avoidance for blocks that must stay intact.
-const CSS: &str = r#"*{box-sizing:border-box}:root{color-scheme:light;--fg:#1f2328;--bg:#fff;--bg-subtle:#f6f8fa;--border:#d0d7de;--muted:#57606a;--on-dark:#fff;--on-dark-muted:#fff;--link:#0969da;--link-on-dark:#fff;--on-light:#000;--on-light-muted:#000;--link-on-light:#000;--text:var(--fg);--text-muted:var(--muted);--text-link:var(--link)}body{max-width:52rem;margin:2.5rem auto;padding:0 1.5rem;line-height:1.65;color:var(--text);background:var(--bg);overflow-wrap:break-word}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.5em 0 .5em;font-weight:400}h1{font-size:2em;padding-bottom:.3em;border-bottom:1px solid #d8dee4}h2{font-size:1.5em;padding-bottom:.25em;border-bottom:1px solid #eaeef2}h3{font-size:1.25em}h4{font-size:1.1em}h5{font-size:1em}h6{font-size:.875em;color:var(--text-muted)}p{margin:.6em 0}a{color:var(--text-link)}code{background:var(--bg-subtle);border:1px solid #e4e7ea;border-radius:4px;padding:.12em .3em;font-size:.9em;color:var(--fg)}pre{background:var(--bg-subtle);border:1px solid #e4e7ea;border-radius:6px;padding:12px;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.45;color:var(--fg)}pre code{background:none;border:0;padding:0;font-size:1em}blockquote{border-left:4px solid var(--border);margin:.8em 0;padding:.2em 1em;color:var(--text-muted)}table{border-collapse:collapse;width:100%;margin:.8em 0}th,td{border:1px solid var(--border);padding:6px 10px;text-align:left}th{background:var(--bg-subtle);color:var(--fg)}img{max-width:100%;height:auto}hr{border:0;border-top:1px solid var(--border);margin:1.5em 0}.nole-box{border:1px solid #999;padding:1ch;border-radius:4px}.nole-columns{display:flex;gap:2ch;flex-wrap:wrap}.nole-column{min-width:0}.nole-center{text-align:center}.nole-right{text-align:right}.nole-tag{font-weight:600;color:var(--text-muted)}.raw-html{white-space:pre-wrap}.image-placeholder{color:var(--text-muted);border:1px dashed #b6bdc4;border-radius:4px;padding:.15em .5em;font-style:italic}.task-marker{margin-right:.4em}.wiki-link{color:var(--text-muted)}.unresolved-link{color:var(--text-muted)}.mermaid{background:var(--bg-subtle);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--fg)}.footnote-ref{font-size:.75em}.footnote-definition{display:block;margin-top:.6em;font-size:.875em;color:var(--text-muted)}.nole-bg-dark{--text:var(--on-dark);--text-muted:var(--on-dark-muted);--text-link:var(--link-on-dark);color:var(--text)}.nole-bg-light{--text:var(--on-light);--text-muted:var(--on-light-muted);--text-link:var(--link-on-light);color:var(--text)}.nole-bg-dark a,.nole-bg-light a{text-decoration:underline}@media print{body{max-width:none;margin:0;padding:0;color:#000}a{color:#000}h1,h2{border-bottom-color:#bbb}pre,blockquote,table,.nole-box,.nole-columns{page-break-inside:avoid}img{max-width:100%}.nole-bg-dark,.nole-bg-dark *{color:#000!important;background:none!important}}"#;
+const CSS: &str = r#"*{box-sizing:border-box}:root{color-scheme:light;--fg:#1f2328;--bg:#fff;--bg-subtle:#f6f8fa;--border:#d0d7de;--muted:#57606a;--on-dark:#fff;--on-dark-muted:#fff;--link:#0969da;--link-on-dark:#fff;--on-light:#000;--on-light-muted:#000;--link-on-light:#000;--text:var(--fg);--text-muted:var(--muted);--text-link:var(--link)}body{max-width:52rem;margin:2.5rem auto;padding:0 1.5rem;line-height:1.65;color:var(--text);background:var(--bg);overflow-wrap:break-word}h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.5em 0 .5em;font-weight:400}h1{font-size:2em;padding-bottom:.3em;border-bottom:1px solid #d8dee4}h2{font-size:1.5em;padding-bottom:.25em;border-bottom:1px solid #eaeef2}h3{font-size:1.25em}h4{font-size:1.1em}h5{font-size:1em}h6{font-size:.875em;color:var(--text-muted)}p{margin:.6em 0}a{color:var(--text-link)}code{background:var(--bg-subtle);border:1px solid #e4e7ea;border-radius:4px;padding:.12em .3em;font-size:.9em;color:var(--fg)}pre{background:var(--bg-subtle);border:1px solid #e4e7ea;border-radius:6px;padding:12px;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.45;color:var(--fg)}pre code{background:none;border:0;padding:0;font-size:1em}blockquote{border-left:4px solid var(--border);margin:.8em 0;padding:.2em 1em;color:var(--text-muted)}table{border-collapse:collapse;width:100%;margin:.8em 0}th,td{border:1px solid var(--border);padding:6px 10px;text-align:left}th{background:var(--bg-subtle);color:var(--fg)}img{max-width:100%;height:auto}hr{border:0;border-top:1px solid var(--border);margin:1.5em 0}.nole-tag{font-weight:600;color:var(--text-muted)}.raw-html{white-space:pre-wrap}.image-placeholder{color:var(--text-muted);border:1px dashed #b6bdc4;border-radius:4px;padding:.15em .5em;font-style:italic}.task-marker{margin-right:.4em}.wiki-link{color:var(--text-muted)}.unresolved-link{color:var(--text-muted)}.mermaid{background:var(--bg-subtle);border:1px solid var(--border);border-radius:6px;padding:12px;color:var(--fg)}.footnote-ref{font-size:.75em}.footnote-definition{display:block;margin-top:.6em;font-size:.875em;color:var(--text-muted)}@media print{body{max-width:none;margin:0;padding:0;color:#000}a{color:#000}h1,h2{border-bottom-color:#bbb}pre,blockquote,table{page-break-inside:avoid}img{max-width:100%}}"#;
 pub(crate) const FONT_STACK_CSS: &str = "\"PingFang SC\",\"Hiragino Sans GB\",\"Microsoft YaHei\",\"Noto Sans CJK SC\",\"Noto Sans CJK JP\",\"Noto Sans\",\"Noto Sans Symbols 2\",\"Noto Emoji\",system-ui,sans-serif";
 
 /// Fixed-version Mermaid browser runtime, vendored under `assets/mermaid/` and
@@ -129,7 +129,7 @@ pub(crate) fn render(
     note: &Path,
     attachments: &AttachmentStore,
 ) -> Result<RenderedHtml> {
-    let document = mbdown::parse(source).context("parsing MBDown for export")?;
+    let document = markup::parse(source);
     let mut renderer = Renderer {
         root,
         note,
@@ -139,7 +139,6 @@ pub(crate) fn render(
         links: Vec::new(),
         headings: Vec::new(),
         image: None,
-        inline_tags: Vec::new(),
         table: None,
         code: None,
         diagnostics: Vec::new(),
@@ -147,7 +146,7 @@ pub(crate) fn render(
         has_mermaid: false,
         has_highlight: false,
     };
-    renderer.nodes(document.nodes())?;
+    renderer.events(&document)?;
     let mut license_notices = String::new();
     if renderer.has_math {
         license_notices.push_str("<!-- KaTeX license\n");
@@ -244,12 +243,6 @@ struct PendingImage {
     alt: String,
 }
 
-enum InlineElement {
-    Span,
-    Link(LinkRender),
-    Raw,
-}
-
 /// How a link target renders in the standalone export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinkRender {
@@ -263,11 +256,6 @@ enum LinkRender {
     /// Anything the export cannot vouch for (`javascript:`, `data:`, empty):
     /// inert plain text, no element, nothing executable.
     Plain,
-}
-
-struct InlineFrame {
-    name: String,
-    element: InlineElement,
 }
 
 struct TableState {
@@ -294,7 +282,6 @@ struct Renderer<'a> {
     links: Vec<LinkRender>,
     headings: Vec<u8>,
     image: Option<PendingImage>,
-    inline_tags: Vec<InlineFrame>,
     table: Option<TableState>,
     code: Option<CodeBlock>,
     diagnostics: Vec<RenderDiagnostic>,
@@ -304,113 +291,10 @@ struct Renderer<'a> {
 }
 
 impl Renderer<'_> {
-    fn nodes(&mut self, nodes: &[Node<'_>]) -> Result<()> {
-        for node in nodes {
-            match node {
-                Node::Markdown(markdown) => self.events(markdown.events())?,
-                Node::Box { spec, children } => {
-                    let mut style = String::new();
-                    if spec.border == BorderMode::None {
-                        style.push_str("border:none;");
-                    }
-                    if let Some(color) = spec.border_color.as_deref().and_then(safe_color) {
-                        style.push_str(&format!("border-color:{color};"));
-                    }
-                    let bg = spec.bg.as_deref().and_then(safe_color);
-                    if let Some(color) = &bg {
-                        style.push_str(&format!("background:{color};"));
-                    }
-                    match spec.width {
-                        WidthMode::Full => style.push_str("width:100%;"),
-                        WidthMode::Exact(width) => {
-                            style.push_str(&format!("width:{width}ch;max-width:100%;"))
-                        }
-                        WidthMode::Fit => {}
-                    }
-                    style.push_str(&format!(
-                        "padding:{}ch {}ch;",
-                        spec.padding.y, spec.padding.x
-                    ));
-                    let class = match bg {
-                        Some(color) => format!("nole-box {}", bg_tone_class(&color)),
-                        None => "nole-box".to_string(),
-                    };
-                    self.body
-                        .push_str(&format!("<section class=\"{class}\" style=\"{style}\">"));
-                    if !spec.title.is_empty() {
-                        self.body
-                            .push_str(&format!("<strong>{}</strong>", escape_text(&spec.title)));
-                    }
-                    self.nodes(children)?;
-                    self.body.push_str("</section>");
-                }
-                Node::Center { children } => {
-                    self.wrapped("<div class=\"nole-center\">", "</div>", children)?
-                }
-                Node::Right { children } => {
-                    self.wrapped("<div class=\"nole-right\">", "</div>", children)?
-                }
-                Node::Indent { spec, children } => self.wrapped(
-                    &format!("<div style=\"margin-left:{}ch\">", spec.first),
-                    "</div>",
-                    children,
-                )?,
-                Node::Columns { spec, children } => {
-                    let mut style = format!(
-                        "gap:{}ch;padding:{}ch {}ch;",
-                        spec.gap, spec.padding.y, spec.padding.x
-                    );
-                    let bg = spec.bg.as_deref().and_then(safe_color);
-                    if let Some(color) = &bg {
-                        style.push_str(&format!("background:{color};"));
-                    }
-                    let class = match bg {
-                        Some(color) => format!("nole-columns {}", bg_tone_class(&color)),
-                        None => "nole-columns".to_string(),
-                    };
-                    self.wrapped(
-                        &format!("<div class=\"{class}\" style=\"{style}\">"),
-                        "</div>",
-                        children,
-                    )?;
-                }
-                Node::Column { spec, children } => {
-                    let width = match spec.width {
-                        ColumnWidth::Fixed(value) => format!("flex:0 0 {value}ch;"),
-                        ColumnWidth::Flex(value) => format!("flex:{value} 1 0;"),
-                    };
-                    let mut style =
-                        format!("{width}padding:{}ch {}ch;", spec.padding.y, spec.padding.x);
-                    let bg = spec.bg.as_deref().and_then(safe_color);
-                    if let Some(color) = &bg {
-                        style.push_str(&format!("background:{color};"));
-                    }
-                    let class = match bg {
-                        Some(color) => format!("nole-column {}", bg_tone_class(&color)),
-                        None => "nole-column".to_string(),
-                    };
-                    self.wrapped(
-                        &format!("<div class=\"{class}\" style=\"{style}\">"),
-                        "</div>",
-                        children,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn wrapped(&mut self, start: &str, end: &str, children: &[Node<'_>]) -> Result<()> {
-        self.body.push_str(start);
-        self.nodes(children)?;
-        self.body.push_str(end);
-        Ok(())
-    }
-
-    fn events(&mut self, events: &[mbdown::SpannedEvent<'_>]) -> Result<()> {
+    fn events(&mut self, events: &[SpannedEvent<'_>]) -> Result<()> {
         for item in events {
             if self.image.is_some() {
-                if matches!(item.event, Event::End(ContainerEnd::Image)) {
+                if matches!(item.event, MarkupEvent::Markdown(Event::End(TagEnd::Image))) {
                     let pending = self.image.take().expect("image state exists");
                     let alt = if pending.alt.trim().is_empty() {
                         pending.target.clone()
@@ -419,13 +303,36 @@ impl Renderer<'_> {
                     };
                     self.image(&pending.target, false, &alt)?;
                 } else if let Some(pending) = self.image.as_mut() {
-                    append_image_alt(&mut pending.alt, &item.event);
+                    pending
+                        .alt
+                        .push_str(&markup::visible_text(std::slice::from_ref(item)));
                 }
                 continue;
             }
+            let event = match &item.event {
+                MarkupEvent::Markdown(event) => event,
+                MarkupEvent::Hashtag(tag) => {
+                    self.body.push_str(&format!(
+                        "<span class=\"nole-tag\">#{}</span>",
+                        escape_text(tag)
+                    ));
+                    continue;
+                }
+                MarkupEvent::WikiLink(target) => {
+                    self.body.push_str(&format!(
+                        "<span class=\"wiki-link\">[[{}]]</span>",
+                        escape_text(target)
+                    ));
+                    continue;
+                }
+                MarkupEvent::Embed(target) => {
+                    self.image(target, true, target)?;
+                    continue;
+                }
+            };
             if let Some(block) = self.code.as_mut() {
-                match &item.event {
-                    Event::End(ContainerEnd::CodeBlock) => {
+                match event {
+                    Event::End(TagEnd::CodeBlock) => {
                         let block = self.code.take().expect("code state exists");
                         if block.mermaid {
                             // Browser-rendered via the inlined Mermaid runtime:
@@ -464,26 +371,10 @@ impl Renderer<'_> {
                 }
                 continue;
             }
-            match &item.event {
+            match event {
                 Event::Start(container) => self.start(container)?,
                 Event::End(end) => self.end(*end),
                 Event::Text(text) => self.text(text),
-                Event::Hashtag(tag) => {
-                    let text = format!("#{tag}");
-                    self.body.push_str(&format!(
-                        "<span class=\"nole-tag\">{}</span>",
-                        escape_text(&text)
-                    ));
-                }
-                Event::Embed(target) => self.image(target, true, target)?,
-                Event::WikiLink(target) => {
-                    let text = format!("[[{target}]]");
-                    self.body.push_str(&format!(
-                        "<span class=\"wiki-link\">{}</span>",
-                        escape_text(&text)
-                    ));
-                }
-                Event::InlineTag(tag) => self.inline_tag(tag),
                 Event::Code(text) => {
                     self.body
                         .push_str(&format!("<code>{}</code>", escape_text(text)));
@@ -515,7 +406,7 @@ impl Renderer<'_> {
                         .push_str(&format!("<span class=\"task-marker\">{marker}</span>"));
                 }
                 Event::InlineMath(text) => {
-                    // The container body is the raw TeX source (mbdown strips
+                    // The container body is the raw TeX source (the parser strips
                     // the `$…$` delimiters), HTML-escaped: KaTeX reads it
                     // verbatim, and it stays visible as a fallback whenever
                     // the inline runtime is unavailable.
@@ -537,10 +428,10 @@ impl Renderer<'_> {
         Ok(())
     }
 
-    fn start(&mut self, container: &Container<'_>) -> Result<()> {
+    fn start(&mut self, container: &Tag<'_>) -> Result<()> {
         match container {
-            Container::Paragraph => self.body.push_str("<p>"),
-            Container::Heading(level) => {
+            Tag::Paragraph => self.body.push_str("<p>"),
+            Tag::Heading { level, .. } => {
                 let level = match level {
                     HeadingLevel::H1 => 1,
                     HeadingLevel::H2 => 2,
@@ -552,9 +443,12 @@ impl Renderer<'_> {
                 self.headings.push(level);
                 self.body.push_str(&format!("<h{level}>"));
             }
-            Container::BlockQuote => self.body.push_str("<blockquote>"),
-            Container::CodeBlock(info) => {
-                let info = info.as_deref().unwrap_or("");
+            Tag::BlockQuote(_) => self.body.push_str("<blockquote>"),
+            Tag::CodeBlock(kind) => {
+                let info = match kind {
+                    CodeBlockKind::Fenced(info) => info.as_ref(),
+                    CodeBlockKind::Indented => "",
+                };
                 let mermaid = info.split_whitespace().next() == Some("mermaid");
                 // Mermaid blocks never take a highlight language: they are
                 // rendered by the Mermaid runtime under `class="mermaid"`.
@@ -569,21 +463,21 @@ impl Renderer<'_> {
                     source: String::new(),
                 })
             }
-            Container::HtmlBlock => self.body.push_str("<div class=\"raw-html\">"),
-            Container::List(first) => self.body.push_str(&first.map_or_else(
+            Tag::HtmlBlock => self.body.push_str("<div class=\"raw-html\">"),
+            Tag::List(first) => self.body.push_str(&first.map_or_else(
                 || "<ul>".to_string(),
                 |value| format!("<ol start=\"{value}\">"),
             )),
-            Container::Item => self.body.push_str("<li>"),
-            Container::FootnoteDefinition(name) => self.body.push_str(&format!(
+            Tag::Item => self.body.push_str("<li>"),
+            Tag::FootnoteDefinition(name) => self.body.push_str(&format!(
                 "<aside class=\"footnote-definition\" id=\"fn-{}\" data-footnote=\"{}\">",
                 escape_attr(name),
                 escape_attr(name)
             )),
-            Container::DefinitionList => self.body.push_str("<dl>"),
-            Container::DefinitionListTitle => self.body.push_str("<dt>"),
-            Container::DefinitionListDefinition => self.body.push_str("<dd>"),
-            Container::Table(alignments) => {
+            Tag::DefinitionList => self.body.push_str("<dl>"),
+            Tag::DefinitionListTitle => self.body.push_str("<dt>"),
+            Tag::DefinitionListDefinition => self.body.push_str("<dd>"),
+            Tag::Table(alignments) => {
                 self.table = Some(TableState {
                     alignments: alignments.clone(),
                     column: 0,
@@ -591,19 +485,19 @@ impl Renderer<'_> {
                 });
                 self.body.push_str("<table>");
             }
-            Container::TableHead => {
+            Tag::TableHead => {
                 if let Some(table) = self.table.as_mut() {
                     table.head = true;
                 }
-                self.body.push_str("<thead>");
+                self.body.push_str("<thead><tr>");
             }
-            Container::TableRow => {
+            Tag::TableRow => {
                 if let Some(table) = self.table.as_mut() {
                     table.column = 0;
                 }
                 self.body.push_str("<tr>");
             }
-            Container::TableCell => {
+            Tag::TableCell => {
                 let (head, alignment) =
                     self.table
                         .as_mut()
@@ -625,12 +519,16 @@ impl Renderer<'_> {
                 };
                 self.body.push_str(&format!("<{tag}{alignment}>"));
             }
-            Container::Emphasis => self.body.push_str("<em>"),
-            Container::Strong => self.body.push_str("<strong>"),
-            Container::Strikethrough => self.body.push_str("<s>"),
-            Container::Superscript => self.body.push_str("<sup>"),
-            Container::Subscript => self.body.push_str("<sub>"),
-            Container::Link { target, title } => {
+            Tag::Emphasis => self.body.push_str("<em>"),
+            Tag::Strong => self.body.push_str("<strong>"),
+            Tag::Strikethrough => self.body.push_str("<s>"),
+            Tag::Superscript => self.body.push_str("<sup>"),
+            Tag::Subscript => self.body.push_str("<sub>"),
+            Tag::Link {
+                dest_url: target,
+                title,
+                ..
+            } => {
                 let render = link_render(target);
                 match render {
                     LinkRender::Anchor => self.body.push_str(&format!(
@@ -645,70 +543,72 @@ impl Renderer<'_> {
                 }
                 self.links.push(render);
             }
-            Container::Image { target, .. } => {
+            Tag::Image {
+                dest_url: target, ..
+            } => {
                 self.image = Some(PendingImage {
                     target: target.to_string(),
                     alt: String::new(),
                 });
             }
-            Container::MetadataBlock => self.body.push_str("<section class=\"metadata\">"),
+            Tag::MetadataBlock(_) => self.body.push_str("<section class=\"metadata\">"),
         }
         Ok(())
     }
 
-    fn end(&mut self, end: ContainerEnd) {
+    fn end(&mut self, end: TagEnd) {
         let heading_end;
         let tag = match end {
-            ContainerEnd::Paragraph => "</p>",
-            ContainerEnd::Heading => {
+            TagEnd::Paragraph => "</p>",
+            TagEnd::Heading(_) => {
                 heading_end = format!("</h{}>", self.headings.pop().unwrap_or(1));
                 &heading_end
             }
-            ContainerEnd::BlockQuote => "</blockquote>",
-            ContainerEnd::CodeBlock => "",
-            ContainerEnd::HtmlBlock => "</div>",
-            ContainerEnd::List(ordered) => {
+            TagEnd::BlockQuote(_) => "</blockquote>",
+            TagEnd::CodeBlock => "",
+            TagEnd::HtmlBlock => "</div>",
+            TagEnd::List(ordered) => {
                 if ordered {
                     "</ol>"
                 } else {
                     "</ul>"
                 }
             }
-            ContainerEnd::Item => "</li>",
-            ContainerEnd::FootnoteDefinition => "</aside>",
-            ContainerEnd::DefinitionList => "</dl>",
-            ContainerEnd::DefinitionListTitle => "</dt>",
-            ContainerEnd::DefinitionListDefinition => "</dd>",
-            ContainerEnd::Table => {
+            TagEnd::Item => "</li>",
+            TagEnd::FootnoteDefinition => "</aside>",
+            TagEnd::DefinitionList => "</dl>",
+            TagEnd::DefinitionListTitle => "</dt>",
+            TagEnd::DefinitionListDefinition => "</dd>",
+            TagEnd::Table => {
                 self.table = None;
                 "</table>"
             }
-            ContainerEnd::TableHead => {
+            TagEnd::TableHead => {
                 if let Some(table) = self.table.as_mut() {
                     table.head = false;
                 }
-                "</thead>"
+                "</tr></thead>"
             }
-            ContainerEnd::TableRow => "</tr>",
-            ContainerEnd::TableCell => {
+            TagEnd::TableRow => "</tr>",
+            TagEnd::TableCell => {
                 if self.table.as_ref().is_some_and(|table| table.head) {
                     "</th>"
                 } else {
                     "</td>"
                 }
             }
-            ContainerEnd::Emphasis => "</em>",
-            ContainerEnd::Strong => "</strong>",
-            ContainerEnd::Strikethrough => "</s>",
-            ContainerEnd::Superscript => "</sup>",
-            ContainerEnd::Subscript => "</sub>",
-            ContainerEnd::Link => match self.links.pop().unwrap_or(LinkRender::Plain) {
+            TagEnd::Emphasis => "</em>",
+            TagEnd::Strong => "</strong>",
+            TagEnd::Strikethrough => "</s>",
+            TagEnd::Superscript => "</sup>",
+            TagEnd::Subscript => "</sub>",
+            TagEnd::Link => match self.links.pop().unwrap_or(LinkRender::Plain) {
                 LinkRender::Anchor => "</a>",
                 LinkRender::Local => "</span>",
                 LinkRender::Plain => "",
             },
-            ContainerEnd::Image => "",
-            ContainerEnd::MetadataBlock => "</section>",
+            TagEnd::Image => "",
+            TagEnd::MetadataBlock(_) => "</section>",
         };
         self.body.push_str(tag);
     }
@@ -755,143 +655,6 @@ impl Renderer<'_> {
     fn text(&mut self, text: &str) {
         self.body.push_str(&escape_text(text));
     }
-
-    fn inline_tag(&mut self, tag: &mbdown::InlineTag<'_>) {
-        if tag.closing {
-            let Some(frame) = self.inline_tags.last() else {
-                self.body.push_str(&escape_text(&tag.raw));
-                return;
-            };
-            if frame.name != tag.name {
-                self.body.push_str(&escape_text(&tag.raw));
-                return;
-            }
-            let frame = self.inline_tags.pop().expect("inline frame exists");
-            match frame.element {
-                InlineElement::Span => self.body.push_str("</span>"),
-                InlineElement::Link(render) => match render {
-                    LinkRender::Anchor => self.body.push_str("</a>"),
-                    LinkRender::Local => self.body.push_str("</span>"),
-                    LinkRender::Plain => {}
-                },
-                InlineElement::Raw => {
-                    self.body.push_str(&escape_text(&tag.raw));
-                }
-            }
-            return;
-        }
-
-        if tag.name == "link" {
-            let render = tag.value.as_deref().map_or(LinkRender::Plain, link_render);
-            match render {
-                LinkRender::Anchor => self.body.push_str(&format!(
-                    "<a href=\"{}\" rel=\"noopener noreferrer\">",
-                    escape_attr(tag.value.as_deref().expect("anchor has a target"))
-                )),
-                LinkRender::Local => self.body.push_str(
-                    "<span class=\"unresolved-link\" title=\"local note link is not available in the exported file\">",
-                ),
-                LinkRender::Plain => {}
-            }
-            self.inline_tags.push(InlineFrame {
-                name: tag.name.clone(),
-                element: InlineElement::Link(render),
-            });
-            return;
-        }
-
-        // A marker is only honored when its exact syntax is supported: the
-        // value-less style tags must not carry a value, and the color tags
-        // only accept values `safe_color` can honor. Anything else (unknown
-        // names, invalid or empty color values, stray attributes) falls back
-        // to the escaped source marker below so no export input silently
-        // drops text or turns into an empty element.
-        let mut style = String::new();
-        let mut tone_class = "";
-        let known = match tag.name.as_str() {
-            "b" if tag.value.is_none() => {
-                style.push_str("font-weight:bold");
-                true
-            }
-            "i" if tag.value.is_none() => {
-                style.push_str("font-style:italic");
-                true
-            }
-            "u" if tag.value.is_none() => {
-                style.push_str("text-decoration:underline");
-                true
-            }
-            "s" if tag.value.is_none() => {
-                style.push_str("text-decoration:line-through");
-                true
-            }
-            "dim" if tag.value.is_none() => {
-                style.push_str("opacity:.65");
-                true
-            }
-            "color" | "fg" => match tag.value.as_deref().and_then(safe_color) {
-                Some(color) => {
-                    style.push_str(&format!("color:{color}"));
-                    true
-                }
-                None => false,
-            },
-            "bg" => match tag.value.as_deref().and_then(safe_color) {
-                Some(color) => {
-                    style.push_str(&format!("background:{color}"));
-                    tone_class = bg_tone_class(&color);
-                    true
-                }
-                None => false,
-            },
-            name if tag.value.is_none() && safe_color(name).is_some() => {
-                let color = safe_color(name).expect("checked safe color");
-                style.push_str(&format!("color:{color}"));
-                true
-            }
-            _ => false,
-        };
-        if known {
-            let class = if tone_class.is_empty() {
-                String::new()
-            } else {
-                format!(" class=\"{tone_class}\"")
-            };
-            self.body
-                .push_str(&format!("<span{class} style=\"{}\">", escape_attr(&style)));
-            self.inline_tags.push(InlineFrame {
-                name: tag.name.clone(),
-                element: InlineElement::Span,
-            });
-        } else {
-            self.body.push_str(&escape_text(&tag.raw));
-            self.inline_tags.push(InlineFrame {
-                name: tag.name.clone(),
-                element: InlineElement::Raw,
-            });
-        }
-    }
-}
-fn append_image_alt(alt: &mut String, event: &Event<'_>) {
-    match event {
-        Event::Text(text)
-        | Event::Code(text)
-        | Event::Html(text)
-        | Event::InlineHtml(text)
-        | Event::InlineMath(text)
-        | Event::DisplayMath(text) => alt.push_str(text),
-        Event::Hashtag(tag) => {
-            alt.push('#');
-            alt.push_str(tag);
-        }
-        Event::Embed(target) => alt.push_str(&format!("![[{target}]]")),
-        Event::WikiLink(target) => alt.push_str(&format!("[[{target}]]")),
-        Event::FootnoteReference(name) => alt.push_str(&format!("[{name}]")),
-        Event::SoftBreak | Event::HardBreak => alt.push(' '),
-        Event::Rule => alt.push('—'),
-        Event::TaskListMarker(checked) => alt.push(if *checked { '☑' } else { '☐' }),
-        Event::Start(_) | Event::End(_) | Event::InlineTag(_) => {}
-    }
 }
 
 pub(crate) fn escape_text(value: &str) -> String {
@@ -904,117 +667,6 @@ pub(crate) fn escape_attr(value: &str) -> String {
     escape_text(value)
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
-}
-
-pub(crate) fn safe_color(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if let Some(digits) = normalized.strip_prefix('#') {
-        if matches!(digits.len(), 3 | 6) && digits.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            return Some(normalized);
-        }
-    }
-    let named = match normalized.as_str() {
-        "black" => "#000000",
-        "red" => "#800000",
-        "green" => "#008000",
-        "yellow" => "#808000",
-        "blue" => "#000080",
-        "magenta" => "#800080",
-        "cyan" => "#008080",
-        "white" => "#ffffff",
-        "gray" | "grey" => "#808080",
-        "bright-red" => "#ff0000",
-        "bright-green" => "#00ff00",
-        "bright-yellow" => "#ffff00",
-        "bright-blue" => "#0000ff",
-        "bright-magenta" => "#ff00ff",
-        "bright-cyan" => "#00ffff",
-        "bright-white" => "#ffffff",
-        _ => return normalized.parse::<u8>().ok().map(indexed_color),
-    };
-    Some(named.to_string())
-}
-
-fn indexed_color(index: u8) -> String {
-    const ANSI: [&str; 16] = [
-        "#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#c0c0c0",
-        "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
-    ];
-    match index {
-        0..=15 => ANSI[usize::from(index)].to_string(),
-        16..=231 => {
-            const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-            let value = index - 16;
-            let red = LEVELS[usize::from(value / 36)];
-            let green = LEVELS[usize::from((value % 36) / 6)];
-            let blue = LEVELS[usize::from(value % 6)];
-            format!("#{red:02x}{green:02x}{blue:02x}")
-        }
-        232..=255 => {
-            let level = 8_u8.saturating_add((index - 232).saturating_mul(10));
-            format!("#{level:02x}{level:02x}{level:02x}")
-        }
-    }
-}
-
-/// WCAG relative luminance of a normalized `#rgb`/`#rrggbb` color, 0.0
-/// (black) to 1.0 (white). Callers pass the output of [`safe_color`], which
-/// is always lowercase hex of length 3 or 6.
-fn relative_luminance(hex: &str) -> f64 {
-    let digits = hex.trim_start_matches('#');
-    let bytes = digits.as_bytes();
-    let nibble = |byte: u8| -> u8 {
-        match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            _ => 0,
-        }
-    };
-    let channels: [u8; 3] = match bytes.len() {
-        // `#rgb` expands to `#rrggbb`: each nibble n stands for n*16+n = n*17.
-        3 => [
-            nibble(bytes[0]) * 17,
-            nibble(bytes[1]) * 17,
-            nibble(bytes[2]) * 17,
-        ],
-        6 => [
-            nibble(bytes[0]) * 16 + nibble(bytes[1]),
-            nibble(bytes[2]) * 16 + nibble(bytes[3]),
-            nibble(bytes[4]) * 16 + nibble(bytes[5]),
-        ],
-        _ => return 0.0,
-    };
-    let linear = |channel: u8| -> f64 {
-        let value = f64::from(channel) / 255.0;
-        if value <= 0.04045 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * linear(channels[0]) + 0.7152 * linear(channels[1]) + 0.0722 * linear(channels[2])
-}
-
-fn contrast_ratio(first: f64, second: f64) -> f64 {
-    let lighter = first.max(second);
-    let darker = first.min(second);
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-/// Tone class for an element carrying a user-supplied background color.
-/// Compare pure black and white against the actual background and choose the
-/// higher WCAG contrast ratio. One of those candidates always reaches at
-/// least 4.58:1, including medium colors where a luminance cutoff fails.
-/// Nested tone classes reset the inherited text/link/muted CSS variables.
-fn bg_tone_class(hex: &str) -> &'static str {
-    let background = relative_luminance(hex);
-    let white_contrast = contrast_ratio(background, 1.0);
-    let black_contrast = contrast_ratio(background, 0.0);
-    if white_contrast > black_contrast {
-        "nole-bg-dark"
-    } else {
-        "nole-bg-light"
-    }
 }
 
 /// Classifies a link target for the standalone export.
@@ -1090,7 +742,6 @@ mod tests {
     #[test]
     fn escapes_inert_content() {
         assert_eq!(escape_text("<script>&"), "&lt;script&gt;&amp;");
-        assert!(safe_color("expression(x)").is_none());
     }
 
     #[test]
@@ -1113,18 +764,13 @@ mod tests {
     }
 
     #[test]
-    fn inline_link_tags_classify_the_same_way() {
+    fn bbcode_links_remain_literal() {
         let (_directory, root, store) = renderer_fixture();
         let note = root.join("data/nested/note.md");
-        let source = "[link=local note.md]local[/link] [link=https://example.test]web[/link] [link=javascript:alert(1)]plain[/link]\n";
-        std::fs::write(&note, source).unwrap();
+        let source = "[link=https://example.test]web[/link]";
         let rendered = render(source, "note.md", &root, &note, &store).unwrap();
-        let html = rendered.assets.materialize_data_uris(&rendered.html);
-        assert!(html.contains("<span class=\"unresolved-link\""));
-        assert!(html.contains("href=\"https://example.test\""));
-        assert!(!html.contains("href=\"javascript:"));
-        assert!(!html.contains("file://"));
-        assert!(!html.contains("[link="));
+        assert!(rendered.html.contains(source));
+        assert!(!rendered.html.contains("<a href="));
     }
 
     #[test]
@@ -1175,31 +821,24 @@ mod tests {
     }
 
     #[test]
-    fn supported_inline_markers_keep_their_semantics() {
+    fn bbcode_styles_and_containers_remain_literal_beside_markdown() {
         let (_directory, root, store) = renderer_fixture();
         let note = root.join("data/nested/note.md");
-        let source = "[b]bold[/b] [i]italic[/i] [u]under[/u] [s]strike[/s] [dim]dim[/dim] [red]name[/red] [color=#ff0000]hex[/color] [fg=bright-red]fg[/fg] [bg=blue]bg[/bg] [link=https://example.test]web[/link]\n";
-        std::fs::write(&note, source).unwrap();
-        let rendered = render(source, "note.md", &root, &note, &store).unwrap();
-        let html = rendered.assets.materialize_data_uris(&rendered.html);
-        assert!(
-            html.contains("style=\"font-weight:bold\">bold</span>"),
-            "html: {html}"
-        );
-        assert!(html.contains("style=\"font-style:italic\">italic</span>"));
-        assert!(html.contains("style=\"text-decoration:underline\">under</span>"));
-        assert!(html.contains("style=\"text-decoration:line-through\">strike</span>"));
-        assert!(html.contains("style=\"opacity:.65\">dim</span>"));
-        assert!(html.contains("style=\"color:#800000\">name</span>"));
-        assert!(html.contains("style=\"color:#ff0000\">hex</span>"));
-        assert!(html.contains("style=\"color:#ff0000\">fg</span>"));
-        assert!(html.contains("class=\"nole-bg-dark\" style=\"background:#000080\">bg</span>"));
-        assert!(html.contains("href=\"https://example.test\""));
-        assert!(html.contains(">web</a>"));
-        // Supported markers are consumed, not echoed back as source text.
-        assert!(!html.contains("[b]"));
-        assert!(!html.contains("[red]"));
-        assert!(!html.contains("[color="));
+        let source =
+            "**bold** [b]plain[/b] [color=red]plain[/color]\n\n[box title=Info]\nbody\n[/box]";
+        let html = render(source, "note.md", &root, &note, &store)
+            .unwrap()
+            .html;
+        assert!(html.contains("<strong>bold</strong>"));
+        for marker in [
+            "[b]plain[/b]",
+            "[color=red]plain[/color]",
+            "[box title=Info]",
+            "[/box]",
+        ] {
+            assert!(html.contains(marker));
+        }
+        assert!(!html.contains("class=\"nole-box"));
     }
 
     #[test]
@@ -1425,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn math_wikilinks_and_unsupported_footnotes_remain_detectable() {
+    fn math_wikilinks_and_footnotes_render() {
         let (_directory, root, store) = renderer_fixture();
         let note = root.join("data/nested/note.md");
         let source =
@@ -1436,9 +1075,10 @@ mod tests {
         assert!(html.contains("<span class=\"wiki-link\">[[target]]</span>"));
         assert!(html.contains("<span class=\"math\" data-math=\"inline\">x^2</span>"));
         assert!(html.contains("<div class=\"math\" data-math=\"display\">\\frac{1}{2}</div>"));
-        // MBDown currently leaves footnote syntax as ordinary visible text.
-        assert!(html.contains("here[^1]"));
-        assert!(html.contains("[^1]: The definition."));
+        // Footnotes use the standard parser extension.
+        assert!(html.contains("here<sup class=\"footnote-ref\""));
+        assert!(html.contains("class=\"footnote-definition\""));
+        assert!(html.contains("The definition."));
     }
 
     #[test]
@@ -1548,73 +1188,6 @@ mod tests {
     }
 
     #[test]
-    fn bg_tone_classification_maximizes_wcag_contrast() {
-        for (background, expected) in [
-            ("#00005f", "nole-bg-dark"),
-            ("#ffffff", "nole-bg-light"),
-            ("#000000", "nole-bg-dark"),
-            ("#c0c0c0", "nole-bg-light"),
-            ("#00a000", "nole-bg-light"),
-            ("#ff0000", "nole-bg-light"),
-        ] {
-            let class = bg_tone_class(background);
-            assert_eq!(class, expected, "background {background}");
-            let foreground = if class == "nole-bg-dark" { 1.0 } else { 0.0 };
-            assert!(
-                contrast_ratio(relative_luminance(background), foreground) >= 4.5,
-                "background {background}"
-            );
-        }
-    }
-
-    #[test]
-    fn dark_backgrounds_get_light_default_text_and_keep_explicit_colors() {
-        let (_directory, root, store) = renderer_fixture();
-        let note = root.join("data/nested/note.md");
-        let source =
-            "[bg=17]dark[/bg] [bg=17][color=white]kept[/color][/bg]\n\n[box bg=17]boxed[/box]\n";
-        std::fs::write(&note, source).unwrap();
-        let rendered = render(source, "note.md", &root, &note, &store).unwrap();
-        let html = rendered.assets.materialize_data_uris(&rendered.html);
-        // The 256-color index 17 maps to a dark blue (#00005f) background; the
-        // rendered span must carry the tone class so CSS picks a light default
-        // foreground instead of leaving browser-default black text on dark.
-        assert!(
-            html.contains("<span class=\"nole-bg-dark\" style=\"background:#00005f\">dark</span>"),
-            "html: {html}"
-        );
-        assert!(html.contains(
-            "<span class=\"nole-bg-dark\" style=\"background:#00005f\"><span style=\"color:#ffffff\">kept</span></span>"
-        ));
-        assert!(html.contains(
-            "<section class=\"nole-box nole-bg-dark\" style=\"background:#00005f;padding:"
-        ));
-        // The dark default foreground is a light color, and explicit safe
-        // foregrounds are preserved verbatim.
-        assert!(html.contains("--on-dark:#fff"));
-        assert!(html.contains("--link-on-dark:#fff"));
-        assert!(html.contains("color:#ffffff"));
-        assert!(html.contains(".nole-bg-dark{--text:var(--on-dark)"));
-    }
-
-    #[test]
-    fn light_backgrounds_keep_dark_text_even_inside_dark_containers() {
-        let (_directory, root, store) = renderer_fixture();
-        let note = root.join("data/nested/note.md");
-        let source = "[bg=17]a[bg=15][link=https://example.test]link[/link][/bg]c[/bg]\n";
-        std::fs::write(&note, source).unwrap();
-        let rendered = render(source, "note.md", &root, &note, &store).unwrap();
-        let html = rendered.assets.materialize_data_uris(&rendered.html);
-        // White (index 15) inside a dark span must pin dark text again instead
-        // of inheriting the light-on-dark color.
-        assert!(html.contains(
-            "<span class=\"nole-bg-light\" style=\"background:#ffffff\"><a href=\"https://example.test\""
-        ));
-        assert!(html.contains(">link</a></span>"));
-        assert!(html.contains(".nole-bg-light{--text:var(--on-light);--text-muted:var(--on-light-muted);--text-link:var(--link-on-light);color:var(--text)}"));
-    }
-
-    #[test]
     fn export_declares_light_scheme_and_readable_surfaces() {
         let (_directory, root, store) = renderer_fixture();
         let note = root.join("data/nested/note.md");
@@ -1634,13 +1207,6 @@ mod tests {
         assert!(html.contains("color:var(--fg)}"));
         assert!(html.contains("th{background:var(--bg-subtle);color:var(--fg)}"));
         assert!(html.contains(".mermaid{background:var(--bg-subtle);"));
-        assert!(html.contains(".nole-bg-dark{--text:var(--on-dark)"));
-        // Print stays readable in black and white: dark backgrounds are
-        // dropped and their text forced black.
-        assert!(html.contains("@media print{"));
-        assert!(html.contains(
-            ".nole-bg-dark,.nole-bg-dark *{color:#000!important;background:none!important}"
-        ));
         assert!(html.contains("page-break-inside:avoid"));
     }
 }

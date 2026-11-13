@@ -62,7 +62,7 @@ export function DocumentActions({ path, source }: { path: string; source: string
       })
       downloadFile(
         preview.html,
-        note.name.replace(/\.(md|mb)$/i, '.html'),
+        note.name.replace(/\.md$/i, '.html'),
         'text/html;charset=utf-8',
       )
       if (preview.warnings.length > 0)

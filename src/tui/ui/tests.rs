@@ -140,7 +140,7 @@ fn render_agent_entry(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     super::render_agent_entry(entry, width, tick, animate, Theme::default())
 }
@@ -1675,7 +1675,7 @@ fn wikilink_choice_marks_location_and_file_format_as_muted_metadata() {
             location: WikiLinkLocation::Notes,
         },
         WikiLinkCandidate {
-            path: directory.path().join("archives/Project.mb"),
+            path: directory.path().join("archives/Project.md"),
             location: WikiLinkLocation::Archives,
         },
     ];
@@ -1687,7 +1687,6 @@ fn wikilink_choice_marks_location_and_file_format_as_muted_metadata() {
     assert!(screen.contains("Project.md"));
     assert!(screen.contains("MD"));
     assert!(screen.contains("Archived"));
-    assert!(screen.contains("MB"));
     assert_eq!(app.wiki_link_hitboxes.len(), 3);
 }
 
@@ -2585,7 +2584,7 @@ fn ask_user_overlay_renders_choices_and_free_text_input() {
     let (mut app, _directory) = make_app();
     app.ask_user_request = Some(crate::core::agent::AskUserRequest {
         question: "Which output format should be used?".to_string(),
-        options: vec!["Markdown".to_string(), "MBDown".to_string()],
+        options: vec!["Markdown".to_string(), "HTML".to_string()],
     });
     app.ask_user_option = 0;
     app.set_overlay(Overlay::AskUser);
@@ -2594,7 +2593,7 @@ fn ask_user_overlay_renders_choices_and_free_text_input() {
     assert!(screen.contains("Agent question"));
     assert!(screen.contains("Which output format should be used?"));
     assert!(screen.contains("Markdown"));
-    assert!(screen.contains("MBDown"));
+    assert!(screen.contains("HTML"));
     assert!(screen.contains("Other answer"));
     assert!(screen.contains("Your answer"));
     assert!(!screen.contains("> Markdown"));
@@ -2608,21 +2607,21 @@ fn ask_user_overlay_renders_choices_and_free_text_input() {
         .iter()
         .find(|hitbox| hitbox.index == 0)
         .expect("selected Markdown option");
-    let mbdown = app
+    let markdown = app
         .dialog_hitboxes
         .iter()
         .find(|hitbox| hitbox.index == 1)
-        .expect("MBDown option");
+        .expect("HTML option");
     let other = app
         .dialog_hitboxes
         .iter()
         .find(|hitbox| hitbox.index == 2)
         .expect("Other answer option");
     assert_eq!(selected.area.height, SELECT_OPTION_HEIGHT);
-    assert_eq!(mbdown.area.height, SELECT_OPTION_HEIGHT);
+    assert_eq!(markdown.area.height, SELECT_OPTION_HEIGHT);
     assert_eq!(other.area.height, SELECT_OPTION_HEIGHT);
-    assert_eq!(mbdown.area.y, selected.area.y + SELECT_OPTION_HEIGHT);
-    assert_eq!(other.area.y, mbdown.area.y + SELECT_OPTION_HEIGHT);
+    assert_eq!(markdown.area.y, selected.area.y + SELECT_OPTION_HEIGHT);
+    assert_eq!(other.area.y, markdown.area.y + SELECT_OPTION_HEIGHT);
     let buffer = terminal.backend().buffer();
     for y in selected.area.y.saturating_sub(1)..selected.area.y + selected.area.height {
         assert_eq!(
@@ -3145,13 +3144,9 @@ fn chat_renders_block_markdown_on_colored_cards() {
     for expected in ["Heading", "• first", "• second", "code"] {
         assert!(screen.contains(expected), "missing {expected}");
     }
-    assert!(screen
-        .lines()
-        .any(|line| line.contains("Left") && line.contains("Right")));
-    assert!(buffer
-        .content()
-        .iter()
-        .any(|cell| cell.symbol() == "c" && cell.bg == Color::Indexed(196)));
+    assert!(screen.contains("[column]Left[/column]"));
+    assert!(screen.contains("[column]Right[/column]"));
+    assert!(screen.contains("[bg=196]colored[/bg]"));
     assert!(!screen.contains("[view]"));
     assert!(
         app.hitboxes
@@ -3459,10 +3454,7 @@ fn document_code_block_renders_and_exposes_a_clickable_copy_button() {
 
     let terminal = render(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
-    let background = mbtui::Theme::default()
-        .code_block
-        .bg
-        .expect("the default code block theme has a background");
+    let background = Theme::default().markdown_code_block_background;
     let compose = app.layout.compose.expect("document compose");
     let rows = (0..compose.y)
         .filter(|y| (0..buffer.area().width).any(|x| buffer[(x, *y)].bg == background))

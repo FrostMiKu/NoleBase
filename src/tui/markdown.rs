@@ -1,16 +1,14 @@
-//! MBDown markup -> styled ratatui lines. AST traversal and extraction live
-//! in [`crate::core::markup`]; this module owns MBTUI layout and styling.
+//! Standard Markdown and Nole extensions rendered as styled terminal lines.
 
-use std::borrow::Cow;
-
-use mbtui::Renderer;
+mod code;
+mod diagram;
+mod layout;
+mod math;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::core::markup::{
-    code_block_specs, embed_link_target, expand_tabs, link_specs, CodeBlockSpec, LinkSpec,
-};
+use crate::core::markup::{code_block_specs, expand_tabs, link_specs, CodeBlockSpec, LinkSpec};
 use crate::core::model::LinkTarget;
 use crate::tui::theme::Theme;
 
@@ -19,7 +17,7 @@ pub struct RenderedMarkup {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<RenderedLink>,
     pub tags: Vec<RenderedTag>,
-    pub images: Vec<mbtui::ImagePlacement>,
+    pub images: Vec<ImagePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,79 +43,32 @@ pub fn to_lines_at_width(source: &str, width: usize, theme: Theme) -> Vec<Line<'
 
 pub fn render_at_width(source: &str, width: usize, theme: Theme) -> RenderedMarkup {
     let expanded = expand_tabs(source);
-    match mbdown::parse(expanded.as_ref()) {
-        Ok(document) => {
-            let code_specs = if matches!(expanded, Cow::Borrowed(_)) {
-                code_block_specs(document.nodes())
-            } else {
-                mbdown::parse(source)
-                    .map(|original| code_block_specs(original.nodes()))
-                    .unwrap_or_default()
-            };
-            let rendered = Renderer::with_theme(width.max(1), theme.markdown_theme())
-                .with_image_height(12)
-                .render(&document);
-            let mut lines = rendered.text.lines;
-            let specs = link_specs(document.nodes());
-            let mut links = locate_links(&lines, &specs, theme.markdown_link);
-            let mut tags = Vec::new();
-            for semantic in rendered.semantics {
-                match semantic.kind {
-                    mbtui::SemanticKind::Hashtag { name } => {
-                        tags.extend(semantic.regions.into_iter().map(|region| RenderedTag {
-                            name: name.clone(),
-                            row: region.row,
-                            column: region.column,
-                            width: region.width,
-                        }));
-                    }
-                    mbtui::SemanticKind::Embed { target } => {
-                        let target = embed_link_target(&target);
-                        links.extend(semantic.regions.into_iter().map(|region| RenderedLink {
-                            target: target.clone(),
-                            row: region.row,
-                            column: region.column,
-                            width: region.width,
-                        }));
-                    }
-                    _ => {}
-                }
-            }
-            links.extend(decorate_code_blocks(&mut lines, &code_specs, theme));
-            RenderedMarkup {
-                lines,
-                links,
-                tags,
-                images: rendered.images,
-            }
-        }
-        Err(_) => RenderedMarkup {
-            lines: plain_text_lines(expanded.as_ref(), width.max(1)),
-            links: Vec::new(),
-            tags: Vec::new(),
-            images: Vec::new(),
-        },
-    }
+    let document = crate::core::markup::parse(expanded.as_ref());
+    let code_specs = code_block_specs(&crate::core::markup::parse(source));
+    let mut rendered = layout::render(&document, width, theme);
+    let specs = link_specs(&document);
+    rendered.tags = locate_tags(&rendered.lines, &document, theme);
+    rendered
+        .links
+        .extend(locate_links(&rendered.lines, &specs, theme.markdown_link));
+    rendered.links.extend(decorate_code_blocks(
+        &mut rendered.lines,
+        &code_specs,
+        theme,
+    ));
+    rendered
 }
 
-fn plain_text_lines(source: &str, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for source_line in source.split('\n') {
-        let source_line = source_line.strip_suffix('\r').unwrap_or(source_line);
-        let mut row = String::new();
-        let mut row_width = 0;
-        for character in source_line.chars() {
-            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-            if row_width + character_width > width && !row.is_empty() {
-                lines.push(Line::raw(std::mem::take(&mut row)));
-                row_width = 0;
-            }
-            row.push(character);
-            row_width += character_width;
-        }
-        lines.push(Line::raw(row));
-    }
-    lines
+/// A terminal image region; pixel loading and drawing live in `tui::media`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImagePlacement {
+    pub source: String,
+    pub title: String,
+    pub alt: String,
+    pub row: usize,
+    pub column: usize,
+    pub width: usize,
+    pub height: usize,
 }
 
 const COPY_BUTTON: &str = " Copy ";
@@ -217,10 +168,12 @@ fn locate_links(
     specs: &[LinkSpec],
     link_underline_color: Color,
 ) -> Vec<RenderedLink> {
-    let cells = rendered_cells(lines, link_underline_color)
-        .into_iter()
-        .filter(|cell| cell.clickable)
-        .collect::<Vec<_>>();
+    let cells = rendered_cells(lines, |style| {
+        style.underline_color == Some(link_underline_color)
+    })
+    .into_iter()
+    .filter(|cell| cell.clickable)
+    .collect::<Vec<_>>();
     let mut used = vec![false; cells.len()];
     let mut links = Vec::new();
     for spec in specs.iter().filter(|spec| !spec.label.is_empty()) {
@@ -238,12 +191,45 @@ fn locate_links(
     links
 }
 
-fn rendered_cells(lines: &[Line<'_>], link_underline_color: Color) -> Vec<RenderedCell> {
+fn locate_tags(
+    lines: &[Line<'_>],
+    events: &[crate::core::markup::SpannedEvent<'_>],
+    theme: Theme,
+) -> Vec<RenderedTag> {
+    let cells: Vec<_> = rendered_cells(lines, |style| {
+        style.fg == Some(theme.markdown_hashtag) && style.add_modifier.contains(Modifier::BOLD)
+    })
+    .into_iter()
+    .filter(|cell| cell.clickable)
+    .collect();
+    let mut used = vec![false; cells.len()];
+    let mut tags = Vec::new();
+    for event in events {
+        let crate::core::markup::Event::Hashtag(name) = &event.event else {
+            continue;
+        };
+        let label: Vec<_> = format!("#{name}").chars().collect();
+        if let Some(range) = find_cells(&cells, &label, &used) {
+            used[range.clone()].fill(true);
+            for segment in link_segments(&cells[range], &LinkTarget::WikiLink(String::new())) {
+                tags.push(RenderedTag {
+                    name: name.to_string(),
+                    row: segment.row,
+                    column: segment.column,
+                    width: segment.width,
+                });
+            }
+        }
+    }
+    tags
+}
+
+fn rendered_cells(lines: &[Line<'_>], selected: impl Fn(Style) -> bool) -> Vec<RenderedCell> {
     let mut cells = Vec::new();
     for (row, line) in lines.iter().enumerate() {
         let mut column = 0;
         for span in &line.spans {
-            let clickable = span.style.underline_color == Some(link_underline_color);
+            let clickable = selected(span.style);
             for character in span.content.chars() {
                 let width = UnicodeWidthChar::width(character).unwrap_or(0);
                 if width > 0 {
@@ -300,7 +286,7 @@ fn link_segments(cells: &[RenderedCell], target: &LinkTarget) -> Vec<RenderedLin
     links
 }
 
-/// Map a one-based source line to its first terminal row after MBTUI layout.
+/// Map a one-based source line to its first terminal row after terminal Markdown layout.
 #[cfg(test)]
 pub fn rendered_row_for_source_line(
     source: &str,
@@ -393,7 +379,7 @@ fn normalize_search_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
 
     use super::*;
     use crate::tui::theme::catppuccin as ctp;
@@ -504,21 +490,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mbdown_falls_back_to_width_bounded_plain_text() {
-        let source = "# Visible source\n\n[box border=double]\nbody\n[/box]";
-        let rendered = render_at_width(source, WIDTH);
-
-        assert_eq!(text(&rendered.lines), source);
-        assert!(rendered.links.is_empty());
-        assert!(rendered.tags.is_empty());
-        assert!(rendered.images.is_empty());
-
-        let wrapped = render_at_width("[box border=double] abcdefghijklmnop", 10);
-        assert!(wrapped
-            .lines
-            .iter()
-            .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 10));
-        assert!(!text(&wrapped.lines).contains("MBDown parse error"));
+    fn bbcode_does_not_disable_standard_markdown_rendering() {
+        let rendered = render_at_width("# Heading\n\n[box border=double]\nbody\n[/box]", 30);
+        assert!(span_with(&rendered.lines, "Heading")
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(text(&rendered.lines).contains("[box border=double]"));
+        assert!(text(&rendered.lines).contains("[/box]"));
     }
 
     #[test]
@@ -598,8 +577,8 @@ mod tests {
                 &["Idle", "Processing", "Running", "Success", "Error", "Retry", "接收任务", "开始执行", "完成", "失败", "重试", "放弃"][..],
             ),
             (
-                "mindmap\n  root((Nole))\n    核心\n      编辑器\n        MBDown 渲染\n        Mermaid 图表\n        BBCode 样式\n      文件管理\n        data 笔记\n        daily 日志\n        archives 归档\n    AI Agent\n      工具\n        文件读写\n        搜索\n        网络请求\n      记忆\n        MEMORY.md\n        每日笔记\n    主题\n      TOML 配置\n      自定义颜色\n",
-                &["Nole", "核心", "编辑器", "MBDown 渲染", "文件管理", "AI Agent", "MEMORY.md", "主题", "自定义颜色"][..],
+                "mindmap\n  root((Nole))\n    核心\n      编辑器\n        Markdown 渲染\n        Mermaid 图表\n        Markdown 样式\n      文件管理\n        data 笔记\n        daily 日志\n        archives 归档\n    AI Agent\n      工具\n        文件读写\n        搜索\n        网络请求\n      记忆\n        MEMORY.md\n        每日笔记\n    主题\n      TOML 配置\n      自定义颜色\n",
+                &["Nole", "核心", "编辑器", "Markdown 渲染", "文件管理", "AI Agent", "MEMORY.md", "主题", "自定义颜色"][..],
             ),
         ];
 
@@ -630,23 +609,18 @@ mod tests {
     }
 
     #[test]
-    fn renders_bbcode_foreground_and_background_colors() {
-        let lines = to_lines_at_width(
-            "[color=#12abef]foreground[/color] [bg=196]background[/bg]",
-            WIDTH,
-        );
-        assert_eq!(
-            span_with(&lines, "foreground").style.fg,
-            Some(Color::Rgb(0x12, 0xab, 0xef))
-        );
-        assert_eq!(
-            span_with(&lines, "background").style.bg,
-            Some(Color::Indexed(196))
-        );
+    fn bbcode_colors_remain_literal_text() {
+        let source = "[color=#12abef]foreground[/color] [bg=196]background[/bg]";
+        let lines = to_lines_at_width(source, WIDTH);
+        assert_eq!(text(&lines), source);
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style.bg.is_none()));
     }
 
     #[test]
-    fn renders_mbdown_hashtags_and_wikilinks() {
+    fn renders_hashtags_and_wikilinks() {
         let lines = to_lines_at_width("See #开发/日志 and [[项目计划]]", WIDTH);
         assert_eq!(span_with(&lines, "#开发/日志").style.fg, Some(ctp::PINK));
         let wikilink = span_with(&lines, "[[项目计划]]");
@@ -731,10 +705,7 @@ mod tests {
         }));
 
         let rendered = render_at_width(&format!("[link={uri}]open[/link]"), WIDTH);
-        assert!(rendered
-            .links
-            .iter()
-            .any(|link| { link.target == LinkTarget::Attachment(uri.clone()) }));
+        assert!(rendered.links.is_empty());
     }
 
     #[test]
@@ -777,9 +748,9 @@ mod tests {
     }
 
     #[test]
-    fn locates_markdown_wiki_and_bbcode_link_cells() {
+    fn locates_markdown_and_wiki_link_cells() {
         let rendered = render_at_width(
-            "[site](https://example.test) [[项目计划]] [link=mailto:a@example.test]mail[/link]",
+            "[site](https://example.test) [[项目计划]] [mail](mailto:a@example.test)",
             WIDTH,
         );
         assert_eq!(rendered.links.len(), 3);
@@ -807,6 +778,27 @@ mod tests {
     }
 
     #[test]
+    fn table_semantics_follow_the_final_cell_layout() {
+        let rendered =
+            render_at_width("| Tag | File |\n|---|---|\n| #开发 | ![[report.pdf]] |", 50);
+        let tag = rendered
+            .tags
+            .iter()
+            .find(|tag| tag.name == "开发")
+            .expect("table tag");
+        let link = rendered
+            .links
+            .iter()
+            .find(|link| link.target == LinkTarget::LocalFile("report.pdf".into()))
+            .expect("table file link");
+        assert_eq!(tag.row, 3);
+        assert_eq!(link.row, 3);
+        assert_eq!(tag.column, 2);
+        assert!(link.column > tag.column + tag.width);
+        assert!(rendered.lines[tag.row].to_string().contains("#开发"));
+    }
+
+    #[test]
     fn link_locations_ignore_identical_underlined_non_link_text() {
         let rendered = render_at_width("# site\n\n[site](https://example.test)", WIDTH);
         assert_eq!(rendered.links.len(), 1);
@@ -814,41 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn renders_boxes_and_responsive_columns() {
-        let box_lines = to_lines_at_width(
-            "[box title=Info width=24 border=single bg=17]\nHello\n[/box]",
-            40,
-        );
-        let boxed = text(&box_lines);
-        assert!(boxed.contains("╭─ Info"));
-        assert!(boxed.contains("Hello"));
-        assert!(boxed.lines().any(|line| line.starts_with('│')));
-        assert!(boxed.lines().any(|line| line.starts_with('╰')));
-        assert!(box_lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .any(|span| span.style.bg == Some(Color::Indexed(17))));
-
-        let source = concat!(
-            "[columns gap=2]\n",
-            "[column]Left[/column]\n",
-            "[column]Right[/column]\n",
-            "[/columns]"
-        );
-        let wide = text(&to_lines_at_width(source, 30));
-        assert!(wide
-            .lines()
-            .any(|line| line.contains("Left") && line.contains("Right")));
-        let narrow = text(&to_lines_at_width(source, 15));
-        assert!(!narrow
-            .lines()
-            .any(|line| line.contains("Left") && line.contains("Right")));
+    fn bbcode_containers_remain_literal_text() {
+        let source = "[box title=Info]\nHello\n[/box]\n\n[cols]Left[/cols]";
+        assert_eq!(text(&to_lines_at_width(source, WIDTH)), source);
     }
 
     #[test]
     fn output_contains_no_terminal_escape_sequences() {
         let output = text(&to_lines_at_width("[red][b]safe[/b][/red]", WIDTH));
-        assert_eq!(output, "safe");
+        assert_eq!(output, "[red][b]safe[/b][/red]");
         assert!(!output.contains('\x1b'));
 
         let linked = to_lines_at_width("**bold** [label](https://example.test)", WIDTH);
@@ -860,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn source_lines_map_to_mbterm_rows() {
+    fn source_lines_map_to_terminal_rows() {
         assert_eq!(
             rendered_row_for_source_line("# Heading\n\nintro\n\nneedle", 5, 80),
             4

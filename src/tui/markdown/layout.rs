@@ -1,0 +1,522 @@
+//! Terminal layout for the shared Markdown event stream.
+use super::{ImagePlacement, RenderedMarkup};
+use crate::core::markup::{self, Event, SpannedEvent};
+use crate::tui::theme::Theme;
+use pulldown_cmark::{CodeBlockKind, Event as Md, HeadingLevel, Tag, TagEnd};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+pub(super) fn render(events: &[SpannedEvent<'_>], width: usize, theme: Theme) -> RenderedMarkup {
+    let mut layout = Layout {
+        output: RenderedMarkup {
+            lines: Vec::new(),
+            links: Vec::new(),
+            tags: Vec::new(),
+            images: Vec::new(),
+        },
+        line: Line::default(),
+        width: width.max(1),
+        theme,
+        styles: vec![Style::default()],
+        lists: Vec::new(),
+        quote: 0,
+        prefix: String::new(),
+        table: None,
+    };
+    layout.events(events);
+    layout.flush();
+    // Image reservations are real content even though their lines are blank.
+    let image_end = layout
+        .output
+        .images
+        .iter()
+        .map(|image| image.row + image.height)
+        .max()
+        .unwrap_or(0);
+    while layout.output.lines.len() > image_end
+        && layout
+            .output
+            .lines
+            .last()
+            .is_some_and(|line| line.spans.is_empty())
+    {
+        layout.output.lines.pop();
+    }
+    layout.output
+}
+
+struct Layout {
+    output: RenderedMarkup,
+    line: Line<'static>,
+    width: usize,
+    theme: Theme,
+    styles: Vec<Style>,
+    lists: Vec<Option<u64>>,
+    quote: usize,
+    prefix: String,
+    table: Option<Table>,
+}
+
+#[derive(Default)]
+struct Table {
+    alignments: Vec<pulldown_cmark::Alignment>,
+    rows: Vec<Vec<Line<'static>>>,
+    cells: Vec<Line<'static>>,
+}
+
+impl Layout {
+    fn style(&self) -> Style {
+        *self.styles.last().unwrap()
+    }
+    fn push_style(&mut self, style: Style) {
+        self.styles.push(self.style().patch(style));
+    }
+    fn flush(&mut self) {
+        if !self.line.spans.is_empty() {
+            let line = std::mem::take(&mut self.line);
+            if let Some(table) = &mut self.table {
+                table.cells.push(line);
+            } else {
+                self.output.lines.push(line);
+            }
+        }
+    }
+    fn blank(&mut self) {
+        self.flush();
+        if self.table.is_none()
+            && !self.output.lines.is_empty()
+            && self
+                .output
+                .lines
+                .last()
+                .is_some_and(|line| !line.spans.is_empty())
+        {
+            self.output.lines.push(Line::default());
+        }
+    }
+    fn emit(&mut self, text: &str, style: Style) {
+        // Neither raw HTML nor prose can inject terminal controls.
+        let clean: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect();
+        for (index, part) in clean.split('\n').enumerate() {
+            if index > 0 {
+                self.flush();
+            }
+            let mut chunk = String::new();
+            let mut used = self.line.width();
+            if used == 0 && !self.prefix.is_empty() && self.table.is_none() {
+                let prefix = self
+                    .prefix
+                    .chars()
+                    .take(self.width.saturating_sub(1))
+                    .collect::<String>();
+                self.line.spans.push(Span::styled(
+                    prefix,
+                    Style::default().fg(self.theme.markdown_quote),
+                ));
+                used = self.line.width();
+            }
+            for ch in part.chars() {
+                let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if self.table.is_none()
+                    && used + cells > self.width
+                    && (used > 0 || !chunk.is_empty())
+                {
+                    if !chunk.is_empty() {
+                        self.line
+                            .spans
+                            .push(Span::styled(std::mem::take(&mut chunk), style));
+                    }
+                    self.flush();
+                    used = 0;
+                }
+                chunk.push(ch);
+                used += cells;
+            }
+            if !chunk.is_empty() {
+                self.line.spans.push(Span::styled(chunk, style));
+            }
+        }
+    }
+    fn events(&mut self, events: &[SpannedEvent<'_>]) {
+        let mut index = 0;
+        while index < events.len() {
+            match &events[index].event {
+                Event::Hashtag(name) => {
+                    self.emit(
+                        &format!("#{name}"),
+                        self.style()
+                            .fg(self.theme.markdown_hashtag)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                Event::WikiLink(target) => self.emit(
+                    &format!("[[{target}]]"),
+                    self.link_style(self.theme.markdown_wikilink),
+                ),
+                Event::Embed(target) => {
+                    if is_image(target) {
+                        self.image(target, "", target);
+                    } else {
+                        self.emit(
+                            &format!("![[{target}]]"),
+                            self.link_style(self.theme.markdown_link),
+                        );
+                    }
+                }
+                Event::Markdown(Md::Start(Tag::Image {
+                    dest_url, title, ..
+                })) => {
+                    let end = events[index + 1..]
+                        .iter()
+                        .position(|e| matches!(e.event, Event::Markdown(Md::End(TagEnd::Image))))
+                        .map_or(index, |n| index + 1 + n);
+                    self.image(
+                        dest_url,
+                        title,
+                        &markup::visible_text(&events[index + 1..end]),
+                    );
+                    index = end;
+                }
+                Event::Markdown(Md::Start(Tag::CodeBlock(kind))) => {
+                    let end = events[index + 1..]
+                        .iter()
+                        .position(|e| {
+                            matches!(e.event, Event::Markdown(Md::End(TagEnd::CodeBlock)))
+                        })
+                        .map_or(events.len(), |n| index + 1 + n);
+                    let source = markup::visible_text(&events[index + 1..end]);
+                    let info = match kind {
+                        CodeBlockKind::Fenced(info) => info.as_ref(),
+                        _ => "text",
+                    };
+                    self.code(info.split_whitespace().next().unwrap_or("text"), &source);
+                    index = end;
+                }
+                Event::Markdown(event) => self.markdown(event),
+            }
+            index += 1;
+        }
+    }
+    fn link_style(&self, color: ratatui::style::Color) -> Style {
+        self.style()
+            .fg(color)
+            .underline_color(self.theme.markdown_link)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+    fn image(&mut self, source: &str, title: &str, alt: &str) {
+        self.flush();
+        let row = self.output.lines.len();
+        self.output.images.push(ImagePlacement {
+            source: source.to_owned(),
+            title: title.to_owned(),
+            alt: alt.to_owned(),
+            row,
+            column: 0,
+            width: self.width,
+            height: 12,
+        });
+        self.output
+            .lines
+            .extend(std::iter::repeat_n(Line::default(), 12));
+    }
+    fn markdown(&mut self, event: &Md<'_>) {
+        match event {
+            Md::Text(text) | Md::Html(text) | Md::InlineHtml(text) => self.emit(text, self.style()),
+            Md::Code(text) => self.emit(text, self.style().fg(self.theme.markdown_code)),
+            Md::SoftBreak | Md::HardBreak => self.flush(),
+            Md::Rule => {
+                self.blank();
+                self.emit(
+                    &"─".repeat(self.width),
+                    Style::default().fg(self.theme.markdown_rule),
+                );
+                self.blank();
+            }
+            Md::TaskListMarker(done) => self.emit(if *done { "☑ " } else { "☐ " }, self.style()),
+            Md::FootnoteReference(name) => self.emit(
+                &format!("[{name}]"),
+                self.link_style(self.theme.markdown_link),
+            ),
+            Md::InlineMath(source) => {
+                let rendered = super::math::render(source, self.width);
+                self.emit(
+                    &rendered.unwrap_or_else(|| format!("${source}$")),
+                    self.style().fg(self.theme.markdown_code),
+                );
+            }
+            Md::DisplayMath(source) => {
+                self.blank();
+                let rendered = super::math::render(source.trim_matches('\n'), self.width);
+                self.emit(
+                    &rendered.unwrap_or_else(|| format!("$${source}$$")),
+                    self.style().fg(self.theme.markdown_code),
+                );
+                self.blank();
+            }
+            Md::Start(tag) => match tag {
+                Tag::Heading { level, .. } => {
+                    self.blank();
+                    let color = match level {
+                        HeadingLevel::H1 => self.theme.markdown_heading_1,
+                        HeadingLevel::H2 => self.theme.markdown_heading_2,
+                        HeadingLevel::H3 => self.theme.markdown_heading_3,
+                        _ => self.theme.markdown_heading_minor,
+                    };
+                    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                    self.push_style(if *level == HeadingLevel::H1 {
+                        style.add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        style
+                    });
+                }
+                Tag::Paragraph => self.flush(),
+                Tag::Emphasis => self.push_style(Style::default().add_modifier(Modifier::ITALIC)),
+                Tag::Strong => self.push_style(Style::default().add_modifier(Modifier::BOLD)),
+                Tag::Strikethrough => {
+                    self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT))
+                }
+                Tag::Link { .. } => self.push_style(self.link_style(self.theme.markdown_link)),
+                Tag::BlockQuote(_) => {
+                    self.blank();
+                    self.quote += 1;
+                    self.prefix = "  ▌ ".repeat(self.quote);
+                    self.push_style(Style::default().fg(self.theme.markdown_quote));
+                }
+                Tag::List(first) => {
+                    self.flush();
+                    self.lists.push(*first);
+                }
+                Tag::Item => {
+                    self.flush();
+                    let marker = if let Some(Some(number)) = self.lists.last_mut() {
+                        let text = format!("{number}. ");
+                        *number += 1;
+                        text
+                    } else {
+                        "• ".to_owned()
+                    };
+                    let indent = " ".repeat(1 + self.lists.len().saturating_sub(1) * 3);
+                    self.emit(
+                        &format!("{indent}{marker}"),
+                        Style::default().fg(self.theme.markdown_list),
+                    );
+                }
+                Tag::Table(alignments) => {
+                    self.blank();
+                    self.table = Some(Table {
+                        alignments: alignments.clone(),
+                        ..Default::default()
+                    });
+                }
+                Tag::TableHead | Tag::TableRow => self.flush(),
+                Tag::TableCell => {
+                    self.line = Line::default();
+                }
+                Tag::FootnoteDefinition(name) => {
+                    self.blank();
+                    self.emit(&format!("[{name}] "), self.style());
+                }
+                _ => {}
+            },
+            Md::End(tag) => match tag {
+                TagEnd::Heading(_) => {
+                    self.styles.pop();
+                    self.blank();
+                }
+                TagEnd::Paragraph => {
+                    if self.lists.is_empty() {
+                        self.blank();
+                    }
+                }
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                    self.styles.pop();
+                }
+                TagEnd::BlockQuote(_) => {
+                    self.blank();
+                    self.quote = self.quote.saturating_sub(1);
+                    self.prefix = "  ▌ ".repeat(self.quote);
+                    self.styles.pop();
+                }
+                TagEnd::Item => self.flush(),
+                TagEnd::List(_) => {
+                    self.flush();
+                    self.lists.pop();
+                }
+                TagEnd::TableCell => {
+                    if self.line.spans.is_empty() {
+                        if let Some(table) = &mut self.table {
+                            table.cells.push(Line::default());
+                        }
+                    } else {
+                        self.flush();
+                    }
+                }
+                TagEnd::TableHead | TagEnd::TableRow => {
+                    if let Some(table) = &mut self.table {
+                        table.rows.push(std::mem::take(&mut table.cells));
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(table) = self.table.take() {
+                        self.draw_table(table);
+                    }
+                    self.blank();
+                }
+                _ => {}
+            },
+        }
+    }
+    fn code(&mut self, language: &str, source: &str) {
+        self.blank();
+        let mut status = "";
+        if language == "mermaid" {
+            match super::diagram::render(source, self.width) {
+                Ok(diagram) => {
+                    self.emit(&diagram, self.style());
+                    self.blank();
+                    return;
+                }
+                Err(error) => {
+                    status = match error {
+                        mermaid_text::Error::UnsupportedDiagram(_) => "unsupported",
+                        mermaid_text::Error::TooWide { .. } => "too wide",
+                        mermaid_text::Error::ParseError(ref message)
+                            if message.contains("not yet supported") =>
+                        {
+                            "unsupported"
+                        }
+                        _ => "syntax error",
+                    }
+                }
+            }
+        }
+        let base = Style::default()
+            .fg(self.theme.markdown_code_block_text)
+            .bg(self.theme.markdown_code_block_background);
+        self.output
+            .lines
+            .push(Line::styled(" ".repeat(self.width), base));
+        let label = format!(
+            "  {language}{}",
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!(" · {status}")
+            }
+        );
+        let label: String = label.chars().take(self.width).collect();
+        let label_width = UnicodeWidthStr::width(label.as_str());
+        self.output.lines.push(Line::from(vec![
+            Span::styled(label, base.fg(self.theme.markdown_code_label)),
+            Span::styled(" ".repeat(self.width.saturating_sub(label_width)), base),
+        ]));
+        for line in super::code::lines(source, language, base) {
+            self.emit("  ", base);
+            for span in line.spans {
+                self.emit(&span.content, span.style);
+            }
+            let padding = self.width.saturating_sub(self.line.width());
+            self.emit(&" ".repeat(padding), base);
+            self.flush();
+        }
+        self.output.lines.extend(std::iter::repeat_n(
+            Line::styled(" ".repeat(self.width), base),
+            2,
+        ));
+        self.blank();
+    }
+    fn draw_table(&mut self, table: Table) {
+        let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if columns == 0 {
+            return;
+        }
+        if self.width < columns * 3 + 1 {
+            for row in table.rows {
+                for cell in row {
+                    self.emit(&cell.to_string(), self.style());
+                    self.flush();
+                }
+            }
+            return;
+        }
+        let available = self.width - columns * 3 - 1;
+        let widths: Vec<_> = (0..columns)
+            .map(|i| available / columns + usize::from(i < available % columns))
+            .collect();
+        let border = |left: char, middle: char, right: char| {
+            let segments = widths
+                .iter()
+                .map(|width| "─".repeat(width + 2))
+                .collect::<Vec<_>>();
+            format!("{left}{}{right}", segments.join(&middle.to_string()))
+        };
+        self.output.lines.push(Line::raw(border('╭', '┬', '╮')));
+        for (index, row) in table.rows.into_iter().enumerate() {
+            let cells: Vec<_> = (0..columns)
+                .map(|column| {
+                    wrap_cell(row.get(column).cloned().unwrap_or_default(), widths[column])
+                })
+                .collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            for y in 0..height {
+                let mut line = Line::raw("│");
+                for (column, rows) in cells.iter().enumerate() {
+                    line.spans.push(Span::raw(" "));
+                    let cell = rows.get(y).cloned().unwrap_or_default();
+                    let padding = widths[column].saturating_sub(cell.width());
+                    let left = match table.alignments.get(column) {
+                        Some(pulldown_cmark::Alignment::Right) => padding,
+                        Some(pulldown_cmark::Alignment::Center) => padding / 2,
+                        _ => 0,
+                    };
+                    line.spans.push(Span::raw(" ".repeat(left)));
+                    line.spans.extend(cell.spans);
+                    line.spans
+                        .push(Span::raw(format!("{} │", " ".repeat(padding - left))));
+                }
+                self.output.lines.push(line);
+            }
+            if index == 0 {
+                self.output.lines.push(Line::raw(border('├', '┼', '┤')));
+            }
+        }
+        self.output.lines.push(Line::raw(border('╰', '┴', '╯')));
+    }
+}
+fn wrap_cell(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut current = Line::default();
+    for span in line.spans {
+        let mut chunk = String::new();
+        let mut used = current.width();
+        for ch in span.content.chars() {
+            let size = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + size > width && used > 0 {
+                current
+                    .spans
+                    .push(Span::styled(std::mem::take(&mut chunk), span.style));
+                rows.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            chunk.push(ch);
+            used += size;
+        }
+        current.spans.push(Span::styled(chunk, span.style));
+    }
+    rows.push(current);
+    rows
+}
+fn is_image(target: &str) -> bool {
+    target.rsplit('.').next().is_some_and(|ext| {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+        )
+    })
+}

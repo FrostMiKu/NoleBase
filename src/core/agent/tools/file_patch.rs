@@ -20,7 +20,7 @@ use super::file_edit::{inspect_text_file, prepare_edit, FileInspection, Prepared
 use super::file_ops::{move_to_new_file, path_zone, resolve_mutation_path, PathZone};
 use super::util::required_string;
 use super::workspace_quota::{check_workspace_staged_write, workspace_edit_budget};
-use super::write_policy::{post_write_result, validate_write_preconditions, WriteSource};
+use super::write_policy::{validate_write_preconditions, WriteSource};
 use crate::core::agent::hashline::{
     parse_patch, plan_section, rebase_edits, syntax_for_path, FileOp, PlannedFile, RegisterBank,
     Section,
@@ -399,11 +399,6 @@ impl Edit {
             }
             for resolution in &plan.planned.resolutions {
                 out.push(&format!("{}: {resolution}\n", plan.relative));
-            }
-        }
-        for plan in plans {
-            if let Some((location, display)) = plan.surviving_location() {
-                out.push(&post_write_result(String::new(), display, location));
             }
         }
         out.into_string()

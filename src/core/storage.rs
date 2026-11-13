@@ -51,7 +51,7 @@ const AGENT_SESSION_DIR: &str = "agent-session";
 const AGENT_SESSION_FILE: &str = "session.json";
 const AGENTS_FILE: &str = "AGENTS.md";
 const MEMORY_FILE: &str = "MEMORY.md";
-const TEMPLATE_FILE: &str = "template.mb";
+const TEMPLATE_FILE: &str = "template.md";
 const THEMES_DIR: &str = "themes";
 const DATA_DIR: &str = "data";
 const DAILY_DIR: &str = "daily";
@@ -263,13 +263,8 @@ impl Storage {
             let extension = canonical_source
                 .extension()
                 .and_then(|value| value.to_str());
-            if !extension.is_some_and(|value| {
-                value.eq_ignore_ascii_case("md") || value.eq_ignore_ascii_case("mb")
-            }) {
-                bail!(
-                    "{} export requires a UTF-8 .md or .mb source",
-                    format.label()
-                );
+            if !extension.is_some_and(|value| value.eq_ignore_ascii_case("md")) {
+                bail!("{} export requires a UTF-8 .md source", format.label());
             }
             let bytes = fs::read(&canonical_source)
                 .with_context(|| format!("reading {}", canonical_source.display()))?;
@@ -1190,12 +1185,12 @@ impl Storage {
             .collect())
     }
 
-    /// List flat `.md` and `.mb` notes under `data/`, most recently modified first.
+    /// List flat `.md` notes under `data/`, most recently modified first.
     pub fn list_note_files(&self) -> Result<Vec<NoteFile>> {
         self.list_note_files_in(&self.data_dir, false)
     }
 
-    /// List flat `.md` and `.mb` files under `archives/`, most recently modified first.
+    /// List flat `.md` files under `archives/`, most recently modified first.
     pub fn list_archived_note_files(&self) -> Result<Vec<NoteFile>> {
         self.list_note_files_in(&self.archives_dir, true)
     }
@@ -1252,10 +1247,7 @@ impl Storage {
     /// outside the Nole root. Returns the canonical path.
     pub(crate) fn validate_wiki_note(&self, path: &Path) -> Result<PathBuf> {
         if !is_note_path(path) {
-            bail!(
-                "wiki note must have a .md or .mb extension: {}",
-                path.display()
-            );
+            bail!("wiki note must have a .md extension: {}", path.display());
         }
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("checking wiki note {}", path.display()))?;
@@ -1301,10 +1293,7 @@ impl Storage {
             || canonical.starts_with(config)
             || !is_note_path(&canonical)
         {
-            bail!(
-                "document must be a managed .md or .mb file: {}",
-                path.display()
-            );
+            bail!("document must be a managed .md file: {}", path.display());
         }
         fs::read_to_string(canonical).context("reading document")
     }
@@ -1323,10 +1312,7 @@ impl Storage {
     /// Existing targets are canonicalized in full; symlinks are always rejected.
     pub fn validate_target(&self, target: &Path) -> Result<PathBuf> {
         if !is_note_path(target) {
-            bail!(
-                "target must have a .md or .mb extension: {}",
-                target.display()
-            );
+            bail!("target must have a .md extension: {}", target.display());
         }
 
         let canonical_data = fs::canonicalize(&self.data_dir).with_context(|| {
@@ -1684,21 +1670,16 @@ fn date_from_path(path: &Path) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()
 }
 
-/// Whether a path names a Markdown or MBDown note by extension.
+/// Whether a path names a Markdown note by extension.
 pub(crate) fn is_note_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
-        })
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
 }
 
 fn validate_direct_note(directory: &Path, target: &Path, label: &str) -> Result<PathBuf> {
     if !is_note_path(target) {
-        bail!(
-            "target must have a .md or .mb extension: {}",
-            target.display()
-        );
+        bail!("target must have a .md extension: {}", target.display());
     }
     let canonical_directory = fs::canonicalize(directory)
         .with_context(|| format!("resolving {label} directory {}", directory.display()))?;
@@ -1756,7 +1737,7 @@ pub fn normalize_new_name(name: &str) -> Result<String> {
         bail!("file name must not be absolute");
     }
     let lower = trimmed.to_ascii_lowercase();
-    if !(lower.ends_with(".md") || lower.ends_with(".mb")) {
+    if !(lower.ends_with(".md")) {
         Ok(format!("{trimmed}.md"))
     } else {
         Ok(trimmed.to_string())
@@ -2103,16 +2084,16 @@ mod tests {
         assert!(normalize_new_name("").is_err());
         assert_eq!(normalize_new_name("ok").unwrap(), "ok.md");
         assert_eq!(normalize_new_name("ok.MD").unwrap(), "ok.MD");
-        assert_eq!(normalize_new_name("ok.MB").unwrap(), "ok.MB");
+        assert_eq!(normalize_new_name("ok.MD").unwrap(), "ok.MD");
     }
 
     #[test]
     fn create_accepts_case_insensitive_extensions_and_refuses_existing_entries() {
         let (_dir, st) = fresh();
         let upper = st.create_named_file("upper.MD").unwrap();
-        let mb = st.create_named_file("long.MB").unwrap();
+        let note = st.create_named_file("long.MD").unwrap();
         assert!(upper.is_file());
-        assert!(mb.is_file());
+        assert!(note.is_file());
 
         fs::write(&upper, "keep this").unwrap();
         assert!(st.create_named_file("upper.MD").is_err());
@@ -2134,7 +2115,7 @@ mod tests {
     #[test]
     fn rename_accepts_note_extensions_case_insensitively() {
         let (_dir, st) = fresh();
-        let from = st.create_named_file("before.MB").unwrap();
+        let from = st.create_named_file("before.MD").unwrap();
         let to = st.rename_file(&from, "after.Md").unwrap();
         assert_eq!(to.file_name().unwrap(), "after.Md");
         assert!(to.is_file());
@@ -2144,7 +2125,7 @@ mod tests {
     #[test]
     fn validate_and_read_accept_direct_case_insensitive_note_files() {
         let (_dir, st) = fresh();
-        let path = st.data_dir.join("Readable.MB");
+        let path = st.data_dir.join("Readable.MD");
         fs::write(&path, "hello").unwrap();
 
         assert_eq!(
@@ -2211,10 +2192,10 @@ mod tests {
     }
 
     #[test]
-    fn list_reads_only_flat_md_and_mb_files_from_data() {
+    fn list_reads_only_flat_markdown_files_from_data() {
         let (_dir, st) = fresh();
         fs::write(st.data_dir.join("alpha.MD"), "alpha").unwrap();
-        fs::write(st.data_dir.join("beta.mB"), "beta").unwrap();
+        fs::write(st.data_dir.join("beta.mD"), "beta").unwrap();
         fs::write(st.root.join("root-note.md"), "hidden").unwrap();
         fs::write(st.data_dir.join("plain.txt"), "plain").unwrap();
         fs::create_dir(st.data_dir.join("directory.md")).unwrap();
@@ -2231,7 +2212,7 @@ mod tests {
             })
             .collect();
         assert!(names.contains(&"alpha.MD".to_string()));
-        assert!(names.contains(&"beta.mB".to_string()));
+        assert!(names.contains(&"beta.mD".to_string()));
         assert!(!names.contains(&"root-note.md".to_string()));
         assert!(!names.contains(&"TODO.md".to_string()));
         assert!(!names.contains(&"plain.txt".to_string()));
@@ -2256,7 +2237,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let archived = storage.archives_dir.join("Project.MB");
+        let archived = storage.archives_dir.join("Project.MD");
         fs::write(&archived, "archived").unwrap();
         let files = storage.list_archived_note_files().unwrap();
         assert_eq!(files.len(), 1);

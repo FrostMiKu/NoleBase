@@ -1,6 +1,6 @@
 //! Note search and listing tools: `notes` and `search_notes`.
 //!
-//! Both operate on `data/` `.md`/`.mb` note files (`search_notes` also covers
+//! Both operate on `data/` `.md` note files (`search_notes` also covers
 //! `archives/`) and share the `range` pagination shape.
 
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ impl Tool for Notes {
     }
 
     fn description(&self) -> &'static str {
-        "List active data/ .md and .mb notes with line count, creation time, modification time, and byte size. Supports metadata sorting and pagination."
+        "List active data/ .md notes with line count, creation time, modification time, and byte size. Supports metadata sorting and pagination."
     }
 
     fn input_schema(&self) -> Value {
@@ -190,7 +190,7 @@ impl Tool for SearchNotes {
     }
 
     fn description(&self) -> &'static str {
-        "Fuzzy, case-insensitive filename search across active and archived .md/.mb notes with result pagination."
+        "Fuzzy, case-insensitive filename search across active and archived .md notes with result pagination."
     }
 
     fn input_schema(&self) -> Value {

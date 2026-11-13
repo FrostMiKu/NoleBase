@@ -39,7 +39,7 @@ impl Tool for Open {
     }
 
     fn description(&self) -> &'static str {
-        "Open an existing managed .md or .mb note from daily/, data/, or archives/ in the user's TUI. The path may be absolute or relative to the Nole root."
+        "Open an existing managed .md note from daily/, data/, or archives/ in the user's TUI. The path may be absolute or relative to the Nole root."
     }
 
     fn input_schema(&self) -> Value {

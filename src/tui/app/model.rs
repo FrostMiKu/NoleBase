@@ -94,13 +94,13 @@ pub(super) const APP_COMMANDS: &[AppCommandDefinition] = &[
     AppCommandDefinition {
         id: AppCommand::NewNoteFromTemplate,
         label: "Note: New from template",
-        description: "Create and open a note from template.mb",
+        description: "Create and open a note from template.md",
         keywords: "note new create file template",
     },
     AppCommandDefinition {
         id: AppCommand::EditTemplate,
         label: "Template: Edit",
-        description: "Open template.mb in your editor",
+        description: "Open template.md in your editor",
         keywords: "template edit note new mb editor",
     },
     AppCommandDefinition {

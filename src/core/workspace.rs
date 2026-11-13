@@ -200,8 +200,8 @@ impl Workspace {
 
     /// Read the source of a managed document addressed by its
     /// workspace-relative path (`data/note.md`, `daily/2026-09-19.md`,
-    /// `archives/old.mb`). The address is validated lexically and the target
-    /// is validated in full (regular non-symlink `.md`/`.mb` file inside the
+    /// `archives/old.md`). The address is validated lexically and the target
+    /// is validated in full (regular non-symlink `.md` file inside the
     /// Nole root) before reading.
     pub fn read_document(&self, relative: &str) -> Result<String> {
         let target = self.document_path(relative)?;
@@ -527,7 +527,7 @@ impl Workspace {
             .and_then(|stem| stem.to_str())
             .unwrap_or_default();
         // The stem becomes the `[[wikilink]]` identity of the renamed note, so
-        // it must be a target the MBDown tokenizer can even represent.
+        // it must be a target the Markdown tokenizer can even represent.
         validate_wiki_target(stem)
             .with_context(|| format!("note names cannot become wiki targets: {new_name}"))?;
         let directory = from
@@ -559,7 +559,7 @@ impl Workspace {
     /// Find every managed document whose wiki links resolve to `from` — the
     /// note itself included when it self-links — using the shared wiki-link
     /// index (`locations_ignoring_case` for both the stem and file-name
-    /// spellings) and the MBDown parser for the exact source spans, then plan
+    /// spellings) and the Markdown parser for the exact source spans, then plan
     /// the rewritten text. Only real wiki-link events count: targets inside
     /// code, HTML comments, escaped text, or `![[...]]` embeds remain content
     /// and are left untouched, and links to other notes never match.
@@ -689,7 +689,7 @@ impl Workspace {
     /// Validate a workspace-relative document address and resolve it to an
     /// absolute path without checking existence. Accepted addresses are
     /// exactly one managed directory component (`data`, `daily`, or
-    /// `archives`) followed by one `.md`/`.mb` file name. Absolute paths,
+    /// `archives`) followed by one `.md` file name. Absolute paths,
     /// parent-directory components, backslashes, and deeper or shallower
     /// paths are rejected, so the resolved path can never escape the managed
     /// note directories. Clients use this to translate a wire address into a
@@ -708,17 +708,17 @@ impl Workspace {
         let mut components = path.components();
         let (directory, name) = match (components.next(), components.next(), components.next()) {
             (Some(first), Some(second), None) => (first, second),
-            _ => anyhow::bail!(
-                "document path must be `<data|daily|archives>/<name>.<md|mb>`: {relative}"
-            ),
+            _ => {
+                anyhow::bail!("document path must be `<data|daily|archives>/<name>.md`: {relative}")
+            }
         };
         let directory = match directory.as_os_str().to_str() {
             Some("data") => self.storage.data_dir.clone(),
             Some("daily") => self.storage.daily_dir.clone(),
             Some("archives") => self.storage.archives_dir.clone(),
-            _ => anyhow::bail!(
-                "document path must be `<data|daily|archives>/<name>.<md|mb>`: {relative}"
-            ),
+            _ => {
+                anyhow::bail!("document path must be `<data|daily|archives>/<name>.md`: {relative}")
+            }
         };
         let name = name
             .as_os_str()
@@ -729,7 +729,7 @@ impl Workspace {
         }
         let candidate = directory.join(name);
         if !crate::core::storage::is_note_path(&candidate) {
-            anyhow::bail!("document must be a .md or .mb file: {relative}");
+            anyhow::bail!("document must be a .md file: {relative}");
         }
         Ok(candidate)
     }
@@ -1133,7 +1133,7 @@ mod tests {
             fs::write(storage.data_dir.join("foo.md"), "the target\n").unwrap();
             fs::write(storage.data_dir.join("a.md"), "see [[foo]] today\n").unwrap();
             fs::write(
-                storage.data_dir.join("b.mb"),
+                storage.data_dir.join("b.md"),
                 "[[FOO]] case [[foo.md]] ext\n",
             )
             .unwrap();
@@ -1141,7 +1141,7 @@ mod tests {
         let foo = storage.data_dir.join("foo.md");
         let bar = storage.data_dir.join("bar.md");
         let a = storage.data_dir.join("a.md");
-        let b = storage.data_dir.join("b.mb");
+        let b = storage.data_dir.join("b.md");
 
         assert_eq!(
             workspace.backlinks(&foo).unwrap(),

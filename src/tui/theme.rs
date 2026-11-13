@@ -2,8 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use mbtui::{CornerStyle, Theme as MarkdownTheme};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Color;
 use serde::Deserialize;
 
 use crate::core::storage::{Storage, DEFAULT_THEME_TOML};
@@ -84,7 +83,6 @@ pub struct Theme {
     pub markdown_link: Color,
     pub markdown_hashtag: Color,
     pub markdown_wikilink: Color,
-    pub markdown_box_border: Color,
     pub animation_gradient: [Color; 6],
 }
 
@@ -183,7 +181,6 @@ struct MarkdownTokens {
     link: String,
     hashtag: String,
     wikilink: String,
-    box_border: String,
 }
 
 #[derive(Deserialize)]
@@ -275,51 +272,8 @@ impl Theme {
             markdown_link: parse_color("markdown.link", &file.markdown.link)?,
             markdown_hashtag: parse_color("markdown.hashtag", &file.markdown.hashtag)?,
             markdown_wikilink: parse_color("markdown.wikilink", &file.markdown.wikilink)?,
-            markdown_box_border: parse_color("markdown.box_border", &file.markdown.box_border)?,
             animation_gradient: parse_gradient(&file.animation.gradient)?,
         })
-    }
-
-    pub fn markdown_theme(self) -> MarkdownTheme {
-        let mut theme = MarkdownTheme::default().with_corner_style(CornerStyle::Rounded);
-        theme.heading_1 = Style::default()
-            .fg(self.markdown_heading_1)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-        theme.heading_2 = Style::default()
-            .fg(self.markdown_heading_2)
-            .add_modifier(Modifier::BOLD);
-        theme.heading_3 = Style::default()
-            .fg(self.markdown_heading_3)
-            .add_modifier(Modifier::BOLD);
-        theme.heading_minor = Style::default()
-            .fg(self.markdown_heading_minor)
-            .add_modifier(Modifier::BOLD);
-        theme.quote = Style::default().fg(self.markdown_quote);
-        theme.list = Style::default()
-            .fg(self.markdown_list)
-            .add_modifier(Modifier::BOLD);
-        theme.rule = Style::default().fg(self.markdown_rule);
-        theme.code = Style::default().fg(self.markdown_code);
-        theme.code_block = Style::default()
-            .fg(self.markdown_code_block_text)
-            .bg(self.markdown_code_block_background);
-        theme.code_label = Style::default().fg(self.markdown_code_label);
-        theme.link = Style::default()
-            .fg(self.markdown_link)
-            .underline_color(self.markdown_link)
-            .add_modifier(Modifier::UNDERLINED);
-        theme.hashtag = Style::default()
-            .fg(self.markdown_hashtag)
-            .add_modifier(Modifier::BOLD);
-        theme.wikilink = Style::default()
-            .fg(self.markdown_wikilink)
-            .underline_color(self.markdown_link)
-            .add_modifier(Modifier::UNDERLINED);
-        theme.insert(
-            "markdown-box",
-            Style::default().fg(self.markdown_box_border),
-        );
-        theme
     }
 }
 
@@ -578,13 +532,6 @@ mod tests {
         assert_eq!(theme.diff_deletion_background, Color::Rgb(73, 49, 63));
         assert_eq!(theme.markdown_code_block_background, Color::Rgb(49, 50, 68));
         assert_eq!(theme.surface_status_context, Color::Rgb(137, 180, 250));
-        let markdown = theme.markdown_theme();
-        assert_eq!(markdown.heading_1.fg, Some(theme.markdown_heading_1));
-        assert_eq!(
-            markdown.code_block.bg,
-            Some(theme.markdown_code_block_background)
-        );
-        assert_eq!(markdown.link.fg, Some(theme.markdown_link));
     }
 
     #[test]

@@ -7,15 +7,15 @@
 
 use std::sync::Arc;
 
+use crate::core::markup::Event;
 use anyhow::{bail, Context, Result};
-use mbdown::{Container, ContainerEnd, Event, Node};
+use pulldown_cmark::{Event as MarkdownEvent, Tag, TagEnd};
 use reqwest::Client;
 use tokio::fs as async_fs;
 
 use crate::core::agent::tools::read::fetch_web_response;
 use crate::core::attachment::{AttachmentStore, AttachmentUri};
 use crate::core::image_data::{decode_image, MAX_IMAGE_BYTES};
-use crate::core::markup::visit_markdown;
 use crate::core::provider::{
     ImageBlock, ImageMediaType, ImageSource, Message, MessagePart, MessageRole,
 };
@@ -211,54 +211,29 @@ pub(crate) async fn prepare_provider_messages(
 /// order. Code blocks, escaped text, HTML comments, ordinary links, and
 /// remote/local image targets never produce these events.
 fn attachment_image_spans(source: &str) -> Vec<(usize, usize, String, String)> {
-    let Ok(document) = mbdown::parse(source) else {
-        return Vec::new();
-    };
+    let events = crate::core::markup::parse(source);
     let mut spans = Vec::new();
-    collect_attachment_image_spans(document.nodes(), &mut spans);
-    spans.sort_by_key(|span| span.0);
-    spans
-}
-
-fn collect_attachment_image_spans(
-    nodes: &[Node<'_>],
-    spans: &mut Vec<(usize, usize, String, String)>,
-) {
-    visit_markdown(nodes, &mut |markdown| {
-        let offset = markdown.source_span().start;
-        let events = markdown.events();
-        let mut index = 0;
-        while index < events.len() {
-            if let Event::Start(Container::Image { target, .. }) = &events[index].event {
-                let relative_end = events[index..]
-                    .iter()
-                    .position(|item| matches!(item.event, Event::End(ContainerEnd::Image)))
-                    .map(|end_offset| index + end_offset);
-                if let Some(end_index) = relative_end {
-                    if let Ok(uri) = AttachmentUri::parse(target.as_ref()) {
-                        let start = offset + events[index].span.start;
-                        let end = offset + events[end_index].span.end;
-                        let alt = alt_text(&events[index + 1..end_index]);
-                        spans.push((start, end, alt, uri.to_string()));
-                    }
-                    index = end_index + 1;
-                    continue;
+    for (index, item) in events.iter().enumerate() {
+        if let Event::Markdown(MarkdownEvent::Start(Tag::Image { dest_url, .. })) = &item.event {
+            if let Ok(uri) = AttachmentUri::parse(dest_url) {
+                if let Some(end) = events[index + 1..].iter().position(|item| {
+                    matches!(
+                        item.event,
+                        Event::Markdown(MarkdownEvent::End(TagEnd::Image))
+                    )
+                }) {
+                    let end = index + 1 + end;
+                    spans.push((
+                        item.span.start,
+                        events[end].span.end,
+                        crate::core::markup::visible_text(&events[index + 1..end]),
+                        uri.to_string(),
+                    ));
                 }
             }
-            index += 1;
         }
-    });
-}
-
-fn alt_text(events: &[mbdown::SpannedEvent<'_>]) -> String {
-    events
-        .iter()
-        .filter_map(|item| match &item.event {
-            Event::Text(text) => Some(text.as_ref()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    }
+    spans
 }
 
 /// Parse a user prompt into an ordered `Message` of Text and Image parts.

@@ -1,11 +1,11 @@
 //! Derived index of canonical attachment URIs referenced by managed notes.
 //!
-//! The index parses each managed Markdown/MBDown file (daily/, data/,
-//! archives/) with the same MBDown parser the renderer uses and records the
+//! The index parses each managed Markdown file (daily/, data/,
+//! archives/) with the same Markdown parser the renderer uses and records the
 //! canonical attachment URIs (`nole://attachment/<id>`) emitted for
 //! clickable/renderable reference targets: Markdown link destinations
 //! (including autolinks and reference-style links), image destinations,
-//! MBDown embeds (`![[...]]`), and `[link=...]` tag targets. URI strings in
+//! Markdown embeds (`![[...]]`), but not BBCode tag targets. URI strings in
 //! prose, fenced or inline code, HTML comments, escaped text, and wiki-link
 //! bodies remain ordinary content because the renderer classifies those
 //! regions as text.
@@ -24,12 +24,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::core::markup::{Event, SpannedEvent};
 use anyhow::Result;
-use mbdown::{Container, Event, InlineTag, Node, SpannedEvent};
+use pulldown_cmark::{Event as MarkdownEvent, Tag};
 
 use crate::core::attachment::AttachmentUri;
 use crate::core::document_index::{aggregate_references, DocumentIndex, ReferenceEntry};
-use crate::core::markup::visit_markdown;
 use crate::core::storage::Storage;
 
 /// Derived reference index: canonical attachment URI -> referencing notes.
@@ -48,7 +48,7 @@ impl AttachmentReferenceIndex {
         let references = aggregate_references(&files);
         Self { references }
     }
-    /// Scan every managed Markdown/MBDown file and index its attachment URIs.
+    /// Scan every managed Markdown file and index its attachment URIs.
     #[cfg(test)]
     pub fn build(storage: &Storage) -> Self {
         Self::from_documents(&DocumentIndex::build(storage))
@@ -84,49 +84,29 @@ impl AttachmentReferenceIndex {
     }
 }
 
-/// Every canonical attachment URI in `text` that the MBDown renderer would
+/// Every canonical attachment URI in `text` that the Markdown renderer would
 /// render as an attachment reference, in source order, including duplicates:
 /// Markdown link destinations (including autolinks and reference-style links),
-/// image destinations, MBDown embeds, and `[link=...]` tag targets. URI
+/// image destinations, Markdown embeds, but not BBCode tag targets. URI
 /// strings inside code, HTML comments, escaped text, or plain prose remain
-/// content because MBDown emits attachment events for rendered targets.
+/// content because Markdown emits attachment events for rendered targets.
 #[cfg(test)]
 pub fn find_attachment_uris(text: &str) -> Vec<String> {
-    let Ok(document) = mbdown::parse(text) else {
-        return Vec::new();
-    };
-    collect_attachment_uris(document.nodes())
+    collect_attachment_uris(&crate::core::markup::parse(text))
 }
 
-pub(crate) fn collect_attachment_uris(nodes: &[Node<'_>]) -> Vec<String> {
+pub(crate) fn collect_attachment_uris(events: &[SpannedEvent<'_>]) -> Vec<String> {
     let mut uris = Vec::new();
-    collect_node_attachment_uris(nodes, &mut uris);
-    uris
-}
-
-fn collect_node_attachment_uris(nodes: &[Node<'_>], uris: &mut Vec<String>) {
-    visit_markdown(nodes, &mut |markdown| {
-        collect_event_attachment_uris(markdown.events(), uris)
-    });
-}
-
-fn collect_event_attachment_uris(events: &[SpannedEvent<'_>], uris: &mut Vec<String>) {
     for item in events {
         match &item.event {
-            Event::Start(Container::Link { target, .. })
-            | Event::Start(Container::Image { target, .. }) => {
-                push_canonical_attachment_uri(target, uris);
-            }
-            Event::Embed(target) => push_canonical_attachment_uri(target, uris),
-            Event::InlineTag(InlineTag {
-                name,
-                value: Some(target),
-                closing: false,
-                ..
-            }) if name == "link" => push_canonical_attachment_uri(target, uris),
+            Event::Markdown(MarkdownEvent::Start(
+                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. },
+            )) => push_canonical_attachment_uri(dest_url, &mut uris),
+            Event::Embed(target) => push_canonical_attachment_uri(target, &mut uris),
             _ => {}
         }
     }
+    uris
 }
 
 /// Push `target` when it strictly parses as a canonical attachment URI.
@@ -157,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_indexes_links_images_embeds_and_link_tags_only() {
+    fn scanner_indexes_links_images_and_embeds_but_not_bbcode() {
         let a = uri(1);
         let b = uri(2);
         let text = format!(
@@ -177,10 +157,7 @@ mod tests {
              wikilink [[{b}]]\n"
         );
         let found = find_attachment_uris(&text);
-        assert_eq!(
-            found,
-            vec![a.clone(), b.clone(), a.clone(), b.clone(), a, b]
-        );
+        assert_eq!(found, vec![a.clone(), b.clone(), a.clone(), a, b]);
     }
 
     #[test]
@@ -210,7 +187,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            storage.data_dir.join("Note.mb"),
+            storage.data_dir.join("Note.md"),
             format!("[a]({a}) and [b]({b})\n"),
         )
         .unwrap();
@@ -266,13 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn references_inside_mbdown_containers_are_indexed() {
+    fn references_inside_markdown_containers_are_indexed() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage_with(&directory);
         let a = uri(1);
         fs::write(
-            storage.data_dir.join("Note.mb"),
-            format!("[box]\n[link={a}]open[/link]\n[/box]\n"),
+            storage.data_dir.join("Note.md"),
+            format!("[box]\n[open]({a})\n[/box]\n"),
         )
         .unwrap();
         let index = AttachmentReferenceIndex::build(&storage);

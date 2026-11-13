@@ -15,12 +15,12 @@ it('renders unsaved source in an opaque sandbox and surfaces image warnings', as
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={client}>
-      <RenderedPreview path="data/a.mb" source="Unsaved source" />
+      <RenderedPreview path="data/a.md" source="Unsaved source" />
     </QueryClientProvider>,
   )
   const frame = await screen.findByTitle('Rendered document')
   expect(frame).toHaveAttribute('sandbox', 'allow-scripts')
   expect(frame).toHaveAttribute('srcdoc', '<!doctype html><h1>Unsaved preview</h1>')
   expect(screen.getByText('1 image warning(s)')).toBeTruthy()
-  expect(workspaceApi.previewDocument).toHaveBeenCalledWith('data/a.mb', 'Unsaved source')
+  expect(workspaceApi.previewDocument).toHaveBeenCalledWith('data/a.md', 'Unsaved source')
 })

@@ -105,7 +105,7 @@ pub(super) fn render_chat_entry(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     render_chat_entry_with_thinking_mode(entry, width, false, theme)
 }
@@ -118,7 +118,7 @@ pub(super) fn render_chat_entry_with_thinking_mode(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     match entry {
         crate::core::agent_session::AgentPanelEntry::Prompt { text, muted } => {
@@ -206,7 +206,7 @@ fn render_chat_prompt_bar(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     let background = theme.selection_background;
     let style = Style::default().bg(background);
@@ -270,7 +270,7 @@ pub(super) fn render_chat_plain_text(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     let body_width = width.saturating_sub(CHAT_BLOCK_PAD * 2).max(1);
     let markdown = crate::tui::markdown::render_at_width(text, body_width, theme);
@@ -315,7 +315,7 @@ pub(super) fn render_chat_thinking_box(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     let background = theme.surface_message_agent;
     let style = Style::default().bg(background);
@@ -677,7 +677,7 @@ mod tests {
 
         let tool = render_chat_entry(
             &AgentPanelEntry::Tool {
-                text: "Failed Write: MBDown validation failed\ndata/gantt-2026-08.md".to_string(),
+                text: "Failed Write: Markdown validation failed\ndata/gantt-2026-08.md".to_string(),
                 active: false,
                 preview: None,
             },
@@ -689,13 +689,13 @@ mod tests {
         let padding = " ".repeat(CHAT_BLOCK_PAD);
         assert_eq!(tool[0].to_string(), format!("{padding} • Failed Write"));
         assert!(tool[1].to_string().starts_with(&format!(
-            "{padding}   └─ MBDown validation failed · data/gantt-2026-08.md"
+            "{padding}   └─ Markdown validation failed · data/gantt-2026-08.md"
         )));
         assert_eq!(tool[2].to_string(), "");
         assert_eq!(tool[2].style.bg, None);
 
         let ask = render_chat_tool(
-            "Completed Ask.\nChoose a format\nMBDown",
+            "Completed Ask.\nChoose a format\nHTML",
             None,
             80,
             0,
@@ -708,7 +708,7 @@ mod tests {
             ask[1].to_string(),
             format!("{padding}   ├─ Choose a format")
         );
-        assert_eq!(ask[2].to_string(), format!("{padding}   └─ MBDown"));
+        assert_eq!(ask[2].to_string(), format!("{padding}   └─ HTML"));
         assert_eq!(ask[3].to_string(), "");
 
         let with_preview = render_chat_tool(
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_thinking_renders_invalid_mbdown_as_literal_plain_text() {
+    fn chat_thinking_renders_invalid_markdown_as_literal_plain_text() {
         let source = r#"Planning [box title="..." width=WIDTH and **not styled**"#;
         let (lines, links, images) =
             render_chat_thinking_box(source, true, 180, 0, true, Theme::default());
@@ -1026,7 +1026,7 @@ mod tests {
             .join("\n");
 
         assert!(output.contains(source), "{output:?}");
-        assert!(!output.contains("MBDown parse error"), "{output:?}");
+        assert!(!output.contains("Markdown parse error"), "{output:?}");
         assert!(links.is_empty());
         assert!(images.is_empty());
     }

@@ -25,7 +25,7 @@ export function NoteMarkdown({ text, path }: { text: string; path: string }) {
   const follow = (href: string) => {
     if (href.startsWith('/nole-wiki?')) {
       const target = new URLSearchParams(href.split('?')[1]).get('target') ?? ''
-      const stem = (name: string) => name.replace(/\.(md|mb)$/i, '').toLowerCase()
+      const stem = (name: string) => name.replace(/\.md$/i, '').toLowerCase()
       const matches = [
         ...(notes.data ?? []).map((note) => note.path),
         ...(daily.data ?? []).map((note) => note.path),

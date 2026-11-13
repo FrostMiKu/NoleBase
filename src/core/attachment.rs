@@ -1068,7 +1068,7 @@ pub(crate) fn markdown_embed(metadata: &AttachmentMetadata) -> String {
 fn infer_mime_from_extension(name: &str) -> Option<String> {
     let extension = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
     let mime = match extension.as_str() {
-        "md" | "markdown" | "mb" => "text/markdown",
+        "md" | "markdown" => "text/markdown",
         "txt" => "text/plain",
         "html" | "htm" => "text/html",
         "json" => "application/json",
@@ -1144,7 +1144,7 @@ pub fn detect_mime_type(content: &[u8], display_name: &str) -> Option<String> {
             if std::str::from_utf8(content).is_ok() {
                 // UTF-8 text: extension distinguishes Markdown/JSON/plain.
                 let text_mime = match extension.as_deref() {
-                    Some("md" | "markdown" | "mb") => Some("text/markdown"),
+                    Some("md" | "markdown") => Some("text/markdown"),
                     Some("html" | "htm") => Some("text/html"),
                     Some("json") => Some("application/json"),
                     Some("csv") => Some("text/csv"),

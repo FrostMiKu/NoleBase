@@ -575,7 +575,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage::Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let document_path = storage.data_dir.join("live.mb");
+        let document_path = storage.data_dir.join("live.md");
         fs::write(&document_path, "before").unwrap();
 
         let (mut watcher, sender) = inject_watcher(&storage);

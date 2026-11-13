@@ -107,13 +107,13 @@ fn command_dialog_supports_single_multi_and_free_text_modes() {
         "Choose a format",
         DialogMode::SingleSelect,
         DialogPurpose::Custom,
-        vec![DialogOption::new("Markdown"), DialogOption::new("MBDown")],
+        vec![DialogOption::new("Markdown"), DialogOption::new("HTML")],
     ));
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         app.take_dialog_result(),
-        Some(DialogResult::Selected("MBDown".to_string()))
+        Some(DialogResult::Selected("HTML".to_string()))
     );
 
     app.open_dialog(DialogState::new(
@@ -691,12 +691,12 @@ fn current_file_export_selects_format_cancels_cleanly_and_publishes() {
 #[test]
 fn export_format_switch_changes_default_destination_extension() {
     let (mut app, _directory) = make_app();
-    let current = app.storage().data_dir.join("Quarterly Report.mb");
+    let current = app.storage().data_dir.join("Quarterly Report.md");
     fs::write(&current, b"# Quarterly\n").unwrap();
     app.open_file_document(&current, DocumentReturn::Daily);
 
     for (index, (expected, format)) in [
-        (home_dest("Quarterly Report.mb"), ExportFormat::Original),
+        (home_dest("Quarterly Report.md"), ExportFormat::Original),
         (home_dest("Quarterly Report.html"), ExportFormat::Html),
     ]
     .into_iter()
@@ -1531,7 +1531,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     event_sender
         .send(AgentEvent::AskUser(AskUserRequest {
             question: "Choose a format".to_string(),
-            options: vec!["Markdown".to_string(), "MBDown".to_string()],
+            options: vec!["Markdown".to_string(), "HTML".to_string()],
         }))
         .unwrap();
     app.poll_agent();
@@ -1541,13 +1541,13 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         answer_receiver.try_recv().unwrap(),
-        AskUserResponse::Answer("MBDown".to_string())
+        AskUserResponse::Answer("HTML".to_string())
     );
     assert_eq!(app.overlay, None);
     assert!(matches!(
         app.agent_panel.entries().last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Tool { text, active: true, .. })
-            if text == "Calling Ask...\nChoose a format\nMBDown"
+            if text == "Calling Ask...\nChoose a format\nHTML"
     ));
 
     event_sender
@@ -1561,7 +1561,7 @@ fn ask_user_overlay_accepts_options_and_custom_text() {
     assert!(matches!(
         app.agent_panel.entries().last().map(|entry| entry.as_ref()),
         Some(AgentPanelEntry::Tool { text, active: false, .. })
-            if text == "Completed Ask.\nChoose a format\nMBDown"
+            if text == "Completed Ask.\nChoose a format\nHTML"
     ));
 
     event_sender
@@ -2532,7 +2532,7 @@ fn next_round_replaces_a_failed_tool_status_with_working_state() {
     sender
         .send(AgentEvent::ToolFinished {
             id: "bad-write".to_string(),
-            message: "Failed Write: MBDown validation failed".to_string(),
+            message: "Failed Write: Markdown validation failed".to_string(),
             preview: None,
         })
         .unwrap();
@@ -2549,7 +2549,7 @@ fn next_round_replaces_a_failed_tool_status_with_working_state() {
             text,
             active: false,
             ..
-        }) if text == "Failed Write: MBDown validation failed"
+        }) if text == "Failed Write: Markdown validation failed"
     ));
 }
 

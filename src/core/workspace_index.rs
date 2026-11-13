@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+use crate::core::markup::{Event, SpannedEvent};
 use anyhow::{bail, Context, Result};
-use mbdown::{Event, Node};
 
 use crate::core::document_index::{
     self, DocumentGroup as FileGroup, DocumentIndex, IndexedDocument, IndexedLine,
 };
-use crate::core::markup::visit_markdown;
 use crate::core::model::SearchHit;
 use crate::core::storage::Storage;
 
@@ -377,7 +376,7 @@ impl TagRenamePlan {
             }
             let before =
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            let spans = matching_tag_spans(&before, &from)?;
+            let spans = matching_tag_spans(&before, &from);
             if spans.is_empty() {
                 continue;
             }
@@ -475,7 +474,7 @@ fn indexed_file(document: IndexedDocument) -> IndexedFile {
 }
 
 pub(crate) fn collect_document_tags(
-    nodes: &[Node<'_>],
+    events: &[SpannedEvent<'_>],
     source: &str,
     tags_by_line: &mut HashMap<usize, Vec<String>>,
 ) {
@@ -487,18 +486,16 @@ pub(crate) fn collect_document_tags(
                 .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
         )
         .collect::<Vec<_>>();
-    visit_markdown(nodes, &mut |markdown| {
-        for event in markdown.events() {
-            if let Event::Hashtag(tag) = &event.event {
-                let document_offset = markdown.source_span().start + event.span.start;
-                let line_no = line_starts.partition_point(|start| *start <= document_offset);
-                tags_by_line
-                    .entry(line_no)
-                    .or_default()
-                    .push(tag.to_string());
-            }
+    for event in events {
+        if let Event::Hashtag(tag) = &event.event {
+            let document_offset = event.span.start;
+            let line_no = line_starts.partition_point(|start| *start <= document_offset);
+            tags_by_line
+                .entry(line_no)
+                .or_default()
+                .push(tag.to_string());
         }
-    });
+    }
 }
 
 fn valid_tag_name(value: &str) -> Result<String> {
@@ -507,35 +504,36 @@ fn valid_tag_name(value: &str) -> Result<String> {
         bail!("tag name is empty");
     }
     let source = format!("#{name}");
-    let document = mbdown::parse(&source).context("validating tag name")?;
+    let document = crate::core::markup::parse(&source);
     let mut spans = Vec::new();
-    collect_matching_tag_spans(document.nodes(), name, &mut spans);
+    collect_matching_tag_spans(&document, name, &mut spans);
     if spans.len() != 1 || spans[0].start != 0 || spans[0].end != source.len() {
         bail!("invalid tag name: {value}");
     }
     Ok(name.to_string())
 }
 
-fn matching_tag_spans(source: &str, tag: &str) -> Result<Vec<Range<usize>>> {
-    let document = mbdown::parse(source).context("parsing Markdown for tag rename")?;
+fn matching_tag_spans(source: &str, tag: &str) -> Vec<Range<usize>> {
+    let document = crate::core::markup::parse(source);
     let mut spans = Vec::new();
-    collect_matching_tag_spans(document.nodes(), tag, &mut spans);
+    collect_matching_tag_spans(&document, tag, &mut spans);
     spans.sort_by_key(|span| span.start);
-    Ok(spans)
+    spans
 }
 
-fn collect_matching_tag_spans(nodes: &[Node<'_>], tag: &str, spans: &mut Vec<Range<usize>>) {
+fn collect_matching_tag_spans(
+    events: &[SpannedEvent<'_>],
+    tag: &str,
+    spans: &mut Vec<Range<usize>>,
+) {
     let normalized = normalize_tag(tag);
-    visit_markdown(nodes, &mut |markdown| {
-        for event in markdown.events() {
-            if let Event::Hashtag(found) = &event.event {
-                if normalize_tag(found) == normalized {
-                    let offset = markdown.source_span().start;
-                    spans.push(offset + event.span.start..offset + event.span.end);
-                }
+    for event in events {
+        if let Event::Hashtag(found) = &event.event {
+            if normalize_tag(found) == normalized {
+                spans.push(event.span.clone());
             }
         }
-    });
+    }
 }
 
 fn replace_tag_spans(source: &str, spans: &[Range<usize>], tag: &str) -> String {
@@ -630,11 +628,11 @@ mod tests {
     }
 
     #[test]
-    fn structural_mbdown_tags_keep_document_line_numbers() {
+    fn structural_markdown_tags_keep_document_line_numbers() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let path = storage.data_dir.join("Layout.mb");
+        let path = storage.data_dir.join("Layout.md");
         fs::write(&path, "before\n[box width=20]\ninside #layout\n[/box]\n").unwrap();
 
         assert!(matches!(
@@ -669,7 +667,7 @@ mod tests {
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
         let daily = storage.daily_dir.join("2026-07-28.md");
-        let note = storage.data_dir.join("Note.mb");
+        let note = storage.data_dir.join("Note.md");
         let archive = storage.archives_dir.join("Old.md");
         fs::write(&daily, "#Rust and #rust\n`#rust` \\#rust #rustlang\n").unwrap();
         fs::write(&note, "[box width=20]\n#RUST\n[/box]\n").unwrap();

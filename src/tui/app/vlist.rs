@@ -17,7 +17,7 @@ pub(crate) struct DailyCardRenderCache {
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::tui::markdown::RenderedLink>,
     pub tags: Vec<crate::tui::markdown::RenderedTag>,
-    pub images: Vec<mbtui::ImagePlacement>,
+    pub images: Vec<crate::tui::markdown::ImagePlacement>,
     pub button_line: usize,
     pub button_start: usize,
 }
@@ -30,7 +30,7 @@ pub(crate) struct AgentEntryRenderCache {
     pub entry: Arc<AgentPanelEntry>,
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::tui::markdown::RenderedLink>,
-    pub images: Vec<mbtui::ImagePlacement>,
+    pub images: Vec<crate::tui::markdown::ImagePlacement>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,7 +72,7 @@ pub(crate) struct TagNoteCardRenderCache {
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub links: Vec<crate::tui::markdown::RenderedLink>,
     pub tags: Vec<crate::tui::markdown::RenderedTag>,
-    pub images: Vec<mbtui::ImagePlacement>,
+    pub images: Vec<crate::tui::markdown::ImagePlacement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

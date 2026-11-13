@@ -1616,10 +1616,10 @@ fn agent_events_are_recorded_and_persisted_at_lifecycle_points() {
 }
 
 #[tokio::test]
-async fn document_preview_renders_unsaved_mbdown_and_managed_images_without_writing() {
+async fn document_preview_renders_unsaved_markdown_and_managed_images_without_writing() {
     let (state, _directory) = test_state();
     let original = "# Original\n";
-    let path = state.workspace.storage().data_dir.join("preview.mb");
+    let path = state.workspace.storage().data_dir.join("preview.md");
     std::fs::write(&path, original).unwrap();
     let image_path = state.workspace.storage().data_dir.join("tiny.png");
     image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
@@ -1633,12 +1633,13 @@ async fn document_preview_renders_unsaved_mbdown_and_managed_images_without_writ
     let uri = crate::core::attachment::AttachmentUri::from_id(image.id).to_string();
     let app = server::router(state);
     let (status, body, _) = post_json(&app, "/api/document/preview", json!({
-        "path": "data/preview.mb",
+        "path": "data/preview.md",
         "source": format!("[box title=Preview]\nUnsaved content\n[/box]\n\n![Managed]({uri})\n\n<script>alert(1)</script>\n")
     })).await;
     assert_eq!(status, StatusCode::OK);
     let html = body["html"].as_str().unwrap();
-    assert!(html.contains("nole-box"));
+    assert!(html.contains("[box title=Preview]"));
+    assert!(!html.contains("class=\"nole-box"));
     assert!(html.contains("Unsaved content"));
     assert!(html.contains("data:image/png;base64,"));
     assert!(html.contains("Content-Security-Policy"));

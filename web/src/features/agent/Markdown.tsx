@@ -7,7 +7,7 @@ type Components = ComponentProps<typeof ReactMarkdown>['components']
 
 /**
  * Dense dark Markdown rendering for agent output. Agent text is plain
- * markdown (not MBDown documents), so a standard renderer with GFM covers
+ * Markdown; the standard renderer with GFM covers
  * headings, lists, tables, code, and links. Styling is mapped per element
  * to the app's tokens; links open in a new tab.
  */

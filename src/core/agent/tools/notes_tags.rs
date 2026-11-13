@@ -10,7 +10,6 @@ use super::util::{
     truncate_with_marker, RangeSelector, MAX_DIFF_BYTES, MAX_SEARCH_RESULTS,
     MAX_SEARCH_SNIPPET_CHARS,
 };
-use super::write_policy::{mbdown_warning, REPAIR_REQUIRED_MARKER};
 use crate::core::agent::{
     canonical_root, ApprovalGate, ApprovalKind, ApprovalRequest, Tool, ToolExecutionPolicy,
 };
@@ -359,20 +358,11 @@ impl Tool for Daily {
                         .map(str::to_owned)
                 })
                 .transpose()?;
-            let date = requested_date
-                .clone()
-                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
-            let path = self.storage.daily_file_path(&date)?;
             let note = match requested_date {
                 Some(date) => self.storage.append_daily(&date, content)?,
                 None => self.storage.append_to_today(content)?,
             };
-            let display_path = format!("daily/{}.md", note.date);
-            let mut result = format!("Added daily entry\nDate: {}", note.date);
-            if let Some(warning) = mbdown_warning(&display_path, &path) {
-                result.push_str(&format!("\nMBDown warning: {warning}\nRepair: The entry was added. Read the daily note and {REPAIR_REQUIRED_MARKER}."));
-            }
-            Ok(result)
+            Ok(format!("Added daily entry\nDate: {}", note.date))
         }
         .await;
         let content = content?;

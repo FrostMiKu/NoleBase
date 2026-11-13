@@ -1,32 +1,147 @@
-//! Pure MBDown AST traversal and extraction shared by indexing, the agent,
-//! and the TUI renderer. Depends on mbdown and core types only; rendering
-//! lives in the TUI markdown renderer module.
+//! CommonMark/GFM parsing with Nole's semantic extensions and source spans.
+//! All consumers share these events, including indexing, export and the TUI.
 
-use std::borrow::Cow;
-use std::path::Path;
-
-use mbdown::{Container, ContainerEnd, Event, InlineTag, Node};
+use crate::core::{attachment::AttachmentUri, model::LinkTarget};
+use pulldown_cmark::{CowStr, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
+use std::{borrow::Cow, ops::Range, path::Path};
 use unicode_width::UnicodeWidthChar;
 
-use crate::core::attachment::AttachmentUri;
-use crate::core::model::LinkTarget;
+#[derive(Clone, Debug)]
+pub(crate) enum Event<'a> {
+    Markdown(MarkdownEvent<'a>),
+    WikiLink(CowStr<'a>),
+    Embed(CowStr<'a>),
+    Hashtag(CowStr<'a>),
+}
 
-/// Visit every Markdown leaf in document order, hiding MBDown's structural
-/// container recursion from consumers that only inspect parsed events.
-pub(crate) fn visit_markdown<'a>(
-    nodes: &[Node<'a>],
-    visitor: &mut impl FnMut(&mbdown::Markdown<'a>),
-) {
-    for node in nodes {
-        match node {
-            Node::Markdown(markdown) => visitor(markdown),
-            Node::Box { children, .. }
-            | Node::Center { children }
-            | Node::Right { children }
-            | Node::Indent { children, .. }
-            | Node::Columns { children, .. }
-            | Node::Column { children, .. } => visit_markdown(children, visitor),
+#[derive(Clone, Debug)]
+pub(crate) struct SpannedEvent<'a> {
+    pub event: Event<'a>,
+    pub span: Range<usize>,
+}
+
+/// Parse standard Markdown first. Extensions only inspect literal prose;
+/// code, HTML, escaped characters and link destinations stay untouched.
+pub(crate) fn parse(source: &str) -> Vec<SpannedEvent<'_>> {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH;
+    let mut parser = Parser::new_ext(source, options)
+        .into_offset_iter()
+        .peekable();
+    let mut output = Vec::new();
+    let mut code = false;
+    while let Some((event, mut span)) = parser.next() {
+        if matches!(event, MarkdownEvent::Start(Tag::CodeBlock(_))) {
+            code = true;
         }
+        if matches!(event, MarkdownEvent::End(TagEnd::CodeBlock)) {
+            code = false;
+        }
+        if let MarkdownEvent::Text(text) = &event {
+            if !code && source.get(span.clone()) == Some(text.as_ref()) {
+                // The CommonMark parser may split adjacent bracket text. Merge
+                // only byte-identical runs so escapes/entities keep their meaning.
+                while let Some((MarkdownEvent::Text(next), range)) = parser.peek() {
+                    if range.start != span.end || source.get(range.clone()) != Some(next.as_ref()) {
+                        break;
+                    }
+                    span.end = range.end;
+                    parser.next();
+                }
+                prose(source, span, &mut output);
+                continue;
+            }
+        }
+        output.push(SpannedEvent {
+            event: Event::Markdown(event),
+            span,
+        });
+    }
+    output
+}
+
+fn prose<'a>(source: &'a str, span: Range<usize>, output: &mut Vec<SpannedEvent<'a>>) {
+    let mut cursor = span.start;
+    let mut start = cursor;
+    while cursor < span.end {
+        let rest = &source[cursor..span.end];
+        let escaped = source[..cursor]
+            .bytes()
+            .rev()
+            .take_while(|b| *b == b'\\')
+            .count()
+            % 2
+            == 1;
+        let mut token = None;
+        if !escaped {
+            let prefix = if rest.starts_with("![[") {
+                3
+            } else if rest.starts_with("[[") {
+                2
+            } else {
+                0
+            };
+            if prefix > 0 {
+                if let Some(close) = rest[prefix..].find("]]") {
+                    let target = &rest[prefix..prefix + close];
+                    if !target.is_empty()
+                        && target.trim() == target
+                        && !target.contains(['[', ']', '\n', '\r'])
+                    {
+                        let event = if prefix == 3 {
+                            Event::Embed(target.into())
+                        } else {
+                            Event::WikiLink(target.into())
+                        };
+                        token = Some((event, cursor + prefix + close + 2));
+                    }
+                }
+            } else if rest.starts_with('#')
+                && (cursor == 0
+                    || source[..cursor]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+            {
+                let name = &rest[1..];
+                if name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    let length = name
+                        .char_indices()
+                        .find(|(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '/')))
+                        .map_or(name.len(), |(i, _)| i);
+                    token = Some((Event::Hashtag(name[..length].into()), cursor + 1 + length));
+                }
+            }
+        }
+        if let Some((event, end)) = token {
+            if start < cursor {
+                output.push(SpannedEvent {
+                    event: Event::Markdown(MarkdownEvent::Text(source[start..cursor].into())),
+                    span: start..cursor,
+                });
+            }
+            output.push(SpannedEvent {
+                event,
+                span: cursor..end,
+            });
+            cursor = end;
+            start = end;
+        } else {
+            cursor += rest.chars().next().unwrap().len_utf8();
+        }
+    }
+    if start < span.end {
+        output.push(SpannedEvent {
+            event: Event::Markdown(MarkdownEvent::Text(source[start..span.end].into())),
+            span: start..span.end,
+        });
     }
 }
 
@@ -62,76 +177,50 @@ pub(crate) struct LinkSpec {
     pub label: String,
     pub target: LinkTarget,
 }
-
 #[derive(Clone)]
 pub(crate) struct CodeBlockSpec {
     pub language: String,
     pub source: String,
 }
 
-pub(crate) fn code_block_specs(nodes: &[Node<'_>]) -> Vec<CodeBlockSpec> {
+pub(crate) fn code_block_specs(events: &[SpannedEvent<'_>]) -> Vec<CodeBlockSpec> {
     let mut blocks = Vec::new();
-    collect_code_block_specs(nodes, &mut blocks);
+    let mut current: Option<CodeBlockSpec> = None;
+    for item in events {
+        match &item.event {
+            Event::Markdown(MarkdownEvent::Start(Tag::CodeBlock(kind))) => {
+                let language = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
+                        info.split_whitespace().next().unwrap_or("text")
+                    }
+                    _ => "text",
+                };
+                current = Some(CodeBlockSpec {
+                    language: language.to_string(),
+                    source: String::new(),
+                });
+            }
+            Event::Markdown(MarkdownEvent::Text(text)) => {
+                if let Some(block) = &mut current {
+                    block.source.push_str(text);
+                }
+            }
+            Event::Markdown(MarkdownEvent::End(TagEnd::CodeBlock)) => {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+            }
+            _ => {}
+        }
+    }
     blocks
 }
 
-fn collect_code_block_specs(nodes: &[Node<'_>], blocks: &mut Vec<CodeBlockSpec>) {
-    visit_markdown(nodes, &mut |markdown| {
-        collect_event_code_blocks(markdown.events(), blocks)
-    });
-}
-
-fn collect_event_code_blocks(events: &[mbdown::SpannedEvent<'_>], blocks: &mut Vec<CodeBlockSpec>) {
-    let mut index = 0;
-    while index < events.len() {
-        let Event::Start(Container::CodeBlock(info)) = &events[index].event else {
-            index += 1;
-            continue;
-        };
-        let end = events[index + 1..]
-            .iter()
-            .position(|item| matches!(item.event, Event::End(ContainerEnd::CodeBlock)))
-            .map_or(events.len(), |offset| index + 1 + offset);
-        let source = events[index + 1..end]
-            .iter()
-            .filter_map(|item| match &item.event {
-                Event::Text(text)
-                | Event::Code(text)
-                | Event::Html(text)
-                | Event::InlineHtml(text) => Some(text.as_ref()),
-                _ => None,
-            })
-            .collect();
-        blocks.push(CodeBlockSpec {
-            language: info
-                .as_deref()
-                .and_then(code_language)
-                .unwrap_or("text")
-                .to_string(),
-            source,
-        });
-        index = end.saturating_add(1);
-    }
-}
-
-fn code_language(info: &str) -> Option<&str> {
-    let language = info
-        .split_whitespace()
-        .next()?
-        .trim_matches(|character| matches!(character, '{' | '}' | '.'));
-    (!language.is_empty()).then_some(language)
-}
-
-/// Classify a raw Markdown or BBCode link target. Managed attachment URIs stay
-/// attachment targets even when malformed, absolute and relative file paths
-/// become local files, and URI-like targets remain external. Relative local
-/// files are rebased against the containing document by the UI.
-fn link_target(raw: &str) -> LinkTarget {
+pub(crate) fn link_target(raw: &str) -> LinkTarget {
     if AttachmentUri::is_attachment_uri(raw) {
         LinkTarget::Attachment(raw.to_string())
     } else if raw.is_empty()
-        || raw.starts_with('#')
-        || raw.starts_with('?')
+        || raw.starts_with(['#', '?'])
         || raw.starts_with("//")
         || (!Path::new(raw).is_absolute() && reqwest::Url::parse(raw).is_ok())
     {
@@ -141,8 +230,6 @@ fn link_target(raw: &str) -> LinkTarget {
     }
 }
 
-/// Classify an embed (`![[...]]`) target: attachment URIs become attachment
-/// links, everything else a local file.
 pub(crate) fn embed_link_target(raw: &str) -> LinkTarget {
     if AttachmentUri::is_attachment_uri(raw) {
         LinkTarget::Attachment(raw.to_string())
@@ -151,87 +238,105 @@ pub(crate) fn embed_link_target(raw: &str) -> LinkTarget {
     }
 }
 
-pub(crate) fn link_specs(nodes: &[Node<'_>]) -> Vec<LinkSpec> {
+pub(crate) fn link_specs(events: &[SpannedEvent<'_>]) -> Vec<LinkSpec> {
     let mut links = Vec::new();
-    collect_link_specs(nodes, &mut links);
-    links
-}
-
-fn collect_link_specs(nodes: &[Node<'_>], links: &mut Vec<LinkSpec>) {
-    visit_markdown(nodes, &mut |markdown| {
-        collect_event_links(markdown.events(), links)
-    });
-}
-
-fn collect_event_links(events: &[mbdown::SpannedEvent<'_>], links: &mut Vec<LinkSpec>) {
-    let mut index = 0;
-    while index < events.len() {
-        match &events[index].event {
-            Event::Start(Container::Link { target, .. }) => {
+    for (index, item) in events.iter().enumerate() {
+        match &item.event {
+            Event::Markdown(MarkdownEvent::Start(Tag::Link { dest_url, .. })) => {
                 let end = events[index + 1..]
                     .iter()
-                    .position(|item| matches!(item.event, Event::End(ContainerEnd::Link)))
+                    .position(|e| {
+                        matches!(e.event, Event::Markdown(MarkdownEvent::End(TagEnd::Link)))
+                    })
                     .map_or(events.len(), |offset| index + 1 + offset);
                 links.push(LinkSpec {
-                    label: visible_event_text(&events[index + 1..end]),
-                    target: link_target(target),
+                    label: visible_text(&events[index + 1..end]),
+                    target: link_target(dest_url),
                 });
-                index = end.saturating_add(1);
-                continue;
             }
             Event::WikiLink(target) => links.push(LinkSpec {
                 label: format!("[[{target}]]"),
                 target: LinkTarget::WikiLink(target.to_string()),
             }),
-            Event::InlineTag(InlineTag {
-                name,
-                value: Some(target),
-                closing: false,
-                ..
-            }) if name == "link" => {
-                let end = events[index + 1..]
-                    .iter()
-                    .position(|item| {
-                        matches!(
-                            &item.event,
-                            Event::InlineTag(InlineTag {
-                                name,
-                                closing: true,
-                                ..
-                            }) if name == "link"
-                        )
-                    })
-                    .map_or(events.len(), |offset| index + 1 + offset);
-                links.push(LinkSpec {
-                    label: visible_event_text(&events[index + 1..end]),
-                    target: link_target(target),
-                });
-                index = end.saturating_add(1);
-                continue;
-            }
+            Event::Embed(target) => links.push(LinkSpec {
+                label: format!("![[{target}]]"),
+                target: embed_link_target(target),
+            }),
             _ => {}
         }
-        index += 1;
     }
+    links
 }
 
-fn visible_event_text(events: &[mbdown::SpannedEvent<'_>]) -> String {
+pub(crate) fn visible_text(events: &[SpannedEvent<'_>]) -> String {
     let mut text = String::new();
     for item in events {
         match &item.event {
-            Event::Text(value)
-            | Event::Code(value)
-            | Event::Html(value)
-            | Event::InlineHtml(value) => text.push_str(value),
-            Event::Hashtag(tag) => {
-                text.push('#');
-                text.push_str(tag);
-            }
+            Event::Markdown(
+                MarkdownEvent::Text(value)
+                | MarkdownEvent::Code(value)
+                | MarkdownEvent::Html(value)
+                | MarkdownEvent::InlineHtml(value)
+                | MarkdownEvent::InlineMath(value)
+                | MarkdownEvent::DisplayMath(value),
+            ) => text.push_str(value),
+            Event::Hashtag(tag) => text.push_str(&format!("#{tag}")),
             Event::WikiLink(target) => text.push_str(&format!("[[{target}]]")),
             Event::Embed(target) => text.push_str(&format!("![[{target}]]")),
-            Event::SoftBreak | Event::HardBreak => text.push(' '),
+            Event::Markdown(MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak) => text.push(' '),
             _ => {}
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensions_keep_exact_source_spans_and_skip_non_prose() {
+        let source = concat!(
+            "See [[计划]] #开发/日志 ![[report.pdf]]\n\n",
+            "`[[code]] #code` \\[[escaped]] \\#escaped &#35;entity\n\n",
+            "<!-- [[comment]] #comment -->\n\n",
+            "[label](https://example.test/#fragment)\n\n",
+            "```text\n[[fenced]] #fenced\n```\n\n",
+            "    [[indented]] #indented\n\n",
+            "$x + #math$\n"
+        );
+        let events = parse(source);
+        let semantic: Vec<_> = events
+            .iter()
+            .filter(|item| !matches!(item.event, Event::Markdown(_)))
+            .map(|item| &source[item.span.clone()])
+            .collect();
+        assert_eq!(semantic, ["[[计划]]", "#开发/日志", "![[report.pdf]]"]);
+    }
+
+    #[test]
+    fn standard_markdown_and_literal_bbcode_share_one_parse() {
+        let source = "**bold** [b]plain[/b]\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- [x] done\n\n~~gone~~ $x^2$";
+        let events = parse(source);
+        assert!(events.iter().any(|item| matches!(
+            item.event,
+            Event::Markdown(MarkdownEvent::Start(Tag::Strong))
+        )));
+        assert!(events.iter().any(|item| matches!(
+            item.event,
+            Event::Markdown(MarkdownEvent::Start(Tag::Table(_)))
+        )));
+        assert!(events.iter().any(|item| matches!(
+            item.event,
+            Event::Markdown(MarkdownEvent::TaskListMarker(true))
+        )));
+        assert!(events.iter().any(|item| matches!(
+            item.event,
+            Event::Markdown(MarkdownEvent::Start(Tag::Strikethrough))
+        )));
+        assert!(events
+            .iter()
+            .any(|item| matches!(item.event, Event::Markdown(MarkdownEvent::InlineMath(_)))));
+        assert!(visible_text(&events).contains("[b]plain[/b]"));
+    }
 }

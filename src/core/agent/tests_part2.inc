@@ -1,5 +1,5 @@
     #[test]
-    fn post_write_diagnostic_is_returned_to_the_model_for_repair() {
+    fn markdown_write_result_is_returned_to_the_model() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let responses = [
@@ -17,7 +17,7 @@
                 "usage": {"input_tokens": 10, "output_tokens": 2}
             }),
             json!({
-                "content": [{"type": "text", "text": "Received the persisted-file diagnostic"}],
+                "content": [{"type": "text", "text": "Received the successful write result"}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 14, "output_tokens": 6}
             }),
@@ -84,7 +84,7 @@
 
         assert_eq!(
             run_agent(&agent, "Write the note", &mut AgentConversation::default()).unwrap(),
-            "Received the persisted-file diagnostic"
+            "Received the successful write result"
         );
         let requests = server.join().unwrap();
         let messages = requests[1]["messages"].as_array().unwrap();
@@ -94,7 +94,7 @@
         assert!(result["content"]
             .as_str()
             .unwrap()
-            .contains("MBDown validation warning"));
+            .contains("wrote"));
         assert_eq!(
             fs::read_to_string(storage.data_dir.join("invalid.md")).unwrap(),
             "[box border=double]\nbody\n[/box]\n"
@@ -983,7 +983,7 @@
     }
 
     #[test]
-    fn markdown_writes_persist_and_return_diagnostics_for_focused_repairs() {
+    fn markdown_writes_and_edits_accept_literal_bracket_syntax() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
@@ -994,10 +994,6 @@
             .execute(&json!({"path": "data/invalid.md", "content": invalid}))
             .unwrap();
         assert!(result.content.contains("wrote"));
-        assert!(result.content.contains("MBDown validation warning"));
-        assert!(result.content.contains("box border must be single or none"));
-        assert!(result.content.contains("file change succeeded"));
-        assert!(result.content.contains("Read it and use edit"));
         assert_eq!(
             fs::read_to_string(storage.data_dir.join("invalid.md")).unwrap(),
             invalid
@@ -1009,14 +1005,13 @@
                 "content": "# Diagram\n\n```mermaid\nclassDiagram\nclass Agent~T~ {}\n```\n"
             }))
             .unwrap();
-        assert!(mermaid_result.content.contains("Mermaid validation failed at line 3"));
-        assert!(mermaid_result.content.contains("generics not yet supported"));
+        assert!(mermaid_result.content.contains("wrote"));
         assert!(storage.data_dir.join("invalid-mermaid.md").exists());
 
         let plain_result = write
             .execute(&json!({"path": "data/plain.txt", "content": invalid}))
             .unwrap();
-        assert!(!plain_result.content.contains("MBDown validation warning"));
+        assert!(plain_result.content.contains("wrote"));
         assert_eq!(fs::read_to_string(storage.data_dir.join("plain.txt")).unwrap(), invalid);
 
         let path = storage.data_dir.join("note.md");
@@ -1052,7 +1047,6 @@
             })))
             .unwrap();
         assert!(result.content.contains("edited data/note.md"));
-        assert!(result.content.contains("box border must be single or none"));
         assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
 
         Read::new(directory.path(), reads.clone(), build_http_client().unwrap())
@@ -1068,7 +1062,6 @@
             })))
             .unwrap();
         assert!(repaired.content.contains("edited data/note.md"));
-        assert!(mbdown::validate(&fs::read_to_string(&path).unwrap()).is_ok());
     }
 
     #[test]
@@ -1470,8 +1463,7 @@
                 "content": "[box border=double]\ninvalid\n[/box]"
             }))
             .unwrap();
-        assert!(result.content.contains("MBDown validation warning"));
-        assert!(result.content.contains("box border must be single or none"));
+        assert!(result.content.contains("Added daily entry"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "existing\n\n[box border=double]\ninvalid\n[/box]\n"
@@ -1563,7 +1555,7 @@
             .execute(&json!({"path": "data/raw.txt"}))
             .unwrap_err()
             .to_string()
-            .contains("managed .md or .mb"));
+            .contains("managed .md"));
     }
 
     #[test]
@@ -1579,7 +1571,7 @@
         let worker = std::thread::spawn(move || {
             test_runtime().block_on(tool.execute(&json!({
                 "question": "Which format?",
-                "options": ["Markdown", "MBDown"]
+                "options": ["Markdown", "HTML"]
             })))
         });
 
@@ -1587,11 +1579,11 @@
             panic!("expected user question");
         };
         assert_eq!(request.question, "Which format?");
-        assert_eq!(request.options, ["Markdown", "MBDown"]);
+        assert_eq!(request.options, ["Markdown", "HTML"]);
         response_sender
-            .send(AskUserResponse::Answer("MBDown".to_string()))
+            .send(AskUserResponse::Answer("HTML".to_string()))
             .unwrap();
-        assert_eq!(worker.join().unwrap().unwrap().content, "MBDown");
+        assert_eq!(worker.join().unwrap().unwrap().content, "HTML");
     }
 
     #[test]

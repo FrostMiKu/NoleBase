@@ -96,7 +96,7 @@ fn system_prompt_text(root: &Path) -> String {
 Environment: target OS {target_os}; command shell {shell}, not PowerShell; Agent PTY starts at {pty_cols}×{pty_rows} cells (columns×rows) and its columns may follow the UI width.
 
 ## Notes
-Nole notes use CommonMark plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`, and closed BBCode tags: `[b]`, `[i]`, `[u]`, `[s]`, `[dim]`, `[color=COLOR]`, `[bg=COLOR]`, `[link=URL]`, `[center]`, `[right]`, `[indent first=N]`, `[box title="..." width=fit/full/N border=none/single border-color=COLOR bg=COLOR px=N py=N]` (`title`/`border-color` require `border=single`), `[cols gap=N]`, and `[col width=N/Nfr]`. Colors may be names, palette indexes, or `#RRGGBB`. Close every tag. Resolve wikilinks before creating or changing their targets. Local links in notes are relative to the containing note; links in chat are relative to the Nole root. Never emit terminal escape sequences.
+Nole notes use standard CommonMark/GFM Markdown plus `#tag`, `[[note]]`, `![[file]]`, fenced `mermaid`, and LaTeX math (`$...$` and `$$...$$`). Use standard Markdown formatting; BBCode is plain text. Resolve wikilinks before creating or changing their targets. Local links in notes are relative to the containing note; links in chat are relative to the Nole root. Never emit terminal escape sequences.
 
 ## Workspace
 Nole root: {root}

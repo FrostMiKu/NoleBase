@@ -572,7 +572,7 @@ pub(super) fn render_agent_entry(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     let mut lines = Vec::new();
     let mut links = Vec::new();
@@ -730,7 +730,7 @@ pub(super) fn visible_agent_lines(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     let end = scroll.saturating_add(view_height);
     let mut visible = Vec::with_capacity(view_height);
@@ -808,7 +808,7 @@ fn render_agent_entry_current(
 ) -> (
     Vec<Line<'static>>,
     Vec<crate::tui::markdown::RenderedLink>,
-    Vec<mbtui::ImagePlacement>,
+    Vec<crate::tui::markdown::ImagePlacement>,
 ) {
     let entry = app.agent_panel.entries()[index].as_ref();
     match app.agent_vlist.style {

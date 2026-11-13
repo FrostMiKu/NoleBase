@@ -332,7 +332,7 @@ pub(super) struct NoteCardRender {
     pub(super) lines: Vec<Line<'static>>,
     pub(super) links: Vec<crate::tui::markdown::RenderedLink>,
     pub(super) tags: Vec<crate::tui::markdown::RenderedTag>,
-    pub(super) images: Vec<mbtui::ImagePlacement>,
+    pub(super) images: Vec<crate::tui::markdown::ImagePlacement>,
 }
 
 /// Render the common heading and Markdown body used by Daily and tag cards.

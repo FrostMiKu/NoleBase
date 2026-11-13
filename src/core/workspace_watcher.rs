@@ -263,9 +263,7 @@ pub(crate) fn classify_events(
 fn is_managed_markdown(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("mb")
-        })
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
 }
 
 #[cfg(test)]
@@ -458,7 +456,7 @@ mod tests {
             .join("workspace")
             .join("main")
             .join("scratch.md");
-        let note = directory.path().join("data").join("note.mb");
+        let note = directory.path().join("data").join("note.md");
         let (events, markdown_paths) = classify(
             vec![modify_event(vec![scratch.clone(), note.clone()])],
             &context,

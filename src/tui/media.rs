@@ -135,7 +135,7 @@ impl ImageService {
     pub(crate) fn render(
         &mut self,
         frame: &mut Frame,
-        placements: &[mbtui::ImagePlacement],
+        placements: &[crate::tui::markdown::ImagePlacement],
         viewport: Rect,
         scroll: usize,
         base_dir: &Path,
@@ -565,7 +565,7 @@ fn draw_image_placeholder(
     frame: &mut Frame,
     viewport: Rect,
     top: i64,
-    placement: &mbtui::ImagePlacement,
+    placement: &crate::tui::markdown::ImagePlacement,
     detail: &str,
     failed: bool,
     theme: Theme,
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn failed_image_placeholder_frames_the_alt_and_error() {
-        let placement = mbtui::ImagePlacement {
+        let placement = crate::tui::markdown::ImagePlacement {
             source: "https://example.test/image.png".to_string(),
             title: String::new(),
             alt: "Architecture diagram".to_string(),

@@ -255,14 +255,13 @@ mod tests {
         assert!(html.contains("alt=\"chart\""));
         assert!(html.contains("Image Missing alt"));
         assert!(html.contains("Image Broken alt"));
-        assert!(html.contains("class=\"nole-box nole-bg-dark\" style=\"border:none;"));
-        assert!(html.contains("background:#00005f"));
-        assert!(html.contains("color:#00ffff"));
+        assert!(html.contains("[box width=full border=none bg=17]"));
+        assert!(html.contains("[color=bright-cyan]Bright[/color]"));
         assert!(html.contains("<th style=\"text-align:left\">Left</th>"));
         assert!(html.contains("<th style=\"text-align:center\">Center</th>"));
         assert!(html.contains("<th style=\"text-align:right\">Right</th>"));
-        assert!(html.contains("href=\"https://example.test\""));
-        assert!(!html.contains("[link="));
+        assert!(html.contains("[link=https://example.test]safe[/link]"));
+        assert!(html.contains("[link="));
         // The fenced mermaid block becomes an escaped-source container with the
         // inlined runtime and hashed CSP; the hostile `<script>` in the source
         // stays inert escaped text.

@@ -54,7 +54,7 @@ Agent 接口只暴露附件 ID、URI、metadata、内容 token，以及有界或
 
 ## 引用索引与删除一致性
 
-共享 `DocumentIndex` 读取 `daily/`、`data/` 和 `archives/`，以 MBDown AST 同时派生：
+共享 `DocumentIndex` 读取 `daily/`、`data/` 和 `archives/`，以 共享 Markdown 事件流 同时派生：
 
 - hashtag 索引；
 - wiki-link 索引；

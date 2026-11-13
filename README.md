@@ -1,7 +1,7 @@
 # NólëBase
 
 NólëBase is an Agent-driven terminal knowledge management system. It brings
-daily capture, Markdown and MBDown notes, semantic tags, task tracking, and an
+daily capture, Markdown notes, semantic tags, task tracking, and an
 autonomous workspace Agent into one local-first TUI.
 
 Knowledge stays in plain files under `~/.nole`. The Agent can search, read,
@@ -34,8 +34,7 @@ The UI is one responsive workspace with focused surfaces:
   appended to that article while it remains in view; the viewport follows the newly
   appended content to the end.
 
-Files is a flat recent-files list. Direct `.md` and
-`.mb` files under the storage `data/` directory are sorted by last modification
+Files is a flat recent-files list. Direct `.md` files under the storage `data/` directory are sorted by last modification
 time, newest first. Pressing `f` focuses this list directly.
 
 ## Main workflow
@@ -71,28 +70,13 @@ chooser instead of silently preferring one copy.
 
 ## Markup
 
-Daily cards and document views parse the shared MBDown language with `mbdown`,
-then render its AST directly to Ratatui with `mbtui`. The AST flows directly
-to the terminal. In addition to CommonMark, notes may use restricted BBCode for
-terminal colors, backgrounds, boxes, and responsive columns. MBDown also
-recognizes `#tag` and `[[wikilink]]` references in ordinary text:
-
-```text
-[box title="Status" width=full border=single bg=17]
-[color=bright-cyan]Ready[/color]
-[/box]
-
-[columns gap=2]
-[column width=1fr]Left[/column]
-[column width=2fr bg=#202830]Right[/column]
-[/columns]
-```
-
-Columns stack when the center pane is too narrow. Widths are Unicode terminal
-columns, and background colors fill the complete Box or column rectangle. The
-full syntax rules are documented in the standalone
-[`mbdown`](https://crates.io/crates/mbdown) parser crate, and its native
-Ratatui renderer is published as [`mbtui`](https://crates.io/crates/mbtui).
+Daily cards, document views, indexes, and HTML export share standard
+CommonMark/GFM parsing through `pulldown-cmark`. Nole adds semantic `#tag`,
+`[[wikilink]]`, and `![[file]]` references plus LaTeX math (`$...$` and
+`$$...$$`). Tables, task lists, strikethrough, and footnotes are supported.
+BBCode tags, colors, boxes, and columns are ordinary text, with no custom
+formatting or syntax validation. Code, HTML, escaped text, and link
+destinations are excluded from extension scanning.
 
 Fenced `mermaid` blocks render directly as width-aware Unicode character
 diagrams. Rendering is local and runs independently of a browser,
@@ -123,8 +107,8 @@ short cooldown. Images reserve twelve terminal rows, scale proportionally, and
 are sliced to the visible virtual-scroll window. While loading, or after a
 failure, the alt text remains visible.
 
-Standalone HTML export uses the offline MBDown renderer. The renderer escapes
-raw HTML, preserves MBDown markers outside the supported subset, and presents unsafe links as
+Standalone HTML export uses the shared Markdown parser. The renderer escapes
+raw HTML and presents unsafe links as
 text; a restrictive CSP permits only the exact inlined renderers. Local note
 links stay visibly marked and inert, keeping private Nole `file://` paths out of
 the standalone document. Supported local images are embedded after
@@ -139,8 +123,7 @@ through pinned Mermaid.js, KaTeX, and highlight.js runtimes embedded in the
 single HTML file, including KaTeX fonts and syntax-highlighting styles;
 rendering runs offline, and escaped source remains visible for renderer errors
 and unknown languages. The page pins readable
-light defaults and chooses whichever black/white foreground has the stronger
-WCAG contrast for MBDown blocks with custom backgrounds.
+light defaults for text, code, and tables.
 
 Managed attachments are mutable files with stable UUID identities, referenced as
 `nole://attachment/<uuid>`. The same URI works from Daily cards, notes, and Agent
@@ -178,7 +161,7 @@ Opening a file displays it in Center. `Esc` closes it; `e` suspends the TUI and
 opens that file in the configured editor (then `$EDITOR`, `$VISUAL`, and `vi`).
 Search and message
 editing also use Center instead of covering the workspace with a popup. External
-changes to `.md` and `.mb` files under the note directory are detected
+changes to `.md` files under the note directory are detected
 automatically; Daily, ToDo, Files, Search, and an open document refresh while
 Nole remains running.
 
@@ -286,19 +269,17 @@ agent-session/  # current Agent conversation and its temporary tool results
   session.json  # conversation; the whole directory is absent when empty
   results/      # oversized UTF-8 tool results, readable as nole://result/<id>
     <id>
-themes/         # Agent-editable application and MBDown themes
+themes/         # Agent-editable application and Markdown themes
   default.toml   # generated current default colors
   <name>.toml    # additional custom themes
 MEMORY.md       # Agent-maintained persistent memory
-template.mb     # initial content for "Note: New from template"
+template.md     # initial content for "Note: New from template"
 daily/         # chat cards; each date gets a file when its first content arrives
   YYYY-MM-DD.md
 archives/      # flat storage for archived articles
   <name>.md
-  <name>.mb
 data/          # flat note storage
   <name>.md
-  <name>.mb
 attachments/   # mutable UUID-addressed managed attachments and trash
 cache/         # disposable validated index snapshots; safe to delete
 workspace/      # Agent-owned scratch files; agent-maintained, persists across sessions
@@ -318,7 +299,7 @@ workspace copy and returns a content token; after editing, `update_attachment`
 uses that token to atomically update the same UUID after approval, refusing stale
 content. Importing the edited copy instead creates a new attachment.
 
-`.md` and `.mb` extensions are recognized case-insensitively. NoleBase shows
+`.md` extensions are recognized case-insensitively. NoleBase shows
 direct, regular files from both `data/` and `archives/` as separate Notes and
 Archives groups; symlinks and nested paths receive validation errors. Startup creates
 `daily/` and `archives/`, but a daily file is created only when content is first
@@ -472,7 +453,7 @@ toolset and instructions.
 
 While the Agent is running, its panel border carries a moving color gradient
 and the current tool uses the same animated full-text color gradient. Messages
-API text is streamed into the current Agent entry and rendered as MBDown. The
+API text is streamed into the current Agent entry and rendered as Markdown. The
 panel header shows request rounds, session-cumulative input/output, timed
 main-stream throughput, and provider-confirmed cache reads as a share of total
 input; cache writes appear when reported. Only final replies count as Agent
@@ -493,7 +474,7 @@ its original call order even when completion order differs.
 Press `Ctrl+P` to open the fuzzy command palette. Commands run through one
 application command pipeline; the initial commands interrupt the active Agent
 task, copy its latest visible output, clear its saved session, create or manage
-notes, or open `template.mb`, `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the
+notes, or open `template.md`, `ai.toml`, `AGENTS.md`, and `MEMORY.md` with the
 configured editor.
 `File: Export…` is available when Center is previewing a file, Skill, or Daily
 document. The UI retains its Original/HTML picker; the Agent's `export`
@@ -563,7 +544,7 @@ from the old plan are deferred so the Agent can reconsider them with the new
 input; round counting restarts once the follow-up is delivered. A follow-up
 appears at the end of the
 timeline in muted text while queued, then
-uses normal MBDown colors once the Agent consumes it. Final responses and later
+uses normal Markdown colors once the Agent consumes it. Final responses and later
 prompts append to the same virtual-scrolling timeline. Only clearing the Agent
 session removes panel history.
 Focus the Agent panel and press `c` to cancel the current task, or `C` to clear
@@ -642,8 +623,8 @@ fuzzy filename search used by the Files sidebar.
 `write` creates a complete new file and always refuses an existing path. Ordinary
 files use the full-size path; workspace files remain subject to the 64 MiB
 per-file and 512 MiB total workspace quotas, while Skills retain their separate
-size limit because they enter Agent context. The full candidate content passes
-MBDown or Skill validation before publication. `append` takes a path, the latest
+size limit because they enter Agent context. Skill documents validate their metadata before publication; ordinary Markdown
+is accepted as permissive text. `append` takes a path, the latest
 4-hex snapshot tag, and plain content, and is the preferred tool for ordinary
 end-of-file additions. It uses the same read snapshot, drift detection, approval,
 and atomic publication path as `edit`, with plain content replacing hashline body syntax.
@@ -681,7 +662,7 @@ read-before-`edit` snapshots, collision preflight, and rollback for a failed
 dedicated APIs; recursive
 directory removal inside Nole remains limited to `workspace/`.
 
-`export` renders a UTF-8 `.md` or `.mb` source as standalone HTML at a
+`export` renders a UTF-8 `.md` source as standalone HTML at a
 new external destination. Preparation validates the source and destination
 before the permission gate; preparation and publication run off the Agent
 async runtime. Publication revalidates source content and destination afterward,
@@ -693,7 +674,7 @@ internals remain protected export sources.
 The `notify` tool lets the Agent display a short notification card in the TUI's
 top-right corner and emits the terminal bell. Notifications are non-blocking
 and expire automatically.
-The `open` tool switches the TUI to an existing managed `.md` or `.mb` note in
+The `open` tool switches the TUI to an existing managed `.md` note in
 `daily/`, `data/`, or `archives/`, so the Agent can present relevant material to
 the user directly.
 The `ask` tool pauses the Agent and opens a TUI dialog for clarification.
@@ -759,7 +740,7 @@ The system prompt requires the Agent to use `ask` when it needs an answer before
 it can complete the current task. Later `Ctrl+Enter` prompts remain part
 of the same conversation until `C` is pressed or `Agent: Clear session` is run.
 
-Nole creates an empty `template.mb`. `Note: New from template` starts the new
+Nole creates an empty `template.md`. `Note: New from template` starts the new
 note with its exact contents; regular note creation still generates the note title.
 Nole also creates empty `config/AGENTS.md` and `MEMORY.md` files. Their complete
 contents are appended to the system prompt in that order for every Agent task.
@@ -782,37 +763,16 @@ remains outside the tool surface.
 
 ## Libraries
 
-Every Markdown and MBDown card in NólëBase is parsed and rendered by two
-standalone crates that are also available to any Rust TUI project:
-
-- [`mbdown`](https://crates.io/crates/mbdown) — parser and canonical formatter
-  for the MBDown markup language. It produces a backend-neutral syntax tree
-  covering CommonMark plus hashtags, wikilinks, file embeds, restricted inline
-  BBCode, inline and display math, and structural containers such as boxes and
-  responsive columns. YAML/TOML front matter stays available as source text.
-- [`mbtui`](https://crates.io/crates/mbtui) — native Ratatui renderer for
-  `mbdown` documents. It handles Unicode-aware layout for tables,
-  syntax-highlighted code blocks, boxes, and columns; applies semantic styles;
-  and reports hashtag, wikilink, and embed regions with terminal-cell
-  coordinates so applications can add interaction without reparsing. Images
-  come back as cell rectangles with reserved blank rows for any image backend.
-
-Render MBDown directly in your own application:
-
-```rust
-use mbtui::Renderer;
-
-let rendered = Renderer::new(80).render(&mbdown::parse("# Hello")?);
-for line in &rendered.text {
-    // native Ratatui lines, ready for a Paragraph widget
-}
-```
+Markdown uses [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark)
+for CommonMark/GFM and source ranges. Nole's shared semantic layer handles
+its note extensions; terminal layout renders directly to Ratatui.
+[`mermaid-text`](https://crates.io/crates/mermaid-text) renders terminal diagrams,
+`txm` renders terminal math, and `syntect` highlights terminal code. Standalone
+HTML embeds Mermaid.js, KaTeX, and highlight.js for offline rendering.
 
 ## Build and check
 
-MBDown and its terminal widgets (`mbdown`, `mbtui`) are published as
-standalone crates on crates.io and pulled in as ordinary dependencies, so no
-separate workspace checkout is needed.
+Rust 1.92 or newer is required by the standalone Mermaid renderer.
 
 The web UI (`nole web`) is a React app under `web/`, built with pnpm. A
 production build in `web/dist` is compiled into the binary
@@ -832,7 +792,7 @@ Documents support Edit, Read, Split, and Full preview views, idle autosave, expl
 with confirmation. Search results open at the matching source line. Reading
 supports Markdown/GFM, clickable `[[wikilinks]]`, `#tags`, and relative Markdown
 note links. Ambiguous wiki links show a chooser. Full preview uses the shared offline
-export renderer for MBDown containers, Mermaid, math, syntax highlighting, and
+export renderer for Markdown, Mermaid, math, syntax highlighting, and
 local/managed images, and offers a standalone HTML download. Its sandbox keeps
 the rendered content isolated from the workspace; use Read mode for note-link
 navigation. Rendering warnings are visible above the preview.

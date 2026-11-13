@@ -1,9 +1,8 @@
-//! Preconditions and post-write diagnostics for files written by Agent tools.
+//! Preconditions for files written by Agent tools.
 
 use std::fs;
 use std::path::Path;
 
-use crate::core::storage::is_note_path;
 use anyhow::{bail, Context, Result};
 
 #[derive(Clone, Copy)]
@@ -14,10 +13,8 @@ pub(super) enum WriteSource<'a> {
 
 /// Enforce file contracts that must hold before a tool changes files.
 ///
-/// Ordinary Markdown and MBDown syntax is diagnosed after publication so the
-/// Agent can repair the persisted file with a focused edit. Skill documents
-/// remain atomic because malformed metadata would change their executable
-/// contract rather than merely their rendering.
+/// Markdown is permissive text. Skill documents require valid metadata before
+/// publication because it determines their executable contract.
 pub(super) fn validate_write_preconditions(
     root: &Path,
     destination: &Path,
@@ -42,37 +39,6 @@ pub(super) fn validate_write_preconditions(
         return Ok(());
     }
     Ok(())
-}
-
-/// Marker present in a successful mutation result that still needs a focused
-/// follow-up edit. The Agent loop treats a result carrying this marker as a
-/// recovery round so the round limit cannot interrupt the repair.
-pub(crate) const REPAIR_REQUIRED_MARKER: &str = "use edit to fix the reported issue";
-
-/// Add a non-blocking MBDown diagnostic after a file mutation has succeeded.
-pub(super) fn post_write_result(summary: String, display_path: &str, path: &Path) -> String {
-    match mbdown_warning(display_path, path) {
-        Some(warning) => format!(
-            "{summary}\n{warning}\nThe file change succeeded. Read it and {REPAIR_REQUIRED_MARKER}."
-        ),
-        None => summary,
-    }
-}
-
-pub(super) fn mbdown_warning(display_path: &str, path: &Path) -> Option<String> {
-    if !is_note_path(path) {
-        return None;
-    }
-    let diagnostic = match fs::read_to_string(path) {
-        Ok(content) => mbdown::validate(&content)
-            .err()
-            .map(|error| error.to_string()),
-        Err(error) => Some(format!(
-            "could not read the written file for validation: {error}"
-        )),
-    };
-    diagnostic
-        .map(|diagnostic| format!("MBDown validation warning for {display_path}: {diagnostic}"))
 }
 
 fn skill_document_name(skills: &Path, destination: &Path) -> Result<Option<String>> {

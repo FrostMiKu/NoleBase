@@ -28,7 +28,7 @@ afterEach(() => {
 })
 
 it('exports the current unsaved text from the overflow and closes after success', async () => {
-  editorStore.loadDocument('data/a.mb', 'Saved source')
+  editorStore.loadDocument('data/a.md', 'Saved source')
   vi.spyOn(bridge, 'currentEditorSource').mockReturnValue('Unsaved source')
   vi.spyOn(workspaceApi, 'previewDocument').mockResolvedValue({
     html: '<h1>Unsaved</h1>',
@@ -39,14 +39,14 @@ it('exports the current unsaved text from the overflow and closes after success'
   const user = userEvent.setup()
   render(
     <QueryClientProvider client={client}>
-      <DocumentActions path="data/a.mb" source="Saved source" />
+      <DocumentActions path="data/a.md" source="Saved source" />
     </QueryClientProvider>,
   )
   expect(screen.queryByRole('button', { name: 'Download HTML' })).not.toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'More document actions' }))
   await user.click(screen.getByRole('button', { name: 'Download HTML' }))
   await waitFor(() => expect(download).toHaveBeenCalledOnce())
-  expect(workspaceApi.previewDocument).toHaveBeenCalledWith('data/a.mb', 'Unsaved source')
+  expect(workspaceApi.previewDocument).toHaveBeenCalledWith('data/a.md', 'Unsaved source')
   expect(download.mock.instances[0]).toHaveProperty('download', 'a.html')
   await waitFor(() =>
     expect(screen.queryByRole('button', { name: 'Download HTML' })).not.toBeInTheDocument(),
@@ -60,7 +60,7 @@ it('keeps the export action available to retry after a rendering failure', async
   const user = userEvent.setup()
   render(
     <QueryClientProvider client={client}>
-      <DocumentActions path="data/a.mb" source="Saved source" />
+      <DocumentActions path="data/a.md" source="Saved source" />
     </QueryClientProvider>,
   )
   await user.click(screen.getByRole('button', { name: 'More document actions' }))

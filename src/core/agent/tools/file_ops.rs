@@ -14,10 +14,7 @@ use super::workspace_quota::{
     check_workspace_write, check_workspace_writes, copy_new_file, copy_with_workspace_limits,
     workspace_dir,
 };
-use super::write_policy::{
-    mbdown_warning, post_write_result, validate_write_preconditions, WriteSource,
-    REPAIR_REQUIRED_MARKER,
-};
+use super::write_policy::{validate_write_preconditions, WriteSource};
 use crate::core::agent::{
     canonical_root, AgentEvent, AgentEventSender, ApprovalGate, ApprovalKind, ApprovalRequest, Tool,
 };
@@ -273,11 +270,7 @@ impl Tool for Copy {
                 )
                 .await?;
             let bytes = copy_with_workspace_limits(&self.root, &source, &destination)?;
-            Ok(post_write_result(
-                format!("copied {bytes} bytes to {destination_text}"),
-                destination_text,
-                &destination,
-            ))
+            Ok(format!("copied {bytes} bytes to {destination_text}"))
         }
         .await;
         let content = content?;
@@ -314,7 +307,7 @@ impl Tool for Export {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Nole-root-relative .md or .mb path, or an absolute path within Nole"
+                    "description": "Nole-root-relative .md path, or an absolute path within Nole"
                 },
                 "destination": {
                     "type": "string",
@@ -449,11 +442,7 @@ impl Tool for Move {
             revalidate_source(&identity)?;
             let bytes = move_to_new_file(&source, &destination)?;
             send_file_moved(&self.events, &self.root, &source, &destination);
-            Ok(post_write_result(
-                format!("moved {bytes} bytes to {destination_text}"),
-                destination_text,
-                &destination,
-            ))
+            Ok(format!("moved {bytes} bytes to {destination_text}"))
         }
         .await;
         let content = content?;
@@ -594,22 +583,13 @@ impl Tool for MoveMany {
             for (source, destination, _) in &completed {
                 send_file_moved(&self.events, &self.root, source, destination);
             }
-            let warnings = completed
-                .iter()
-                .filter_map(|(_, destination, _)| {
-                    let display = display_path(&self.root, destination);
-                    mbdown_warning(&display, destination)
-                })
-                .collect::<Vec<_>>();
             let mut result = format!("Destination: {directory_text}\nMoved: {}", completed.len());
             for (source, destination, bytes) in &completed {
-                result.push_str(&format!("\n\nSource: {}\nDestination: {}\nBytes: {bytes}", display_path(&self.root, source), display_path(&self.root, destination)));
-            }
-            if !warnings.is_empty() {
-                for warning in warnings {
-                    result.push_str(&format!("\nMBDown warning: {warning}"));
-                }
-                result.push_str(&format!("\nRepair: Files were moved. Read each affected file and {REPAIR_REQUIRED_MARKER}."));
+                result.push_str(&format!(
+                    "\n\nSource: {}\nDestination: {}\nBytes: {bytes}",
+                    display_path(&self.root, source),
+                    display_path(&self.root, destination)
+                ));
             }
             Ok(result)
         }
@@ -746,10 +726,8 @@ impl Tool for Rename {
             let bytes = move_to_new_file(&source, &destination)?;
             send_file_moved(&self.events, &self.root, &source, &destination);
             let destination_text = display_path(&self.root, &destination);
-            Ok(post_write_result(
-                format!("renamed {path_text} to {destination_text} ({bytes} bytes)"),
-                &destination_text,
-                &destination,
+            Ok(format!(
+                "renamed {path_text} to {destination_text} ({bytes} bytes)"
             ))
         }
         .await;
@@ -937,11 +915,7 @@ impl Tool for Write {
                 .open(&path)
                 .with_context(|| format!("writing file {}", path.display()))?;
             file.write_all(content.as_bytes())?;
-            Ok(post_write_result(
-                format!("wrote {} bytes to {path_text}", content.len()),
-                path_text,
-                &path,
-            ))
+            Ok(format!("wrote {} bytes to {path_text}", content.len()))
         }
         .await;
         let content = content?;

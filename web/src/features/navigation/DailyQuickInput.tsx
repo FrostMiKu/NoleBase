@@ -63,7 +63,7 @@ export function DailyQuickInput() {
   const tagNames = (tagsQuery.data ?? []).map((tag) => tag.name)
   const noteNames = [
     ...new Set([
-      ...(notesQuery.data ?? []).map((note) => note.name.replace(/\.(md|mb)$/i, '')),
+      ...(notesQuery.data ?? []).map((note) => note.name.replace(/\.md$/i, '')),
       ...(dailyQuery.data ?? []).map((note) => note.date),
     ]),
   ]

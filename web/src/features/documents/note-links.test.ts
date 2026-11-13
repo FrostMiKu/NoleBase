@@ -5,7 +5,7 @@ describe('note links', () => {
     expect(resolveNotePath('../data/中文%20笔记.md', 'daily/2026-10-22.md')).toBe(
       'data/中文 笔记.md',
     )
-    expect(resolveNotePath('other.mb', 'data/note.md')).toBe('data/other.mb')
+    expect(resolveNotePath('other.md', 'data/note.md')).toBe('data/other.md')
     for (const href of [
       '../../secret.md',
       '../config/AGENTS.md',

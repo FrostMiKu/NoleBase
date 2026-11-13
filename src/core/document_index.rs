@@ -26,7 +26,7 @@ use crate::core::workspace_index::{collect_document_tags, WorkspaceIndex};
 
 const CACHE_DIR: &str = "cache";
 const CACHE_FILE: &str = "document-index.json";
-const CACHE_FORMAT_VERSION: u32 = 3;
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DocumentGroup {
@@ -501,13 +501,10 @@ pub(crate) fn index_file(storage: &Storage, path: &Path) -> Result<Option<Indexe
 
 fn parse_source(source: &str, group: DocumentGroup, stamp: FileStamp) -> IndexedDocument {
     let mut tags_by_line: HashMap<usize, Vec<String>> = HashMap::new();
-    let mut attachment_uris = Vec::new();
-    let mut wiki_links = Vec::new();
-    if let Ok(document) = mbdown::parse(source) {
-        collect_document_tags(document.nodes(), source, &mut tags_by_line);
-        attachment_uris = collect_attachment_uris(document.nodes());
-        wiki_links = collect_wiki_links(document.nodes());
-    }
+    let document = crate::core::markup::parse(source);
+    collect_document_tags(&document, source, &mut tags_by_line);
+    let attachment_uris = collect_attachment_uris(&document);
+    let wiki_links = collect_wiki_links(&document);
     let lines = source
         .lines()
         .enumerate()
@@ -532,7 +529,7 @@ fn parse_source(source: &str, group: DocumentGroup, stamp: FileStamp) -> Indexed
 
 pub(crate) fn document_group(storage: &Storage, path: &Path) -> Option<DocumentGroup> {
     let extension = path.extension()?.to_str()?;
-    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("mb") {
+    if !extension.eq_ignore_ascii_case("md") {
         return None;
     }
     match path.parent() {
