@@ -146,15 +146,17 @@ fn workspace_source(root: &Path, input: &str) -> Result<PathBuf> {
 
 pub struct ImportAttachment {
     root: PathBuf,
+    gate: ApprovalGate,
     store: AttachmentStore,
 }
 
 impl ImportAttachment {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
             store: store_for(&root)?,
             root,
+            gate,
         })
     }
 }
@@ -207,6 +209,11 @@ impl Tool for ImportAttachment {
             Some(name) => validate_display_name(name)?,
             None => validate_display_name(default_name)?,
         };
+        self.gate.request(ApprovalRequest {
+            title: "Import attachment".into(),
+            message: format!("Import {} as {display_name}", source.display()),
+            kind: ApprovalKind::Confirm,
+        }).await?;
         let metadata = self.store.import_path_as(&source, &display_name)?;
         if let Some(requested) = input.get("media_type").and_then(Value::as_str) {
             let stored = metadata.mime_type.as_deref().unwrap_or("none");
@@ -361,15 +368,17 @@ impl Tool for AttachmentInfo {
 
 pub struct CheckoutAttachment {
     root: PathBuf,
+    gate: ApprovalGate,
     store: AttachmentStore,
 }
 
 impl CheckoutAttachment {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         let root = canonical_root(root)?;
         Ok(Self {
             store: store_for(&root)?,
             root,
+            gate,
         })
     }
 }
@@ -409,6 +418,13 @@ impl Tool for CheckoutAttachment {
             let metadata = self.store.metadata(uri.id())?;
             let destination = workspace_destination(&self.root, destination_text)?;
             check_workspace_write(&self.root, &destination, metadata.size)?;
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Check out attachment".into(),
+                    message: format!("Copy attachment {uri} to workspace/{destination_text}"),
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
             let mut output = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -715,10 +731,51 @@ mod tests {
     }
 
     #[test]
+    fn denying_import_and_checkout_preserves_attachment_and_workspace_files() {
+        let (_directory, root) = fresh_root();
+        let (_outside, source) = outside_file("original.txt", b"original");
+        let store = store_for(&root).unwrap();
+        let (events, _event_receiver) = event_channel();
+        let (decisions, receiver) = tokio::sync::mpsc::unbounded_channel();
+        decisions.send(ApprovalDecision::Deny).unwrap();
+        let import = ImportAttachment::new(
+            &root,
+            gate(PermissionMode::Approve, &root, events, receiver),
+        )
+        .unwrap();
+        assert!(test_runtime()
+            .block_on(import.execute(&json!({"source":source})))
+            .is_err());
+        let listed = ListAttachments::new(&root)
+            .unwrap()
+            .execute(&json!({}))
+            .unwrap();
+        assert!(!listed.content.contains("original.txt"));
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
+        let uri = import_source(&import, &source);
+        let id = AttachmentUri::parse(&uri).unwrap().id();
+        let before = store.metadata(id).unwrap();
+        let (events, _event_receiver) = event_channel();
+        let (decisions, receiver) = tokio::sync::mpsc::unbounded_channel();
+        decisions.send(ApprovalDecision::Deny).unwrap();
+        let checkout = CheckoutAttachment::new(
+            &root,
+            gate(PermissionMode::Approve, &root, events, receiver),
+        )
+        .unwrap();
+        assert!(test_runtime()
+            .block_on(checkout.execute(&json!({"uri":uri,"destination":"copy.txt"})))
+            .is_err());
+        assert!(!root.join("workspace/copy.txt").exists());
+        assert_eq!(store.metadata(id).unwrap().size, before.size);
+        assert_eq!(fs::read(source).unwrap(), b"original");
+    }
+
+    #[test]
     fn import_preserves_source_and_creates_distinct_identities() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("photo.png", TINY_PNG);
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
 
         let first = import.execute(&json!({"source": source})).unwrap();
         assert!(source.exists(), "import must preserve the source file");
@@ -744,7 +801,7 @@ mod tests {
     fn import_accepts_relative_sources_and_validated_metadata() {
         let (_directory, root) = fresh_root();
         fs::write(root.join("data/note.md"), "# imported\n").unwrap();
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
 
         let result = import.execute(&json!({"source": "data/note.md"})).unwrap();
         assert_eq!(field(&result, "Name"), "note.md");
@@ -798,7 +855,7 @@ mod tests {
     #[test]
     fn import_refuses_symlinks_directories_and_attachment_internals() {
         let (_directory, root) = fresh_root();
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let (_outside, source) = outside_file("plain.txt", b"bytes");
         fs::remove_file(&source).unwrap();
         fs::create_dir(&source).unwrap();
@@ -825,7 +882,7 @@ mod tests {
     fn list_and_info_never_leak_object_paths() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("report.pdf", b"%PDF-1.4 fake");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
 
         let root_text = root.to_string_lossy().to_string();
@@ -867,9 +924,9 @@ mod tests {
     fn copy_to_workspace_stays_inside_workspace_main() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("plan.pdf", b"%PDF-1.4 plan bytes");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
-        let copy = CheckoutAttachment::new(&root).unwrap();
+        let copy = CheckoutAttachment::new(&root, bypass_gate()).unwrap();
 
         let result = copy
             .execute(&json!({"uri": uri, "destination": "docs/plan.pdf"}))
@@ -929,13 +986,13 @@ mod tests {
     fn checkout_edit_and_update_preserve_identity_and_refuse_stale_content() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("draft.txt", b"original");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
         let id = AttachmentUri::parse(&uri).unwrap().id();
         let store = store_for(&root).unwrap();
         let original = store.metadata(id).unwrap();
 
-        let checkout = CheckoutAttachment::new(&root).unwrap();
+        let checkout = CheckoutAttachment::new(&root, bypass_gate()).unwrap();
         let checked_out = checkout
             .execute(&json!({"uri": uri, "destination": "draft.txt"}))
             .unwrap();
@@ -984,7 +1041,7 @@ mod tests {
     fn update_attachment_waits_for_approval_and_denial_preserves_content() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("keep.txt", b"original");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
         let id = AttachmentUri::parse(&uri).unwrap().id();
         let store = store_for(&root).unwrap();
@@ -1035,7 +1092,7 @@ mod tests {
     #[test]
     fn list_attachments_paginates_filters_and_sorts() {
         let (_directory, root) = fresh_root();
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         for (name, bytes) in [
             ("alpha.md", &b"# alpha"[..]),
             ("beta.md", &b"# beta"[..]),
@@ -1080,7 +1137,7 @@ mod tests {
     fn delete_attachment_waits_for_approval_and_denial_preserves() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("keep.txt", b"keep me");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
 
         let (event_sender, mut event_receiver) = event_channel();
@@ -1125,7 +1182,7 @@ mod tests {
     fn delete_attachment_moves_to_trash_after_approval() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("gone.txt", b"gone");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
 
         let (event_sender, mut event_receiver) = event_channel();
@@ -1165,7 +1222,7 @@ mod tests {
     fn delete_attachment_refuses_while_referenced() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("cited.txt", b"cited");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
         fs::write(root.join("data/Note.md"), format!("[cited]({uri})\n")).unwrap();
 
@@ -1185,7 +1242,7 @@ mod tests {
     fn bypassed_approval_gate_allows_immediate_delete() {
         let (_directory, root) = fresh_root();
         let (_outside, source) = outside_file("temp.txt", b"temp");
-        let import = ImportAttachment::new(&root).unwrap();
+        let import = ImportAttachment::new(&root, bypass_gate()).unwrap();
         let uri = import_source(&import, &source);
         let delete = DeleteAttachment::new(&root, bypass_gate(), ready_usage(&root)).unwrap();
         let message = delete.execute(&json!({"uri": uri})).unwrap();

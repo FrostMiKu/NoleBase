@@ -40,26 +40,29 @@ mod worker;
 use worker::AgentTask;
 pub(crate) mod collaboration;
 mod config;
+mod context;
+mod environment;
 mod execution;
 mod factory;
-mod runtime;
-use subagent::SubagentRunner;
-mod context;
 pub(crate) mod hashline;
 pub(crate) mod images;
 pub(crate) mod jobs;
+mod output;
 mod prompts;
 mod results;
+#[cfg(test)]
+mod runner_tests;
+mod runtime;
 mod shell_helper;
 mod shell_policy;
 mod snapshots;
-mod subagent;
 mod terminal;
 #[cfg(test)]
 mod test_support;
 mod tool;
 mod tool_stream;
 mod tools;
+mod turn;
 mod types;
 
 pub(crate) use self::activity::*;
@@ -79,6 +82,7 @@ pub(crate) use self::terminal::*;
 pub use self::terminal::{AgentTerminalHandle, AgentTerminalSnapshot, AgentTerminalStatus};
 pub use self::types::*;
 
+use output::{externalize_tool_output_with, render_tool_output};
 use tool_stream::ToolCallStreamPreview;
 use tools::*;
 
@@ -110,7 +114,7 @@ async fn wait_for_provider_retry(cancelled: &AtomicBool, attempt: usize) -> Resu
 }
 
 fn report_provider_metrics(
-    events: &AgentEventSender,
+    emit: impl Fn(AgentEvent),
     reported_usage: &mut TokenUsage,
     reported_duration: &mut Duration,
     usage: TokenUsage,
@@ -122,16 +126,16 @@ fn report_provider_metrics(
     let duration_delta = generation_duration.saturating_sub(*reported_duration);
 
     if !usage_delta.is_empty() {
-        let _ = events.send(AgentEvent::Usage(usage_delta));
+        emit(AgentEvent::Usage(usage_delta));
     }
     if usage.total_input() > 0 {
-        let _ = events.send(AgentEvent::ContextWindow {
+        emit(AgentEvent::ContextWindow {
             tokens: usage.total_input(),
             capacity: context_window_capacity,
         });
     }
     if output_delta > 0 && !duration_delta.is_zero() {
-        let _ = events.send(AgentEvent::ResponseTiming {
+        emit(AgentEvent::ResponseTiming {
             output_tokens: output_delta,
             elapsed: duration_delta,
         });
@@ -160,6 +164,7 @@ struct ApprovalGate {
     events: AgentEventSender,
     decisions: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>>>,
     interactions: UserInteractionWaits,
+    actor: Option<String>,
 }
 
 impl ApprovalGate {
@@ -178,6 +183,15 @@ impl ApprovalGate {
             events,
             decisions,
             interactions,
+            actor: None,
+        }
+    }
+
+    fn for_actor(&self, name: &str, cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            actor: Some(name.to_string()),
+            cancelled,
+            ..self.clone()
         }
     }
 
@@ -226,21 +240,54 @@ impl ApprovalGate {
         }
     }
 
-    async fn request_impl(&self, request: ApprovalRequest) -> Result<()> {
+    async fn request_impl(&self, mut request: ApprovalRequest) -> Result<()> {
+        // Own the decision channel before publishing a request. Every actor in a
+        // Session shares this gate, so each decision belongs to the visible request.
+        let mut decisions = loop {
+            anyhow::ensure!(
+                !self.cancelled.load(Ordering::Relaxed),
+                "agent task cancelled"
+            );
+            if let Ok(guard) =
+                tokio::time::timeout(Duration::from_millis(100), self.decisions.lock()).await
+            {
+                break guard;
+            }
+        };
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Relaxed),
+            "agent task cancelled"
+        );
+        if let Some(actor) = &self.actor {
+            request.title = format!("{actor}: {}", request.title);
+        }
+        let _interaction = self.interactions.begin();
         self.events
             .send(AgentEvent::Approval(request))
             .context("sending approval request")?;
-        let _interaction = self.interactions.begin();
-        let decision = recv_while_active(
-            &self.decisions,
-            &self.cancelled,
-            "waiting for approval decision",
-        )
-        .await?;
+        let _visibility = ApprovalVisibility(self.events.clone());
+        let decision = loop {
+            anyhow::ensure!(
+                !self.cancelled.load(Ordering::Relaxed),
+                "agent task cancelled"
+            );
+            if let Ok(decision) =
+                tokio::time::timeout(Duration::from_millis(100), decisions.recv()).await
+            {
+                break decision.context("waiting for approval decision")?;
+            }
+        };
         match decision {
             ApprovalDecision::Approve => Ok(()),
             ApprovalDecision::Deny => Err(ApprovalDenied.into()),
         }
+    }
+}
+
+struct ApprovalVisibility(AgentEventSender);
+impl Drop for ApprovalVisibility {
+    fn drop(&mut self) {
+        let _ = self.0.send(AgentEvent::ApprovalResolved);
     }
 }
 
@@ -323,7 +370,7 @@ async fn recv_while_active<T>(
 }
 
 pub(crate) use self::tool::{tool_error_message, RegisteredTool};
-pub use self::tool::{Tool, ToolOutput};
+pub use self::tool::{Tool, ToolErrorCode, ToolOutput, ToolStatus};
 
 pub struct Agent {
     config: AgentConfig,
@@ -347,6 +394,7 @@ pub struct Agent {
     todos: TodoHandle,
     results: SessionResultStore,
     interactions: UserInteractionWaits,
+    policy: environment::RunPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,194 +430,8 @@ impl AgentSource {
 }
 
 impl Agent {
-    pub(super) async fn run(
-        &self,
-        prompt: &str,
-        conversation: &mut AgentConversation,
-    ) -> Result<AgentRunCompletion> {
-        // The conversation snapshot is the plan's source of truth across
-        // restarts and session switches; re-arm the shared handle from it
-        // before any tool or compaction can read or write it.
-        self.todos.replace(conversation.todos.clone());
-        let prompt = prompt_with_datetime(prompt, Local::now());
-        let parsed =
-            parse_user_message(prompt, &self.attachments, self.config.supports_images).await?;
-        conversation.messages.push(parsed);
-        self.checkpoint_conversation(conversation);
-        let definitions = &self.definitions;
-        let mut empty_response_retries = 0usize;
-        let mut truncation_retries = 0usize;
-        let mut round = 0u32;
-
-        loop {
-            let buffered = self.take_buffered_prompts()?;
-            let delivered = self.jobs.take_deliveries();
-            if !buffered.is_empty() || !delivered.is_empty() {
-                for raw_prompt in buffered {
-                    let dated = prompt_with_datetime(&raw_prompt, Local::now());
-                    let parsed =
-                        parse_user_message(dated, &self.attachments, self.config.supports_images)
-                            .await?;
-                    append_user_parts(&mut conversation.messages, parsed.parts);
-                }
-                if !delivered.is_empty() {
-                    let frame = format_job_deliveries(&delivered);
-                    append_user_parts(&mut conversation.messages, Message::user(frame).parts);
-                    let image_parts = delivered
-                        .iter()
-                        .flat_map(|job| job.output.images.iter())
-                        .flat_map(|image| {
-                            [
-                                MessagePart::Text {
-                                    text: format!(
-                                        "Image returned by background job: {}",
-                                        image.label
-                                    ),
-                                },
-                                MessagePart::Image(image.clone()),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    if !image_parts.is_empty() {
-                        append_user_parts(&mut conversation.messages, image_parts);
-                    }
-                    let _ = self.events.send(AgentEvent::JobDelivered(
-                        delivered.iter().map(|job| job.id.clone()).collect(),
-                    ));
-                }
-                self.checkpoint_conversation(conversation);
-                round = 0;
-            }
-            round = round.saturating_add(1);
-            self.ensure_active()?;
-            let _ = self.events.send(AgentEvent::Round { current: round });
-            if self
-                .compact_context_if_needed(
-                    &mut conversation.messages,
-                    conversation.last_request_input_tokens,
-                    definitions,
-                )
-                .await?
-            {
-                self.checkpoint_conversation(conversation);
-            }
-            let response = self
-                .request_message(&mut conversation.messages, definitions)
-                .await?;
-            let reported_input_tokens = response.token_usage.total_input();
-            if reported_input_tokens > 0 {
-                conversation.last_request_input_tokens = reported_input_tokens;
-            }
-            let content = response.message.parts.clone();
-            let stop_reason = response.stop_reason.clone();
-            let tool_uses = response.message.tool_calls().cloned().collect::<Vec<_>>();
-            let response_text = response.text();
-            if tool_uses.is_empty() {
-                let output = response_text;
-                if !output.trim().is_empty() {
-                    conversation.messages.push(response.message);
-                }
-                self.checkpoint_conversation(conversation);
-                let buffered = self.take_buffered_prompts()?;
-                if !buffered.is_empty() {
-                    if !output.trim().is_empty() {
-                        let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                            text: output.clone(),
-                            final_output: false,
-                        });
-                    }
-                    append_user_text(
-                        &mut conversation.messages,
-                        format_buffered_prompts(buffered),
-                    );
-                    self.checkpoint_conversation(conversation);
-                    round = 0;
-                    empty_response_retries = 0;
-                    truncation_retries = 0;
-                    continue;
-                }
-                if stop_reason == StopReason::Length {
-                    if !output.trim().is_empty() {
-                        let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                            text: output.clone(),
-                            final_output: false,
-                        });
-                    }
-                    if truncation_retries >= MAX_TRUNCATION_RETRIES {
-                        bail!("{}", empty_response_diagnostic(&stop_reason, &content));
-                    }
-                    truncation_retries += 1;
-                    append_user_text(
-                        &mut conversation.messages,
-                        "Continue from the previous response and provide the complete answer. Do not repeat completed work.".to_string(),
-                    );
-                    self.checkpoint_conversation(conversation);
-                    continue;
-                }
-                if output.trim().is_empty() {
-                    if stop_reason == StopReason::Refusal
-                        || empty_response_retries >= MAX_EMPTY_RESPONSE_RETRIES
-                    {
-                        bail!("{}", empty_response_diagnostic(&stop_reason, &content));
-                    }
-                    empty_response_retries += 1;
-                    append_user_text(
-                        &mut conversation.messages,
-                        "Provide a non-empty final answer to the user's request. If required information is missing, use ask.".to_string(),
-                    );
-                    self.checkpoint_conversation(conversation);
-                    continue;
-                }
-                let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                    text: output.clone(),
-                    final_output: true,
-                });
-                return Ok(AgentRunCompletion::Finished(output));
-            }
-
-            empty_response_retries = 0;
-            truncation_retries = 0;
-
-            let _ = self.events.send(AgentEvent::AssistantMessageFinished {
-                text: response_text,
-                final_output: false,
-            });
-
-            conversation.messages.push(response.message);
-            self.ensure_active()?;
-            let results = self
-                .execute_tool_batch(&tool_uses, &response.tool_input_errors)
-                .await?;
-            match results {
-                ToolBatchExecution::Completed {
-                    messages,
-                    followup_delivered,
-                } => {
-                    conversation.messages.extend(messages);
-                    // A completed batch is the only place the plan can change
-                    // (todo is a tool), so mirror the handle into the
-                    // conversation before the checkpoint persists it.
-                    conversation.todos = self.todos.snapshot();
-                    self.checkpoint_conversation(conversation);
-                    if followup_delivered {
-                        round = 0;
-                    }
-                }
-                ToolBatchExecution::Denied(results) => {
-                    conversation.messages.extend(results);
-                    self.checkpoint_conversation(conversation);
-                    return Ok(AgentRunCompletion::Stopped(
-                        AgentStopReason::ToolApprovalDenied,
-                    ));
-                }
-            }
-        }
-    }
-
     fn checkpoint_conversation(&self, conversation: &AgentConversation) {
-        let _ = self
-            .events
-            .send(AgentEvent::ConversationUpdated(conversation.clone()));
+        let _ = self.emit(AgentEvent::ConversationUpdated(conversation.clone()));
     }
 
     async fn request_message(
@@ -583,7 +445,7 @@ impl Agent {
                     if is_transient_provider_error(&error)
                         && attempt + 1 < MAX_PROVIDER_REQUEST_ATTEMPTS =>
                 {
-                    let _ = self.events.send(AgentEvent::Retry);
+                    let _ = self.emit(AgentEvent::Retry);
                     wait_for_provider_retry(&self.cancelled, attempt).await?;
                 }
                 result => return result,
@@ -656,7 +518,7 @@ impl Agent {
                     }
                     if let Ok(answer) = &result {
                         report_provider_metrics(
-                            &self.events,
+                            |event| { let _ = self.emit(event); },
                             &mut reported_usage,
                             &mut reported_duration,
                             answer.token_usage,
@@ -668,7 +530,7 @@ impl Agent {
                         if !preview.is_visible() {
                             continue;
                         }
-                        let _ = self.events.send(AgentEvent::ToolPreparationFinished {
+                        let _ = self.emit(AgentEvent::ToolPreparationFinished {
                             index,
                             id: None,
                         });
@@ -697,13 +559,13 @@ impl Agent {
     ) {
         match event {
             ProviderEvent::TextDelta(text) => {
-                let _ = self.events.send(AgentEvent::AssistantDelta(text));
+                let _ = self.emit(AgentEvent::AssistantDelta(text));
             }
             ProviderEvent::ThinkingDelta(text) => {
-                let _ = self.events.send(AgentEvent::ThinkingDelta(text));
+                let _ = self.emit(AgentEvent::ThinkingDelta(text));
             }
             ProviderEvent::ThinkingFinished => {
-                let _ = self.events.send(AgentEvent::ThinkingFinished);
+                let _ = self.emit(AgentEvent::ThinkingFinished);
             }
             ProviderEvent::ToolCallDelta {
                 index,
@@ -716,9 +578,7 @@ impl Agent {
                     .or_default()
                     .push(&name, &arguments)
                 {
-                    let _ = self
-                        .events
-                        .send(AgentEvent::ToolPreparing { index, message });
+                    let _ = self.emit(AgentEvent::ToolPreparing { index, message });
                 }
             }
             ProviderEvent::ToolCallFinished { index, id } => {
@@ -726,7 +586,7 @@ impl Agent {
                     .remove(&index)
                     .is_some_and(|preview| preview.is_visible())
                 {
-                    let _ = self.events.send(AgentEvent::ToolPreparationFinished {
+                    let _ = self.emit(AgentEvent::ToolPreparationFinished {
                         index,
                         id: (!id.is_empty()).then_some(id),
                     });
@@ -737,7 +597,9 @@ impl Agent {
                 generation_duration,
             } => {
                 report_provider_metrics(
-                    &self.events,
+                    |event| {
+                        let _ = self.emit(event);
+                    },
                     reported_usage,
                     reported_duration,
                     usage,
@@ -746,7 +608,7 @@ impl Agent {
                 );
             }
             ProviderEvent::Retry => {
-                let _ = self.events.send(AgentEvent::Retry);
+                let _ = self.emit(AgentEvent::Retry);
             }
         }
     }
@@ -878,7 +740,7 @@ impl Agent {
             .await?;
         self.ensure_active()?;
         if !response.token_usage.is_empty() {
-            let _ = self.events.send(AgentEvent::Usage(response.token_usage));
+            let _ = self.emit(AgentEvent::Usage(response.token_usage));
         }
         let summary = response.text();
         if summary.trim().is_empty() {
@@ -901,33 +763,9 @@ impl Agent {
             .map_err(|_| anyhow::anyhow!("agent input buffer is unavailable"))?;
         let prompts = std::mem::take(&mut *buffer);
         if !prompts.is_empty() {
-            let _ = self
-                .events
-                .send(AgentEvent::BufferedInputConsumed(prompts.len()));
+            let _ = self.emit(AgentEvent::BufferedInputConsumed(prompts.len()));
         }
         Ok(prompts)
-    }
-}
-
-fn externalize_tool_output_with(
-    results: &SessionResultStore,
-    token_cap: u64,
-    mut output: ToolOutput,
-) -> Result<ToolOutput> {
-    let text = &output.content;
-    if should_externalize_text(text, token_cap) {
-        let stored = normalize_stored_result(text);
-        let uri = results.store(&stored)?;
-        let reference = result_reference_message(&uri, text, &stored);
-        output.content = reference;
-    }
-    Ok(output)
-}
-
-fn render_tool_output(output: &ToolOutput) -> String {
-    match output.exit_code {
-        Some(code) => format!("Exit code: {code}\n{}", output.content),
-        None => output.content.clone(),
     }
 }
 

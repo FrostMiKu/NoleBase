@@ -139,13 +139,13 @@ impl SessionNoteRuntime {
                 state.duration = state.duration.saturating_add(*elapsed);
             }
             AgentEvent::Approval(request) => state.approval = Some(request.clone()),
+            AgentEvent::ApprovalResolved => state.approval = None,
             AgentEvent::AskUser(request) => state.question = Some(request.clone()),
             AgentEvent::PrivateTerminalInput(request) => {
                 state.private_input = Some(request.clone())
             }
             AgentEvent::Finished(_) | AgentEvent::Stopped(_) => {
                 state.note.completed = state.note.completed.saturating_add(1);
-                state.approval = None;
                 state.question = None;
                 state.private_input = None;
             }

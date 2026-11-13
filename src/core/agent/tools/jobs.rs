@@ -255,6 +255,7 @@ mod tests {
                         height: 4,
                         bytes: None,
                     }],
+                    ..crate::core::agent::ToolOutput::text("")
                 }),
             );
         });

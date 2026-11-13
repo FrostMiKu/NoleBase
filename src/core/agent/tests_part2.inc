@@ -1288,7 +1288,7 @@
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::new(directory.path()).unwrap();
         storage.ensure_files().unwrap();
-        let add = Daily::new(directory.path()).unwrap();
+        let add = Daily::new(directory.path(), bypass_gate()).unwrap();
 
         add.execute(&json!({"date": "2026-07-27", "content": "first"}))
             .unwrap();
@@ -1781,7 +1781,7 @@
             runtime
                 .block_on(registered.execute(&json!({"message": "valid"})))
                 .unwrap()
-                .into_inline_text()
+                .content
                 ,
             "notification shown"
         );

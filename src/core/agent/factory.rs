@@ -43,6 +43,7 @@ impl Agent {
             wiki_links,
             session_directory,
             collaborators,
+            mutation_lock,
         } = runtime;
         let interactions = UserInteractionWaits::default();
         let AgentSource {
@@ -53,7 +54,6 @@ impl Agent {
         } = source;
         let SkillCatalog { skills, warnings } = skill_catalog;
         let tavily_api_key = config.tavily_api_key.trim().to_string();
-        let has_web_search = !tavily_api_key.is_empty();
         let system = system_prompt_sections(nole_root, &agents_instructions, &skills, &memory);
         let provider: Arc<dyn Provider> = match config.api_format {
             ApiFormat::Messages => Arc::new(MessagesProvider::new(
@@ -73,25 +73,21 @@ impl Agent {
             session_directory.unwrap_or_else(|| nole_root.join("agents/scratch"));
         let results = SessionResultStore::in_directory(&session_directory)?;
         let tool_result_token_cap = tool_result_token_cap_for(&config);
-        let mut agent = Self {
+        let environment = environment::AgentEnvironment {
             config,
             provider,
-            tools: HashMap::new(),
-            definitions: Vec::new(),
             system,
             events: events.clone(),
-            input_buffer,
-            cancelled: cancelled.clone(),
-            jobs: jobs_handle
-                .clone()
-                .with_result_store(results.clone(), tool_result_token_cap),
             concurrency,
             attachments,
             client: agent_client,
-            todos: todos.clone(),
             results,
-            interactions: interactions.clone(),
         };
+        let mut agent = environment.create(cancelled.clone(), environment::RunPolicy::Session);
+        agent.input_buffer = input_buffer;
+        agent.jobs = jobs_handle.with_result_store(agent.results.clone(), tool_result_token_cap);
+        agent.todos = todos.clone();
+        agent.interactions = interactions.clone();
         let gate = ApprovalGate::new(
             permission_mode,
             canonical_root(nole_root)?,
@@ -100,12 +96,31 @@ impl Agent {
             decisions,
             interactions.clone(),
         );
+        let mutations = tools::mutations::MutationTools {
+            root: nole_root.into(),
+            workspace_index: workspace_index.clone(),
+            wiki_links: wiki_links.clone(),
+            attachment_usage,
+            gate: gate.clone(),
+            lock: mutation_lock,
+            cancelled: cancelled.clone(),
+        };
+        let agent_tools = AgentTools {
+            root: nole_root.into(),
+            session_directory: session_directory.clone(),
+            workspace_index,
+            wiki_links,
+            client: client.clone(),
+            tavily_api_key: tavily_api_key.clone(),
+            skills,
+            mutations: mutations.clone(),
+            jobs: agent.jobs.clone(),
+        };
         for warning in warnings {
             let _ = agent.events.send(AgentEvent::Notification(format!(
                 "Skill warning: {warning}"
             )));
         }
-        agent.register(Calculate);
         agent.register(Todo::new(todos));
         agent.register(Wait::new(cancelled.clone()));
         agent.register(Shell::new(
@@ -148,46 +163,9 @@ impl Agent {
             interactions: interactions.clone(),
         });
         agent.register(TerminalClose::new(terminal));
-        let mut read = Read::new(nole_root, reads.clone(), client.clone())?
-            .with_session_directory(&session_directory);
-        read.register(SkillParser::new(&skills));
-        agent.register(read);
+        agent_tools.register_inspection(&mut agent, reads.clone())?;
+        mutations.register(&mut agent, reads, registers)?;
         agent.register(Http::new(nole_root, client.clone(), agent.jobs.clone())?);
-        agent.register(Notes::new(nole_root)?);
-        agent.register(Grep::new(nole_root)?);
-        agent.register(SearchNotes::new(nole_root)?);
-        agent.register(Tags::new(workspace_index.clone()));
-        agent.register(SearchTag::new(nole_root, workspace_index.clone())?);
-        agent.register(RenameTag::new(
-            nole_root,
-            workspace_index.clone(),
-            gate.clone(),
-        )?);
-        agent.register(Wikilink::new(nole_root, wiki_links.clone())?);
-        agent.register(Backlinks::new(nole_root, wiki_links.clone())?);
-        agent.register(RenameWikilink::new(
-            nole_root,
-            wiki_links.clone(),
-            gate.clone(),
-        )?);
-        agent.register(Write::new(nole_root, gate.clone())?);
-        agent.register(Append::new(
-            nole_root,
-            gate.clone(),
-            reads.clone(),
-            registers.clone(),
-        )?);
-        agent.register(Copy::new(nole_root, gate.clone())?);
-        agent.register(Export::new(nole_root, gate.clone())?);
-        agent.register(Mkdir::new(nole_root, gate.clone())?);
-        agent.register(Rmdir::new(nole_root, gate.clone())?);
-        let file_events = agent.events.clone();
-        agent.register(Move::new(nole_root, file_events.clone(), gate.clone())?);
-        agent.register(MoveMany::new(nole_root, file_events.clone(), gate.clone())?);
-        agent.register(Rename::new(nole_root, file_events, gate.clone())?);
-        agent.register(Delete::new(nole_root, gate.clone())?);
-        agent.register(Edit::new(nole_root, gate.clone(), reads, registers)?);
-        agent.register(Daily::new(nole_root)?);
         agent.register(Open::new(nole_root, agent.events.clone())?);
         agent.register(Notify {
             events: agent.events.clone(),
@@ -198,51 +176,16 @@ impl Agent {
             cancelled,
             interactions,
         });
-        if has_web_search {
-            agent.register(SearchWeb {
-                client: client.clone(),
-                api_key: tavily_api_key.clone(),
-            });
-        }
-        let subagent_runtime = subagent::SubagentRuntime::new(
-            &agent.config,
-            agent.provider.clone(),
-            agent.system.clone(),
-            agent.events.clone(),
-            agent.cancelled.clone(),
-            agent.concurrency.clone(),
-        );
         let collaborators = collaborators
             .unwrap_or_else(|| collaboration::CollaboratorsHandle::new(&session_directory));
         collaborators.load()?;
         agent.register(Collaborate::new(
-            SubagentTools {
-                root: nole_root.into(),
-                session_directory: session_directory.clone(),
-                workspace_index,
-                wiki_links,
-                client,
-                tavily_api_key,
-                skills,
-            },
-            subagent_runtime,
+            agent_tools,
+            environment,
             collaborators,
             agent.jobs.clone(),
             agent.config.max_concurrent_subagents,
         ));
-        agent.register(ImportAttachment::new(nole_root)?);
-        agent.register(ListAttachments::new(nole_root)?);
-        agent.register(AttachmentInfo::new(nole_root)?);
-        agent.register(CheckoutAttachment::new(nole_root)?);
-        agent.register(UpdateAttachment::new(nole_root, gate.clone())?);
-        agent.register(DeleteAttachment::new(
-            nole_root,
-            gate.clone(),
-            attachment_usage,
-        )?);
-        if let Some(definition) = agent.definitions.last_mut() {
-            definition.cache = true;
-        }
         Ok(agent)
     }
 
@@ -263,6 +206,10 @@ impl Agent {
             self.definitions[index] = definition;
         } else {
             self.definitions.push(definition);
+        }
+        let last = self.definitions.len().saturating_sub(1);
+        for (index, definition) in self.definitions.iter_mut().enumerate() {
+            definition.cache = index == last;
         }
         self.tools
             .insert(name, Arc::new(RegisteredTool::new(tool, &schema)));

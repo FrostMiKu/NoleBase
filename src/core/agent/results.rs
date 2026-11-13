@@ -80,9 +80,8 @@ impl SessionResultStore {
         }
         fs::create_dir_all(&self.root)
             .with_context(|| format!("creating {}", self.root.display()))?;
-        let id = *next;
+        let mut id = *next;
         *next = next.checked_add(1).context("session result id exhausted")?;
-        let path = self.root.join(id.to_string());
         let temporary = self.root.join(format!(
             ".{id}.{}-{:016x}.tmp",
             std::process::id(),
@@ -101,13 +100,25 @@ impl SessionResultStore {
                 .with_context(|| format!("creating {}", temporary.display()))?;
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
-            fs::rename(&temporary, &path)
-                .with_context(|| format!("publishing {}", path.display()))?;
+            // Publish complete bytes without replacing an existing result. An
+            // Agent rebuilt after a configuration refresh can share this directory
+            // with collaborators holding an earlier store instance.
+            loop {
+                let path = self.root.join(id.to_string());
+                match fs::hard_link(&temporary, &path) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        id = id.checked_add(1).context("session result id exhausted")?;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("publishing {}", path.display()))
+                    }
+                }
+            }
+            *next = id.checked_add(1).context("session result id exhausted")?;
             Ok(())
         })();
-        if outcome.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
+        let _ = fs::remove_file(&temporary);
         outcome?;
         Ok(format!("{RESULT_URI_PREFIX}{id}"))
     }
@@ -169,6 +180,38 @@ fn next_result_id(root: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrently_active_store_instances_publish_distinct_complete_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = SessionResultStore::in_directory(directory.path()).unwrap();
+        let b = SessionResultStore::in_directory(directory.path()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads = [a.clone(), b]
+            .into_iter()
+            .enumerate()
+            .map(|(index, store)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let body = format!("Result {index}\n{}", "full text\n".repeat(1000));
+                    (store.store(&body).unwrap(), body)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(results[0].0, results[1].0);
+        for (uri, body) in results {
+            let id = parse_result_id(&uri).unwrap().unwrap();
+            assert_eq!(
+                fs::read_to_string(resolve_result_in(directory.path(), id).unwrap()).unwrap(),
+                body
+            );
+        }
+    }
 
     #[test]
     fn stored_results_bound_every_line_without_splitting_unicode() {

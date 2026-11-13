@@ -314,12 +314,14 @@ impl Tool for RenameTag {
 
 pub struct Daily {
     storage: Storage,
+    gate: ApprovalGate,
 }
 
 impl Daily {
-    pub fn new(root: &Path) -> Result<Self> {
+    pub fn new(root: &Path, gate: ApprovalGate) -> Result<Self> {
         Ok(Self {
             storage: Storage::new(root)?,
+            gate,
         })
     }
 }
@@ -358,6 +360,16 @@ impl Tool for Daily {
                         .map(str::to_owned)
                 })
                 .transpose()?;
+            self.gate
+                .request(ApprovalRequest {
+                    title: "Add daily entry".into(),
+                    message: format!(
+                        "Add to {}: {content}",
+                        requested_date.as_deref().unwrap_or("today")
+                    ),
+                    kind: ApprovalKind::Confirm,
+                })
+                .await?;
             let note = match requested_date {
                 Some(date) => self.storage.append_daily(&date, content)?,
                 None => self.storage.append_to_today(content)?,
@@ -388,5 +400,34 @@ fn tag_scope_label(scope: Option<TagScope>) -> &'static str {
         Some(TagScope::Daily) => "daily",
         Some(TagScope::Notes) => "notes",
         Some(TagScope::Archives) => "archives",
+    }
+}
+
+#[cfg(test)]
+mod daily_approval_tests {
+    use super::*;
+    use crate::core::agent::test_support::{event_channel, gate, test_runtime};
+    use crate::core::agent::{ApprovalDecision, PermissionMode};
+
+    #[test]
+    fn denying_a_daily_entry_preserves_the_existing_note() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::new(directory.path()).unwrap();
+        storage.ensure_files().unwrap();
+        storage.append_daily("2026-11-14", "Original").unwrap();
+        let path = directory.path().join("daily/2026-11-14.md");
+        let before = std::fs::read(&path).unwrap();
+        let (events, _receiver) = event_channel();
+        let (decisions, receiver) = tokio::sync::mpsc::unbounded_channel();
+        decisions.send(ApprovalDecision::Deny).unwrap();
+        let tool = Daily::new(
+            directory.path(),
+            gate(PermissionMode::Approve, directory.path(), events, receiver),
+        )
+        .unwrap();
+        assert!(test_runtime()
+            .block_on(tool.execute(&json!({"date":"2026-11-14","content":"Change"})))
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }

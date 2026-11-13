@@ -8,48 +8,7 @@ use serde_json::Value;
 
 use super::types::ToolExecutionPolicy;
 
-/// A tool execution result: the human/model text plus any native image blocks
-/// the tool produced (currently only `read`). Images travel alongside the text
-/// so the caller can place them protocol-safe in outgoing messages.
-#[derive(Clone, Debug)]
-pub struct ToolOutput {
-    pub exit_code: Option<i32>,
-    pub content: String,
-    pub images: Vec<crate::core::provider::ImageBlock>,
-}
-
-impl ToolOutput {
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            exit_code: None,
-            content: text.into(),
-            images: Vec::new(),
-        }
-    }
-
-    pub fn process(exit_code: i32, content: impl Into<String>) -> Self {
-        Self {
-            exit_code: Some(exit_code),
-            content: content.into(),
-            images: Vec::new(),
-        }
-    }
-
-    pub fn with_images(
-        content: impl Into<String>,
-        images: Vec<crate::core::provider::ImageBlock>,
-    ) -> Self {
-        Self {
-            exit_code: None,
-            content: content.into(),
-            images,
-        }
-    }
-
-    pub(crate) fn into_inline_text(self) -> String {
-        self.content
-    }
-}
+pub use super::output::{ToolErrorCode, ToolOutput, ToolStatus};
 
 /// The minimal interface needed to expose a new tool to the model.
 #[async_trait::async_trait]
@@ -99,8 +58,20 @@ impl RegisteredTool {
 
     pub(crate) async fn execute(&self, input: &Value) -> Result<ToolOutput> {
         self.validator.validate(input).map_err(|error| {
-            anyhow::anyhow!("invalid input for tool {}: {error}", self.tool.name())
+            anyhow::Error::new(ToolInputError(format!(
+                "invalid input for tool {}: {error}",
+                self.tool.name()
+            )))
         })?;
         self.tool.execute(input).await
     }
 }
+
+#[derive(Debug)]
+pub(super) struct ToolInputError(pub String);
+impl std::fmt::Display for ToolInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for ToolInputError {}

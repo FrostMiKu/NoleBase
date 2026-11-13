@@ -199,3 +199,19 @@ fn a_session_interrupted_by_shutdown_restores_its_history_and_recovers_once() {
     let again = AgentSessions::open(workspace).unwrap();
     assert_eq!(again.get(id).unwrap().history(), restored.history());
 }
+
+#[test]
+fn collaborator_approval_remains_visible_after_parent_finishes_until_resolved() {
+    let (_directory, workspace) = workspace();
+    let sessions = AgentSessions::open(workspace).unwrap();
+    let session = sessions.create("Writing").unwrap();
+    session.observe(&AgentEvent::Approval(crate::core::agent::ApprovalRequest {
+        title: "editor: Write checklist".into(),
+        message: "Checklist".into(),
+        kind: crate::core::agent::ApprovalKind::Confirm,
+    }));
+    session.observe(&AgentEvent::Finished(Ok("Delegated".into())));
+    assert!(session.pending_interactions().0.is_some());
+    session.observe(&AgentEvent::ApprovalResolved);
+    assert!(session.pending_interactions().0.is_none());
+}

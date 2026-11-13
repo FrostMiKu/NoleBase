@@ -12,14 +12,6 @@ pub(crate) fn deferred_tool_result(call: &ToolCall) -> ToolResult {
     }
 }
 
-pub(crate) fn failed_tool_result(call: &ToolCall, error: &str) -> ToolResult {
-    ToolResult {
-        tool_use_id: call.id.clone(),
-        content: error.to_string(),
-        is_error: true,
-    }
-}
-
 pub(crate) fn skipped_after_denial_tool_result(call: &ToolCall) -> ToolResult {
     ToolResult {
         tool_use_id: call.id.clone(),

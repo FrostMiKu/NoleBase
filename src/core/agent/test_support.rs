@@ -1,4 +1,7 @@
 //! Shared test helpers used by both the agent-runtime tests and the tool tests.
+use super::{
+    AgentConfig, AttachmentStore, Client, Path, Provider, SessionResultStore, ToolConcurrencyLimits,
+};
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8};
@@ -116,4 +119,23 @@ pub(crate) fn gate(
         Arc::new(tokio::sync::Mutex::new(decisions)),
         UserInteractionWaits::default(),
     )
+}
+
+/// Exercise the production Agent constructor with controlled provider I/O.
+pub(crate) fn environment(
+    config: &AgentConfig,
+    provider: Arc<dyn Provider>,
+    events: AgentEventSender,
+    directory: &Path,
+) -> super::environment::AgentEnvironment {
+    super::environment::AgentEnvironment {
+        config: config.clone(),
+        provider,
+        system: Vec::new(),
+        events,
+        concurrency: ToolConcurrencyLimits::from_config(config),
+        attachments: AttachmentStore::new(directory.join("attachments")),
+        client: Client::new(),
+        results: SessionResultStore::in_directory(directory).unwrap(),
+    }
 }

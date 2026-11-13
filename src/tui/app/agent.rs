@@ -95,7 +95,10 @@ impl App {
         }
         for event in events {
             if self.ai_cancelling
-                && !matches!(&event, AgentEvent::Stopped(_) | AgentEvent::Finished(_))
+                && !matches!(
+                    &event,
+                    AgentEvent::Stopped(_) | AgentEvent::Finished(_) | AgentEvent::ApprovalResolved
+                )
             {
                 continue;
             }
@@ -230,6 +233,20 @@ impl App {
                     self.approval_request = Some(request);
                     self.approval_scroll = 0;
                     self.set_overlay(Overlay::Approval);
+                }
+                AgentEvent::ApprovalResolved => {
+                    self.approval_request = None;
+                    if self.overlay == Some(Overlay::Approval) {
+                        self.overlay = None;
+                    }
+                    if self.dialog.as_ref().is_some_and(|dialog| {
+                        matches!(
+                            dialog.purpose,
+                            DialogPurpose::AgentApproval | DialogPurpose::AgentDestructiveApproval
+                        )
+                    }) {
+                        self.dialog = None;
+                    }
                 }
                 AgentEvent::AskUser(request) => {
                     self.set_status("Agent is waiting for your answer");

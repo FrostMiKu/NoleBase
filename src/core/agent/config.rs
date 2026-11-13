@@ -76,8 +76,7 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: u64,
-    /// Round budget for non-interactive subagents (explore, review, and the
-    /// subagent tool). The main Agent conversation has no round limit; the
+    /// Round budget for each collaborator assignment. The main Agent conversation has no round limit; the
     /// user interrupts it directly.
     #[serde(default = "default_max_subagent_rounds")]
     pub max_subagent_rounds: u32,

@@ -19,7 +19,10 @@ use crate::core::provider::ImageSource;
 use anyhow::{bail, Result};
 
 use super::types::{AgentEvent, AgentEventSender};
-use super::{externalize_tool_output_with, render_tool_output, SessionResultStore, ToolOutput};
+use super::{
+    externalize_tool_output_with, render_tool_output, SessionResultStore, ToolErrorCode,
+    ToolOutput, ToolStatus,
+};
 /// How long settled job rows stay listed after settlement.
 const SETTLED_RETENTION: Duration = Duration::from_secs(10 * 60);
 
@@ -277,12 +280,17 @@ impl AgentJobsHandle {
             .lock()
             .ok()
             .and_then(|state| state.result_store.clone());
-        let outcome = match (outcome, result_store) {
-            (Ok(output), Some((results, token_cap))) => {
-                externalize_tool_output_with(&results, token_cap, output)
-                    .map_err(|error| format!("storing background job result: {error:#}"))
-            }
-            (outcome, _) => outcome,
+        let output =
+            outcome.unwrap_or_else(|error| ToolOutput::failure(ToolErrorCode::ToolFailed, error));
+        let output = match result_store {
+            Some((results, token_cap)) => externalize_tool_output_with(&results, token_cap, output)
+                .unwrap_or_else(|error| {
+                    ToolOutput::failure(
+                        ToolErrorCode::ResultStorage,
+                        format!("storing background job result: {error:#}"),
+                    )
+                }),
+            None => output,
         };
         let delivery = {
             let Ok(mut state) = self.inner.lock() else {
@@ -294,25 +302,17 @@ impl AgentJobsHandle {
             if state.entries[index].status.is_settled() {
                 return;
             }
-            let status = match &outcome {
-                Ok(_) => JobStatus::Done,
-                Err(_) => JobStatus::Failed,
+            let status = match output.status() {
+                ToolStatus::Success => JobStatus::Done,
+                ToolStatus::Error => JobStatus::Failed,
             };
             let duration = state.entries[index].started.elapsed();
-            let (output, error) = match outcome {
-                Ok(output) => (output, None),
-                Err(error) => (ToolOutput::text(&error), Some(error)),
-            };
             let entry = &mut state.entries[index];
             entry.status = status;
             entry.settled = Some(Instant::now());
             entry.output = Some(output.clone());
             if let Some(waiter) = entry.waiter.take() {
-                let forwarded = match error {
-                    None => Ok(output.clone()),
-                    Some(error) => Err(error),
-                };
-                let _ = waiter.send(forwarded);
+                let _ = waiter.send(Ok(output.clone()));
             }
             state.revision += 1;
             let should_deliver =
@@ -804,11 +804,17 @@ mod tests {
                 height: 4,
                 bytes: None,
             }],
+            ..crate::core::agent::ToolOutput::text("")
         };
         jobs.settle(&started.id, Ok(output));
         let deliveries = jobs.take_deliveries();
         assert!(deliveries[0].output.content.contains("nole://result/1"));
         assert_eq!(deliveries[0].output.exit_code, Some(7));
+        assert_eq!(deliveries[0].status, JobStatus::Failed);
+        assert_eq!(
+            deliveries[0].output.error_code(),
+            Some(ToolErrorCode::ProcessExit)
+        );
         assert_eq!(deliveries[0].output.images.len(), 1);
     }
 
@@ -825,8 +831,36 @@ mod tests {
         assert!(deliveries[0].output.content.contains("nole://result/1"));
         assert_eq!(
             std::fs::read_to_string(results.root.join("1")).unwrap(),
-            big
+            format!("Status: success\n\n{big}")
         );
+    }
+
+    #[test]
+    fn oversized_background_errors_use_the_common_readable_result_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, _) = event_channel();
+        let results = crate::core::agent::SessionResultStore::new(directory.path()).unwrap();
+        let jobs = AgentJobsHandle::new(events).with_result_store(results.clone(), 1);
+        let started = jobs
+            .start_background(JobKind::Tool, "failing tool")
+            .unwrap();
+        let error = "Failure\ncaused by: detail\n".repeat(100);
+        jobs.settle(&started.id, Err(error.clone()));
+        let deliveries = jobs.take_deliveries();
+        assert_eq!(deliveries[0].status, JobStatus::Failed);
+        assert_eq!(deliveries[0].output.status(), ToolStatus::Error);
+        assert_eq!(
+            deliveries[0].output.error_code(),
+            Some(ToolErrorCode::ToolFailed)
+        );
+        assert!(deliveries[0].output.content.contains("nole://result/1"));
+        assert_eq!(
+            std::fs::read_to_string(results.root.join("1")).unwrap(),
+            format!("Status: error\nError code: tool_failed\n\n{error}")
+        );
+        let outcome = jobs.take_result(&started.id).unwrap();
+        assert_eq!(outcome.status(), ToolStatus::Error);
+        assert_eq!(outcome.content, deliveries[0].output.content);
     }
 
     #[test]

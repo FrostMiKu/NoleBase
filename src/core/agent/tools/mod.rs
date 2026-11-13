@@ -7,6 +7,7 @@
 
 mod attachment_ops;
 mod calculator;
+mod capabilities;
 mod collaborate;
 mod file_edit;
 mod file_ops;
@@ -14,10 +15,10 @@ mod file_patch;
 mod grep;
 mod interactive;
 mod jobs;
+pub(crate) mod mutations;
 mod notes_tags;
 pub(crate) mod read;
 mod shell;
-mod subagent_tools;
 mod todo;
 mod util;
 mod wait;
@@ -26,7 +27,7 @@ mod wiki_links;
 mod workspace_quota;
 mod write_policy;
 
-pub(crate) use subagent_tools::SubagentTools;
+pub(crate) use capabilities::AgentTools;
 
 pub use self::{
     attachment_ops::*, calculator::*, collaborate::*, file_ops::*, file_patch::*, grep::*,

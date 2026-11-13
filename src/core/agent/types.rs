@@ -165,6 +165,7 @@ pub enum AgentEvent {
     },
     OpenFile(PathBuf),
     Approval(ApprovalRequest),
+    ApprovalResolved,
     AskUser(AskUserRequest),
     PrivateTerminalInput(PrivateTerminalInputRequest),
     Stopped(AgentStopReason),

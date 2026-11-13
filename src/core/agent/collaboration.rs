@@ -1,39 +1,17 @@
 //! Persistent collaborators with independent histories and round-boundary mailboxes.
+mod model;
 #[cfg(test)]
 mod tests;
-use super::{AgentJobsHandle, JobKind, SubagentRunner, ToolOutput};
+mod worker;
+use super::{Agent, AgentJobsHandle, JobKind};
 use crate::core::provider::Message;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+pub(crate) use model::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CollaboratorStatus {
-    Running,
-    Idle,
-    Failed,
-    Stopped,
-    Interrupted,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CollaboratorNote {
-    pub id: Uuid,
-    pub name: String,
-    pub profile: String,
-    pub instructions: String,
-    pub status: CollaboratorStatus,
-    pub messages: Vec<Message>,
-    pub inbox: VecDeque<String>,
-    pub result: Option<String>,
-    pub generation: u64,
-}
 
 pub(crate) struct Collaborator {
     note: Mutex<CollaboratorNote>,
@@ -43,14 +21,8 @@ pub(crate) struct Collaborator {
 }
 
 impl Collaborator {
-    pub fn has_pending(&self) -> bool {
-        !self.note.lock().unwrap().inbox.is_empty()
-    }
     pub fn is_running(&self) -> bool {
-        matches!(
-            self.note.lock().unwrap().status,
-            CollaboratorStatus::Running
-        )
+        self.note.lock().unwrap().status.is_active()
     }
     pub fn snapshot(&self) -> CollaboratorNote {
         self.note.lock().unwrap().clone()
@@ -87,7 +59,10 @@ impl Collaborator {
     pub fn checkpoint(&self, messages: &mut Vec<Message>) -> Result<bool> {
         let mut note = self.note.lock().unwrap();
         let received = !note.inbox.is_empty();
-        messages.extend(note.inbox.drain(..).map(Message::user));
+        while let Some(message) = note.inbox.pop_front() {
+            note.consumed_messages = message.sequence;
+            messages.push(Message::user(message.text));
+        }
         note.messages = messages.clone();
         self.save(&note)?;
         Ok(received)
@@ -117,6 +92,7 @@ impl CollaboratorsHandle {
         if self.loaded.load(Ordering::Acquire) {
             return Ok(());
         }
+        let mut restored = HashMap::<Uuid, Arc<Collaborator>>::new();
         if self.directory.exists() {
             for entry in std::fs::read_dir(&self.directory)? {
                 let entry = entry?;
@@ -134,10 +110,18 @@ impl CollaboratorsHandle {
                         == Some(&note.id.to_string()),
                     "Collaborator identity differs from its file"
                 );
-                if matches!(note.status, CollaboratorStatus::Running) {
+                if note.status.is_active() {
                     note.status = CollaboratorStatus::Interrupted;
                 }
-                agents.insert(
+                validate_name(&note.name)?;
+                anyhow::ensure!(
+                    !restored
+                        .values()
+                        .any(|agent| agent.snapshot().name == note.name),
+                    "Duplicate collaborator name: {}",
+                    note.name
+                );
+                restored.insert(
                     note.id,
                     Arc::new(Collaborator {
                         note: Mutex::new(note),
@@ -148,17 +132,18 @@ impl CollaboratorsHandle {
                 );
             }
         }
+        *agents = restored;
         self.loaded.store(true, Ordering::Release);
         Ok(())
     }
 
-    pub fn rows(&self) -> Vec<CollaboratorNote> {
+    pub fn rows(&self) -> Vec<CollaboratorSummary> {
         let mut rows = self
             .agents
             .lock()
             .unwrap()
             .values()
-            .map(|agent| agent.snapshot())
+            .map(|agent| agent.note.lock().unwrap().summary())
             .collect::<Vec<_>>();
         rows.sort_by_key(|agent| agent.id);
         rows
@@ -183,13 +168,33 @@ impl CollaboratorsHandle {
             .context("Collaborator not found in this Session")
     }
 
+    pub fn resolve(&self, identifier: &str) -> Result<Uuid> {
+        let agents = self.agents.lock().unwrap();
+        if let Ok(id) = Uuid::parse_str(identifier) {
+            if agents.contains_key(&id) {
+                return Ok(id);
+            }
+        }
+        if let Some((id, _)) = agents
+            .iter()
+            .find(|(_, agent)| agent.note.lock().unwrap().name == identifier)
+        {
+            return Ok(*id);
+        }
+        anyhow::bail!("invalid input for tool agents (id): choose a full UUID or exact collaborator name from agents list; received {identifier:?}")
+    }
+
     pub fn create(
         &self,
         name: String,
-        profile: String,
+        access: CollaboratorAccess,
         instructions: String,
     ) -> Result<Arc<Collaborator>> {
+        validate_name(&name)?;
+        self.load()?;
+        let mut agents = self.agents.lock().unwrap();
         anyhow::ensure!(!*self.closed.lock().unwrap(), "Session has ended");
+        anyhow::ensure!(!agents.values().any(|agent| agent.note.lock().unwrap().name == name), "invalid input for tool agents (name): collaborator {name:?} already exists in this Session; use send to continue it");
         let id = Uuid::new_v4();
         let agent = Arc::new(Collaborator {
             path: self.directory.join(format!("{id}.json")),
@@ -198,132 +203,118 @@ impl CollaboratorsHandle {
             note: Mutex::new(CollaboratorNote {
                 id,
                 name,
-                profile,
+                access,
                 instructions,
                 status: CollaboratorStatus::Idle,
                 messages: Vec::new(),
                 inbox: VecDeque::new(),
-                result: None,
+                received_messages: 0,
+                consumed_messages: 0,
+                reports: Vec::new(),
+                error: None,
                 generation: 0,
             }),
         });
         agent.save(&agent.snapshot())?;
-        self.agents.lock().unwrap().insert(id, agent.clone());
+        agents.insert(id, agent.clone());
         Ok(agent)
+    }
+
+    pub fn discard_unstarted(&self, id: Uuid) -> Result<()> {
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(agent) = agents.get(&id) {
+            anyhow::ensure!(!agent.is_running(), "Collaborator is active");
+            std::fs::remove_file(&agent.path)?;
+        }
+        agents.remove(&id);
+        Ok(())
     }
 
     pub fn send(
         &self,
         agent: Arc<Collaborator>,
         text: String,
-        runner: Arc<SubagentRunner>,
+        runner: Arc<Agent>,
         jobs: AgentJobsHandle,
         maximum: usize,
-    ) -> Result<()> {
+    ) -> Result<MessageReceipt> {
+        anyhow::ensure!(
+            !text.trim().is_empty(),
+            "invalid input for tool agents (message): provide a non-empty message"
+        );
         let agents = self.agents.lock().unwrap();
         anyhow::ensure!(!*self.closed.lock().unwrap(), "Session has ended");
         let running = agents.values().filter(|agent| agent.is_running()).count();
         let mut note = agent.note.lock().unwrap();
-        if matches!(note.status, CollaboratorStatus::Running) {
-            note.inbox.push_back(text);
-            return agent.save(&note);
-        }
         anyhow::ensure!(
-            running < maximum,
+            note.status != CollaboratorStatus::Stopping,
+            "Collaborator is stopping; wait for stopped before sending another message"
+        );
+        let active = note.status == CollaboratorStatus::Running;
+        anyhow::ensure!(
+            active || running < maximum,
             "All collaborator slots are busy; wait for a collaborator to finish"
         );
-        let job = jobs.start_background(JobKind::Tool, &format!("Agent {}", note.name))?;
-        note.inbox.push_back(text);
-        note.status = CollaboratorStatus::Running;
-        note.generation += 1;
-        note.result = None;
-        agent.cancelled.store(false, Ordering::Relaxed);
+        let job = if active {
+            None
+        } else {
+            Some(jobs.start_background(
+                JobKind::Tool,
+                &format!("Agent {} · report {}", note.name, note.reports.len() + 1),
+            )?)
+        };
+        let previous = note.clone();
+        note.received_messages += 1;
+        let sequence = note.received_messages;
+        note.inbox.push_back(CollaboratorMessage { sequence, text });
+        if !active {
+            note.status = CollaboratorStatus::Running;
+            note.generation += 1;
+            note.error = None;
+            agent.cancelled.store(false, Ordering::Relaxed);
+        }
         if let Err(error) = agent.save(&note) {
-            jobs.cancel(&job.id);
+            *note = previous;
+            if let Some(job) = job {
+                jobs.cancel(&job.id);
+            }
             return Err(error);
         }
-        let mut messages = note.messages.clone();
+        let receipt = MessageReceipt {
+            id: note.id,
+            sequence,
+            generation: note.generation,
+            pending_messages_at_acceptance: note.inbox.len(),
+        };
         drop(note);
         drop(agents);
-        let closed = self.closed.clone();
-        let worker_agent = agent.clone();
-        let worker_jobs = jobs.clone();
-        let job_id = job.id.clone();
-        let spawned = std::thread::Builder::new()
-            .name("collaborator".into())
-            .spawn(move || {
-                let agent = worker_agent;
-                let result = (|| -> Result<String> {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    runtime.block_on(async {
-                        loop {
-                            agent.checkpoint(&mut messages)?;
-                            let result = runner.run_conversation(&mut messages, Some(&agent)).await;
-                            let mut note = agent.note.lock().unwrap();
-                            note.messages = messages.clone();
-                            if *closed.lock().unwrap() {
-                                return Err(anyhow::anyhow!("Session has ended"));
-                            }
-                            if result.is_ok() && !note.inbox.is_empty() {
-                                drop(note);
-                                continue;
-                            }
-                            note.status = if agent.cancelled.load(Ordering::Relaxed) {
-                                CollaboratorStatus::Stopped
-                            } else if result.is_ok() {
-                                CollaboratorStatus::Idle
-                            } else {
-                                CollaboratorStatus::Failed
-                            };
-                            note.result = Some(
-                                result
-                                    .as_ref()
-                                    .map(Clone::clone)
-                                    .unwrap_or_else(|error| format!("{error:#}")),
-                            );
-                            agent.save(&note)?;
-                            return result;
-                        }
-                    })
-                })();
-                if let Err(error) = &result {
-                    let mut note = agent.note.lock().unwrap();
-                    if matches!(note.status, CollaboratorStatus::Running) {
-                        note.status = if agent.cancelled.load(Ordering::Relaxed) {
-                            CollaboratorStatus::Stopped
-                        } else {
-                            CollaboratorStatus::Failed
-                        };
-                        note.result = Some(format!("{error:#}"));
-                        let _ = agent.save(&note);
-                    }
-                }
-                worker_jobs.settle(
-                    &job_id,
-                    result
-                        .map(ToolOutput::text)
-                        .map_err(|error| format!("{error:#}")),
-                );
-            });
-        if let Err(error) = spawned {
-            let mut note = agent.note.lock().unwrap();
-            note.status = CollaboratorStatus::Failed;
-            note.result = Some(error.to_string());
-            let _ = agent.save(&note);
-            jobs.cancel(&job.id);
-            return Err(error.into());
+        if let Some(job) = job {
+            worker::spawn(agent, runner, jobs, job.id)?;
         }
-        Ok(())
+        Ok(receipt)
     }
 
     pub fn cancellation(&self, id: Uuid) -> Result<Arc<AtomicBool>> {
         Ok(self.get(id)?.cancelled.clone())
     }
-    pub fn stop(&self, id: Uuid) -> Result<()> {
-        self.cancellation(id)?.store(true, Ordering::Relaxed);
-        Ok(())
+    pub fn stop(&self, id: Uuid) -> Result<StopOutcome> {
+        let agent = self.get(id)?;
+        let mut note = agent.note.lock().unwrap();
+        let outcome = match note.status {
+            CollaboratorStatus::Running => {
+                note.status = CollaboratorStatus::Stopping;
+                if let Err(error) = agent.save(&note) {
+                    note.status = CollaboratorStatus::Running;
+                    return Err(error);
+                }
+                agent.cancelled.store(true, Ordering::Relaxed);
+                StopOutcome::Stopping
+            }
+            CollaboratorStatus::Stopping => StopOutcome::AlreadyStopping,
+            CollaboratorStatus::Stopped => StopOutcome::AlreadyStopped,
+            _ => StopOutcome::AlreadyIdle,
+        };
+        Ok(outcome)
     }
     pub fn cancel_all(&self) {
         for agent in self.agents.lock().unwrap().values() {

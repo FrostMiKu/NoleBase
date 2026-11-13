@@ -291,7 +291,7 @@ mod tests {
         let output = read.execute(&json!({ "path": uri })).await.unwrap();
         assert!(output
             .clone()
-            .into_inline_text()
+            .content
             .starts_with(&format!("Read image {uri} (8x4, image/png, ")));
         assert_eq!(output.images.len(), 1);
         let block = &output.images[0];

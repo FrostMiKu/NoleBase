@@ -1,7 +1,10 @@
 //! Model-facing lifecycle operations for Session-scoped collaborators.
-use super::subagent_tools::SubagentTools;
-use crate::core::agent::collaboration::CollaboratorsHandle;
-use crate::core::agent::subagent::{SubagentProfile, SubagentRunner, SubagentRuntime};
+use super::capabilities::AgentTools;
+use crate::core::agent::collaboration::{
+    Collaborator, CollaboratorAccess, CollaboratorsHandle, MAX_NAME_LENGTH, NAME_PATTERN,
+};
+use crate::core::agent::environment::AgentEnvironment;
+use crate::core::agent::Agent;
 use crate::core::agent::{AgentJobsHandle, Tool, ToolOutput};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -9,8 +12,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct Collaborate {
-    tools: SubagentTools,
-    runtime: SubagentRuntime,
+    tools: AgentTools,
+    environment: AgentEnvironment,
     agents: CollaboratorsHandle,
     jobs: AgentJobsHandle,
     maximum: usize,
@@ -18,46 +21,40 @@ pub struct Collaborate {
 
 impl Collaborate {
     pub(crate) fn new(
-        tools: SubagentTools,
-        runtime: SubagentRuntime,
+        tools: AgentTools,
+        environment: AgentEnvironment,
         agents: CollaboratorsHandle,
         jobs: AgentJobsHandle,
         maximum: usize,
     ) -> Self {
         Self {
             tools,
-            runtime,
+            environment,
             agents,
             jobs,
             maximum,
         }
     }
 
-    fn runner(&self, id: Uuid) -> Result<Arc<SubagentRunner>> {
-        let note = self.agents.get(id)?.snapshot();
-        let instructions = match note.profile.as_str() {
-            "review" => "Independently evaluate the supplied artifact against the task's goals and constraints. Gather evidence, prioritize actionable findings, and explain their impact.",
-            _ => "Investigate the supplied task, gather evidence with the available tools, and report concrete findings, relevant paths and uncertainties.",
+    fn runner(&self, agent: &Collaborator) -> Result<Arc<Agent>> {
+        let note = agent.snapshot();
+        let scope = match note.access {
+            CollaboratorAccess::ReadOnly => "Inspect sources using your read-only tools and report findings to your parent.",
+            CollaboratorAccess::ReadWrite => "Carry out the assigned work using inspection, file mutation and foreground shell tools. Coordinate file ownership with your parent; this Session's approval policy applies to your operations.",
         };
-        let profile = SubagentProfile::new("collaborator", format!(
-            "You are {} in a Nole Agent Session. {instructions} {}\nKeep your scope focused and use inspection tools to gather evidence. Messages from your parent arrive between rounds. Your conversation is retained across assignments. Return a complete report to your parent when the assignment is complete. Your parent handles user questions and file changes.", note.name, note.instructions),
-            "Synthesize the gathered evidence into a complete report now.", "Continue the assignment and return a complete report.");
-        let runtime = self
-            .runtime
-            .clone()
-            .with_cancellation(self.agents.cancellation(id)?);
-        let mut runner = SubagentRunner::new(runtime, profile);
-        self.tools.register(&mut runner)?;
+        let instructions = format!(
+            "You are {} in a Nole Agent Session. Your parent defines your role:\n{}\n{scope}\nFollow messages from your parent between rounds. Your conversation is retained across assignments. Return a complete report of the work and its outcome. Route user questions through your parent.", note.name, note.instructions);
+        let cancelled = self.agents.cancellation(note.id)?;
+        let mut runner = self
+            .environment
+            .collaborator(cancelled.clone(), &instructions);
+        self.tools
+            .register(&mut runner, note.access, &note.name, cancelled)?;
         Ok(Arc::new(runner))
     }
 
-    fn id(input: &Value) -> Result<Uuid> {
-        input
-            .get("id")
-            .and_then(Value::as_str)
-            .context("Choose a collaborator id")?
-            .parse()
-            .context("Use a valid collaborator id")
+    fn id(&self, input: &Value) -> Result<Uuid> {
+        self.agents.resolve(&Self::text(input, "id")?)
     }
     fn text(input: &Value, name: &str) -> Result<String> {
         Ok(input
@@ -65,14 +62,18 @@ impl Collaborate {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .with_context(|| format!("Provide {name}"))?
+            .with_context(|| {
+                format!("invalid input for tool agents ({name}): provide a non-empty {name}")
+            })?
             .to_string())
     }
     fn rows(&self, ids: &[Uuid]) -> Value {
-        json!(self.agents.rows().into_iter().filter(|note| ids.is_empty() || ids.contains(&note.id)).map(|note| json!({
-            "id": note.id, "name": note.name, "profile": note.profile, "status": note.status,
-            "generation": note.generation, "result": note.result, "pending_messages": note.inbox.len(),
-        })).collect::<Vec<_>>())
+        json!(self
+            .agents
+            .rows()
+            .into_iter()
+            .filter(|note| ids.is_empty() || ids.contains(&note.id))
+            .collect::<Vec<_>>())
     }
 }
 
@@ -82,75 +83,78 @@ impl Tool for Collaborate {
         "agents"
     }
     fn description(&self) -> &'static str {
-        "Create and interact with persistent collaborators inside this Session. Spawn returns immediately. Send steers a running collaborator between rounds or wakes an idle collaborator with its retained conversation. Explore and review profiles inspect sources; the parent handles changes and user interaction. List shows results and stable ids. Wait observes selected collaborators for up to 60 seconds. Completed reports also arrive as background results and wake the parent when idle. Stop interrupts one collaborator. Session histories survive restarts; interrupted collaborators can be resumed with send."
+        "Manage persistent collaborators in this Session. Spawn requires a unique lowercase name, access (read_only or read_write), custom role instructions and an initial message. read_only grants inspection tools. read_write adds file operations and foreground shell under this Session's approval policy. The parent defines every collaborator role and handles user questions. Access is fixed at creation. Send, stop and reports accept a full UUID or exact name; wait accepts those identifiers in ids. Every complete reply is saved and delivered as its own background result, including replies followed by steering. List includes UUID, name, latest successful result, report_count, error, and received/consumed/pending message counts. Pending is the current queue length, not a cumulative count. Send returns a durable receipt with message sequence and queue size at acceptance. Reports retrieves saved replies after a sequence. Stop returns an explicit stopping/idle/stopped acknowledgement; wait observes confirmation for up to 60 seconds. Resume an idle or stopped collaborator using send; its previous result remains readable."
     }
     fn allows_auto_background(&self) -> bool {
         false
     }
     fn input_schema(&self) -> Value {
         json!({ "type": "object", "properties": {
-            "action": {"type": "string", "enum": ["spawn", "send", "list", "wait", "stop"]},
-            "name": {"type": "string", "minLength": 1, "maxLength": 100},
-            "profile": {"type": "string", "enum": ["explore", "review"]},
-            "instructions": {"type": "string"},
-            "message": {"type": "string", "minLength": 1},
-            "id": {"type": "string"},
-            "ids": {"type": "array", "items": {"type": "string"}},
-            "seconds": {"type": "integer", "minimum": 1, "maximum": 60}
-        }, "required": ["action"], "additionalProperties": false })
+            "action": {"type": "string", "enum": ["spawn", "send", "list", "wait", "stop", "reports"]},
+            "name": {"type": "string", "maxLength": MAX_NAME_LENGTH, "pattern": NAME_PATTERN, "description": "Unique Session-scoped lowercase name, for example notes-scout"},
+            "access": {"type": "string", "enum": ["read_only", "read_write"], "description":"Tool access granted at creation, within the Session approval policy"},
+            "instructions": {"type": "string", "minLength":1, "pattern": r"\S", "description": "Custom role, responsibilities and working instructions defined by the parent"},
+            "message": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "Initial task for spawn, or follow-up for send"},
+            "id": {"type": "string", "minLength": 1, "description": "Full UUID or exact name returned by list"},
+            "ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "seconds": {"type": "integer", "minimum": 1, "maximum": 60},
+            "after": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+        }, "required": ["action"], "additionalProperties": false,
+        "allOf": [
+            {"if": {"properties": {"action": {"const": "spawn"}}}, "then": {"required": ["name", "access", "instructions", "message"]}},
+            {"if": {"properties": {"action": {"not": {"const":"spawn"}}}}, "then": {"not": {"anyOf":[{"required":["access"]},{"required":["instructions"]},{"required":["name"]}]}}},
+            {"if": {"properties": {"action": {"const": "send"}}}, "then": {"required": ["id", "message"]}},
+            {"if": {"properties": {"action": {"enum": ["stop", "reports"]}}}, "then": {"required": ["id"]}}
+        ] })
     }
     async fn execute(&self, input: &Value) -> Result<ToolOutput> {
         let action = Self::text(input, "action")?;
         let output = match action.as_str() {
             "spawn" => {
                 let name = Self::text(input, "name")?;
-                let profile = input["profile"].as_str().unwrap_or("explore");
-                anyhow::ensure!(
-                    ["explore", "review"].contains(&profile),
-                    "Choose explore or review"
-                );
+                let access: CollaboratorAccess = serde_json::from_value(input["access"].clone()).context("invalid input for tool agents (access): choose read_only or read_write")?;
+                let instructions = Self::text(input, "instructions")?;
                 let message = Self::text(input, "message")?;
                 let agent = self.agents.create(
                     name,
-                    profile.into(),
-                    input["instructions"].as_str().unwrap_or("").to_string(),
+                    access,
+                    instructions,
                 )?;
                 let id = agent.snapshot().id;
-                self.agents.send(
-                    agent,
-                    message,
-                    self.runner(id)?,
-                    self.jobs.clone(),
-                    self.maximum,
-                )?;
-                self.rows(&[id])
+                let started = self.runner(&agent).and_then(|runner| self.agents.send(agent, message, runner, self.jobs.clone(), self.maximum));
+                match started {
+                    Ok(receipt) => json!({"agents": self.rows(&[id]), "receipt": receipt}),
+                    Err(error) => {
+                        self.agents.discard_unstarted(id).context("cleaning up the unsuccessful spawn")?;
+                        return Err(error);
+                    }
+                }
             }
             "send" => {
-                let id = Self::id(input)?;
-                self.agents.send(
-                    self.agents.get(id)?,
-                    Self::text(input, "message")?,
-                    self.runner(id)?,
-                    self.jobs.clone(),
-                    self.maximum,
-                )?;
-                self.rows(&[id])
+                let id = self.id(input)?;
+                let agent = self.agents.get(id)?;
+                let runner = self.runner(&agent)?;
+                let receipt = self.agents.send(agent, Self::text(input, "message")?, runner, self.jobs.clone(), self.maximum)?;
+                json!({"agents": self.rows(&[id]), "receipt": receipt})
             }
             "stop" => {
-                let id = Self::id(input)?;
-                self.agents.stop(id)?;
-                self.rows(&[id])
+                let id = self.id(input)?;
+                let outcome = self.agents.stop(id)?;
+                json!({"agents": self.rows(&[id]), "outcome": outcome})
             }
-            "list" => self.rows(&[]),
+            "reports" => {
+                let id = self.id(input)?;
+                let after = input["after"].as_u64().unwrap_or(0);
+                let limit = input["limit"].as_u64().unwrap_or(20) as usize;
+                let note = self.agents.get(id)?.snapshot();
+                let reports = note.reports.iter().filter(|report| report.sequence > after).take(limit).collect::<Vec<_>>();
+                json!({"id": id, "name": note.name, "reports": reports, "report_count": note.reports.len()})
+            }
+            "list" => json!({"agents": self.rows(&[])}),
             "wait" => {
-                let ids = input
-                    .get("ids")
-                    .map(|ids| serde_json::from_value::<Vec<Uuid>>(ids.clone()))
-                    .transpose()?
-                    .unwrap_or_default();
-                for id in &ids {
-                    self.agents.get(*id)?;
-                }
+                let identifiers = input.get("ids").map(|ids| serde_json::from_value::<Vec<String>>(ids.clone())).transpose()?.unwrap_or_default();
+                let ids = identifiers.iter().map(|id| self.agents.resolve(id)).collect::<Result<Vec<_>>>()?;
                 let seconds = input["seconds"].as_u64().unwrap_or(30).clamp(1, 60);
                 let deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
@@ -158,12 +162,12 @@ impl Tool for Collaborate {
                     if tokio::time::Instant::now() >= deadline {
                         break;
                     }
-                    self.runtime.ensure_active()?;
+                    anyhow::ensure!(!self.tools.mutations.cancelled.load(std::sync::atomic::Ordering::Relaxed), "agent task cancelled");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                self.rows(&ids)
+                json!({"agents": self.rows(&ids), "timed_out": self.agents.any_running(&ids)})
             }
-            _ => anyhow::bail!("Choose spawn, send, list, wait or stop"),
+            _ => anyhow::bail!("invalid input for tool agents (action): choose spawn, send, list, wait, stop or reports"),
         };
         Ok(ToolOutput::text(serde_json::to_string(&output)?))
     }

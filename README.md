@@ -391,7 +391,7 @@ shows the target, decoded line/byte progress, and latest non-empty content line;
 the complete JSON is still validated before approval or execution.
 `max_subagent_rounds` is the request-round budget for each collaborator assignment; each response may call several tools within that budget.
 The main Agent conversation has no round limit — the user watches the timeline
-and interrupts directly. On an `explore` or `review` subagent's last allowed
+and interrupts directly. On a collaborator's last allowed
 request, Nole appends its finalization prompt and removes all tools. Subagent
 provider responses stream
 internally so long generations stay active, but their text and thinking deltas
@@ -406,12 +406,39 @@ conversation and tool history, so a later prompt can continue it.
 exhausted, uses provider token counting when available and replaces a safe prefix
 of older completed turns with a dense summary. The system prompt, current turn,
 recent history, and complete `tool_use`/`tool_result` pairs are retained.
-Tool results entering the conversation are capped by the same input budget —
-one quarter per result and one half per tool batch, with an explicit
-truncation marker telling the model how to fetch the remainder. If a stored
-result still blocks compaction (cuts only land on user-message boundaries,
-which current-turn results follow), it is cut to a small emergency snippet so
-the conversation keeps running instead of failing the turn.
+Every Agent uses the same conversation loop, provider request path, tool executor,
+context compaction, image handling, and output pipeline. Collaborator policy adds
+its role instructions and assignment round budget, keeps its streamed activity
+scoped to that collaborator, and keeps commands owned by its foreground task.
+
+All tools share one output model:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `status` | `success` or `error` | Derived from the outcome and process exit code |
+| `content` | UTF-8 string | Complete readable result or error text |
+| `exit_code` | signed 32-bit integer or `null` | Process exit code; zero indicates success |
+| `error_code` | enum string or `null` | `tool_failed`, `invalid_input`, `approval_denied`, `process_exit`, `unsupported_image`, `result_storage`, `execution_failed`, or `cancelled` |
+| `images` | array of `ImageBlock` | Native images; an empty array for text-only results |
+
+Each image carries `source` (attachment URI, local path, or URL), `label`,
+`media_type` (`jpeg`, `png`, or `webp`), and unsigned 32-bit `width` and `height`.
+Pixel bytes stay in the in-memory image cache and travel as native provider image
+parts. Runtime errors are normalized at the common tool execution boundary.
+Approval denial ends the current assignment in every Agent scope.
+
+Tool text entering the conversation is capped at 8,192 characters and one quarter
+of the configured input token budget per result. Oversized success and error
+results are saved under the Session's `results/` directory; the model receives a
+`nole://result/<id>` reference that `read` can page. These UTF-8 files start with
+`Status`, followed by the available `Exit code` and `Error code`, each on its own
+line. A blank line separates those headers from the full `content` string. The
+store wraps lines longer than 4,096 characters for pagination. The output envelope
+is rendered as readable text, while the provider supplies its standard tool-result
+protocol framing. Concurrent writes publish distinct complete result files,
+including across Agent configuration refreshes.
+If a stored reference still blocks context compaction, the existing emergency
+snippet keeps the current turn within its context budget.
 The three `max_concurrent_*` settings bound local read/search calls, web
 search/fetch calls, and isolated subagents across the complete Agent tree.
 Endpoints lacking token counting use a conservative local estimate.
@@ -498,12 +525,29 @@ dialog; `r` and `d` manage the selected Session in Agents. Deleting a Session
 cancels its work and removes its conversation and stored results while preserving
 the shared workspace.
 
-The `agents` tool creates explore and review collaborators inside the current
-Session. It supports spawn, send, list, wait, and stop. A collaborator retains its
-conversation, receives messages between rounds, and can be woken for another
-assignment. Completed reports wake the parent through background delivery.
-Session and collaborator histories persist across application restarts; send a
-new message to continue a restored conversation.
+The `agents` tool creates collaborators inside the current
+Session. It supports `spawn`, `send`, `list`, `wait`, `stop`, and `reports`.
+`spawn` requires a unique lowercase `name` (for example `notes-scout`),
+`access` (`read_only` or `read_write`), custom role `instructions`, and a
+`message` with the initial task. The parent defines each collaborator’s role. Use the full UUID or exact name from `list` to address a collaborator.
+Each complete reply is saved and delivered as a separate background result,
+including a reply followed by more steering. `reports` retrieves saved replies
+in sequence order (`after` selects the last sequence already read; `limit`
+bounds a page). The latest successful `result` stays available during another
+assignment; `error` describes a failed or cancelled assignment separately.
+
+Send receipts identify the accepted message by `sequence` and record the queue
+size at acceptance. List snapshots distinguish cumulative `received_messages`
+and `consumed_messages` from the instantaneous `pending_messages` queue length.
+`stop` acknowledges `stopping`, `already_stopping`, `already_stopped`, or
+`already_idle`; `wait` observes the eventual state. Collaborators retain their
+conversations and reports across restarts and can be woken with `send`.
+`read_only` exposes inspection tools. `read_write` also exposes file operations
+and foreground shell commands, following the Session’s Approve/Auto/Yolo policy.
+Access is fixed at creation. Approvals identify the collaborator and are
+serialized across the Session; file mutations share a Session lock. Stopping
+a collaborator cancels its foreground shell command and pending approval.
+The parent handles user interaction.
 
 Each active Session reuses its HTTP client, tools, and read snapshots across
 prompts. Configuration and instructions are refreshed before each run, and
@@ -518,12 +562,10 @@ stable prefix. The current timestamp remains in the newest user message.
 The Agent can inspect the same shared tag index with `tags` and
 `search_tag`. Its `rename_tag` tool follows the active permission policy before
 changing exact Hashtag source spans across a multi-file diff.
-Explore collaborators gather evidence; review collaborators independently evaluate
-artifacts against the assignment’s goals and constraints. Both profiles use
-inspection tools and retain their own tool history and intermediate reasoning.
+Collaborators retain their own tool history and intermediate reasoning.
 The parent sees their reports and can send additional instructions at any time.
 Independent collaborators and their read/search/fetch calls share the Session’s
-concurrency limits. The parent Agent handles file changes and user interaction.
+concurrency limits.
 You can also press `Ctrl+Enter` while the Agent is running. Nole combines all
 such prompts in one buffer and delivers them before the next pending tool call.
 An in-flight concurrent wave is allowed to finish, while later unstarted calls

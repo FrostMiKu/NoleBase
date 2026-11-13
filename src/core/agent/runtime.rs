@@ -17,6 +17,7 @@ pub struct AgentRuntime {
     pub(super) workspace_index: WorkspaceIndexHandle,
     pub(super) wiki_links: crate::core::wiki_link_index::WikiLinkIndexHandle,
     pub(super) session_directory: Option<PathBuf>,
+    pub(super) mutation_lock: Arc<tokio::sync::Mutex<()>>,
     pub(super) collaborators: Option<collaboration::CollaboratorsHandle>,
 }
 
@@ -33,6 +34,7 @@ impl AgentRuntime {
         Self {
             session_directory: None,
             collaborators: None,
+            mutation_lock: Arc::default(),
             jobs: AgentJobsHandle::new(events.clone()),
             events,
             decisions: Arc::new(tokio::sync::Mutex::new(decisions)),

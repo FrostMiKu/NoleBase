@@ -180,7 +180,7 @@
         assert!(oversized.contains("Tool result stored at nole://result/1"));
         assert!(estimate_text_tokens(&oversized) <= agent.tool_result_token_cap());
         let stored = fs::read_to_string(agent.results.root.join("1")).unwrap();
-        assert_eq!(stored.replace('\n', ""), "x".repeat(40_000));
+        assert_eq!(stored.strip_prefix("Status: success\n\n").unwrap().replace('\n', ""), "x".repeat(40_000));
         assert!(stored.lines().all(|line| line.chars().count() <= 4_096));
         assert_eq!(
             agent
@@ -191,14 +191,14 @@
     }
 
     #[test]
-    fn oversized_process_output_stores_only_content() {
+    fn oversized_process_output_stores_readable_metadata_and_content() {
         let agent = small_budget_agent();
         let output = ToolOutput::process(23, "你".repeat(10_000));
         let rendered = agent.materialize_tool_output(output).unwrap();
         assert!(rendered.contains("Exit code: 23"));
         assert!(rendered.contains("nole://result/1"));
         let stored = fs::read_to_string(agent.results.root.join("1")).unwrap();
-        assert_eq!(stored.replace('\n', ""), "你".repeat(10_000));
+        assert_eq!(stored.strip_prefix("Status: error\nExit code: 23\nError code: process_exit\n\n").unwrap().replace('\n', ""), "你".repeat(10_000));
         assert!(stored.lines().all(|line| line.chars().count() <= 4_096));
     }
 
@@ -560,7 +560,7 @@
         let mut reported_duration = Duration::ZERO;
 
         report_provider_metrics(
-            &events,
+            |event| { let _ = events.send(event); },
             &mut reported_usage,
             &mut reported_duration,
             TokenUsage {
@@ -1119,6 +1119,7 @@
         };
         decision_sender.send(ApprovalDecision::Deny).unwrap();
         assert!(outside_worker.join().unwrap().is_err());
+        assert!(matches!(event_receiver.blocking_recv().unwrap(), AgentEvent::ApprovalResolved));
 
         let (decision_sender, decision_receiver) = tokio::sync::mpsc::unbounded_channel();
         let delete = Delete::new(
@@ -2309,7 +2310,8 @@
                     height: 4,
                     bytes: Some(Arc::from(vec![0xAAu8; 16])),
                 }],
-            })
+            ..crate::core::agent::ToolOutput::text("")
+})
         }
     }
 
@@ -2517,13 +2519,14 @@
                     .unwrap()
                 }),
         );
-        // Capability disabled: only the exact is_error text is produced, and
+        // Capability disabled: a typed error is produced, and
         // no image parts ever reach the conversation.
         assert_eq!(messages.len(), 1);
         match &messages[0].parts[0] {
             MessagePart::ToolResult(result) => {
                 assert!(result.is_error);
-                assert_eq!(result.content, crate::core::agent::images::DISABLED_IMAGE_ERROR);
+                assert!(result.content.contains("Error code: unsupported_image"));
+                assert!(result.content.ends_with(crate::core::agent::images::DISABLED_IMAGE_ERROR));
             }
             _ => panic!("expected tool result"),
         }
@@ -2693,7 +2696,8 @@
                     height: 4,
                     bytes: Some(Arc::from(vec![0xBBu8; 16])),
                 }],
-            })
+            ..crate::core::agent::ToolOutput::text("")
+})
         }
     }
 

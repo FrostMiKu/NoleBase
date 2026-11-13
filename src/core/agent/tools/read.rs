@@ -632,7 +632,7 @@ mod tests {
             .unwrap();
         assert!(output
             .clone()
-            .into_inline_text()
+            .content
             .starts_with("Read image diagram.png (8x4, image/png, "));
         assert_eq!(output.images.len(), 1);
         assert!(output.images[0].bytes.is_some());

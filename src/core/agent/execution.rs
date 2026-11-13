@@ -17,7 +17,7 @@ impl Agent {
                     // The call never executes, so no ToolStarted/ToolFinished
                     // pair will arrive from the executor: retire its streamed
                     // preparation row here or it spins forever.
-                    let _ = self.events.send(AgentEvent::ToolFinished {
+                    let _ = self.emit(AgentEvent::ToolFinished {
                         id: call.id.clone(),
                         message: tool_abandoned_activity(&tool_call_value(call), "Deferred"),
                         preview: None,
@@ -67,7 +67,7 @@ impl Agent {
                 outputs.extend(tool_uses[end..].iter().enumerate().map(|(offset, call)| {
                     // Skipped without execution: retire the preparation row
                     // the same way the deferral path does.
-                    let _ = self.events.send(AgentEvent::ToolFinished {
+                    let _ = self.emit(AgentEvent::ToolFinished {
                         id: call.id.clone(),
                         message: tool_abandoned_activity(&tool_call_value(call), "Skipped"),
                         preview: None,
@@ -186,16 +186,18 @@ impl Agent {
             .concurrency
             .acquire(self.tool_execution_policy(call))
             .await;
-        let _ = self.events.send(AgentEvent::ToolStarted {
+        let _ = self.emit(AgentEvent::ToolStarted {
             id: call.id.clone(),
             message: tool_start_activity(&tool_call_value(call)),
         });
         let execution = match input_error {
-            Some(error) => {
-                ToolCallExecution::Completed(ToolCallOutput::text(failed_tool_result(call, error)))
-            }
+            Some(error) => self.finish_tool_output(
+                call,
+                Ok(ToolOutput::failure(ToolErrorCode::InvalidInput, error)),
+            ),
             None => {
-                if self.config.auto_background
+                if self.policy.is_session()
+                    && self.config.auto_background
                     && self.config.auto_background_threshold_seconds > 0
                     && call.name != "job_wait"
                     && call.name != "jobs"
@@ -222,7 +224,7 @@ impl Agent {
         let preview = (!result.is_error && call.name != "ask")
             .then(|| tool_result_preview(&result.content))
             .flatten();
-        let _ = self.events.send(AgentEvent::ToolFinished {
+        let _ = self.emit(AgentEvent::ToolFinished {
             id: call.id.clone(),
             message: tool_finish_activity(&tool_call_value(call), error),
             preview,
@@ -319,50 +321,54 @@ impl Agent {
         call: &ToolCall,
         joined: Result<Result<ToolOutput>, tokio::task::JoinError>,
     ) -> ToolCallExecution {
-        match joined {
-            Ok(Ok(mut output)) => {
-                if !output.images.is_empty() && !self.config.supports_images {
-                    return ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
-                        tool_use_id: call.id.clone(),
-                        content: DISABLED_IMAGE_ERROR.to_string(),
-                        is_error: true,
-                    }));
-                }
-                let images = std::mem::take(&mut output.images);
-                match self.materialize_tool_output(output) {
-                    Ok(content) => ToolCallExecution::Completed(ToolCallOutput::with_images(
-                        ToolResult {
-                            tool_use_id: call.id.clone(),
-                            content,
-                            is_error: false,
-                        },
-                        images,
-                    )),
-                    Err(error) => ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
-                        tool_use_id: call.id.clone(),
-                        content: tool_error_message(&error),
-                        is_error: true,
-                    })),
-                }
-            }
-            Ok(Err(error)) => {
-                let denied = error.downcast_ref::<ApprovalDenied>().is_some();
-                let output = ToolCallOutput::text(ToolResult {
+        let outcome = match joined {
+            Ok(outcome) => outcome,
+            Err(error) => Ok(ToolOutput::failure(
+                ToolErrorCode::ExecutionFailed,
+                format!("tool task failed: {error}"),
+            )),
+        };
+        self.finish_tool_output(call, outcome)
+    }
+
+    /// One conversion boundary for all tool outcomes in every Agent scope.
+    pub(super) fn finish_tool_output(
+        &self,
+        call: &ToolCall,
+        outcome: Result<ToolOutput>,
+    ) -> ToolCallExecution {
+        let mut output = match outcome {
+            Ok(output) => output,
+            Err(error) => ToolOutput::from_error(&error),
+        };
+        let denied = output.error_code() == Some(ToolErrorCode::ApprovalDenied);
+        if !output.images.is_empty() && !self.config.supports_images {
+            output = ToolOutput::failure(ToolErrorCode::UnsupportedImage, DISABLED_IMAGE_ERROR);
+        }
+        let images = std::mem::take(&mut output.images);
+        let is_error = output.status() == ToolStatus::Error;
+        let output = match self.materialize_tool_output(output) {
+            Ok(content) => ToolCallOutput::with_images(
+                ToolResult {
                     tool_use_id: call.id.clone(),
-                    content: tool_error_message(&error),
-                    is_error: true,
-                });
-                if denied {
-                    ToolCallExecution::Denied(output)
-                } else {
-                    ToolCallExecution::Completed(output)
-                }
-            }
-            Err(error) => ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
+                    content,
+                    is_error,
+                },
+                images,
+            ),
+            Err(error) => ToolCallOutput::text(ToolResult {
                 tool_use_id: call.id.clone(),
-                content: format!("tool task failed: {error}"),
+                content: render_tool_output(&ToolOutput::failure(
+                    ToolErrorCode::ResultStorage,
+                    tool_error_message(&error),
+                )),
                 is_error: true,
-            })),
+            }),
+        };
+        if denied {
+            ToolCallExecution::Denied(output)
+        } else {
+            ToolCallExecution::Completed(output)
         }
     }
 
@@ -403,64 +409,20 @@ impl Agent {
     }
 
     pub(super) async fn execute_tool_call(&self, call: &ToolCall) -> ToolCallExecution {
-        let id = call.id.as_str();
-        let name = call.name.as_str();
-        let input = &call.input;
-        if let Err(error) = self.ensure_active() {
-            return ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
-                tool_use_id: id.to_string(),
-                content: error.to_string(),
-                is_error: true,
-            }));
+        if self.cancelled.load(Ordering::Relaxed) {
+            return self.finish_tool_output(
+                call,
+                Ok(ToolOutput::failure(
+                    ToolErrorCode::Cancelled,
+                    "agent task cancelled",
+                )),
+            );
         }
-        let result = self.tools.get(name).cloned().context("unknown tool");
-        let result = match result {
-            Ok(tool) => tool.execute(input).await,
+        let outcome = match self.tools.get(&call.name).cloned().context("unknown tool") {
+            Ok(tool) => tool.execute(&call.input).await,
             Err(error) => Err(error),
         };
-        match result {
-            Ok(mut output) => {
-                if !output.images.is_empty() && !self.config.supports_images {
-                    ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
-                        tool_use_id: id.to_string(),
-                        content: DISABLED_IMAGE_ERROR.to_string(),
-                        is_error: true,
-                    }))
-                } else {
-                    let images = std::mem::take(&mut output.images);
-                    match self.materialize_tool_output(output) {
-                        Ok(content) => ToolCallExecution::Completed(ToolCallOutput::with_images(
-                            ToolResult {
-                                tool_use_id: id.to_string(),
-                                content,
-                                is_error: false,
-                            },
-                            images,
-                        )),
-                        Err(error) => {
-                            ToolCallExecution::Completed(ToolCallOutput::text(ToolResult {
-                                tool_use_id: id.to_string(),
-                                content: tool_error_message(&error),
-                                is_error: true,
-                            }))
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                let denied = error.downcast_ref::<ApprovalDenied>().is_some();
-                let result = ToolCallOutput::text(ToolResult {
-                    tool_use_id: id.to_string(),
-                    content: tool_error_message(&error),
-                    is_error: true,
-                });
-                if denied {
-                    ToolCallExecution::Denied(result)
-                } else {
-                    ToolCallExecution::Completed(result)
-                }
-            }
-        }
+        self.finish_tool_output(call, outcome)
     }
 
     pub(super) fn materialize_tool_output(&self, output: ToolOutput) -> Result<String> {
