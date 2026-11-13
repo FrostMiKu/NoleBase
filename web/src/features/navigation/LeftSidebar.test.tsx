@@ -37,6 +37,19 @@ function menuItemNames(): string[] {
 }
 
 describe('LeftSidebar context menus', () => {
+  it('shows Agents between Notes and Archives', async () => {
+    stubApi(readOnlyApi({ notes: () => NOTES, daily: () => DAILY }))
+    await renderSidebarApp({ notes: NOTES, daily: DAILY })
+    const headers = ['Notes', 'Agents', 'Archives', 'Daily'].map((name) =>
+      screen.getByText(name, { selector: 'span' }),
+    )
+    for (let index = 1; index < headers.length; index++) {
+      expect(headers[index - 1]!.compareDocumentPosition(headers[index]!)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      )
+    }
+  })
+
   it('a normal note offers exactly Rename / Archive / Delete', async () => {
     const user = userEvent.setup()
     stubApi(readOnlyApi({ notes: () => NOTES, daily: () => DAILY }))

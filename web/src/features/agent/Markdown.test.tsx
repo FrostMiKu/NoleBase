@@ -7,6 +7,18 @@ import { useUiStore } from '@/stores/ui-store'
 afterEach(cleanup)
 
 describe('Markdown', () => {
+  it('shows a single checkbox for task items alongside ordinary list items', () => {
+    render(<Markdown text={'- [ ] open\n- [x] done\n- ordinary'} />)
+    const checkboxes = screen.getAllByRole('checkbox')
+    expect(checkboxes).toHaveLength(2)
+    expect(checkboxes[0]).not.toBeChecked()
+    expect(checkboxes[1]).toBeChecked()
+    for (const checkbox of checkboxes) {
+      expect(getComputedStyle(checkbox.closest('li')!).listStyleType).toBe('none')
+    }
+    expect(screen.getByText('ordinary')).toBeInTheDocument()
+  })
+
   const id = 'ca24169f-9431-4645-8eb3-0a88c1dae545'
 
   it('renders managed image URIs and provides downloads for attachment links', () => {

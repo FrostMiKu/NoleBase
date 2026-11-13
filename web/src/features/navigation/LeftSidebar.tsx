@@ -16,7 +16,7 @@ import { useDailyNotes, useNotes } from '@/queries/workspace'
 import type { DailyNote, NoteSummary } from '@/types/workspace'
 
 /**
- * The file list: Notes, Archives, and Daily as collapsible flat lists.
+ * The file list: Notes, Agents, Archives, and Daily as collapsible flat lists.
  * Notes and Archives split the same endpoint by `archived`; Daily comes
  * from the daily endpoint. Every row carries a right-click context menu
  * with the TUI's file actions (the only document action menu — `···`
@@ -112,6 +112,8 @@ export function LeftSidebar() {
         {notesQuery.isError && <ErrorRow message="Notes failed to load" />}
       </Section>
 
+      <AgentsSection filter={filter} />
+
       <Section sectionKey="archives" label="Archives" count={archives.length}>
         {archives.map((note) => (
           <ContextRow
@@ -138,8 +140,6 @@ export function LeftSidebar() {
           </ContextRow>
         ))}
       </Section>
-
-      <AgentsSection filter={filter} />
 
       <Section sectionKey="daily" label="Daily" count={daily.length}>
         {daily

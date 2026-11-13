@@ -4,6 +4,8 @@ mod code;
 mod diagram;
 mod layout;
 mod math;
+mod table;
+mod wrap;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -72,7 +74,6 @@ pub struct ImagePlacement {
 }
 
 const COPY_BUTTON: &str = " Copy ";
-const CODE_BLOCK_PADDING: usize = 2;
 
 /// Overlay a right-aligned action on each rendered fenced-code header and
 /// expose it through the existing clickable-region pipeline used by every view.
@@ -109,7 +110,7 @@ fn decorate_code_blocks(
                     let trailing = &line.spans[region_end];
                     let trailing_width = UnicodeWidthStr::width(trailing.content.as_ref());
                     if trailing.content.chars().all(char::is_whitespace)
-                        && trailing_width >= button_width + CODE_BLOCK_PADDING
+                        && trailing_width >= button_width + code::PADDING_X
                     {
                         candidate = Some((row, column, region_end, trailing_width));
                         break 'rows;
@@ -127,7 +128,7 @@ fn decorate_code_blocks(
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum::<usize>();
-        let before = trailing_width - button_width - CODE_BLOCK_PADDING;
+        let before = trailing_width - button_width - code::PADDING_X;
         let button_column = trailing_start + before;
         let trailing_style = lines[row].spans[trailing_index].style;
         lines[row].spans.splice(
@@ -141,7 +142,7 @@ fn decorate_code_blocks(
                         .bg(theme.markdown_code_block_background)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" ".repeat(CODE_BLOCK_PADDING), trailing_style),
+                Span::styled(" ".repeat(code::PADDING_X), trailing_style),
             ],
         );
         actions.push(RenderedLink {
@@ -443,6 +444,65 @@ mod tests {
     }
 
     #[test]
+    fn task_items_use_one_checkbox_and_keep_nested_indentation() {
+        let source = "- [ ] first\n- [x] second\n- regular\n  - [ ] nested\n\n- [ ] loose";
+        let output = text(&to_lines_at_width(source, WIDTH));
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                " ☐ first",
+                " ☑ second",
+                " • regular",
+                "    ☐ nested",
+                " ☐ loose"
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_code_keeps_padding_and_header_spacing() {
+        let source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+        let rendered = render_at_width(&format!("```text\n{source}\n```"), 24);
+        let action = rendered
+            .links
+            .iter()
+            .find(|link| matches!(link.target, LinkTarget::CopyCode(_)))
+            .expect("copy action");
+        assert!(rendered.lines[action.row + 1].to_string().trim().is_empty());
+        let body = &rendered.lines[action.row + 2..rendered.lines.len() - 1];
+        assert!(body[0].to_string().starts_with("  1 │ "));
+        let recovered: String = body
+            .iter()
+            .map(|line| {
+                let row = line.to_string();
+                assert_eq!(UnicodeWidthStr::width(row.as_str()), 24);
+                assert!(row.starts_with("  ") && row.ends_with("  "));
+                row.chars()
+                    .skip(6)
+                    .take(16)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(recovered, source);
+    }
+
+    #[test]
+    fn code_wrapping_keeps_graphemes_and_quote_padding() {
+        let rendered = render_at_width("> ```text\n> 中文👩‍💻abcdef中文👩‍💻abcdef\n> ```", 20);
+        for line in &rendered.lines {
+            assert!(line.width() <= 20, "{line:?}");
+        }
+        let output = text(&rendered.lines);
+        assert!(output.contains("👩‍💻"));
+        assert!(output
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with("  ▌ ")));
+    }
+
+    #[test]
     fn expands_tabs_before_rendering_terminal_text() {
         let lines = to_lines_at_width(
             "```text\n1:- 今天健完身\n3:\t- @所有人\n4:\t  1. 注意简表\n```",
@@ -473,7 +533,7 @@ mod tests {
             LinkTarget::CopyCode("fn main() {\n\tprintln!(\"hi\");\n}\n".to_string())
         );
         assert_eq!(action.width, UnicodeWidthStr::width(COPY_BUTTON));
-        assert_eq!(action.column + action.width + CODE_BLOCK_PADDING, 48);
+        assert_eq!(action.column + action.width + code::PADDING_X, 48);
         let header = rendered.lines[action.row]
             .spans
             .iter()
@@ -745,6 +805,31 @@ mod tests {
             table.iter().all(|line| UnicodeWidthStr::width(*line) == 60),
             "{output}"
         );
+    }
+
+    #[test]
+    fn table_keeps_short_columns_compact_and_long_text_on_one_row() {
+        let description = "A longer description that fits with a compact label";
+        let rendered = render_at_width(
+            &format!("| 类别 | Description |\n|---|---|\n| 短 | {description} |"),
+            64,
+        );
+        assert_eq!(rendered.lines.len(), 5);
+        let row = rendered.lines[3].to_string();
+        assert!(row.contains(description), "{row}");
+        let cells: Vec<_> = row.split('│').collect();
+        assert_eq!(UnicodeWidthStr::width(cells[1]), 6);
+        assert!(UnicodeWidthStr::width(cells[2]) > 40);
+    }
+
+    #[test]
+    fn tables_fit_narrow_windows_and_keep_wide_graphemes() {
+        for width in [8, 12, 20, 32] {
+            let rendered =
+                render_at_width("| 字 | Emoji |\n|---|---|\n| 中文说明 | 👩‍💻👩‍💻👩‍💻 |", width);
+            assert!(rendered.lines.iter().all(|line| line.width() <= width));
+            assert!(text(&rendered.lines).contains("👩‍💻"));
+        }
     }
 
     #[test]

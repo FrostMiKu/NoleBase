@@ -38,12 +38,6 @@ impl App {
                 rows.extend(notes.into_iter().map(FileListRow::File));
             }
         }
-        if !searching || !archives.is_empty() {
-            rows.push(FileListRow::Group(FileGroup::Archives));
-            if self.archives_expanded || searching {
-                rows.extend(archives.into_iter().map(FileListRow::File));
-            }
-        }
         let agents = self
             .agent_notes
             .iter()
@@ -53,6 +47,12 @@ impl App {
             rows.push(FileListRow::Group(FileGroup::Agents));
             if self.agents_expanded || searching {
                 rows.extend(agents.into_iter().map(|note| FileListRow::Agent(note.id)));
+            }
+        }
+        if !searching || !archives.is_empty() {
+            rows.push(FileListRow::Group(FileGroup::Archives));
+            if self.archives_expanded || searching {
+                rows.extend(archives.into_iter().map(FileListRow::File));
             }
         }
         rows

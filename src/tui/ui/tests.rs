@@ -1017,7 +1017,14 @@ fn file_selection_includes_both_shared_spacing_lines() {
     assert_eq!(files.len(), 2);
     assert_eq!(files[0].area.y, notes.y + 2);
     assert_eq!(files[1].area.y, files[0].area.y + 3);
-    assert_eq!(archives.y, files[1].area.y + 3);
+    let agents = app
+        .file_group_hitboxes
+        .iter()
+        .find(|hitbox| hitbox.group == FileGroup::Agents)
+        .expect("Agents group")
+        .area;
+    assert_eq!(agents.y, files[1].area.y + 3);
+    assert_eq!(archives.y, agents.bottom());
     assert_eq!(files[0].area.height, 2);
     assert_eq!(files[1].area.height, 2);
     let buffer = terminal.backend().buffer();
@@ -4004,6 +4011,16 @@ fn agents_category_uses_animation_unread_dot_and_full_row_selection_without_chan
     let running_area = area(running);
     let unread_area = area(unread);
     let plain_area = area(plain);
+    let header_y = |group| {
+        app.file_group_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.group == group)
+            .unwrap()
+            .area
+            .y
+    };
+    assert!(header_y(FileGroup::Notes) < header_y(FileGroup::Agents));
+    assert!(header_y(FileGroup::Agents) < header_y(FileGroup::Archives));
     assert_eq!(
         running_area.y,
         group.y + 2,

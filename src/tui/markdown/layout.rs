@@ -1,5 +1,5 @@
 //! Terminal layout for the shared Markdown event stream.
-use super::{ImagePlacement, RenderedMarkup};
+use super::{table::Table, ImagePlacement, RenderedMarkup};
 use crate::core::markup::{self, Event, SpannedEvent};
 use crate::tui::theme::Theme;
 use pulldown_cmark::{CodeBlockKind, Event as Md, HeadingLevel, Tag, TagEnd};
@@ -58,13 +58,6 @@ struct Layout {
     quote: usize,
     prefix: String,
     table: Option<Table>,
-}
-
-#[derive(Default)]
-struct Table {
-    alignments: Vec<pulldown_cmark::Alignment>,
-    rows: Vec<Vec<Line<'static>>>,
-    cells: Vec<Line<'static>>,
 }
 
 impl Layout {
@@ -198,10 +191,42 @@ impl Layout {
                     self.code(info.split_whitespace().next().unwrap_or("text"), &source);
                     index = end;
                 }
+                Event::Markdown(Md::Start(Tag::Item)) => {
+                    let next = events[index + 1..].iter().find(|event| {
+                        !matches!(event.event, Event::Markdown(Md::Start(Tag::Paragraph)))
+                    });
+                    let task = next.and_then(|event| match event.event {
+                        Event::Markdown(Md::TaskListMarker(done)) => Some(done),
+                        _ => None,
+                    });
+                    self.start_item(task);
+                }
                 Event::Markdown(event) => self.markdown(event),
             }
             index += 1;
         }
+    }
+    fn start_item(&mut self, task: Option<bool>) {
+        self.flush();
+        let list_marker = if let Some(Some(number)) = self.lists.last_mut() {
+            let text = format!("{number}. ");
+            *number += 1;
+            text
+        } else {
+            "• ".to_owned()
+        };
+        let marker = task.map_or(list_marker, |done| {
+            if done {
+                "☑ ".to_owned()
+            } else {
+                "☐ ".to_owned()
+            }
+        });
+        let indent = " ".repeat(1 + self.lists.len().saturating_sub(1) * 3);
+        self.emit(
+            &format!("{indent}{marker}"),
+            Style::default().fg(self.theme.markdown_list),
+        );
     }
     fn link_style(&self, color: ratatui::style::Color) -> Style {
         self.style()
@@ -238,7 +263,7 @@ impl Layout {
                 );
                 self.blank();
             }
-            Md::TaskListMarker(done) => self.emit(if *done { "☑ " } else { "☐ " }, self.style()),
+            Md::TaskListMarker(_) => {}
             Md::FootnoteReference(name) => self.emit(
                 &format!("[{name}]"),
                 self.link_style(self.theme.markdown_link),
@@ -275,7 +300,11 @@ impl Layout {
                         style
                     });
                 }
-                Tag::Paragraph => self.flush(),
+                Tag::Paragraph => {
+                    if self.lists.is_empty() {
+                        self.flush();
+                    }
+                }
                 Tag::Emphasis => self.push_style(Style::default().add_modifier(Modifier::ITALIC)),
                 Tag::Strong => self.push_style(Style::default().add_modifier(Modifier::BOLD)),
                 Tag::Strikethrough => {
@@ -292,21 +321,6 @@ impl Layout {
                     self.flush();
                     self.lists.push(*first);
                 }
-                Tag::Item => {
-                    self.flush();
-                    let marker = if let Some(Some(number)) = self.lists.last_mut() {
-                        let text = format!("{number}. ");
-                        *number += 1;
-                        text
-                    } else {
-                        "• ".to_owned()
-                    };
-                    let indent = " ".repeat(1 + self.lists.len().saturating_sub(1) * 3);
-                    self.emit(
-                        &format!("{indent}{marker}"),
-                        Style::default().fg(self.theme.markdown_list),
-                    );
-                }
                 Tag::Table(alignments) => {
                     self.blank();
                     self.table = Some(Table {
@@ -314,6 +328,7 @@ impl Layout {
                         ..Default::default()
                     });
                 }
+                Tag::Item => unreachable!("list items are handled with their task marker"),
                 Tag::TableHead | Tag::TableRow => self.flush(),
                 Tag::TableCell => {
                     self.line = Line::default();
@@ -364,7 +379,9 @@ impl Layout {
                 }
                 TagEnd::Table => {
                     if let Some(table) = self.table.take() {
-                        self.draw_table(table);
+                        self.output
+                            .lines
+                            .extend(super::table::render(table, self.width));
                     }
                     self.blank();
                 }
@@ -396,122 +413,24 @@ impl Layout {
                 }
             }
         }
-        let base = Style::default()
-            .fg(self.theme.markdown_code_block_text)
-            .bg(self.theme.markdown_code_block_background);
-        self.output
-            .lines
-            .push(Line::styled(" ".repeat(self.width), base));
-        let label = format!(
-            "  {language}{}",
-            if status.is_empty() {
-                String::new()
-            } else {
-                format!(" · {status}")
+        let prefix_width = UnicodeWidthStr::width(self.prefix.as_str());
+        let width = self.width.saturating_sub(prefix_width).max(1);
+        for mut line in super::code::render(source, language, status, width, self.theme) {
+            if !self.prefix.is_empty() {
+                line.spans.insert(
+                    0,
+                    Span::styled(
+                        self.prefix.clone(),
+                        Style::default().fg(self.theme.markdown_quote),
+                    ),
+                );
             }
-        );
-        let label: String = label.chars().take(self.width).collect();
-        let label_width = UnicodeWidthStr::width(label.as_str());
-        self.output.lines.push(Line::from(vec![
-            Span::styled(label, base.fg(self.theme.markdown_code_label)),
-            Span::styled(" ".repeat(self.width.saturating_sub(label_width)), base),
-        ]));
-        for line in super::code::lines(source, language, base) {
-            self.emit("  ", base);
-            for span in line.spans {
-                self.emit(&span.content, span.style);
-            }
-            let padding = self.width.saturating_sub(self.line.width());
-            self.emit(&" ".repeat(padding), base);
-            self.flush();
+            self.output.lines.push(line);
         }
-        self.output.lines.extend(std::iter::repeat_n(
-            Line::styled(" ".repeat(self.width), base),
-            2,
-        ));
         self.blank();
     }
-    fn draw_table(&mut self, table: Table) {
-        let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
-        if columns == 0 {
-            return;
-        }
-        if self.width < columns * 3 + 1 {
-            for row in table.rows {
-                for cell in row {
-                    self.emit(&cell.to_string(), self.style());
-                    self.flush();
-                }
-            }
-            return;
-        }
-        let available = self.width - columns * 3 - 1;
-        let widths: Vec<_> = (0..columns)
-            .map(|i| available / columns + usize::from(i < available % columns))
-            .collect();
-        let border = |left: char, middle: char, right: char| {
-            let segments = widths
-                .iter()
-                .map(|width| "─".repeat(width + 2))
-                .collect::<Vec<_>>();
-            format!("{left}{}{right}", segments.join(&middle.to_string()))
-        };
-        self.output.lines.push(Line::raw(border('╭', '┬', '╮')));
-        for (index, row) in table.rows.into_iter().enumerate() {
-            let cells: Vec<_> = (0..columns)
-                .map(|column| {
-                    wrap_cell(row.get(column).cloned().unwrap_or_default(), widths[column])
-                })
-                .collect();
-            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
-            for y in 0..height {
-                let mut line = Line::raw("│");
-                for (column, rows) in cells.iter().enumerate() {
-                    line.spans.push(Span::raw(" "));
-                    let cell = rows.get(y).cloned().unwrap_or_default();
-                    let padding = widths[column].saturating_sub(cell.width());
-                    let left = match table.alignments.get(column) {
-                        Some(pulldown_cmark::Alignment::Right) => padding,
-                        Some(pulldown_cmark::Alignment::Center) => padding / 2,
-                        _ => 0,
-                    };
-                    line.spans.push(Span::raw(" ".repeat(left)));
-                    line.spans.extend(cell.spans);
-                    line.spans
-                        .push(Span::raw(format!("{} │", " ".repeat(padding - left))));
-                }
-                self.output.lines.push(line);
-            }
-            if index == 0 {
-                self.output.lines.push(Line::raw(border('├', '┼', '┤')));
-            }
-        }
-        self.output.lines.push(Line::raw(border('╰', '┴', '╯')));
-    }
 }
-fn wrap_cell(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    let mut current = Line::default();
-    for span in line.spans {
-        let mut chunk = String::new();
-        let mut used = current.width();
-        for ch in span.content.chars() {
-            let size = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + size > width && used > 0 {
-                current
-                    .spans
-                    .push(Span::styled(std::mem::take(&mut chunk), span.style));
-                rows.push(std::mem::take(&mut current));
-                used = 0;
-            }
-            chunk.push(ch);
-            used += size;
-        }
-        current.spans.push(Span::styled(chunk, span.style));
-    }
-    rows.push(current);
-    rows
-}
+
 fn is_image(target: &str) -> bool {
     target.rsplit('.').next().is_some_and(|ext| {
         matches!(

@@ -61,7 +61,14 @@ const components: Components = {
   p: ({ children }) => <p className="my-1 leading-[1.5]">{children}</p>,
   ul: ({ children }) => <ul className="my-1 list-disc pl-4">{children}</ul>,
   ol: ({ children }) => <ol className="my-1 list-decimal pl-4">{children}</ol>,
-  li: ({ children }) => <li className="my-px leading-[1.5]">{children}</li>,
+  li: ({ children, className }) => (
+    <li
+      className="my-px leading-[1.5]"
+      style={{ listStyleType: className?.split(' ').includes('task-list-item') ? 'none' : undefined }}
+    >
+      {children}
+    </li>
+  ),
   blockquote: ({ children }) => (
     <blockquote className="my-1 border-l-2 border-border-strong pl-2 text-muted">
       {children}
