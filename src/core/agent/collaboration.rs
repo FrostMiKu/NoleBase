@@ -259,7 +259,7 @@ impl CollaboratorsHandle {
             None
         } else {
             Some(jobs.start_background(
-                JobKind::Tool,
+                JobKind::Collaborator,
                 &format!("Agent {} · report {}", note.name, note.reports.len() + 1),
             )?)
         };

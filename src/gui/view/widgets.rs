@@ -175,6 +175,22 @@ pub(super) fn daily_label(date: NaiveDate, today: NaiveDate) -> String {
     }
 }
 
+/// Shared running indicator for transcript activity and task widgets.
+pub(super) fn spinning_icon(
+    id: impl Into<gpui_kit::SharedString>,
+    tone: gpui_kit::Hsla,
+) -> gpui_kit::AnyElement {
+    icon("nole/spinner")
+        .size(px(14.))
+        .text_color(tone)
+        .with_animation(
+            id.into(),
+            Animation::new(Duration::from_millis(1200)).repeat(),
+            |icon, delta| icon.rotate(gpui_kit::radians(delta * std::f32::consts::TAU)),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

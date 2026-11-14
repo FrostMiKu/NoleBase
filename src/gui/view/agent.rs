@@ -90,11 +90,13 @@ impl DesktopView {
             .w_full()
             .flex_1()
             .min_h_0()
+            .relative()
             .flex()
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .min_h_0()
                     .flex()
                     .flex_col()
                     .child(
@@ -116,8 +118,9 @@ impl DesktopView {
                     .child(
                         div()
                             .id("agent-interaction-scroll")
-                            .max_h(px(300.))
-                            .overflow_y_scroll()
+                            .when(agent.question.is_none(), |panel| {
+                                panel.max_h(px(300.)).overflow_y_scroll()
+                            })
                             .flex_shrink_0()
                             .child(reading_row(interactions)),
                     )
@@ -152,6 +155,13 @@ impl DesktopView {
                         .flex_shrink_0(),
                     ),
             )
+            .when(self.echo_open, |surface| {
+                surface.child(
+                    div().absolute().top_0().right_0()
+                        .w(px(280.0_f32.min((self.content_width(window) - PAGE_INSET * 2.).max(0.))))
+                        .child(self.agent_echo(window))
+                )
+            })
     }
 
     fn agent_interactions(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::Div {
@@ -162,6 +172,7 @@ impl DesktopView {
         let card = || {
             div()
                 .w_full()
+                .min_w_0()
                 .p(px(SPACE_MD + 2.))
                 .rounded(px(RADIUS_LG))
                 .border_1()
@@ -173,12 +184,15 @@ impl DesktopView {
         };
         let heading = |label: &'static str, text: String| {
             div()
+                .w_full()
+                .min_w_0()
                 .flex()
-                .items_center()
+                .items_start()
                 .gap(px(SPACE_SM))
                 .text_size(px(TEXT_UI))
                 .child(
                     div()
+                        .flex_shrink_0()
                         .text_size(px(TEXT_META))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(color(t.ui_action_ai))
@@ -186,12 +200,17 @@ impl DesktopView {
                 )
                 .child(
                     div()
+                        .debug_selector(|| "agent-interaction-heading".into())
                         .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .child(text),
                 )
         };
         let mut panel = div()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -199,13 +218,19 @@ impl DesktopView {
         if let Some(approval) = &agent.approval {
             panel = panel.child(self.agent_approval(approval, cx));
         } else if let Some(question) = &agent.question {
-            let mut body = card().child(heading("需要你的选择", question.question.clone()));
+            let mut body = card()
+                .debug_selector(|| "agent-question".into())
+                .child(heading("需要你的选择", question.question.clone()));
             let hover = self.row_hover();
             for (index, option) in question.options.iter().enumerate() {
                 let answer = option.clone();
                 body = body.child(
                     div()
                         .id(("agent-option", index))
+                        .debug_selector(move || format!("agent-option-{index}"))
+                        .w_full()
+                        .min_w_0()
+                        .whitespace_normal()
                         .px(px(SPACE_MD))
                         .py(px(SPACE_SM))
                         .rounded(px(RADIUS_MD))

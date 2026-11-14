@@ -96,6 +96,7 @@ impl DesktopView {
     pub(super) fn active_nav(&self) -> Option<Nav> {
         Some(match self.page {
             Page::Daily => Nav::Daily,
+            Page::Document if self.model.selected_daily_date().is_some() => Nav::Daily,
             Page::Tags => Nav::Tags,
             Page::Todo => Nav::Todo,
             Page::Agent => Nav::Agent,
@@ -168,6 +169,7 @@ impl DesktopView {
     ) {
         self.open_page(Page::Agent, window, cx);
         self.expanded_thinking.clear();
+        self.expanded_tools.clear();
         self.private_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.answer_input
@@ -185,6 +187,7 @@ impl DesktopView {
     pub(super) fn new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_page(Page::Agent, window, cx);
         self.expanded_thinking.clear();
+        self.expanded_tools.clear();
         self.private_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.answer_input
@@ -502,7 +505,8 @@ impl DesktopView {
                         .when_some(marker, |row, tone| row.child(self.activity_dot(tone)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_agent_session(id, window, cx)
-                        })),
+                        }))
+                        .context_menu(self.session_context_menu(id, cx)),
                 )
                 .into_any_element()
             }

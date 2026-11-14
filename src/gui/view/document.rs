@@ -9,6 +9,40 @@ use crate::gui::presentation::{
 use gpui_kit::base::TextView;
 
 impl DesktopView {
+    pub(super) fn open_daily_document(
+        &mut self,
+        date: chrono::NaiveDate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .model
+            .workspace
+            .storage()
+            .daily_file_path(&date.to_string())
+            .and_then(|path| {
+                self.model
+                    .workspace
+                    .relative_path(&path)
+                    .ok_or_else(|| anyhow::anyhow!("日常记录路径超出了知识库范围"))
+            });
+        match path {
+            Ok(path) => {
+                self.navigate(Some(path.clone()), window, cx);
+                if self.page == Page::Document
+                    && self.model.selected.as_ref() == Some(&path)
+                    && self.preview
+                {
+                    self.toggle_preview(window, cx);
+                }
+            }
+            Err(error) => {
+                self.status = format!("打开日常记录遇到问题：{error}");
+                cx.notify();
+            }
+        }
+    }
+
     pub(super) fn document_surface(
         &self,
         window: &mut Window,
@@ -52,15 +86,20 @@ impl DesktopView {
     ) -> gpui_kit::AnyElement {
         let t = self.model.theme.theme;
         let scroll = self.document_scroll.clone();
-        let text = crate::gui::rich_text::body(TextView::new(&self.document_text), t, window, cx)
-            .on_reveal(move |line, window, _| {
-                let viewport = scroll.bounds();
-                let offset = scroll.offset();
-                let target = offset.y - (line.top() - viewport.top()) + px(SPACE_XL);
-                let max = scroll.max_offset().y;
-                scroll.set_offset(gpui_kit::point(offset.x, target.min(px(0.)).max(-max)));
-                window.refresh();
-            });
+        let text = crate::gui::rich_text::body(
+            self.markdown_view(TextView::new(&self.document_text), cx),
+            t,
+            window,
+            cx,
+        )
+        .on_reveal(move |line, window, _| {
+            let viewport = scroll.bounds();
+            let offset = scroll.offset();
+            let target = offset.y - (line.top() - viewport.top()) + px(SPACE_XL);
+            let max = scroll.max_offset().y;
+            scroll.set_offset(gpui_kit::point(offset.x, target.min(px(0.)).max(-max)));
+            window.refresh();
+        });
         div()
             .debug_selector(|| "document-reading".into())
             .size_full()

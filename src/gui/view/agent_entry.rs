@@ -15,14 +15,7 @@ impl DesktopView {
     ) -> gpui_kit::Div {
         let t = self.model.theme.theme;
         let body = match &row.kind {
-            AgentRowKind::Assistant => crate::gui::rich_text::markdown(
-                row.id.clone(),
-                row.text.clone(),
-                false,
-                t,
-                window,
-                cx,
-            ),
+            AgentRowKind::Assistant => self.markdown(row.id.clone(), &row.text, window, cx),
             AgentRowKind::Prompt => div()
                 .w_full()
                 .flex()
@@ -114,61 +107,103 @@ impl DesktopView {
                 active,
                 details,
                 preview,
-            } => div()
-                .debug_selector(|| "agent-tool".into())
-                .w_full()
-                .child(
-                    div()
-                        .debug_selector(|| "agent-tool-status".into())
-                        .w_full()
-                        .min_h(px(26.))
-                        .flex()
-                        .items_center()
-                        .gap(px(SPACE_SM))
-                        .text_size(px(TEXT_NAV))
-                        .text_color(color(t.text_secondary))
-                        .child(activity_marker(
-                            &row.id,
-                            *active,
-                            color(if *active {
-                                t.ui_action_ai
-                            } else {
-                                t.ui_success
-                            }),
-                        ))
-                        .child(SelectableText::new(
-                            gpui_kit::SharedString::from(format!("{}-status", row.id)),
-                            row.text.clone(),
-                        )),
-                )
-                .when(!details.is_empty() || preview.is_some(), |tool| {
-                    tool.child(
+            } => {
+                let expanded = self.expanded_tools.contains(&row.id);
+                let collapsible = !details.is_empty() || preview.is_some();
+                let id = row.id.clone();
+                div()
+                    .debug_selector(|| "agent-tool".into())
+                    .w_full()
+                    .child(
                         div()
-                            .debug_selector(|| "agent-tool-result".into())
-                            .ml(px(7.))
-                            .pl(px(14.))
-                            .py(px(6.))
-                            .border_l_1()
-                            .border_color(color(t.ui_border))
-                            .text_size(px(TEXT_META))
-                            .line_height(gpui_kit::relative(1.5))
-                            .text_color(color(t.text_muted))
-                            .font_family(crate::gui::presentation::fonts(cx).mono)
-                            .when(!details.is_empty(), |body| {
-                                body.child(SelectableText::new(
-                                    gpui_kit::SharedString::from(format!("{}-details", row.id)),
-                                    details.clone(),
-                                ))
-                            })
-                            .when_some(preview.clone(), |body, preview| {
-                                body.child(div().child(SelectableText::new(
-                                    gpui_kit::SharedString::from(format!("{}-preview", row.id)),
-                                    preview,
-                                )))
+                            .debug_selector(|| "agent-tool-status".into())
+                            .w_full()
+                            .min_h(px(26.))
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_SM))
+                            .text_size(px(TEXT_NAV))
+                            .text_color(color(t.text_secondary))
+                            .child(activity_marker(
+                                &row.id,
+                                *active,
+                                color(if *active {
+                                    t.ui_action_ai
+                                } else {
+                                    t.ui_success
+                                }),
+                            ))
+                            .child(div().min_w_0().truncate().child(SelectableText::new(
+                                gpui_kit::SharedString::from(format!("{}-status", row.id)),
+                                row.text.clone(),
+                            )))
+                            .when(collapsible, |status| {
+                                status.child(
+                                    div()
+                                        .id(gpui_kit::SharedString::from(format!(
+                                            "{}-tool-toggle",
+                                            row.id
+                                        )))
+                                        .debug_selector(|| "agent-tool-toggle".into())
+                                        .size(px(26.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .child(
+                                            icon(if expanded {
+                                                "nole/chevron-down"
+                                            } else {
+                                                "nole/chevron-right"
+                                            })
+                                            .size(px(14.)),
+                                        )
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            if !view.expanded_tools.remove(&id) {
+                                                view.expanded_tools.insert(id.clone());
+                                            }
+                                            if let Some(index) =
+                                                view.agent.as_ref().and_then(|agent| {
+                                                    agent.rows.iter().position(|row| row.id == id)
+                                                })
+                                            {
+                                                view.agent_list.splice(index..index + 1, 1);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
                             }),
                     )
-                })
-                .into_any_element(),
+                    .when(collapsible && expanded, |tool| {
+                        tool.child(
+                            div()
+                                .debug_selector(|| "agent-tool-result".into())
+                                .ml(px(7.))
+                                .pl(px(14.))
+                                .py(px(6.))
+                                .border_l_1()
+                                .border_color(color(t.ui_border))
+                                .text_size(px(TEXT_META))
+                                .line_height(gpui_kit::relative(1.5))
+                                .text_color(color(t.text_muted))
+                                .font_family(crate::gui::presentation::fonts(cx).mono)
+                                .when(!details.is_empty(), |body| {
+                                    body.child(SelectableText::new(
+                                        gpui_kit::SharedString::from(format!("{}-details", row.id)),
+                                        details.clone(),
+                                    ))
+                                })
+                                .when_some(preview.clone(), |body, preview| {
+                                    body.child(div().child(SelectableText::new(
+                                        gpui_kit::SharedString::from(format!("{}-preview", row.id)),
+                                        preview,
+                                    )))
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
             AgentRowKind::Error => {
                 let error = color(t.ui_error);
                 div()
@@ -210,15 +245,7 @@ impl DesktopView {
 
 fn activity_marker(id: &str, active: bool, color: gpui_kit::Hsla) -> gpui_kit::AnyElement {
     if active {
-        icon("nole/spinner")
-            .size(px(14.))
-            .text_color(color)
-            .with_animation(
-                gpui_kit::SharedString::from(format!("{id}-spinner")),
-                Animation::new(Duration::from_millis(1200)).repeat(),
-                |icon, delta| icon.rotate(gpui_kit::radians(delta * std::f32::consts::TAU)),
-            )
-            .into_any_element()
+        super::widgets::spinning_icon(format!("{id}-spinner"), color)
     } else {
         icon("nole/check")
             .size(px(14.))

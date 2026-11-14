@@ -1,5 +1,6 @@
 use super::*;
 use crate::gui::presentation::{RADIUS_MD, SPACE_MD, SPACE_XS, TEXT_META, TEXT_NAV, TEXT_UI};
+use gpui_kit::component::Selectable;
 
 impl DesktopView {
     pub(super) fn main_scrollbar(
@@ -40,7 +41,10 @@ impl DesktopView {
             },
             Page::Document => {
                 let path = self.model.selected.as_deref().unwrap_or_default();
-                let section = if path.starts_with("archives/") {
+                let daily = self.model.selected_daily_date();
+                let section = if daily.is_some() {
+                    "日常记录"
+                } else if path.starts_with("archives/") {
                     "归档"
                 } else {
                     "笔记"
@@ -51,6 +55,7 @@ impl DesktopView {
                     .iter()
                     .find(|doc| doc.path == path)
                     .map(|doc| doc.title.clone())
+                    .or_else(|| daily.map(|date| date.to_string()))
                     .unwrap_or_default();
                 (Some(section), title)
             }
@@ -115,12 +120,21 @@ impl DesktopView {
                     .icon(icon("nole/plus").size(px(14.)))
                     .on_click(cx.listener(|this, _, window, cx| this.begin_new_note(window, cx))),
             ),
-            Page::Agent => bar.child(
-                self.icon_button("new-session", "nole/plus", "新会话")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.new_agent_session(window, cx)),
-                    ),
-            ),
+            Page::Agent => bar
+                .child(
+                    self.icon_button("toggle-echo", "nole/todo", "后台任务与 Todo")
+                        .selected(self.echo_open)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.echo_open = !this.echo_open;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    self.icon_button("new-session", "nole/plus", "新会话")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.new_agent_session(window, cx)),
+                        ),
+                ),
             Page::Document => bar
                 .child(self.save_state())
                 .child(self.mode_switch(cx))
@@ -210,15 +224,10 @@ impl DesktopView {
 
     /// Start a conversation about the open note, referencing it by wiki link.
     fn ask_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self
-            .model
-            .selected
-            .as_ref()
-            .and_then(|path| self.model.documents.iter().find(|doc| &doc.path == path))
-            .map(|doc| doc.title.clone())
-        else {
+        if self.model.selected.is_none() {
             return;
-        };
+        }
+        let title = self.page_title().1;
         self.open_page(Page::Agent, window, cx);
         if self.page == Page::Agent {
             self.agent_input.update(cx, |input, cx| {
@@ -258,10 +267,54 @@ impl Render for DesktopView {
             self.active_tag,
             self.home.collection.index(),
         ));
+        let completion = self.completion_overlay(window, cx);
         let problem = !self.new_note_open && !self.status.is_empty() && self.status != "已保存";
         div()
             .relative()
             .key_context("Desktop")
+            .capture_action(cx.listener(
+                |view, _: &gpui_kit::component::input::MoveUp, window, cx| {
+                    if !view.completion_key("up", window, cx) {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |view, _: &gpui_kit::component::input::MoveDown, window, cx| {
+                    if !view.completion_key("down", window, cx) {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |view, _: &gpui_kit::component::input::Escape, window, cx| {
+                    if !view.completion_key("escape", window, cx) {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |view, _: &gpui_kit::component::input::IndentInline, window, cx| {
+                    if !view.completion_key("tab", window, cx) {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |view, action: &gpui_kit::component::input::Enter, window, cx| {
+                    if action.shift || action.secondary || !view.completion_key("enter", window, cx)
+                    {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .on_key_up(
+                cx.listener(|view, _, window, cx| view.refresh_focused_completion(window, cx)),
+            )
+            .on_mouse_up(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|view, _, window, cx| view.refresh_focused_completion(window, cx)),
+            )
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -313,6 +366,7 @@ impl Render for DesktopView {
                     )
                     .when(problem, |body| body.child(self.status_banner())),
             )
+            .when_some(completion, |root, popup| root.child(popup))
             .when(self.appearance, |root| {
                 root.child(self.appearance_panel(cx))
             })

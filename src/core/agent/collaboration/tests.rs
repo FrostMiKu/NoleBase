@@ -110,6 +110,9 @@ fn messages_steer_running_collaborators_and_wake_retained_conversations_after_re
         agent.snapshot().summary().result.as_deref(),
         Some("Combined findings")
     );
+    let rows = jobs.rows();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.kind == JobKind::Collaborator));
     let deliveries = jobs.take_deliveries();
     assert_eq!(
         deliveries

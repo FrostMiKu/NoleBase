@@ -21,6 +21,10 @@ pub struct AgentClient {
     pub private_input: Option<PrivateTerminalInputRequest>,
     pub revision: u64,
     pub rows: Vec<AgentRow>,
+    collaborators: Vec<(
+        uuid::Uuid,
+        crate::core::agent::collaboration::CollaboratorStatus,
+    )>,
     row_cache: Vec<(Arc<AgentPanelEntry>, usize)>,
     pub changed_from: usize,
     events: broadcast::Receiver<AgentEvent>,
@@ -33,6 +37,7 @@ impl AgentClient {
             Some(summary) => sessions.get(summary.id)?,
             None => sessions.draft("新会话")?,
         };
+        current.service.collaborators().load()?;
         let (panel, _, events) = current.attach();
         let (approval, question, private_input) = current.pending_interactions();
         let mut client = Self {
@@ -44,6 +49,7 @@ impl AgentClient {
             private_input,
             revision: 0,
             rows: Vec::new(),
+            collaborators: Vec::new(),
             row_cache: Vec::new(),
             changed_from: 0,
             events,
@@ -54,6 +60,7 @@ impl AgentClient {
 
     pub fn select(&mut self, id: uuid::Uuid) -> Result<()> {
         let current = self.sessions.get(id)?;
+        current.service.collaborators().load()?;
         let (panel, _, events) = current.attach();
         let (approval, question, private_input) = current.pending_interactions();
         current.mark_read()?;
@@ -135,7 +142,17 @@ impl AgentClient {
             self.rebuild_rows();
             self.revision += 1;
         }
-        changed
+        let collaborators = self
+            .current
+            .service
+            .collaborators()
+            .rows()
+            .into_iter()
+            .map(|agent| (agent.id, agent.status))
+            .collect::<Vec<_>>();
+        let collaborators_changed = collaborators != self.collaborators;
+        self.collaborators = collaborators;
+        changed | self.current.service.jobs().poll_change() | collaborators_changed
     }
 
     pub(super) fn rebuild_rows(&mut self) {

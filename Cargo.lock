@@ -5971,6 +5971,7 @@ dependencies = [
  "chrono",
  "clipboard-rs",
  "crossterm",
+ "data-url",
  "dirs 7.0.0",
  "eventsource-stream",
  "fasteval",

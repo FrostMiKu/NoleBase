@@ -165,6 +165,14 @@ impl Desktop {
         Ok(())
     }
 
+    pub fn selected_daily_date(&self) -> Option<chrono::NaiveDate> {
+        let path = self
+            .workspace
+            .document_path(self.selected.as_deref()?)
+            .ok()?;
+        self.workspace.storage().daily_date_for_path(&path)
+    }
+
     pub fn save(&mut self, draft: &str) -> Result<()> {
         if let Some(path) = &self.selected {
             if draft == self.source {

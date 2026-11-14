@@ -22,11 +22,15 @@ use std::time::Duration;
 
 mod agent;
 mod agent_approval;
+mod agent_controls;
+mod agent_echo;
 mod agent_entry;
+mod completion;
 mod discovery;
 mod document;
 mod file_actions;
 mod home;
+mod markup;
 mod persistence;
 mod runtime;
 mod scrolling;
@@ -66,6 +70,8 @@ gpui_kit::actions!(
 
 pub struct DesktopView {
     focus: gpui_kit::FocusHandle,
+    completion: Option<completion::Completion>,
+    completion_dismissed: Option<(completion::Owner, usize, String)>,
     model: Desktop,
     sessions: Vec<SessionSummary>,
     todo_scroll: UniformListScrollHandle,
@@ -84,6 +90,10 @@ pub struct DesktopView {
     page: Page,
     active_tag: Option<String>,
     agent: Option<super::agent::AgentClient>,
+    echo_open: bool,
+    expanded_tools: std::collections::HashSet<String>,
+    session_action: Option<agent_controls::SessionAction>,
+    session_action_name: Entity<InputState>,
     expanded_thinking: std::collections::HashSet<String>,
     agent_input: Entity<TextareaState>,
     answer_input: Entity<InputState>,
@@ -128,6 +138,7 @@ impl DesktopView {
         });
         let new_note_name = cx.new(|cx| InputState::new(window, cx).placeholder("笔记名称"));
         let note_action_name = cx.new(|cx| InputState::new(window, cx).placeholder("笔记名称"));
+        let session_action_name = cx.new(|cx| InputState::new(window, cx).placeholder("会话名称"));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索知识库"));
         let agent_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -140,6 +151,26 @@ impl DesktopView {
                 .placeholder("输入后提交")
         });
         let subscriptions = vec![
+            cx.observe_in(&editor, window, |view, _, window, cx| {
+                view.refresh_completion(completion::Owner::Editor, window, cx);
+            }),
+            cx.observe_in(&agent_input, window, |view, _, window, cx| {
+                view.refresh_completion(completion::Owner::Agent, window, cx);
+            }),
+            cx.subscribe_in(&agent_input, window, |view, _, event, window, cx| {
+                if matches!(event, InputEvent::Change | InputEvent::Focus) {
+                    view.refresh_completion(completion::Owner::Agent, window, cx);
+                }
+            }),
+            cx.subscribe_in(
+                &session_action_name,
+                window,
+                |view, _, event, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        view.confirm_session_action(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(&note_action_name, window, |view, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     view.confirm_note_action(window, cx);
@@ -156,6 +187,9 @@ impl DesktopView {
                 }
             }),
             cx.subscribe_in(&editor, window, |view, input, event, window, cx| {
+                if matches!(event, InputEvent::Change | InputEvent::Focus) {
+                    view.refresh_completion(completion::Owner::Editor, window, cx);
+                }
                 if matches!(event, InputEvent::Change) {
                     view.queue_autosave(window, cx);
                     let text = input.read(cx).text().to_string();
@@ -194,9 +228,12 @@ impl DesktopView {
                 .unwrap_or(true)
         });
         let sessions = model.sessions.list();
-        let document_text = cx.new(|cx| TextViewState::markdown(&model.source, cx));
+        let document_text =
+            cx.new(|cx| TextViewState::markdown(&markup::render_source(&model.source), cx));
         Self {
             focus,
+            completion: None,
+            completion_dismissed: None,
             sessions,
             todo_scroll: UniformListScrollHandle::new(),
             autosave_task: None,
@@ -214,6 +251,10 @@ impl DesktopView {
             active_tag: None,
             agent: None,
             expanded_thinking: Default::default(),
+            echo_open: false,
+            expanded_tools: Default::default(),
+            session_action: None,
+            session_action_name,
             agent_input,
             answer_input,
             private_input,
@@ -288,8 +329,9 @@ impl DesktopView {
     fn set_draft(&mut self, draft: gpui_kit::SharedString, cx: &mut Context<Self>) {
         self.draft_chars = draft.chars().count();
         self.outline = super::markdown::outline(&draft);
-        self.document_text
-            .update(cx, |text, cx| text.set_text(&draft, cx));
+        self.document_text.update(cx, |text, cx| {
+            text.set_text(&markup::render_source(&draft), cx)
+        });
         self.draft = draft;
     }
 
@@ -303,6 +345,9 @@ impl DesktopView {
                         .update(cx, |editor, cx| editor.set_value("", window, cx));
                 }
                 self.sync_daily_list();
+                if self.page == Page::Daily {
+                    self.daily_list.scroll_to_end();
+                }
                 self.status = "已保存".into();
                 cx.notify();
                 true
@@ -329,6 +374,9 @@ impl DesktopView {
                 } else {
                     Page::Daily
                 };
+                if self.page == Page::Daily {
+                    self.daily_list.scroll_to_end();
+                }
                 if self.preview {
                     self.focus.focus(window, cx);
                 } else {

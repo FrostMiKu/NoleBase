@@ -90,6 +90,9 @@ impl DesktopView {
             }
         }
         self.page = page;
+        if page == Page::Daily {
+            self.daily_list.scroll_to_end();
+        }
         match page {
             Page::Search => self.search.update(cx, |input, cx| input.focus(window, cx)),
             Page::Agent => self

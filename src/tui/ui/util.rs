@@ -313,24 +313,7 @@ pub(super) fn visible_selection_items(list_height: u16, item_height: u16) -> usi
     (list_height.saturating_sub(1) as usize).div_ceil(item_height)
 }
 
-pub(super) fn selection_viewport_start(
-    start: usize,
-    selected: usize,
-    visible: usize,
-    total: usize,
-) -> usize {
-    if visible == 0 || total == 0 {
-        return 0;
-    }
-    let selected = selected.min(total - 1);
-    let mut start = start.min(total.saturating_sub(visible));
-    if selected < start {
-        start = selected;
-    } else if selected >= start.saturating_add(visible) {
-        start = selected.saturating_add(1).saturating_sub(visible);
-    }
-    start.min(total.saturating_sub(visible))
-}
+pub(super) use crate::core::completion::selection_viewport_start;
 
 pub(super) fn variable_selection_viewport_start(
     start: usize,

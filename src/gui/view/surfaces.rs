@@ -4,6 +4,7 @@ use crate::gui::presentation::{
     BODY_SIZE, RADIUS_LG, RADIUS_MD, RADIUS_SM, READING_WIDTH, SPACE_2XL, SPACE_LG, SPACE_MD,
     SPACE_SM, SPACE_XL, SPACE_XS, TEXT_META, TEXT_NAV, TEXT_UI,
 };
+use gpui_kit::TestSupportExt;
 
 impl DesktopView {
     pub(super) fn home_surface(
@@ -233,6 +234,15 @@ impl DesktopView {
                         .gap(px(SPACE_MD))
                         .child(
                             div()
+                                .id(gpui_kit::SharedString::from(format!("daily-date-{date}")))
+                                .debug_selector(move || format!("daily-date-{date}"))
+                                .test_support()
+                                .role(gpui_kit::Role::Button)
+                                .aria_label(daily_label(date, today))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.open_daily_document(date, window, cx);
+                                }))
                                 .flex_shrink_0()
                                 .font_family(serif.clone())
                                 .text_size(px(TEXT_UI + 1.))
@@ -244,14 +254,7 @@ impl DesktopView {
                         .into_any_element(),
                     None => div()
                         .pb(px(SPACE_MD))
-                        .child(crate::gui::rich_text::markdown(
-                            block.id.clone(),
-                            block.text.clone(),
-                            false,
-                            t,
-                            window,
-                            cx,
-                        ))
+                        .child(view.markdown(block.id.clone(), &block.text, window, cx))
                         .into_any_element(),
                 };
                 reading_row(content).into_any_element()
@@ -335,9 +338,18 @@ impl DesktopView {
                     .mt(px(SPACE_SM))
                     .child(
                         div()
-                            .text_size(px(TEXT_META))
-                            .text_color(color(t.text_muted))
-                            .child(hint),
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_SM))
+                            .when(matches!(kind, super::persistence::Compose::Agent), |row| {
+                                row.child(self.agent_permission_control(cx))
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(TEXT_META))
+                                    .text_color(color(t.text_muted))
+                                    .child(hint),
+                            ),
                     )
                     .child(action),
             )

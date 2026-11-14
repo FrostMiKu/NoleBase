@@ -3,7 +3,10 @@ use crate::core::storage::Storage;
 use gpui_kit::{point, size, TestAppContext};
 
 mod agent;
+mod completion;
+mod daily;
 mod file_actions;
+mod markup;
 mod scrolling;
 
 fn desktop_window(
@@ -826,6 +829,10 @@ fn agent_thinking_tools_and_markdown_have_distinct_layouts(cx: &mut TestAppConte
             cx.notify();
         })
     });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("agent-tool-result").is_none());
+    let toggle = cx.debug_bounds("agent-tool-toggle").unwrap().center();
+    cx.simulate_click(toggle, Default::default());
     cx.run_until_parked();
     let thinking = cx.debug_bounds("agent-thinking-card").unwrap();
     let tool = cx.debug_bounds("agent-tool-status").unwrap();

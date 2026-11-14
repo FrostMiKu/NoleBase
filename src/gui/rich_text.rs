@@ -1,6 +1,8 @@
 //! GPUI Kit owns Markdown layout, selection, table wrapping and streaming motion.
 use gpui_kit::base::{TextView, TextViewMotion};
-use gpui_kit::{div, prelude::*, px, App, SharedString, Window};
+#[cfg(all(test, feature = "gui-test"))]
+use gpui_kit::SharedString;
+use gpui_kit::{div, prelude::*, px, App, Window};
 use std::time::Duration;
 
 /// Streamed words light up over 280 ms, each a few milliseconds after the last.
@@ -29,6 +31,7 @@ pub fn body(
     .min_w_0()
 }
 
+#[cfg(all(test, feature = "gui-test"))]
 pub fn markdown(
     id: impl Into<SharedString>,
     source: SharedString,
@@ -37,7 +40,23 @@ pub fn markdown(
     window: &mut Window,
     cx: &mut App,
 ) -> gpui_kit::AnyElement {
-    let view = body(TextView::markdown(id.into(), source), tokens, window, cx)
+    render(
+        TextView::markdown(id.into(), source),
+        scrollable,
+        tokens,
+        window,
+        cx,
+    )
+}
+
+pub fn render(
+    view: TextView,
+    scrollable: bool,
+    tokens: crate::core::theme::Theme,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui_kit::AnyElement {
+    let view = body(view, tokens, window, cx)
         .scrollable(scrollable)
         .when(!scrollable, |text| text.motion(stream_motion()))
         .when(scrollable, |text| text.size_full());

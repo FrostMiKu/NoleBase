@@ -29,6 +29,7 @@ const SETTLED_RETENTION: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
     Tool,
+    Collaborator,
     Shell,
     Download,
     TerminalWatch,
@@ -38,6 +39,7 @@ impl JobKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tool => "tool",
+            Self::Collaborator => "collaborator",
             Self::Shell => "shell",
             Self::Download => "download",
             Self::TerminalWatch => "terminal-watch",
