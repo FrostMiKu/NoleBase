@@ -1,5 +1,5 @@
 use super::*;
-use gpui_kit::test::{TestQueryExt, TestWindowExt};
+use gpui_kit::test::TestWindowExt;
 
 fn choose_context_action(cx: &mut gpui_kit::VisualTestContext, path: &str, action: &str) {
     cx.run_until_parked();
@@ -15,7 +15,11 @@ fn choose_context_action(cx: &mut gpui_kit::VisualTestContext, path: &str, actio
     cx.run_until_parked();
     let target = cx.update(|window, cx| {
         window.render_frame(cx);
-        window.find_by_label(action).bounds().center()
+        window
+            .within("popup-menu")
+            .find_by_label(action)
+            .bounds()
+            .center()
     });
     cx.simulate_click(target, Default::default());
     cx.run_until_parked();

@@ -25,7 +25,8 @@ use export::*;
 mod notes;
 mod theme;
 
-pub(crate) use theme::DEFAULT_THEME_TOML;
+pub use theme::ThemeTarget;
+pub(crate) use theme::{BUILT_IN_THEMES, DEFAULT_THEME_TOML};
 
 pub(crate) use atomic::replace_file_atomically;
 pub(crate) use atomic::stage_replacement;
@@ -33,7 +34,10 @@ pub(crate) use atomic::stage_replacement;
 const CONFIG_DIR: &str = "config";
 const AI_CONFIG_FILE: &str = "ai.toml";
 const SETTINGS_FILE: &str = "settings.toml";
-const DEFAULT_SETTINGS: &str = r#"theme = "default"
+const DEFAULT_SETTINGS: &str = r#"# Theme names match files in themes/. The terminal and desktop clients keep
+# separate selections; "random" picks a theme file at random.
+theme = "default"
+desktop_theme = "paper"
 
 # Show complete thinking blocks instead of a five-line scrolling window.
 show_full_thinking = false
@@ -84,6 +88,8 @@ impl AppendReceipt {
 #[serde(deny_unknown_fields)]
 struct SettingsFile {
     theme: String,
+    #[serde(default = "theme::default_desktop_theme")]
+    desktop_theme: String,
     editor: Option<String>,
     shell: Option<String>,
     #[serde(default)]
@@ -246,12 +252,7 @@ impl Storage {
         fs::create_dir_all(&self.workspace_dir)
             .with_context(|| format!("creating {}", self.workspace_dir.display()))?;
         crate::core::skill::ensure_skills_directory(&self.skills_dir)?;
-        fs::create_dir_all(&self.themes_dir)
-            .with_context(|| format!("creating {}", self.themes_dir.display()))?;
-        let default_theme_path = self.themes_dir.join("default.toml");
-        if !default_theme_path.exists() {
-            self.write_default_theme(&default_theme_path)?;
-        }
+        self.ensure_theme_files()?;
         if !self.ai_config_path.exists() {
             self.write_default_ai_config()?;
         }
@@ -309,20 +310,6 @@ impl Storage {
         Ok(())
     }
 
-    fn write_default_theme(&self, path: &Path) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        file.write_all(DEFAULT_THEME_TOML.as_bytes())?;
-        Ok(())
-    }
-
-    pub fn load_theme_selection(&self) -> Result<String> {
-        Ok(self.load_settings()?.theme)
-    }
-
     pub fn editor_command(&self) -> Result<String> {
         let settings = self.load_settings()?;
         Ok(resolve_editor_command(
@@ -352,19 +339,6 @@ impl Storage {
             bail!("settings export_directory must not be blank");
         }
         Ok(trimmed.to_string())
-    }
-
-    pub fn write_theme_selection(&self, selection: &str) -> Result<()> {
-        let source = self.read_settings_source()?;
-        self.parse_settings(&source)?;
-        let mut document = source
-            .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("parsing {}", self.settings_path.display()))?;
-        document["theme"] = toml_edit::value(selection);
-        fs::create_dir_all(&self.config_dir)
-            .with_context(|| format!("creating {}", self.config_dir.display()))?;
-        fs::write(&self.settings_path, document.to_string())
-            .with_context(|| format!("writing {}", self.settings_path.display()))
     }
 
     fn load_settings(&self) -> Result<SettingsFile> {
@@ -1246,7 +1220,9 @@ mod tests {
 
         let (_directory, storage) = fresh();
         assert_eq!(storage.default_export_directory().unwrap(), "~");
-        storage.write_theme_selection("custom").unwrap();
+        storage
+            .write_theme_selection(crate::core::storage::ThemeTarget::Terminal, "custom")
+            .unwrap();
         assert_eq!(
             fs::read_to_string(&storage.settings_path).unwrap(),
             DEFAULT_SETTINGS.replacen("theme = \"default\"", "theme = \"custom\"", 1)
@@ -1257,7 +1233,9 @@ mod tests {
             "theme = \"default\"\neditor = \"hx\"\nshell = \"fish\"\nexport_directory = \"~\"\n",
         )
         .unwrap();
-        storage.write_theme_selection("custom").unwrap();
+        storage
+            .write_theme_selection(crate::core::storage::ThemeTarget::Terminal, "custom")
+            .unwrap();
         let settings = storage.load_settings().unwrap();
         assert_eq!(settings.theme, "custom");
         assert_eq!(settings.editor.as_deref(), Some("hx"));

@@ -1,5 +1,8 @@
 //! Terminal adapter for the shared semantic theme.
-use crate::core::{storage::Storage, theme};
+use crate::core::{
+    storage::Storage,
+    theme::{self, ThemeTarget},
+};
 use anyhow::Result;
 use ratatui::style::Color;
 use std::path::Path;
@@ -17,9 +20,9 @@ impl From<theme::Color> for Color {
 }
 
 pub fn load_theme(storage: &Storage, previous: Option<&Path>) -> Result<LoadedTheme> {
-    theme::load_theme(storage, previous)
+    theme::load_theme(storage, ThemeTarget::Terminal, previous)
 }
 
 pub fn select_theme(storage: &Storage, selection: &str) -> Result<LoadedTheme> {
-    theme::select_theme(storage, selection)
+    theme::select_theme(storage, ThemeTarget::Terminal, selection)
 }

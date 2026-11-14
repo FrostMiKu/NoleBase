@@ -124,10 +124,18 @@ impl App {
             DialogOption::with_hint("random", "Choose a theme at random"),
         ];
         options.extend(names.into_iter().map(|name| {
-            let hint = if name == self.active_theme {
-                "Custom theme · active"
+            let kind = if crate::core::storage::BUILT_IN_THEMES
+                .iter()
+                .any(|(built_in, _)| *built_in == name)
+            {
+                "Built-in theme"
             } else {
                 "Custom theme"
+            };
+            let hint = if name == self.active_theme {
+                format!("{kind} · active")
+            } else {
+                kind.to_string()
             };
             DialogOption::with_hint(name, hint)
         }));

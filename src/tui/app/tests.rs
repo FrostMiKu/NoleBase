@@ -1018,7 +1018,12 @@ fn command_palette_switches_theme_and_persists_the_selection() {
     assert_eq!(app.overlay, None);
     assert_eq!(app.theme_selection, "custom");
     assert_eq!(app.active_theme, "custom");
-    assert_eq!(app.storage().load_theme_selection().unwrap(), "custom");
+    assert_eq!(
+        app.storage()
+            .load_theme_selection(crate::core::storage::ThemeTarget::Terminal)
+            .unwrap(),
+        "custom"
+    );
     assert_eq!(app.theme.surface_panel, ratatui::style::Color::Rgb(1, 2, 3));
 }
 
@@ -2561,7 +2566,9 @@ fn workspace_reload_applies_theme_changes_and_invalidates_render_caches() {
     let custom = crate::core::storage::DEFAULT_THEME_TOML
         .replace("panel = \"#181825\"", "panel = \"#010203\"");
     fs::write(app.storage().themes_dir.join("custom.toml"), custom).unwrap();
-    app.storage().write_theme_selection("custom").unwrap();
+    app.storage()
+        .write_theme_selection(crate::core::storage::ThemeTarget::Terminal, "custom")
+        .unwrap();
 
     app.reload_workspace();
 

@@ -13,8 +13,9 @@ use std::{sync::Arc, time::SystemTime};
 pub struct Document {
     pub path: String,
     pub title: String,
-    pub preview: Arc<Vec<super::markdown::PreviewBlock>>,
-    stamp: SystemTime,
+    pub summary: SharedString,
+    pub tags: Arc<Vec<String>>,
+    pub modified: SystemTime,
     pub archived: bool,
 }
 
@@ -41,7 +42,7 @@ pub struct Desktop {
 impl Desktop {
     pub fn open(storage: Storage) -> Result<Self> {
         storage.ensure_files()?;
-        let theme = theme::load_theme(&storage, None)?;
+        let theme = theme::load_theme(&storage, theme::ThemeTarget::Desktop, None)?;
         let workspace = Arc::new(Workspace::open(storage)?);
         let sessions = crate::core::agent_sessions::AgentSessions::open(workspace.clone())?;
         let mut model = Self {
@@ -82,7 +83,7 @@ impl Desktop {
                     let date = note.date.to_string();
                     let mut rows = vec![DailyBlock {
                         id: format!("{date}-header"),
-                        date: Some(date.clone()),
+                        date: Some(note.date),
                         text: SharedString::default(),
                     }];
                     rows.extend(
@@ -113,7 +114,10 @@ impl Desktop {
                     .workspace
                     .relative_path(&file.path)
                     .context("locating note")?;
-                if let Some(cached) = previous.get(&path).filter(|doc| doc.stamp == file.modified) {
+                if let Some(cached) = previous
+                    .get(&path)
+                    .filter(|doc| doc.modified == file.modified)
+                {
                     return Ok(cached.clone());
                 }
                 let title = file
@@ -126,8 +130,9 @@ impl Desktop {
                 Ok(Document {
                     path,
                     title,
-                    preview: Arc::new(super::markdown::preview(&source)),
-                    stamp: file.modified,
+                    summary: super::markdown::summary(&source),
+                    tags: Arc::new(super::markdown::tags(&source)),
+                    modified: file.modified,
                     archived: file.archived,
                 })
             })
@@ -207,6 +212,19 @@ impl Desktop {
         search_workspace(&self.workspace, query)
     }
 
+    /// Workspace-relative paths of the notes linking to `path`, or `None`
+    /// while the link index is still building.
+    pub fn backlinks(&self, path: &str) -> Option<Vec<String>> {
+        let absolute = self.workspace.document_path(path).ok()?;
+        Some(
+            self.workspace
+                .backlinks(&absolute)?
+                .iter()
+                .filter_map(|link| self.workspace.relative_path(link))
+                .collect(),
+        )
+    }
+
     pub fn select_tag(&mut self, tag: &str) {
         self.tag_documents = self
             .workspace
@@ -218,14 +236,17 @@ impl Desktop {
     }
 
     pub fn cycle_theme(&mut self) -> Result<()> {
-        let mut names = vec!["default".to_owned()];
-        names.extend(self.workspace.storage().list_theme_names()?);
+        let names = theme::theme_names(self.workspace.storage())?;
         let next = names
             .iter()
             .position(|name| name == &self.theme.active)
             .map(|index| (index + 1) % names.len())
             .unwrap_or(0);
-        self.theme = theme::select_theme(self.workspace.storage(), &names[next])?;
+        self.theme = theme::select_theme(
+            self.workspace.storage(),
+            theme::ThemeTarget::Desktop,
+            &names[next],
+        )?;
         Ok(())
     }
 }
@@ -233,7 +254,7 @@ impl Desktop {
 #[derive(Clone)]
 pub struct DailyBlock {
     pub id: String,
-    pub date: Option<String>,
+    pub date: Option<chrono::NaiveDate>,
     pub text: SharedString,
 }
 
@@ -363,9 +384,8 @@ mod discovery_tests {
             .iter()
             .find(|doc| doc.path == path)
             .unwrap()
-            .preview
-            .iter()
-            .any(|block| block.text.contains("needle")));
+            .summary
+            .contains("needle"));
         let hits = model.search("needle");
         assert!(hits
             .iter()

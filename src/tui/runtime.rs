@@ -634,7 +634,9 @@ mod tests {
             .replace("panel = \"#181825\"", "panel = \"#010203\"");
         let theme_path = app.storage().themes_dir.join("custom.toml");
         fs::write(&theme_path, custom).unwrap();
-        app.storage().write_theme_selection("custom").unwrap();
+        app.storage()
+            .write_theme_selection(crate::core::storage::ThemeTarget::Terminal, "custom")
+            .unwrap();
 
         sender
             .send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))

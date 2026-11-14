@@ -1,5 +1,7 @@
+use super::surfaces::reading_row;
 use super::*;
 use crate::core::agent::{ApprovalDecision, AskUserResponse, PrivateTerminalInputDecision};
+use crate::gui::presentation::{RADIUS_LG, RADIUS_MD, SPACE_MD, SPACE_SM, TEXT_META, TEXT_UI};
 
 impl DesktopView {
     #[cfg(feature = "gui-test")]
@@ -45,7 +47,7 @@ impl DesktopView {
                 self.agent_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.agent_list.reset(agent.rows.len());
-                self.rebuild_tree();
+                self.refresh_sessions();
                 self.status.clear();
             }
             Err(error) => self.status = format!("发送遇到问题：{error}"),
@@ -58,9 +60,13 @@ impl DesktopView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
-        let t = self.model.theme.theme;
         let Some(agent) = &self.agent else {
-            return div().id("agent-unavailable");
+            return div().id("agent-unavailable").child(self.empty_state(
+                "agent-unavailable-state",
+                "nole/agent",
+                "Agent 暂时无法打开",
+                "检查 config/ai.toml 中的模型配置后重试。",
+            ));
         };
         let running = agent.current.session.is_running();
         let view = cx.entity().downgrade();
@@ -96,12 +102,12 @@ impl DesktopView {
                             .flex_1()
                             .min_h_0()
                             .when(agent.rows.is_empty(), |body| {
-                                body.child(
-                                    div()
-                                        .py(px(LIST_TOP))
-                                        .text_color(color(t.text_muted))
-                                        .child("描述你的目标，Agent 会结合知识库协助完成。"),
-                                )
+                                body.child(self.empty_state(
+                                    "agent-empty",
+                                    "nole/agent",
+                                    "开始与 Agent 对话",
+                                    "描述你的目标，Agent 会结合知识库查找资料、整理笔记或完成任务。用 [[笔记名]] 引用笔记。",
+                                ))
                             })
                             .relative()
                             .child(transcript)
@@ -113,51 +119,37 @@ impl DesktopView {
                             .max_h(px(300.))
                             .overflow_y_scroll()
                             .flex_shrink_0()
-                            .child(interactions),
+                            .child(reading_row(interactions)),
                     )
                     .child(
-                        div().w_full().pt(px(12.)).flex_shrink_0().child(
-                            div()
-                                .border_1()
-                                .border_color(color(t.ui_border_subtle))
-                                .rounded(px(10.))
-                                .p(px(12.))
-                                .child(self.compose_input(
+                        reading_row(
+                            div().pt(px(SPACE_MD)).child(
+                                self.composer(
+                                    "agent-composer",
                                     super::persistence::Compose::Agent,
                                     86.,
+                                    "Enter 发送 · Shift+Enter 换行",
+                                    if running {
+                                        self.button("cancel-agent", "停止")
+                                            .icon(icon("nole/close").size(px(14.)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(agent) = &this.agent {
+                                                    agent.current.session.cancel();
+                                                }
+                                                cx.notify();
+                                            }))
+                                    } else {
+                                        self.primary_button("send-agent", "发送")
+                                            .child(icon("nole/arrow").size(px(14.)))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.send_agent(window, cx)
+                                            }))
+                                    },
                                     cx,
-                                ))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .mt(px(6.))
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(color(t.text_muted))
-                                                .child("Enter 发送 · Shift+Enter 换行"),
-                                        )
-                                        .child(if running {
-                                            self.button("cancel-agent", "停止").on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    if let Some(agent) = &this.agent {
-                                                        agent.current.session.cancel();
-                                                    }
-                                                    cx.notify();
-                                                }),
-                                            )
-                                        } else {
-                                            self.button("send-agent", "发送")
-                                                .bg(color(t.ui_action))
-                                                .text_color(color(t.text_on_accent))
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.send_agent(window, cx)
-                                                }))
-                                        }),
                                 ),
-                        ),
+                            ),
+                        )
+                        .flex_shrink_0(),
                     ),
             )
     }
@@ -167,66 +159,111 @@ impl DesktopView {
         let Some(agent) = &self.agent else {
             return div();
         };
-        let mut panel = div().flex_shrink_0().flex().flex_col().gap(px(10.));
+        let card = || {
+            div()
+                .w_full()
+                .p(px(SPACE_MD + 2.))
+                .rounded(px(RADIUS_LG))
+                .border_1()
+                .border_color(color(t.ui_action_ai).opacity(0.35))
+                .bg(color(t.surface_raised))
+                .flex()
+                .flex_col()
+                .gap(px(SPACE_SM + 2.))
+        };
+        let heading = |label: &'static str, text: String| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_SM))
+                .text_size(px(TEXT_UI))
+                .child(
+                    div()
+                        .text_size(px(TEXT_META))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(color(t.ui_action_ai))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .child(text),
+                )
+        };
+        let mut panel = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE_SM + 2.));
         if let Some(approval) = &agent.approval {
             panel = panel.child(self.agent_approval(approval, cx));
         } else if let Some(question) = &agent.question {
-            panel = panel.child(div().text_size(px(13.)).child(question.question.clone()));
+            let mut body = card().child(heading("需要你的选择", question.question.clone()));
+            let hover = self.row_hover();
             for (index, option) in question.options.iter().enumerate() {
                 let answer = option.clone();
-                panel = panel.child(
+                body = body.child(
                     div()
                         .id(("agent-option", index))
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(6.))
+                        .px(px(SPACE_MD))
+                        .py(px(SPACE_SM))
+                        .rounded(px(RADIUS_MD))
+                        .border_1()
+                        .border_color(color(t.ui_border_subtle))
                         .cursor_pointer()
-                        .text_size(px(13.))
-                        .hover(move |row| row.bg(color(t.surface_panel)))
+                        .hover(move |row| row.bg(hover))
                         .child(option.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.agent_answer(AskUserResponse::Answer(answer.clone()), cx)
                         })),
                 );
             }
-            panel = panel.child(Input::new(&self.answer_input)).child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(
-                        self.button("answer-agent", "提交回答")
-                            .on_click(cx.listener(|this, _, window, cx| {
+            panel = panel.child(
+                body.child(Input::new(&self.answer_input)).child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(SPACE_SM))
+                        .child(self.button("cancel-answer", "取消").on_click(cx.listener(
+                            |this, _, _, cx| this.agent_answer(AskUserResponse::Cancelled, cx),
+                        )))
+                        .child(self.primary_button("answer-agent", "提交回答").on_click(
+                            cx.listener(|this, _, window, cx| {
                                 let answer = this.answer_input.read(cx).value();
                                 this.agent_answer(AskUserResponse::Answer(answer.to_string()), cx);
                                 this.answer_input
                                     .update(cx, |input, cx| input.set_value("", window, cx));
-                            })),
-                    )
-                    .child(self.button("cancel-answer", "取消").on_click(cx.listener(
-                        |this, _, _, cx| this.agent_answer(AskUserResponse::Cancelled, cx),
-                    ))),
+                            }),
+                        )),
+                ),
             );
         } else if let Some(request) = &agent.private_input {
-            panel = panel
-                .child(div().text_size(px(13.)).child(request.purpose.clone()))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(color(t.text_muted))
-                        .child(request.prompt.clone()),
-                )
-                .child(Input::new(&self.private_input))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(self.button("submit-private", "提交").on_click(cx.listener(
-                            |this, _, window, cx| this.submit_private(false, window, cx),
-                        )))
-                        .child(self.button("cancel-private", "取消").on_click(cx.listener(
-                            |this, _, window, cx| this.submit_private(true, window, cx),
-                        ))),
-                );
+            panel = panel.child(
+                card()
+                    .child(heading("需要私密输入", request.purpose.clone()))
+                    .child(
+                        div()
+                            .text_size(px(TEXT_META))
+                            .text_color(color(t.text_muted))
+                            .child(request.prompt.clone()),
+                    )
+                    .child(Input::new(&self.private_input))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(SPACE_SM))
+                            .child(self.button("cancel-private", "取消").on_click(cx.listener(
+                                |this, _, window, cx| this.submit_private(true, window, cx),
+                            )))
+                            .child(self.primary_button("submit-private", "提交").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.submit_private(false, window, cx)
+                                }),
+                            )),
+                    ),
+            );
         }
         panel
     }
