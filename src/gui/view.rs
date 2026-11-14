@@ -22,12 +22,15 @@ use gpui_kit::{
 use std::time::Duration;
 
 mod agent;
+mod agent_approval;
 mod agent_entry;
 mod discovery;
+mod file_actions;
 mod home;
 mod persistence;
 mod preview;
 mod runtime;
+mod scrolling;
 mod sidebar;
 mod surfaces;
 mod todo;
@@ -89,6 +92,9 @@ pub struct DesktopView {
     new_note_open: bool,
     new_note_template: bool,
     new_note_name: Entity<InputState>,
+    note_action: Option<file_actions::NoteAction>,
+    note_action_name: Entity<InputState>,
+    document_scroll: gpui_kit::ScrollHandle,
     sidebar_scroll: UniformListScrollHandle,
     results_scroll: UniformListScrollHandle,
     tags_scroll: UniformListScrollHandle,
@@ -120,6 +126,7 @@ impl DesktopView {
                 .default_value(model.source.clone())
         });
         let new_note_name = cx.new(|cx| InputState::new(window, cx).placeholder("笔记名称"));
+        let note_action_name = cx.new(|cx| InputState::new(window, cx).placeholder("笔记名称"));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索知识库"));
         let agent_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -132,6 +139,11 @@ impl DesktopView {
                 .placeholder("输入后提交")
         });
         let subscriptions = vec![
+            cx.subscribe_in(&note_action_name, window, |view, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    view.confirm_note_action(window, cx);
+                }
+            }),
             cx.subscribe_in(&new_note_name, window, |view, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     view.confirm_new_note(window, cx);
@@ -206,6 +218,9 @@ impl DesktopView {
             new_note_open: false,
             new_note_template: false,
             new_note_name,
+            note_action: None,
+            note_action_name,
+            document_scroll: gpui_kit::ScrollHandle::default(),
             sidebar_scroll: UniformListScrollHandle::new(),
             results_scroll: UniformListScrollHandle::new(),
             tags_scroll: UniformListScrollHandle::new(),
@@ -277,6 +292,7 @@ impl DesktopView {
         }
         match self.model.open_document(path) {
             Ok(()) => {
+                self.document_scroll.set_offset(Default::default());
                 self.set_editor(window, cx);
                 self.preview = self.model.selected.is_some();
                 self.page = if self.model.selected.is_some() {

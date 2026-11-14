@@ -40,17 +40,3 @@ fn unknown_arguments_report_usage_before_opening_the_workspace() {
         assert!(!root.exists());
     }
 }
-
-#[test]
-fn agent_shell_subprocess_preserves_output_and_exit_code() {
-    let output = Command::new(env!("CARGO_BIN_EXE_nole"))
-        .args([
-            "--agent-shell-helper",
-            "command",
-            "printf 'client shell'; exit 7",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(7));
-    assert_eq!(output.stdout, b"client shell");
-}

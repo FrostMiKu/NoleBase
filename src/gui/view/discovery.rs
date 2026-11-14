@@ -106,9 +106,10 @@ impl DesktopView {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
                     .pt(px(LIST_TOP))
-                    .child(results),
+                    .relative()
+                    .child(results)
+                    .child(self.main_scrollbar(&self.results_scroll, LIST_TOP)),
             )
     }
 
@@ -233,10 +234,9 @@ impl DesktopView {
                     .w_full()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
                     .pt(px(LIST_TOP))
                     .child(rows)
-                    .child(Scrollbar::vertical(&self.tags_scroll)),
+                    .child(self.main_scrollbar(&self.tags_scroll, LIST_TOP)),
             )
     }
 }

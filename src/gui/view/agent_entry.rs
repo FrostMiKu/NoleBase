@@ -1,5 +1,6 @@
 use super::*;
 use crate::gui::agent::{AgentRow, AgentRowKind};
+use gpui_kit::base::SelectableText;
 
 impl DesktopView {
     pub(super) fn agent_entry(
@@ -28,7 +29,10 @@ impl DesktopView {
                 .flex()
                 .gap(px(10.))
                 .child(div().text_color(color(t.ui_agent_user)).child("›"))
-                .child(div().flex_1().min_w_0().child(row.text.clone()))
+                .child(div().flex_1().min_w_0().child(SelectableText::new(
+                    gpui_kit::SharedString::from(row.id.clone()),
+                    row.text.clone(),
+                )))
                 .into_any_element(),
             AgentRowKind::Thinking { streaming } => {
                 let expanded = self.expanded_thinking.contains(&row.id);
@@ -52,6 +56,7 @@ impl DesktopView {
                     .text_color(color(t.text_muted))
                     .child(
                         div()
+                            .id(gpui_kit::SharedString::from(format!("{}-toggle", row.id)))
                             .flex()
                             .items_center()
                             .gap(px(8.))
@@ -66,30 +71,32 @@ impl DesktopView {
                                     "nole/chevron-right"
                                 })
                                 .size(px(14.)),
-                            ),
+                            )
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if !view.expanded_thinking.remove(&id) {
+                                    view.expanded_thinking.insert(id.clone());
+                                }
+                                if let Some(index) = view.agent.as_ref().and_then(|agent| {
+                                    agent.rows.iter().position(|row| row.id == id)
+                                }) {
+                                    view.agent_list.splice(index..index + 1, 1);
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
                         div()
+                            .debug_selector(|| "agent-thinking-body".into())
                             .mt(px(12.))
                             .text_size(px(13.))
                             .line_height(gpui_kit::relative(1.6))
                             .when(!expanded, |body| body.max_h(px(110.)).overflow_hidden())
-                            .child(body),
+                            .child(SelectableText::new(
+                                gpui_kit::SharedString::from(format!("{}-body", row.id)),
+                                body,
+                            )),
                     )
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        if !view.expanded_thinking.remove(&id) {
-                            view.expanded_thinking.insert(id.clone());
-                        }
-                        if let Some(index) = view
-                            .agent
-                            .as_ref()
-                            .and_then(|agent| agent.rows.iter().position(|row| row.id == id))
-                        {
-                            view.agent_list.splice(index..index + 1, 1);
-                        }
-                        cx.notify();
-                    }))
                     .into_any_element()
             }
             AgentRowKind::Tool {
@@ -103,7 +110,7 @@ impl DesktopView {
                     div()
                         .debug_selector(|| "agent-tool-status".into())
                         .w_full()
-                        .h(px(26.))
+                        .min_h(px(26.))
                         .flex()
                         .items_center()
                         .gap(px(8.))
@@ -113,6 +120,10 @@ impl DesktopView {
                             &row.id,
                             *active,
                             color(t.ui_activity_marker),
+                        ))
+                        .child(SelectableText::new(
+                            gpui_kit::SharedString::from(format!("{}-status", row.id)),
+                            row.text.clone(),
                         )),
                 )
                 .when(!details.is_empty() || preview.is_some(), |tool| {
@@ -127,17 +138,29 @@ impl DesktopView {
                             .text_size(px(12.))
                             .line_height(gpui_kit::relative(1.5))
                             .text_color(color(t.text_muted))
-                            .when(!details.is_empty(), |body| body.child(details.clone()))
+                            .when(!details.is_empty(), |body| {
+                                body.child(SelectableText::new(
+                                    gpui_kit::SharedString::from(format!("{}-details", row.id)),
+                                    details.clone(),
+                                ))
+                            })
                             .when_some(preview.clone(), |body, preview| {
-                                body.child(div().child(preview))
+                                body.child(div().child(SelectableText::new(
+                                    gpui_kit::SharedString::from(format!("{}-preview", row.id)),
+                                    preview,
+                                )))
                             }),
                     )
                 })
                 .into_any_element(),
             AgentRowKind::Error => div()
+                .debug_selector(|| "agent-error".into())
                 .text_color(color(t.ui_error))
                 .text_size(px(13.))
-                .child(row.text.clone())
+                .child(SelectableText::new(
+                    gpui_kit::SharedString::from(row.id.clone()),
+                    row.text.clone(),
+                ))
                 .into_any_element(),
         };
         div()

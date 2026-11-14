@@ -1,5 +1,5 @@
 use super::*;
-use gpui_kit::component::sidebar::{SidebarFooter, SidebarHeader, SidebarItem, SidebarMenuItem};
+use gpui_kit::component::sidebar::{SidebarFooter, SidebarItem, SidebarMenuItem};
 
 impl DesktopView {
     pub(super) fn build_tree(
@@ -126,7 +126,8 @@ impl DesktopView {
             .border_color(color(t.ui_border_subtle).opacity(0.45))
             .text_size(px(13.))
             .child(
-                SidebarHeader::new()
+                div()
+                    .debug_selector(|| "sidebar-header".into())
                     .w_full()
                     .h(px(TOOLBAR_HEIGHT))
                     .px(px(14.))
@@ -282,6 +283,7 @@ impl DesktopView {
                         SidebarMenuItem::new(doc.title.clone())
                             .icon(icon("nole/note"))
                             .active(selected)
+                            .context_menu(self.note_context_menu(path.clone(), cx))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.navigate(Some(path.clone()), window, cx)
                             }))

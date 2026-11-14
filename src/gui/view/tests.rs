@@ -2,6 +2,10 @@ use super::*;
 use crate::core::storage::Storage;
 use gpui_kit::{point, size, TestAppContext};
 
+mod agent;
+mod file_actions;
+mod scrolling;
+
 fn desktop_window(
     cx: &mut TestAppContext,
     model: Desktop,

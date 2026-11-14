@@ -41,7 +41,11 @@ impl DesktopView {
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
         let (id, input) = match kind {
-            Compose::Daily => ("daily-compose", &self.editor),
+            Compose::Daily => {
+                self.editor
+                    .update(cx, |editor, _| editor.set_scrollbar_renderer(None));
+                ("daily-compose", &self.editor)
+            }
             Compose::Agent => ("agent-compose", &self.agent_input),
         };
         div()

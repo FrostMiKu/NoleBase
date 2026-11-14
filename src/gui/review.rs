@@ -71,5 +71,25 @@ pub fn capture(storage: Storage, output: &Path) -> Result<()> {
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
     cx.capture_screenshot(handle)?
         .save(output.join("reading.png"))?;
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.review_agent(window, cx));
+        window.render_frame(cx);
+    })?;
+    cx.advance_clock(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    cx.capture_screenshot(handle)?
+        .save(output.join("agent-approval.png"))?;
+    cx.update_window(handle, |_, window, cx| {
+        window.click_with_options(
+            "file-data/Reading.md",
+            gpui_kit::test::ClickOptions::new().with_button(gpui_kit::MouseButton::Right),
+            cx,
+        );
+    })?;
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    cx.capture_screenshot(handle)?
+        .save(output.join("file-context-menu.png"))?;
     Ok(())
 }

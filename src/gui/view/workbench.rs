@@ -2,6 +2,21 @@ use super::*;
 use gpui_kit::component::toolbar::Toolbar;
 
 impl DesktopView {
+    pub(super) fn main_scrollbar(
+        &self,
+        handle: &(impl gpui_kit::component::scroll::ScrollbarHandle + Clone),
+        top: f32,
+    ) -> gpui_kit::Div {
+        div()
+            .debug_selector(|| "main-scrollbar-viewport".into())
+            .absolute()
+            .top(px(top))
+            .bottom_0()
+            .left_0()
+            .right(-px(PAGE_INSET))
+            .child(Scrollbar::vertical(handle).viewport_from_layout())
+    }
+
     fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::Div {
         let t = self.model.theme.theme;
         let title = match self.page {
@@ -196,8 +211,7 @@ impl Render for DesktopView {
                     .child(
                         div()
                             .debug_selector(|| "page-content".into())
-                            .px(px(PAGE_INSET))
-                            .py(px(PAGE_INSET))
+                            .when(self.page != Page::Document, |page| page.p(px(PAGE_INSET)))
                             .w_full()
                             .flex_1()
                             .min_h_0()

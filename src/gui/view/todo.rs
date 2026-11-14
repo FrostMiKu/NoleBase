@@ -71,10 +71,9 @@ impl DesktopView {
                     .w_full()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
                     .pt(px(LIST_TOP))
                     .child(tasks)
-                    .child(Scrollbar::vertical(&self.todo_scroll)),
+                    .child(self.main_scrollbar(&self.todo_scroll, LIST_TOP)),
             )
     }
     fn toggle_task(&mut self, index: usize, cx: &mut Context<Self>) {

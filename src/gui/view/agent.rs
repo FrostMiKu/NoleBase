@@ -2,6 +2,39 @@ use super::*;
 use crate::core::agent::{ApprovalDecision, AskUserResponse, PrivateTerminalInputDecision};
 
 impl DesktopView {
+    #[cfg(feature = "gui-test")]
+    pub(in crate::gui) fn review_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::core::agent::{ApprovalKind, ApprovalRequest, CommandApproval};
+        use crate::core::agent_session::AgentPanelEntry;
+        self.open_page(Page::Agent, window, cx);
+        let agent = self.agent.as_mut().expect("review Agent session");
+        agent
+            .panel
+            .push_prompt("查看工作区文件，并帮我整理阅读笔记。", false);
+        agent.panel.push_entry(AgentPanelEntry::Assistant {
+            text: "我会先查看工作区中的文件，再根据内容整理笔记。".into(),
+            streaming: false,
+            final_output: false,
+        });
+        agent.panel.push_entry(AgentPanelEntry::Tool {
+            text: "Calling Shell...\nls -la workspace".into(),
+            active: true,
+            preview: None,
+        });
+        agent.rebuild_rows();
+        self.agent_list.reset(agent.rows.len());
+        agent.approval = Some(ApprovalRequest {
+            title: "运行命令".into(),
+            message: String::new(),
+            kind: ApprovalKind::Command(CommandApproval {
+                purpose: "查看工作区文件，确认需要整理的笔记。".into(),
+                label: "Shell".into(),
+                code: "ls -la workspace".into(),
+            }),
+        });
+        cx.notify();
+    }
+
     pub(super) fn send_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent) = &mut self.agent else {
             return;
@@ -62,7 +95,6 @@ impl DesktopView {
                         div()
                             .flex_1()
                             .min_h_0()
-                            .overflow_hidden()
                             .when(agent.rows.is_empty(), |body| {
                                 body.child(
                                     div()
@@ -73,7 +105,7 @@ impl DesktopView {
                             })
                             .relative()
                             .child(transcript)
-                            .child(Scrollbar::vertical(&self.agent_list)),
+                            .child(self.main_scrollbar(&self.agent_list, 0.)),
                     )
                     .child(
                         div()
@@ -137,51 +169,7 @@ impl DesktopView {
         };
         let mut panel = div().flex_shrink_0().flex().flex_col().gap(px(10.));
         if let Some(approval) = &agent.approval {
-            let mut details = div()
-                .id("approval-details")
-                .h(px(180.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .text_size(px(12.))
-                .child(
-                    div()
-                        .font_family("monospace")
-                        .child(approval.message.clone()),
-                );
-            if let crate::core::agent::ApprovalKind::Command(command) = &approval.kind {
-                details = details
-                    .child(format!("{} · {}", command.label, command.purpose))
-                    .child(
-                        div()
-                            .debug_selector(|| "approval-command".into())
-                            .p(px(12.))
-                            .bg(color(t.surface_panel))
-                            .font_family("monospace")
-                            .child(command.code.clone()),
-                    );
-            }
-            panel = panel
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .text_color(color(t.ui_warning))
-                        .child(approval.title.clone()),
-                )
-                .child(details)
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(self.button("approve-agent", "允许").on_click(cx.listener(
-                            |this, _, _, cx| this.agent_decision(ApprovalDecision::Approve, cx),
-                        )))
-                        .child(self.button("deny-agent", "拒绝").on_click(cx.listener(
-                            |this, _, _, cx| this.agent_decision(ApprovalDecision::Deny, cx),
-                        ))),
-                );
+            panel = panel.child(self.agent_approval(approval, cx));
         } else if let Some(question) = &agent.question {
             panel = panel.child(div().text_size(px(13.)).child(question.question.clone()));
             for (index, option) in question.options.iter().enumerate() {
@@ -243,7 +231,7 @@ impl DesktopView {
         panel
     }
 
-    fn agent_decision(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
+    pub(super) fn agent_decision(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
         if let Some(agent) = &mut self.agent {
             if let Err(error) = agent.approve(decision) {
                 self.status = error.to_string();

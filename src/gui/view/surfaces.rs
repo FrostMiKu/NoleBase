@@ -83,10 +83,9 @@ impl DesktopView {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
                     .pt(px(LIST_TOP))
                     .child(grid)
-                    .child(Scrollbar::vertical(&self.home_scroll[collection])),
+                    .child(self.main_scrollbar(&self.home_scroll[collection], LIST_TOP)),
             )
     }
 
@@ -236,9 +235,8 @@ impl DesktopView {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
                     .child(stream)
-                    .child(Scrollbar::vertical(&self.daily_list)),
+                    .child(self.main_scrollbar(&self.daily_list, 0.)),
             )
             .child(
                 div().w_full().pt(px(12.)).flex_shrink_0().child(
@@ -282,7 +280,8 @@ impl DesktopView {
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
         let t = self.model.theme.theme;
         let draft = self.draft.clone();
-        let inset = super::super::presentation::document_inset(self.content_width(window));
+        let inset =
+            super::super::presentation::document_inset(self.content_width(window)) + PAGE_INSET;
         if self.preview {
             div()
                 .id("document-scroll")
@@ -291,45 +290,66 @@ impl DesktopView {
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .px(px(inset))
+                .relative()
                 .overflow_hidden()
                 .text_size(px(super::super::presentation::BODY_SIZE))
                 .line_height(px(super::super::presentation::BODY_LINE))
                 .child(
                     div()
-                        .debug_selector(|| "document-column".into())
+                        .id("document-reading-scroll")
+                        .debug_selector(|| "document-viewport".into())
                         .size_full()
-                        .child(crate::gui::rich_text::markdown(
-                            "document-preview",
-                            draft,
-                            true,
-                            t,
-                            window,
-                            cx,
-                        )),
+                        .overflow_y_scroll()
+                        .track_scroll(&self.document_scroll)
+                        .px(px(inset))
+                        .py(px(PAGE_INSET))
+                        .child(
+                            div()
+                                .debug_selector(|| "document-column".into())
+                                .w_full()
+                                .child(crate::gui::rich_text::markdown(
+                                    "document-preview",
+                                    draft,
+                                    false,
+                                    t,
+                                    window,
+                                    cx,
+                                )),
+                        ),
                 )
+                .child(Scrollbar::vertical(&self.document_scroll))
         } else {
+            let scrollbar = self.document_editor_scrollbar(cx);
             div()
                 .id("document-editor-surface")
                 .w_full()
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .px(px(inset))
+                .py(px(PAGE_INSET))
                 .flex()
                 .flex_col()
                 .child(
                     div()
+                        .relative()
                         .flex_1()
                         .min_h_0()
-                        .debug_selector(|| "document-editor".into())
                         .text_size(px(super::super::presentation::BODY_SIZE))
                         .line_height(px(super::super::presentation::BODY_LINE))
-                        .child(Textarea::new(&self.editor).appearance(false).h_full()),
+                        .child(
+                            div().size_full().px(px(inset)).child(
+                                div()
+                                    .debug_selector(|| "document-editor".into())
+                                    .size_full()
+                                    .child(Textarea::new(&self.editor).appearance(false).h_full()),
+                            ),
+                        )
+                        .child(scrollbar),
                 )
                 .child(
                     div()
                         .h(px(22.))
+                        .px(px(inset))
                         .flex_shrink_0()
                         .flex()
                         .items_center()
