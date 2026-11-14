@@ -1,52 +1,8 @@
-//! Paragraph boundaries from Nole's shared Markdown parser.
+//! Paragraph boundaries, outlines, tags and card summaries from Nole's shared
+//! Markdown parser.
 use crate::core::markup::{self, Event};
 use gpui_kit::SharedString;
-use pulldown_cmark::{Alignment, Event as Markdown, LinkType, Tag, TagEnd};
-
-#[derive(Clone)]
-pub struct Table {
-    pub alignments: Vec<Alignment>,
-    pub rows: Vec<Vec<SharedString>>,
-}
-
-pub fn parse_table(source: &str) -> Option<Table> {
-    let events = markup::parse(source);
-    if !matches!(
-        events.first().map(|item| &item.event),
-        Some(Event::Markdown(Markdown::Start(Tag::Table(_))))
-    ) {
-        return None;
-    }
-    let mut table = None;
-    let mut row = Vec::new();
-    let mut start = 0;
-    let mut cell_event_start = 0;
-    for (index, item) in events.iter().enumerate() {
-        match &item.event {
-            Event::Markdown(Markdown::Start(Tag::Table(alignments))) => {
-                table = Some(Table {
-                    alignments: alignments.clone(),
-                    rows: Vec::new(),
-                });
-            }
-            Event::Markdown(Markdown::Start(Tag::TableCell)) => {
-                start = item.span.start;
-                cell_event_start = index;
-            }
-            Event::Markdown(Markdown::End(TagEnd::TableCell)) => {
-                let definitions = link_definitions(&events[cell_event_start..=index]);
-                row.push(format!("{}{}", source[start..item.span.end].trim(), definitions).into());
-            }
-            Event::Markdown(Markdown::End(TagEnd::TableHead | TagEnd::TableRow)) => {
-                if let Some(table) = &mut table {
-                    table.rows.push(std::mem::take(&mut row));
-                }
-            }
-            _ => {}
-        }
-    }
-    table
-}
+use pulldown_cmark::{Event as Markdown, LinkType, Tag, TagEnd};
 
 fn link_definitions(events: &[markup::SpannedEvent<'_>]) -> String {
     let mut definitions = String::new();
@@ -108,14 +64,6 @@ pub fn blocks(source: &str) -> Vec<SharedString> {
 mod tests {
     use super::*;
     #[test]
-    fn table_cells_preserve_inline_markdown_and_escaped_pipes() {
-        let table =
-            parse_table("| Name | Details |\n| :--- | ---: |\n| **One** | a\\|b |\n").unwrap();
-        assert_eq!(table.alignments, vec![Alignment::Left, Alignment::Right]);
-        assert_eq!(table.rows[1][0].as_ref(), "**One**");
-        assert_eq!(table.rows[1][1].as_ref(), "a\\|b");
-    }
-    #[test]
     fn virtualization_preserves_nested_blocks_and_code_fences() {
         let parts = blocks("# Heading\n\nFirst paragraph.\n\n- One\n  - Nested\n- Two\n\n```rust\nlet x = 1;\n\nlet y = 2;\n```\n");
         assert_eq!(parts.len(), 4);
@@ -138,20 +86,17 @@ pub enum PreviewKind {
 pub struct PreviewBlock {
     pub kind: PreviewKind,
     pub text: SharedString,
-    pub table: Option<Table>,
 }
 
 /// Bounded preview trees follow quiet-md's thumbnail budget approach;
 /// Nole's shared parser remains the authority for Markdown and extensions.
 pub fn preview(source: &str) -> Vec<PreviewBlock> {
-    use pulldown_cmark::{Tag, TagEnd};
     let mut result = Vec::new();
     let mut depth = 0usize;
     let mut kind = PreviewKind::Paragraph;
     let mut text = String::new();
     let mut remaining = 1200usize;
     let mut first = true;
-    let mut table_start = 0;
     let mut list_counters: Vec<Option<u64>> = Vec::new();
     for item in markup::parse(source) {
         match &item.event {
@@ -165,9 +110,6 @@ pub fn preview(source: &str) -> Vec<PreviewBlock> {
                         Tag::Table(_) => PreviewKind::Table,
                         _ => PreviewKind::Paragraph,
                     };
-                }
-                if matches!(tag, Tag::Table(_)) {
-                    table_start = item.span.start;
                 }
                 if let Tag::List(start) = tag {
                     list_counters.push(*start);
@@ -236,26 +178,6 @@ pub fn preview(source: &str) -> Vec<PreviewBlock> {
                 result.push(PreviewBlock {
                     kind,
                     text: content.into(),
-                    table: if matches!(kind, PreviewKind::Table) {
-                        let source: String = source[table_start..item.span.end]
-                            .chars()
-                            .take(1600)
-                            .collect();
-                        parse_table(&source).map(|mut table| {
-                            table.alignments.truncate(4);
-                            table.rows.truncate(6);
-                            for row in &mut table.rows {
-                                row.truncate(4);
-                                for cell in row {
-                                    *cell = markup::visible_text_prefix(&markup::parse(cell), 80)
-                                        .into();
-                                }
-                            }
-                            table
-                        })
-                    } else {
-                        None
-                    },
                 });
             }
             text.clear();
@@ -265,6 +187,151 @@ pub fn preview(source: &str) -> Vec<PreviewBlock> {
         }
     }
     result
+}
+
+/// A heading in a document's outline. `line` is zero-based in the source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutlineHeading {
+    pub level: u8,
+    pub text: SharedString,
+    pub line: usize,
+}
+
+/// Headings in reading order, for the outline beside a document.
+pub fn outline(source: &str) -> Vec<OutlineHeading> {
+    let events = markup::parse(source);
+    let mut headings = Vec::new();
+    let mut current: Option<(u8, usize, String)> = None;
+    for item in &events {
+        match &item.event {
+            Event::Markdown(Markdown::Start(Tag::Heading { level, .. })) => {
+                let line = source[..item.span.start].matches('\n').count();
+                current = Some((*level as u8, line, String::new()));
+            }
+            Event::Markdown(Markdown::End(TagEnd::Heading(_))) => {
+                if let Some((level, line, text)) = current.take() {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        headings.push(OutlineHeading {
+                            level,
+                            text: text.to_owned().into(),
+                            line,
+                        });
+                    }
+                }
+            }
+            _ => {
+                if let Some((_, _, text)) = &mut current {
+                    text.push_str(&markup::visible_text_prefix(
+                        std::slice::from_ref(item),
+                        200,
+                    ));
+                }
+            }
+        }
+    }
+    headings
+}
+
+/// Distinct `#tags` in first-mention order, compared without case.
+pub fn tags(source: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for item in markup::parse(source) {
+        if let Event::Hashtag(tag) = item.event {
+            if !tags
+                .iter()
+                .any(|known| known.to_lowercase() == tag.to_lowercase())
+            {
+                tags.push(tag.to_string());
+            }
+        }
+    }
+    tags
+}
+
+/// A short prose summary of a document for its card: body text first, and
+/// section headings only when the document has no body text.
+pub fn summary(source: &str) -> SharedString {
+    const LIMIT: usize = 180;
+    let blocks = preview(source);
+    let prose = |block: &&PreviewBlock| {
+        matches!(
+            block.kind,
+            PreviewKind::Paragraph | PreviewKind::List | PreviewKind::Quote
+        )
+    };
+    let chosen: Vec<&PreviewBlock> = if blocks.iter().any(|block| prose(&block)) {
+        blocks.iter().filter(prose).collect()
+    } else {
+        blocks
+            .iter()
+            .filter(|block| matches!(block.kind, PreviewKind::Heading(_)))
+            .collect()
+    };
+    let mut text = String::new();
+    for block in chosen {
+        for word in block.text.split_whitespace() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(word);
+        }
+        if text.chars().count() >= LIMIT {
+            break;
+        }
+    }
+    if text.chars().count() > LIMIT {
+        text = text
+            .chars()
+            .take(LIMIT)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+            + "…";
+    }
+    text.into()
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn outline_lists_headings_with_their_source_lines() {
+        let headings = outline(
+            "# Title\n\nIntro.\n\n## **Bold** part\n\n```\n# not a heading\n```\n\n### Last\n",
+        );
+        let found: Vec<_> = headings
+            .iter()
+            .map(|heading| (heading.level, heading.text.as_ref(), heading.line))
+            .collect();
+        assert_eq!(
+            found,
+            [(1, "Title", 0), (2, "Bold part", 4), (3, "Last", 10)]
+        );
+    }
+
+    #[test]
+    fn tags_are_distinct_in_mention_order() {
+        assert_eq!(
+            tags("Uses #Rust and #async.\n\nMore #rust, `#code`."),
+            ["Rust", "async"]
+        );
+    }
+
+    #[test]
+    fn summary_prefers_body_text_and_stays_short() {
+        assert_eq!(
+            summary("# Title\n\n## Part\n\nFirst line\nwraps here.\n\n- One\n- Two\n").as_ref(),
+            "First line wraps here. • One • Two"
+        );
+        assert_eq!(
+            summary("# Title\n\n## Only headings\n").as_ref(),
+            "Only headings"
+        );
+        let long = summary(&"word ".repeat(200));
+        assert!(long.chars().count() <= 181 && long.ends_with('…'));
+    }
 }
 
 #[cfg(test)]
@@ -325,29 +392,12 @@ mod reference_tests {
     use super::*;
 
     #[test]
-    fn virtual_blocks_and_table_cells_keep_document_link_targets() {
+    fn virtual_blocks_keep_document_link_targets() {
         let source = "# Title\n\nRead [the guide][guide].\n\nAnother [guide].\n\n| Link |\n| --- |\n| [guide] |\n\n[guide]: https://example.com/guide \"Guide\"\n";
         let parts = blocks(source);
-        for part in &parts[1..3] {
+        for part in &parts[1..=3] {
             let events = markup::parse(part);
             assert!(events.iter().any(|item| matches!(&item.event, Event::Markdown(Markdown::Start(Tag::Link { dest_url, title, .. })) if dest_url.as_ref() == "https://example.com/guide" && title.as_ref() == "Guide")));
         }
-        let table = parse_table(&parts[3]).unwrap();
-        let events = markup::parse(&table.rows[1][0]);
-        assert!(events.iter().any(|item| matches!(&item.event, Event::Markdown(Markdown::Start(Tag::Link { dest_url, .. })) if dest_url.as_ref() == "https://example.com/guide")));
-    }
-
-    #[test]
-    fn thumbnail_tables_keep_cells_and_bound_the_visible_preview() {
-        let source = format!(
-            "| Name | Details |\n| --- | --- |\n{}",
-            "| **One** | Some details |\n".repeat(200)
-        );
-        let blocks = preview(&source);
-        let table = blocks[0].table.as_ref().unwrap();
-        assert_eq!(table.rows[1][0].as_ref(), "One");
-        assert_eq!(table.rows[1][1].as_ref(), "Some details");
-        assert!(table.rows.len() <= 6);
-        assert!(table.rows.iter().all(|row| row.len() <= 4));
     }
 }

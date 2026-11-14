@@ -16,7 +16,7 @@ impl DesktopView {
         &self,
         path: String,
         cx: &Context<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut gpui_kit::App) -> PopupMenu {
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity().downgrade();
         move |menu, _, _| {
             let rename_view = view.clone();

@@ -1,14 +1,13 @@
 use super::{
     home::{Collection, GridLayout, Home},
     icons::icon,
+    markdown::OutlineHeading,
     model::Desktop,
     presentation::PAGE_INSET,
     theme::{self, color},
 };
-use crate::core::{
-    agent_sessions::SessionSummary,
-    model::{FileGroup, FileListRow},
-};
+use crate::core::agent_sessions::SessionSummary;
+use gpui_kit::base::TextViewState;
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
@@ -25,21 +24,22 @@ mod agent;
 mod agent_approval;
 mod agent_entry;
 mod discovery;
+mod document;
 mod file_actions;
 mod home;
 mod persistence;
-mod preview;
 mod runtime;
 mod scrolling;
 mod sidebar;
 mod surfaces;
 mod todo;
+mod widgets;
 mod workbench;
 
-const SIDEBAR_WIDTH: f32 = 232.;
-const NOTE_ROW_HEIGHT: f32 = 32.;
+const SIDEBAR_WIDTH: f32 = 248.;
+const NOTE_ROW_HEIGHT: f32 = 30.;
 const LIST_TOP: f32 = 12.;
-const TOOLBAR_HEIGHT: f32 = 48.;
+const TOOLBAR_HEIGHT: f32 = 52.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -67,9 +67,7 @@ gpui_kit::actions!(
 pub struct DesktopView {
     focus: gpui_kit::FocusHandle,
     model: Desktop,
-    tree_rows: Vec<FileListRow>,
-    tree_sessions: Vec<SessionSummary>,
-    tree_expanded: [bool; 3],
+    sessions: Vec<SessionSummary>,
     todo_scroll: UniformListScrollHandle,
     autosave_task: Option<Task<()>>,
     save_pending: bool,
@@ -77,6 +75,9 @@ pub struct DesktopView {
     draft: gpui_kit::SharedString,
     draft_chars: usize,
     draft_count_task: Option<Task<()>>,
+    /// The reading view's text, kept as state so outline entries can reveal headings.
+    document_text: Entity<TextViewState>,
+    outline: Vec<OutlineHeading>,
     search_pending: bool,
     search: Entity<InputState>,
     preview: bool,
@@ -157,16 +158,19 @@ impl DesktopView {
             cx.subscribe_in(&editor, window, |view, input, event, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     view.queue_autosave(window, cx);
-                    let text = input.read(cx).text().clone();
+                    let text = input.read(cx).text().to_string();
                     view.draft_count_task = Some(cx.spawn(async move |view, cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(120))
                             .await;
-                        let count = cx
-                            .background_spawn(async move { text.chars().count() })
+                        let (count, outline) = cx
+                            .background_spawn(async move {
+                                (text.chars().count(), super::markdown::outline(&text))
+                            })
                             .await;
                         let _ = view.update(cx, |view, cx| {
                             view.draft_chars = count;
+                            view.outline = outline;
                             cx.notify();
                         });
                     }));
@@ -189,18 +193,18 @@ impl DesktopView {
             view.update(cx, |this, cx| this.flush_save(window, cx))
                 .unwrap_or(true)
         });
-        let tree_sessions = model.sessions.list();
-        let tree_rows = Self::build_tree(&model, &tree_sessions, [true; 3]);
+        let sessions = model.sessions.list();
+        let document_text = cx.new(|cx| TextViewState::markdown(&model.source, cx));
         Self {
             focus,
-            tree_rows,
-            tree_sessions,
-            tree_expanded: [true; 3],
+            sessions,
             todo_scroll: UniformListScrollHandle::new(),
             autosave_task: None,
             save_pending: false,
             draft: model.source.clone().into(),
             draft_chars: model.source.chars().count(),
+            document_text,
+            outline: super::markdown::outline(&model.source),
             search_pending: false,
             draft_count_task: None,
             editor,
@@ -256,12 +260,37 @@ impl DesktopView {
         cx.notify();
     }
 
+    #[cfg(feature = "gui-test")]
+    pub(super) fn review_daily(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(None, window, cx);
+    }
+
+    #[cfg(feature = "gui-test")]
+    pub(super) fn review_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.model.theme = crate::core::theme::select_theme(
+            self.model.workspace.storage(),
+            crate::core::theme::ThemeTarget::Desktop,
+            name,
+        )
+        .expect("review theme");
+        theme::apply(self.model.theme.theme, cx);
+        cx.notify();
+    }
+
     fn set_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let source = self.model.source.clone();
-        self.draft = source.clone().into();
-        self.draft_chars = source.chars().count();
+        self.set_draft(source.clone().into(), cx);
         self.editor
             .update(cx, |editor, cx| editor.set_value(source, window, cx));
+    }
+
+    /// Publish `draft` to the reading view and its outline.
+    fn set_draft(&mut self, draft: gpui_kit::SharedString, cx: &mut Context<Self>) {
+        self.draft_chars = draft.chars().count();
+        self.outline = super::markdown::outline(&draft);
+        self.document_text
+            .update(cx, |text, cx| text.set_text(&draft, cx));
+        self.draft = draft;
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -334,7 +363,8 @@ impl DesktopView {
     fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview = !self.preview;
         if self.preview {
-            self.draft = self.editor.read(cx).value();
+            let draft = self.editor.read(cx).value();
+            self.set_draft(draft, cx);
             self.focus.focus(window, cx);
         } else {
             self.editor

@@ -48,10 +48,13 @@ fn note_list_reserves_space_and_keeps_selected_rows_aligned(cx: &mut TestAppCont
         |_, _| sidebar.into_any_element(),
     );
     let list = cx.debug_bounds("note-list").unwrap();
+    let nav = cx.debug_bounds("daily-nav").unwrap();
     let row = cx.debug_bounds("first-note").unwrap();
-    assert!(row.origin.y >= list.origin.y + px(LIST_TOP));
+    assert!(row.origin.y >= list.origin.y);
     assert_eq!(row.size.height, px(NOTE_ROW_HEIGHT + 2.));
-    assert_eq!(row.size.width, list.size.width - px(8.));
+    // Rows share the navigation's inset on both sides.
+    assert_eq!(row.origin.x, nav.origin.x);
+    assert_eq!(row.size.width, nav.size.width);
     assert!(cx.debug_bounds("selected-indicator").is_none());
 }
 
@@ -350,7 +353,7 @@ fn home_multi_selection_archives_and_restores_the_selected_notes(cx: &mut TestAp
         assert!(view.model.notes.is_empty());
         assert_eq!(view.model.archives.len(), 2);
     });
-    let tab = cx.debug_bounds("tree-archives").unwrap();
+    let tab = cx.debug_bounds("archives-nav").unwrap();
     cx.simulate_click(tab.center(), gpui_kit::Modifiers::default());
     cx.update(|_, cx| assert_eq!(view.read(cx).home.collection, Collection::Archives));
     let manage = cx.debug_bounds("manage-notes").unwrap();
@@ -518,7 +521,7 @@ fn home_keeps_large_cards_and_todo_toggles_persistently(cx: &mut TestAppContext)
     cx.simulate_resize(size(px(1360.), px(900.)));
     cx.run_until_parked();
     let card = cx.debug_bounds("first-card").unwrap();
-    assert!(card.size.width > px(200.) && card.size.height > px(200.));
+    assert!(card.size.width >= px(240.) && card.size.height > px(150.));
     let nav = cx.debug_bounds("todo-nav").unwrap();
     cx.simulate_click(nav.center(), gpui_kit::Modifiers::default());
     cx.run_until_parked();
@@ -639,9 +642,8 @@ fn automatic_save_waits_for_ime_text_to_be_committed(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn folders_toggle_their_children_independently_and_stay_near_the_sidebar_edge(
-    cx: &mut TestAppContext,
-) {
+fn the_sidebar_list_follows_the_navigation(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
     cx.update(gpui_kit::component::init);
     let root = tempfile::tempdir().unwrap();
     let mut model = Desktop::open(Storage::new(root.path()).unwrap()).unwrap();
@@ -654,29 +656,110 @@ fn folders_toggle_their_children_independently_and_stay_near_the_sidebar_edge(
     let session = model.sessions.draft("Research").unwrap();
     model.sessions.retain(session).unwrap();
     model.refresh().unwrap();
+    let session = gpui_kit::SharedString::from(model.sessions.list()[0].id.to_string());
     let (view, cx) = desktop_window(cx, model);
     cx.simulate_resize(size(px(1360.), px(900.)));
     cx.run_until_parked();
-    for (slot, selector) in [(0, "tree-notes"), (2, "tree-agents"), (1, "tree-archives")] {
-        let row = cx.debug_bounds(selector).unwrap();
-        assert!(row.origin.x <= px(8.));
-        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+    let current = gpui_kit::SharedString::from("file-data/Current.md");
+    let past = gpui_kit::SharedString::from("file-archives/Past.md");
+    for (nav, page, shown) in [
+        ("archives-nav", Page::Home, past.clone()),
+        ("agent-nav", Page::Agent, session.clone()),
+        ("notes-nav", Page::Home, current.clone()),
+    ] {
+        let target = cx.debug_bounds(nav).unwrap();
+        cx.simulate_click(target.center(), gpui_kit::Modifiers::default());
         cx.run_until_parked();
-        cx.update(|_, cx| {
-            let view = view.read(cx);
-            assert!(!view.tree_expanded[slot]);
-            assert!(!view.tree_rows.iter().any(|row| match (slot, row) {
-                (0, FileListRow::File(index)) => !view.model.documents[*index].archived,
-                (1, FileListRow::File(index)) => view.model.documents[*index].archived,
-                (2, FileListRow::Agent(_)) => true,
-                _ => false,
-            }));
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(view.read(cx).page == page, "{nav}");
+            for row in [&current, &past, &session] {
+                assert_eq!(
+                    window.try_find(row.clone()).is_some(),
+                    *row == shown,
+                    "{nav}: {row}"
+                );
+            }
         });
-        let row = cx.debug_bounds(selector).unwrap();
-        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
-        cx.run_until_parked();
-        cx.update(|_, cx| assert!(view.read(cx).tree_expanded[slot]));
     }
+    // Opening an archived note keeps the archive listed beside it.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.navigate(Some("archives/Past.md".into()), window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.try_find(past.clone()).is_some());
+        assert!(window.try_find(current.clone()).is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn outline_entries_move_to_their_heading_while_reading_and_editing(cx: &mut TestAppContext) {
+    cx.update(crate::gui::init);
+    let root = tempfile::tempdir().unwrap();
+    let mut model = Desktop::open(Storage::new(root.path()).unwrap()).unwrap();
+    model.create_note("Outline", false).unwrap();
+    let source = format!(
+        "# Outline\n\n{}## Far section\n\nThe end.\n",
+        "A paragraph of document content.\n\n".repeat(80)
+    );
+    model.save(&source).unwrap();
+    let path = model.selected.clone().unwrap();
+    let (view, cx) = desktop_window(cx, model);
+    cx.simulate_resize(size(px(1600.), px(900.)));
+    cx.update(|window, cx| view.update(cx, |view, cx| view.navigate(Some(path), window, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.preview);
+        let headings: Vec<_> = view.outline.iter().map(|h| h.text.to_string()).collect();
+        assert_eq!(headings, ["Outline", "Far section"]);
+    });
+    assert!(cx.debug_bounds("document-outline").is_some());
+    cx.update(|window, cx| view.update(cx, |view, cx| view.reveal_heading(1, window, cx)));
+    for _ in 0..4 {
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.executor().advance_clock(Duration::from_millis(50));
+    }
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(view.read(cx).document_scroll.offset().y < px(-500.)));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.toggle_preview(window, cx);
+            view.reveal_heading(1, window, cx);
+        })
+    });
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.editor.read(cx).cursor_position().line, 162);
+    });
+}
+
+#[gpui_kit::test]
+fn asking_the_agent_references_the_open_note(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::component::init);
+    let root = tempfile::tempdir().unwrap();
+    let mut model = Desktop::open(Storage::new(root.path()).unwrap()).unwrap();
+    model.create_note("Project Atlas", false).unwrap();
+    let (view, cx) = desktop_window(cx, model);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.navigate(Some("data/Project Atlas.md".into()), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let ask = cx.debug_bounds("ask-agent").unwrap();
+    cx.simulate_click(ask.center(), gpui_kit::Modifiers::default());
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.page == Page::Agent);
+        assert_eq!(
+            view.agent_input.read(cx).value().as_str(),
+            "[[Project Atlas]] "
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -766,7 +849,11 @@ fn reading_and_editing_share_a_centered_measure_that_adapts_to_the_window(cx: &m
     let mut model = Desktop::open(Storage::new(root.path()).unwrap()).unwrap();
     model.create_note("Reading layout", false).unwrap();
     let (view, cx) = desktop_window(cx, model);
-    for (window_width, expected_width) in [(1600., 800.), (820., 540.)] {
+    let sidebar = SIDEBAR_WIDTH;
+    for (window_width, expected_width, outline) in [
+        (1600., crate::gui::presentation::READING_WIDTH, true),
+        (820., 820. - sidebar - 48., false),
+    ] {
         cx.simulate_resize(size(px(window_width), px(900.)));
         let mut reading = None;
         for preview in [true, false] {
@@ -787,8 +874,20 @@ fn reading_and_editing_share_a_centered_measure_that_adapts_to_the_window(cx: &m
                 .unwrap();
             let workspace = cx.debug_bounds("main-workspace").unwrap();
             assert_eq!(column.size.width, px(expected_width));
+            // The column, with the outline beside it when it fits, sits centered.
+            let block_right = match cx.debug_bounds("document-outline") {
+                Some(aside) => {
+                    assert!(outline);
+                    assert!(aside.origin.x >= column.right() + px(24.));
+                    aside.right()
+                }
+                None => {
+                    assert!(!outline);
+                    column.right()
+                }
+            };
             let left = column.origin.x - workspace.origin.x;
-            let right = workspace.right() - column.right();
+            let right = workspace.right() - block_right;
             assert_eq!(left, right);
             assert!(left >= px(24.));
             if let Some(reading) = reading {
@@ -845,27 +944,32 @@ fn main_views_share_the_toolbar_content_insets(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn cards_show_a_compact_document_page(cx: &mut TestAppContext) {
+fn cards_show_a_readable_summary_with_its_date_and_tags(cx: &mut TestAppContext) {
     cx.update(gpui_kit::component::init);
     let root = tempfile::tempdir().unwrap();
     let mut model = Desktop::open(Storage::new(root.path()).unwrap()).unwrap();
     model.workspace.create_note("Reading").unwrap();
-    model.workspace.write_document("data/Reading.md", "# Reading\n\nA paragraph in the document.\n\n## Section\n\nA second paragraph.\n\n> A quote.\n\n- One\n- Two\n\n```rust\nlet x = 1;\n```\n").unwrap();
+    model.workspace.write_document("data/Reading.md", "# Reading\n\nA paragraph in the document. #books\n\n## Section\n\nA second paragraph.\n\n```rust\nlet x = 1;\n```\n").unwrap();
     model.refresh().unwrap();
+    assert_eq!(
+        model.documents[0].summary.as_ref(),
+        "A paragraph in the document. #books A second paragraph."
+    );
+    assert_eq!(*model.documents[0].tags, ["books"]);
     let (_, cx) = desktop_window(cx, model);
     cx.simulate_resize(size(px(1360.), px(900.)));
     cx.run_until_parked();
     let card = cx.debug_bounds("first-card").unwrap();
-    let page = cx.debug_bounds("card-page-0").unwrap();
     let title = cx.debug_bounds("card-title-0").unwrap();
-    let first = cx.debug_bounds("card-preview-block-0").unwrap();
-    let last = cx.debug_bounds("card-preview-block-5").unwrap();
-    assert_eq!(page.origin.x, card.origin.x + px(4.));
-    assert_eq!(title.origin.y, page.origin.y + px(18.));
-    assert_eq!(first.origin.x, title.origin.x);
-    assert!(first.origin.y >= title.bottom() + px(8.));
-    assert!(first.size.height < px(15.));
-    assert!(last.bottom() < card.bottom() - px(18.));
+    let summary = cx.debug_bounds("card-summary-0").unwrap();
+    let meta = cx.debug_bounds("card-meta-0").unwrap();
+    assert!(title.origin.y > card.origin.y && title.origin.x > card.origin.x);
+    assert_eq!(summary.origin.x, title.origin.x);
+    assert!(summary.origin.y >= title.bottom());
+    // Body text renders at a readable size rather than as a thumbnail.
+    assert!(summary.size.height >= px(20.));
+    assert!(meta.origin.y >= summary.bottom());
+    assert!(meta.bottom() < card.bottom());
 }
 
 #[gpui_kit::test]

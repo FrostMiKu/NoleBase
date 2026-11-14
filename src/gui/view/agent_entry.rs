@@ -1,5 +1,9 @@
+use super::surfaces::reading_row;
 use super::*;
 use crate::gui::agent::{AgentRow, AgentRowKind};
+use crate::gui::presentation::{
+    BODY_SIZE, RADIUS_LG, RADIUS_MD, SPACE_LG, SPACE_MD, SPACE_SM, TEXT_META, TEXT_NAV,
+};
 use gpui_kit::base::SelectableText;
 
 impl DesktopView {
@@ -20,19 +24,23 @@ impl DesktopView {
                 cx,
             ),
             AgentRowKind::Prompt => div()
-                .debug_selector(|| "agent-prompt".into())
                 .w_full()
-                .p(px(14.))
-                .rounded(px(7.))
-                .bg(color(t.surface_message_user))
-                .text_color(color(t.text_primary))
                 .flex()
-                .gap(px(10.))
-                .child(div().text_color(color(t.ui_agent_user)).child("›"))
-                .child(div().flex_1().min_w_0().child(SelectableText::new(
-                    gpui_kit::SharedString::from(row.id.clone()),
-                    row.text.clone(),
-                )))
+                .justify_end()
+                .child(
+                    div()
+                        .debug_selector(|| "agent-prompt".into())
+                        .max_w(gpui_kit::relative(0.85))
+                        .px(px(SPACE_LG))
+                        .py(px(SPACE_MD))
+                        .rounded(px(RADIUS_LG))
+                        .bg(color(t.surface_message_user))
+                        .text_color(color(t.text_primary))
+                        .child(SelectableText::new(
+                            gpui_kit::SharedString::from(row.id.clone()),
+                            row.text.clone(),
+                        )),
+                )
                 .into_any_element(),
             AgentRowKind::Thinking { streaming } => {
                 let expanded = self.expanded_thinking.contains(&row.id);
@@ -43,26 +51,29 @@ impl DesktopView {
                     let lines = row.text.lines().collect::<Vec<_>>();
                     lines[lines.len().saturating_sub(5)..].join("\n").into()
                 };
-                let marker = activity_marker(&row.id, *streaming, color(t.ui_activity_marker));
+                let marker = activity_marker(&row.id, *streaming, color(t.ui_action_ai));
                 div()
                     .id(gpui_kit::SharedString::from(format!("{}-thinking", row.id)))
                     .debug_selector(|| "agent-thinking-card".into())
                     .w_full()
-                    .p(px(16.))
-                    .rounded(px(8.))
-                    .bg(color(t.surface_message_agent))
-                    .border_1()
-                    .border_color(color(t.ui_border_subtle).opacity(0.45))
+                    .px(px(SPACE_LG))
+                    .py(px(SPACE_MD))
+                    .rounded(px(RADIUS_LG))
+                    .bg(color(t.surface_sunken))
                     .text_color(color(t.text_muted))
                     .child(
                         div()
                             .id(gpui_kit::SharedString::from(format!("{}-toggle", row.id)))
                             .flex()
                             .items_center()
-                            .gap(px(8.))
-                            .text_size(px(12.))
+                            .gap(px(SPACE_SM))
+                            .text_size(px(TEXT_META))
                             .child(marker)
-                            .child("thinking")
+                            .child(if *streaming {
+                                "正在思考"
+                            } else {
+                                "思考过程"
+                            })
                             .child(div().flex_1())
                             .child(
                                 icon(if expanded {
@@ -88,8 +99,8 @@ impl DesktopView {
                     .child(
                         div()
                             .debug_selector(|| "agent-thinking-body".into())
-                            .mt(px(12.))
-                            .text_size(px(13.))
+                            .mt(px(SPACE_SM + 2.))
+                            .text_size(px(TEXT_NAV))
                             .line_height(gpui_kit::relative(1.6))
                             .when(!expanded, |body| body.max_h(px(110.)).overflow_hidden())
                             .child(SelectableText::new(
@@ -113,13 +124,17 @@ impl DesktopView {
                         .min_h(px(26.))
                         .flex()
                         .items_center()
-                        .gap(px(8.))
-                        .text_size(px(13.))
-                        .text_color(color(t.ui_activity_marker))
+                        .gap(px(SPACE_SM))
+                        .text_size(px(TEXT_NAV))
+                        .text_color(color(t.text_secondary))
                         .child(activity_marker(
                             &row.id,
                             *active,
-                            color(t.ui_activity_marker),
+                            color(if *active {
+                                t.ui_action_ai
+                            } else {
+                                t.ui_success
+                            }),
                         ))
                         .child(SelectableText::new(
                             gpui_kit::SharedString::from(format!("{}-status", row.id)),
@@ -134,10 +149,11 @@ impl DesktopView {
                             .pl(px(14.))
                             .py(px(6.))
                             .border_l_1()
-                            .border_color(color(t.ui_border_subtle))
-                            .text_size(px(12.))
+                            .border_color(color(t.ui_border))
+                            .text_size(px(TEXT_META))
                             .line_height(gpui_kit::relative(1.5))
                             .text_color(color(t.text_muted))
+                            .font_family(crate::gui::presentation::fonts(cx).mono)
                             .when(!details.is_empty(), |body| {
                                 body.child(SelectableText::new(
                                     gpui_kit::SharedString::from(format!("{}-details", row.id)),
@@ -153,22 +169,42 @@ impl DesktopView {
                     )
                 })
                 .into_any_element(),
-            AgentRowKind::Error => div()
-                .debug_selector(|| "agent-error".into())
-                .text_color(color(t.ui_error))
-                .text_size(px(13.))
-                .child(SelectableText::new(
-                    gpui_kit::SharedString::from(row.id.clone()),
-                    row.text.clone(),
-                ))
-                .into_any_element(),
+            AgentRowKind::Error => {
+                let error = color(t.ui_error);
+                div()
+                    .w_full()
+                    .px(px(SPACE_MD))
+                    .py(px(SPACE_SM + 2.))
+                    .rounded(px(RADIUS_MD))
+                    .border_1()
+                    .border_color(error.opacity(0.35))
+                    .bg(error.opacity(0.08))
+                    .flex()
+                    .gap(px(SPACE_SM))
+                    .text_color(error)
+                    .text_size(px(TEXT_NAV))
+                    .child(div().pt(px(2.)).child(icon("nole/alert").size(px(16.))))
+                    .child(
+                        div()
+                            .debug_selector(|| "agent-error".into())
+                            .flex_1()
+                            .min_w_0()
+                            .child(SelectableText::new(
+                                gpui_kit::SharedString::from(row.id.clone()),
+                                row.text.clone(),
+                            )),
+                    )
+                    .into_any_element()
+            }
         };
-        div()
-            .w_full()
-            .pb(px(12.))
-            .text_size(px(15.))
-            .line_height(gpui_kit::relative(1.6))
-            .child(body)
+        reading_row(
+            div()
+                .w_full()
+                .pb(px(SPACE_LG))
+                .text_size(px(BODY_SIZE))
+                .line_height(gpui_kit::relative(1.7))
+                .child(body),
+        )
     }
 }
 

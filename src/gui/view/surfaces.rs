@@ -1,4 +1,9 @@
+use super::widgets::{daily_label, relative_time};
 use super::*;
+use crate::gui::presentation::{
+    BODY_SIZE, RADIUS_LG, RADIUS_MD, RADIUS_SM, READING_WIDTH, SPACE_2XL, SPACE_LG, SPACE_MD,
+    SPACE_SM, SPACE_XL, SPACE_XS, TEXT_META, TEXT_NAV, TEXT_UI,
+};
 
 impl DesktopView {
     pub(super) fn home_surface(
@@ -6,7 +11,6 @@ impl DesktopView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
-        let t = self.model.theme.theme;
         let available = self.content_width(window);
         let layout = GridLayout::new(available);
         let columns = layout.columns;
@@ -47,8 +51,28 @@ impl DesktopView {
                 .unwrap_or_default()
             },
         )
-        .track_scroll(&self.home_scroll[collection])
-        .size_full();
+        .track_scroll(&self.home_scroll[collection]);
+        let empty =
+            if self.home.collection == Collection::Notes {
+                self.empty_state(
+                    "home-empty",
+                    "nole/note",
+                    "从第一篇笔记开始",
+                    "笔记是长期保存的 Markdown 文件，可以用 [[双链]] 与 #标签 互相关联。",
+                )
+                .child(div().mt(px(SPACE_SM)).child(
+                    self.primary_button("empty-new", "新建笔记").on_click(
+                        cx.listener(|this, _, window, cx| this.begin_new_note(window, cx)),
+                    ),
+                ))
+            } else {
+                self.empty_state(
+                    "home-empty",
+                    "nole/archive",
+                    "暂无归档",
+                    "归档的笔记会保存在这里，随时可以恢复。",
+                )
+            };
         div()
             .id("home-scroll")
             .debug_selector(|| "home-scroll".into())
@@ -57,34 +81,14 @@ impl DesktopView {
             .min_h_0()
             .flex()
             .flex_col()
-            .when(count == 0, |surface| {
-                surface.child(
-                    div()
-                        .h(px(240.))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(12.))
-                        .text_color(color(t.text_muted))
-                        .child(icon("nole/note").size(px(32.)))
-                        .child(if self.home.collection == Collection::Notes {
-                            "从第一篇笔记开始"
-                        } else {
-                            "归档的笔记会显示在这里"
-                        })
-                        .child(self.button("empty-new", "新建笔记").on_click(
-                            cx.listener(|this, _, window, cx| this.begin_new_note(window, cx)),
-                        )),
-                )
-            })
+            .when(count == 0, |surface| surface.child(empty))
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .pt(px(LIST_TOP))
-                    .child(grid)
+                    .child(grid.size_full())
                     .child(self.main_scrollbar(&self.home_scroll[collection], LIST_TOP)),
             )
     }
@@ -101,6 +105,21 @@ impl DesktopView {
         let t = self.model.theme.theme;
         let selected = self.home.selected.contains(&doc.path);
         let path = doc.path.clone();
+        let serif = crate::gui::presentation::fonts(cx).serif;
+        let hover_border = color(if selected { t.ui_action } else { t.ui_border });
+        let mut meta = div()
+            .debug_selector(move || format!("card-meta-{index}"))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(SPACE_SM))
+            .overflow_hidden()
+            .text_size(px(TEXT_META))
+            .text_color(color(t.text_muted))
+            .child(relative_time(doc.modified, std::time::SystemTime::now()));
+        for tag in doc.tags.iter().take(2) {
+            meta = meta.child(self.tag_pill(tag));
+        }
         div()
             .id(gpui_kit::SharedString::from(path.clone()))
             .when(index == 0, |card| {
@@ -112,69 +131,77 @@ impl DesktopView {
             .w_full()
             .min_w_0()
             .h(px(card_height))
-            .p(px(super::super::presentation::CARD_FRAME))
-            .rounded(px(18.))
-            .bg(color(t.surface_panel))
+            .p(px(SPACE_LG + 2.))
+            .rounded(px(RADIUS_LG))
+            .border_1()
+            .border_color(color(if selected {
+                t.ui_action
+            } else {
+                t.ui_border_subtle
+            }))
+            .bg(color(if selected {
+                t.selection_background
+            } else {
+                t.surface_raised
+            }))
             .cursor_pointer()
             .relative()
-            .when(selected, |card| {
-                card.bg(color(t.selection_indicator).opacity(0.55))
-            })
             .flex()
             .flex_col()
+            .gap(px(SPACE_SM))
             .overflow_hidden()
-            .hover(move |card| {
-                card.bg(color(if selected {
-                    t.selection_indicator
-                } else {
-                    t.ui_border_subtle
-                })
-                .opacity(0.65))
-            })
+            .hover(move |card| card.border_color(hover_border).shadow_sm())
             .child(
                 div()
-                    .debug_selector(move || format!("card-page-{index}").into())
-                    .size_full()
-                    .min_w_0()
-                    .p(px(super::super::presentation::CARD_INSET))
-                    .rounded(px(14.))
-                    .bg(color(t.surface_canvas))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .debug_selector(move || format!("card-title-{index}").into())
-                            .w_full()
-                            .flex_shrink_0()
-                            .text_size(px(14.))
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .line_height(px(20.))
-                            .mb(px(8.))
-                            .child(doc.title.clone()),
-                    )
-                    .child(self.note_preview(&doc.preview)),
+                    .debug_selector(move || format!("card-title-{index}"))
+                    .w_full()
+                    .flex_shrink_0()
+                    .pr(px(if self.home.managing { 28. } else { 0. }))
+                    .font_family(serif)
+                    .text_size(px(BODY_SIZE))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .line_height(px(24.))
+                    .text_color(color(t.text_primary))
+                    .line_clamp(2)
+                    .text_ellipsis()
+                    .child(doc.title.clone()),
             )
+            .child(
+                div()
+                    .debug_selector(move || format!("card-summary-{index}"))
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .text_size(px(TEXT_NAV))
+                    .line_height(px(21.))
+                    .text_color(color(t.text_secondary))
+                    .line_clamp(4)
+                    .text_ellipsis()
+                    .child(doc.summary.clone()),
+            )
+            .child(meta)
             .when(self.home.managing, |card| {
                 card.child(
                     div()
                         .absolute()
-                        .right(px(12.))
-                        .bottom(px(12.))
+                        .right(px(SPACE_MD))
+                        .top(px(SPACE_MD))
                         .size(px(20.))
-                        .rounded(px(5.))
+                        .rounded(px(RADIUS_SM + 1.))
                         .border_1()
-                        .border_color(color(t.ui_border_subtle))
-                        .bg(color(t.surface_canvas))
+                        .border_color(color(if selected { t.ui_action } else { t.ui_border }))
+                        .bg(color(if selected {
+                            t.ui_action
+                        } else {
+                            t.surface_raised
+                        }))
+                        .text_color(color(t.text_on_accent))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(12.))
                         .when(selected, |check| {
-                            check
-                                .bg(color(t.selection_indicator))
-                                .text_color(color(t.text_on_accent))
-                                .child("✓")
+                            check.child(icon("nole/check").size(px(13.)))
                         }),
                 )
             })
@@ -192,22 +219,31 @@ impl DesktopView {
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
         let t = self.model.theme.theme;
         let view = cx.entity().downgrade();
+        let today = chrono::Local::now().date_naive();
+        let serif = crate::gui::presentation::fonts(cx).serif;
         let stream = gpui_kit::list(self.daily_list.clone(), move |index, window, cx| {
             view.update(cx, |view, cx| {
                 let block = &view.model.daily_blocks[index];
-                let row = div().w_full();
-                match &block.date {
-                    Some(date) => row
-                        .pt(px(if index == 0 { 0. } else { 24. }))
-                        .pb(px(16.))
-                        .text_size(px(12.))
-                        .text_color(color(t.text_muted))
-                        .child(date.clone())
+                let content = match block.date {
+                    Some(date) => div()
+                        .pt(px(if index == 0 { 0. } else { SPACE_2XL }))
+                        .pb(px(SPACE_LG))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_MD))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(serif.clone())
+                                .text_size(px(TEXT_UI + 1.))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(color(t.text_primary))
+                                .child(daily_label(date, today)),
+                        )
+                        .child(div().flex_1().h(px(1.)).bg(color(t.ui_border_subtle)))
                         .into_any_element(),
-                    None => row
-                        .pb(px(12.))
-                        .text_size(px(15.))
-                        .line_height(gpui_kit::relative(1.65))
+                    None => div()
+                        .pb(px(SPACE_MD))
                         .child(crate::gui::rich_text::markdown(
                             block.id.clone(),
                             block.text.clone(),
@@ -217,7 +253,8 @@ impl DesktopView {
                             cx,
                         ))
                         .into_any_element(),
-                }
+                };
+                reading_row(content).into_any_element()
             })
             .unwrap_or_else(|_| div().into_any_element())
         })
@@ -235,158 +272,104 @@ impl DesktopView {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .when(self.model.daily_blocks.is_empty(), |body| {
+                        body.child(self.empty_state(
+                            "daily-empty",
+                            "nole/daily",
+                            "今天想记下什么？",
+                            "随手写下想法、会议要点或待办，Enter 保存到今天的日常记录。",
+                        ))
+                    })
                     .child(stream)
                     .child(self.main_scrollbar(&self.daily_list, 0.)),
             )
             .child(
-                div().w_full().pt(px(12.)).flex_shrink_0().child(
-                    div()
-                        .rounded(px(12.))
-                        .border_1()
-                        .border_color(color(t.ui_border_subtle).opacity(0.65))
-                        .bg(color(t.surface_message_agent))
-                        .p(px(14.))
-                        .child(self.compose_input(super::persistence::Compose::Daily, 96., cx))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .mt(px(8.))
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(color(t.text_muted))
-                                        .child("Enter 记录 · Shift+Enter 换行"),
-                                )
-                                .child(
-                                    self.button("capture", "记录")
-                                        .bg(color(t.ui_action))
-                                        .text_color(color(t.text_on_accent))
-                                        .child(icon("nole/arrow").size(px(14.)))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.save(window, cx);
-                                        })),
-                                ),
+                reading_row(
+                    div().pt(px(SPACE_MD)).child(
+                        self.composer(
+                            "daily-composer",
+                            super::persistence::Compose::Daily,
+                            96.,
+                            "Enter 记录 · Shift+Enter 换行",
+                            self.primary_button("capture", "记录")
+                                .child(icon("nole/arrow").size(px(14.)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save(window, cx);
+                                })),
+                            cx,
                         ),
-                ),
+                    ),
+                )
+                .flex_shrink_0(),
             )
     }
 
-    pub(super) fn document_surface(
+    /// The raised writing card shared by Daily capture and the Agent prompt.
+    pub(super) fn composer(
         &self,
-        window: &mut Window,
+        id: &'static str,
+        kind: super::persistence::Compose,
+        height: f32,
+        hint: &'static str,
+        action: Button,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+    ) -> gpui_kit::Div {
         let t = self.model.theme.theme;
-        let draft = self.draft.clone();
-        let inset =
-            super::super::presentation::document_inset(self.content_width(window)) + PAGE_INSET;
-        if self.preview {
-            div()
-                .id("document-scroll")
-                .debug_selector(|| "document-reading".into())
-                .w_full()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .relative()
-                .overflow_hidden()
-                .text_size(px(super::super::presentation::BODY_SIZE))
-                .line_height(px(super::super::presentation::BODY_LINE))
-                .child(
-                    div()
-                        .id("document-reading-scroll")
-                        .debug_selector(|| "document-viewport".into())
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.document_scroll)
-                        .px(px(inset))
-                        .py(px(PAGE_INSET))
-                        .child(
-                            div()
-                                .debug_selector(|| "document-column".into())
-                                .w_full()
-                                .child(crate::gui::rich_text::markdown(
-                                    "document-preview",
-                                    draft,
-                                    false,
-                                    t,
-                                    window,
-                                    cx,
-                                )),
-                        ),
-                )
-                .child(Scrollbar::vertical(&self.document_scroll))
-        } else {
-            let scrollbar = self.document_editor_scrollbar(cx);
-            div()
-                .id("document-editor-surface")
-                .w_full()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .py(px(PAGE_INSET))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .text_size(px(super::super::presentation::BODY_SIZE))
-                        .line_height(px(super::super::presentation::BODY_LINE))
-                        .child(
-                            div().size_full().px(px(inset)).child(
-                                div()
-                                    .debug_selector(|| "document-editor".into())
-                                    .size_full()
-                                    .child(Textarea::new(&self.editor).appearance(false).h_full()),
-                            ),
-                        )
-                        .child(scrollbar),
-                )
-                .child(
-                    div()
-                        .h(px(22.))
-                        .px(px(inset))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .text_size(px(11.))
-                        .text_color(color(t.text_muted))
-                        .child(format!("{} 字", self.draft_chars)),
-                )
-        }
+        div()
+            .debug_selector(|| id.into())
+            .w_full()
+            .rounded(px(RADIUS_LG))
+            .border_1()
+            .border_color(color(t.ui_border))
+            .bg(color(t.surface_raised))
+            .shadow_sm()
+            .px(px(SPACE_LG))
+            .pt(px(SPACE_MD))
+            .pb(px(SPACE_MD - 2.))
+            .child(self.compose_input(kind, height, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .mt(px(SPACE_SM))
+                    .child(
+                        div()
+                            .text_size(px(TEXT_META))
+                            .text_color(color(t.text_muted))
+                            .child(hint),
+                    )
+                    .child(action),
+            )
     }
+
     pub(super) fn appearance_panel(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
         let t = self.model.theme.theme;
         div()
+            .debug_selector(|| "appearance-panel".into())
             .absolute()
-            .left(px(12.))
+            .left(px(SPACE_MD))
             .bottom(px(52.))
-            .w(px(248.))
-            .p(px(16.))
-            .rounded(px(10.))
+            .w(px(260.))
+            .p(px(SPACE_LG))
+            .rounded(px(RADIUS_LG))
             .shadow_lg()
             .border_1()
             .border_color(color(t.ui_border_subtle))
             .bg(color(t.surface_overlay))
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(SPACE_LG))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_size(px(13.))
+                    .text_size(px(TEXT_UI))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child("外观")
                     .child(
                         self.icon_button("close-appearance", "nole/close", "关闭")
-                            .size(px(24.))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.appearance = false;
                                 cx.notify();
@@ -394,11 +377,35 @@ impl DesktopView {
                     ),
             )
             .child(
-                div().flex().gap(px(6.)).children(
-                    t.animation_gradient
-                        .into_iter()
-                        .map(|tone| div().flex_1().h(px(24.)).rounded(px(4.)).bg(color(tone))),
-                ),
+                div()
+                    .h(px(56.))
+                    .rounded(px(RADIUS_MD))
+                    .border_1()
+                    .border_color(color(t.ui_border_subtle))
+                    .bg(color(t.surface_canvas))
+                    .p(px(SPACE_SM + 2.))
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .child(
+                        div().flex().gap(px(SPACE_XS)).children(
+                            [
+                                t.ui_action,
+                                t.ui_action_ai,
+                                t.ui_success,
+                                t.ui_warning,
+                                t.ui_error,
+                            ]
+                            .map(|tone| div().size(px(14.)).rounded(px(7.)).bg(color(tone))),
+                        ),
+                    )
+                    .child(
+                        div().flex().gap(px(SPACE_XS)).children(
+                            [t.text_primary, t.text_secondary, t.text_muted].map(|tone| {
+                                div().h(px(4.)).w(px(48.)).rounded(px(2.)).bg(color(tone))
+                            }),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -407,9 +414,20 @@ impl DesktopView {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .text_color(color(t.text_secondary))
-                            .child(self.model.theme.active.clone()),
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(TEXT_META))
+                                    .text_color(color(t.text_muted))
+                                    .child("当前主题"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(TEXT_NAV))
+                                    .text_color(color(t.text_primary))
+                                    .child(self.model.theme.active.clone()),
+                            ),
                     )
                     .child(
                         self.button("change-theme", "切换主题")
@@ -423,4 +441,15 @@ impl DesktopView {
                     ),
             )
     }
+}
+
+/// Center `content` on the shared reading measure.
+pub(super) fn reading_row(content: impl IntoElement) -> gpui_kit::Div {
+    div().w_full().flex().justify_center().child(
+        div()
+            .w_full()
+            .max_w(px(READING_WIDTH + SPACE_XL * 2.))
+            .px(px(SPACE_XL))
+            .child(content),
+    )
 }

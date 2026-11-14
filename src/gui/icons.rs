@@ -30,6 +30,7 @@ impl AssetSource for Assets {
             "nole/spinner" => include_bytes!("../../assets/icons/lucide/loader-circle.svg"),
             "nole/thinking" => include_bytes!("../../assets/icons/lucide/brain.svg"),
             "nole/tool" => include_bytes!("../../assets/icons/lucide/wrench.svg"),
+            "nole/alert" => include_bytes!("../../assets/icons/lucide/circle-alert.svg"),
             _ => return gpui_kit::assets::Assets.load(path),
         };
         Ok(Some(Cow::Borrowed(bytes)))

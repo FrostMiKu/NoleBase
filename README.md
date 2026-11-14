@@ -60,7 +60,9 @@ and editing, Daily, Search, Tags, Todo, and Agent conversations. Edits save
 automatically, and Agent actions support streaming replies, approvals, and
 interactive questions.
 
-Both clients use the same local workspace, Agent sessions, and themes.
+Both clients use the same local workspace, Agent sessions, and theme files. Each
+client keeps its own theme choice: the terminal starts with the dark `default`
+theme and the desktop with the light `paper` theme.
 
 ## Your knowledge lives in local files
 
@@ -77,7 +79,7 @@ archives/    Archived notes
 attachments/ Managed attachments
 agents/      Saved Agent sessions
 config/      Application settings and Agent instructions
-themes/      Custom themes
+themes/      Built-in and custom themes
 ```
 
 Capture, editing, and local search work independently of the Agent. Agent
@@ -118,8 +120,11 @@ Use the host prefix for `base_url`, such as `https://api.anthropic.com`; Nole ad
 the protocol's `/v1/...` path. Set `context_window_tokens` and `max_tokens` to
 match your model. Add `tavily_api_key` to enable web search.
 
-Appearance, editor, and export preferences live in `config/settings.toml`.
-Custom Agent instructions live in `config/AGENTS.md`.
+Appearance, editor, and export preferences live in `config/settings.toml`:
+`theme` picks the terminal theme and `desktop_theme` the desktop theme. A theme
+file in `themes/` only needs the colors it changes; every other color keeps its
+value from the default theme. Custom Agent instructions live in
+`config/AGENTS.md`.
 
 ## Development
 

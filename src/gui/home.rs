@@ -55,8 +55,7 @@ impl Home {
     }
 }
 
-/// Adapted from quiet-md's MIT-licensed `render_home_grid` sizing algorithm.
-/// Copyright (c) 2026 s1dashu. See assets/licenses/quiet-md.txt.
+/// Summary cards in as many columns as fit at a readable width.
 #[derive(Clone, Copy)]
 pub struct GridLayout {
     pub columns: u16,
@@ -64,20 +63,20 @@ pub struct GridLayout {
     pub gap: f32,
 }
 impl GridLayout {
+    /// The narrowest card that keeps a summary line readable.
+    const MIN_CARD_WIDTH: f32 = 240.;
+    /// Two title lines, four summary lines and the date row.
+    const CARD_HEIGHT: f32 = 188.;
+
     pub fn new(main_width: f32) -> Self {
-        let available = (main_width - 48.).max(1.);
-        let gap = 16.;
-        let wide_columns = ((available + gap) / (200. + gap)).floor().max(1.) as u16;
-        let columns = if wide_columns >= 4 {
-            ((available + gap) / (240. + gap)).floor().max(4.) as u16
-        } else {
-            ((available + gap) / (160. + gap)).floor().clamp(1., 3.) as u16
-        };
-        let card_height =
-            ((available - gap * f32::from(columns - 1)) / f32::from(columns)) * (264. / 236.);
+        let available = (main_width - super::presentation::PAGE_INSET * 2.).max(1.);
+        let gap = super::presentation::SPACE_LG;
+        let columns = ((available + gap) / (Self::MIN_CARD_WIDTH + gap))
+            .floor()
+            .clamp(1., 6.) as u16;
         Self {
             columns,
-            card_height,
+            card_height: Self::CARD_HEIGHT,
             gap,
         }
     }
@@ -86,6 +85,26 @@ impl GridLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grid_columns_keep_cards_at_a_readable_width() {
+        for width in [300., 820., 1112., 1600., 2400.] {
+            let layout = GridLayout::new(width);
+            let available = width - 48.;
+            let card = (available - layout.gap * f32::from(layout.columns - 1))
+                / f32::from(layout.columns);
+            assert!(
+                layout.columns == 1 || card >= GridLayout::MIN_CARD_WIDTH,
+                "{width}"
+            );
+            let wider = (available - layout.gap * f32::from(layout.columns))
+                / f32::from(layout.columns + 1);
+            assert!(
+                layout.columns == 6 || wider < GridLayout::MIN_CARD_WIDTH,
+                "{width}"
+            );
+        }
+    }
+
     #[test]
     fn multi_selection_extends_from_its_anchor_and_resets_on_collection_change() {
         let paths = ["a", "b", "c", "d"].map(str::to_owned);

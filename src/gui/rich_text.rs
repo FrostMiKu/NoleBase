@@ -1,6 +1,33 @@
 //! GPUI Kit owns Markdown layout, selection, table wrapping and streaming motion.
-use gpui_kit::component::text::TextView;
+use gpui_kit::base::{TextView, TextViewMotion};
 use gpui_kit::{div, prelude::*, px, App, SharedString, Window};
+use std::time::Duration;
+
+/// Streamed words light up over 280 ms, each a few milliseconds after the last.
+fn stream_motion() -> TextViewMotion {
+    TextViewMotion::default()
+        .with_stream_fade(Duration::from_millis(280))
+        .with_stream_fade_stagger(Duration::from_millis(10))
+        .with_stream_fade_easing(gpui_kit::base::Easing::EaseOut)
+}
+
+/// Wrap a text view in the body typography every Markdown surface shares.
+pub fn body(
+    view: TextView,
+    tokens: crate::core::theme::Theme,
+    window: &Window,
+    cx: &mut App,
+) -> TextView {
+    let fonts = super::presentation::fonts(cx);
+    view.style(super::presentation::markdown_style(
+        tokens,
+        &fonts,
+        f32::from(window.rem_size()),
+    ))
+    .selectable(true)
+    .w_full()
+    .min_w_0()
+}
 
 pub fn markdown(
     id: impl Into<SharedString>,
@@ -8,9 +35,17 @@ pub fn markdown(
     scrollable: bool,
     tokens: crate::core::theme::Theme,
     window: &mut Window,
-    _cx: &mut App,
+    cx: &mut App,
 ) -> gpui_kit::AnyElement {
-    let style = super::presentation::markdown_style(tokens, f32::from(window.rem_size()));
+    let view = body(TextView::markdown(id.into(), source), tokens, window, cx)
+        .scrollable(scrollable)
+        .when(!scrollable, |text| text.motion(stream_motion()))
+        .when(scrollable, |text| text.size_full());
+    container(scrollable).child(view).into_any_element()
+}
+
+/// The sized box around a Markdown view, carrying the body type scale.
+pub fn container(fill: bool) -> gpui_kit::Div {
     div()
         .debug_selector(|| "markdown-view".into())
         .w_full()
@@ -19,18 +54,7 @@ pub fn markdown(
         .line_height(gpui_kit::relative(
             super::presentation::BODY_LINE / super::presentation::BODY_SIZE,
         ))
-        .when(scrollable, |view| view.size_full())
-        .child(
-            TextView::markdown(id.into(), source)
-                .style(style)
-                .selectable(true)
-                .scrollable(scrollable)
-                .stream_fade(!scrollable)
-                .w_full()
-                .min_w_0()
-                .when(scrollable, |text| text.size_full()),
-        )
-        .into_any_element()
+        .when(fill, |view| view.size_full())
 }
 
 #[cfg(all(test, feature = "gui-test"))]

@@ -10,7 +10,7 @@ impl DesktopView {
         self.daily_list.reset(self.model.daily_blocks.len());
         self.daily_list.scroll_to(top);
         self.list_generation = self.model.generation;
-        self.rebuild_tree();
+        self.refresh_sessions();
         let paths: std::collections::HashSet<_> = self
             .model
             .documents
@@ -63,7 +63,7 @@ impl DesktopView {
                     from..self.agent_list.item_count(),
                     agent.rows.len().saturating_sub(from),
                 );
-                self.rebuild_tree();
+                self.refresh_sessions();
                 changed = true;
             }
         }
