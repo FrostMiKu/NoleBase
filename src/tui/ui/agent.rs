@@ -1035,26 +1035,7 @@ pub(super) fn activity_rows(
     lines
 }
 
-pub(super) fn activity_parts(text: &str) -> (String, Vec<String>) {
-    let mut parts = text.split('\n');
-    let status = parts.next().unwrap_or_default();
-    let details = parts
-        .filter(|detail| !detail.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if status.starts_with("Failed ") {
-        if let Some((status, error)) = status.split_once(": ") {
-            let target = details.join(" · ");
-            let detail = if target.is_empty() {
-                error.to_string()
-            } else {
-                format!("{error} · {target}")
-            };
-            return (status.to_string(), vec![detail]);
-        }
-    }
-    (status.to_string(), details)
-}
+pub(super) use crate::core::agent::activity_parts;
 
 pub(super) fn activity_detail_line(
     detail: &str,

@@ -235,11 +235,32 @@ pub(crate) fn tool_display_name(name: &str) -> String {
         .join(" ")
 }
 
+pub(crate) fn activity_parts(text: &str) -> (String, Vec<String>) {
+    let mut parts = text.split('\n');
+    let status = parts.next().unwrap_or_default();
+    let details = parts
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if status.starts_with("Failed ") {
+        if let Some((status, error)) = status.split_once(": ") {
+            let target = details.join(" · ");
+            let detail = if target.is_empty() {
+                error.to_string()
+            } else {
+                format!("{error} · {target}")
+            };
+            return (status.to_string(), vec![detail]);
+        }
+    }
+    (status.to_string(), details)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{tool_activity_target, tool_finish_activity, tool_start_activity};
+    use super::{activity_parts, tool_activity_target, tool_finish_activity, tool_start_activity};
 
     #[test]
     fn read_activity_includes_the_requested_line_range() {
@@ -281,6 +302,23 @@ mod tests {
         assert_eq!(
             tool_start_activity(&web),
             "Fetching Web...\nhttps://example.com · lines 21-40"
+        );
+    }
+    #[test]
+    fn activity_status_and_results_keep_separate_rows() {
+        assert_eq!(
+            activity_parts("Completed Read.\nnotes.md\n\nThree sections"),
+            (
+                "Completed Read.".into(),
+                vec!["notes.md".into(), "Three sections".into()]
+            )
+        );
+        assert_eq!(
+            activity_parts("Failed Write: Permission denied\ndata/notes.md"),
+            (
+                "Failed Write".into(),
+                vec!["Permission denied · data/notes.md".into()]
+            )
         );
     }
 }

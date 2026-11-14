@@ -1,11 +1,11 @@
 //! Theme file discovery. Storage lists theme TOMLs and persists the theme
 //! selection string; resolving a selection into a parsed theme lives in the
-//! TUI theme module.
+//! shared theme module.
 
 use super::*;
 
 /// Seed content of `themes/default.toml`. Storage owns this default config
-/// file; parsing it into presentation colors lives in the TUI theme module.
+/// file; parsing it into presentation colors lives in the shared theme module.
 pub const DEFAULT_THEME_TOML: &str = r##"# Nole semantic color tokens. Values accept #RRGGBB or "terminal".
 # For background tokens, "terminal" means the terminal's own default background color.
 [surface]

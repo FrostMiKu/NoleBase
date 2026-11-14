@@ -132,7 +132,7 @@ impl AgentService {
 
     /// Swap the approval decision channel for tests so callers can observe
     /// exactly what the UI sends.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, any(feature = "tui", feature = "gui")))]
     pub(crate) fn set_approval_sender_for_test(
         &self,
         sender: tokio::sync::mpsc::UnboundedSender<ApprovalDecision>,
@@ -143,7 +143,7 @@ impl AgentService {
     }
 
     /// Swap the ask-user response channel for tests.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, any(feature = "tui", feature = "gui")))]
     pub(crate) fn set_user_sender_for_test(
         &self,
         sender: tokio::sync::mpsc::UnboundedSender<AskUserResponse>,
@@ -154,7 +154,7 @@ impl AgentService {
     }
 
     /// Swap the private terminal input channel for tests.
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(all(test, any(feature = "tui", feature = "gui")))]
     pub(crate) fn set_private_input_sender_for_test(
         &self,
         sender: tokio::sync::mpsc::UnboundedSender<PrivateTerminalInputDecision>,

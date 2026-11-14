@@ -25,3 +25,5 @@ pub mod wiki_link_index;
 pub mod workspace;
 pub mod workspace_index;
 pub mod workspace_watcher;
+
+pub mod theme;

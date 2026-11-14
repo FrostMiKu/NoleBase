@@ -269,9 +269,16 @@ pub fn link_specs(events: &[SpannedEvent<'_>]) -> Vec<LinkSpec> {
 }
 
 pub fn visible_text(events: &[SpannedEvent<'_>]) -> String {
+    visible_text_prefix(events, usize::MAX)
+}
+
+/// Extract at most `limit` Unicode scalar values, retaining Nole's semantic
+/// labels. Thumbnail consumers can bound text before allocating a full copy.
+pub fn visible_text_prefix(events: &[SpannedEvent<'_>], limit: usize) -> String {
     let mut text = String::new();
-    for item in events {
-        match &item.event {
+    let mut remaining = limit;
+    'events: for item in events {
+        let fragments: [&str; 3] = match &item.event {
             Event::Markdown(
                 MarkdownEvent::Text(value)
                 | MarkdownEvent::Code(value)
@@ -279,12 +286,25 @@ pub fn visible_text(events: &[SpannedEvent<'_>]) -> String {
                 | MarkdownEvent::InlineHtml(value)
                 | MarkdownEvent::InlineMath(value)
                 | MarkdownEvent::DisplayMath(value),
-            ) => text.push_str(value),
-            Event::Hashtag(tag) => text.push_str(&format!("#{tag}")),
-            Event::WikiLink(target) => text.push_str(&format!("[[{target}]]")),
-            Event::Embed(target) => text.push_str(&format!("![[{target}]]")),
-            Event::Markdown(MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak) => text.push(' '),
-            _ => {}
+            ) => [value, "", ""],
+            Event::Hashtag(tag) => ["#", tag, ""],
+            Event::WikiLink(target) => ["[[", target, "]]"],
+            Event::Embed(target) => ["![[", target, "]]"],
+            Event::Markdown(MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak) => [" ", "", ""],
+            _ => continue,
+        };
+        for fragment in fragments {
+            if remaining == usize::MAX {
+                text.push_str(fragment);
+            } else {
+                for ch in fragment.chars().take(remaining) {
+                    text.push(ch);
+                    remaining -= 1;
+                }
+                if remaining == 0 {
+                    break 'events;
+                }
+            }
         }
     }
     text
@@ -338,5 +358,12 @@ mod tests {
             .iter()
             .any(|item| matches!(item.event, Event::Markdown(MarkdownEvent::InlineMath(_)))));
         assert!(visible_text(&events).contains("[b]plain[/b]"));
+    }
+    #[test]
+    fn visible_text_prefix_counts_unicode_and_preserves_semantic_labels() {
+        let events = parse("你🙂 #标签 [[笔记]]");
+        assert_eq!(visible_text_prefix(&events, 0), "");
+        assert_eq!(visible_text_prefix(&events, 4), "你🙂 #");
+        assert_eq!(visible_text(&events), "你🙂 #标签 [[笔记]]");
     }
 }

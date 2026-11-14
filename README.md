@@ -17,6 +17,59 @@ nole
 
 `nole --version` (or `-V`) prints the current version and exits.
 
+## Native desktop (GPUI Kit)
+
+```sh
+cargo run --no-default-features --features gui --bin nole-gui
+```
+
+The desktop client uses GPUI Kit 0.9.1 for controls, toolbar, dialogs, text input,
+and Markdown rendering, with the same workspace (`NOLE_DIR` or `~/.nole`), theme
+selection, and `themes/*.toml` files as the TUI. The left file tree groups
+collapsible **Notes**, **Agents**, and **Archives** folders. Opening Notes or Archives shows a
+document-thumbnail home with named creation, templates, and multi-selection for archiving
+or restoring notes. Cmd/Ctrl-click toggles selection; Shift-click
+extends it. Cards show bounded, cached Markdown previews.
+
+Small sidebar controls open Daily, **Tags**, workspace-wide **Search**, and Todo.
+The Todo page shows daily tasks and saves completion changes immediately.
+Search covers notes, daily records, and archives and opens the matching source
+line. Tags use the shared semantic index. Agent uses the existing AI settings,
+persisted sessions, streaming replies, tool approvals, questions, private input,
+and cancellation. Thinking is shown in expandable cards, tools as status rows with
+results beneath them, and replies as Markdown. Desktop icons use Lucide.
+Attachment and export controls remain in the TUI.
+
+`Cmd/Ctrl+N` creates a note, `Cmd/Ctrl+F` opens Search, `Cmd/Ctrl+J` opens Agent,
+`Cmd/Ctrl+E` switches reading/editing, and `Cmd/Ctrl+B` toggles the file tree.
+Document edits save automatically; navigation and closing the window flush pending
+changes. Enter sends an Agent message or daily capture; Shift+Enter inserts a newline. An external edit detected before saving keeps the draft
+available for recovery.
+
+Home, the sidebar, search, Tags, daily records, document reading, and Agent
+transcripts use virtual lists. Text snapshots and thumbnail parsing stay outside
+scroll redraws. Debug builds optimize GPUI, GPUI Component, and Taffy while
+keeping application code debuggable. The appearance panel saves the theme
+selection for both clients. A `terminal` color uses an opaque desktop canvas.
+
+The home-grid sizing algorithm is adapted from
+[quiet-md](https://github.com/s1dashu/quiet-md); its MIT notice is included under
+`assets/licenses/`. Reading and editing share a centered, responsive 800 px
+column. Main views share the toolbar’s content insets, and desktop selection uses
+a rounded background highlight. Markdown uses a shared heading scale, explicit
+block spacing, themed code
+blocks, and wrapping tables; card previews preserve task completion and table
+rows. Page navigation uses a 150 ms fade and the sidebar uses an interruptible
+180 ms eased transition.
+
+Build requirements: Rust 1.100 or newer and the native GPUI platform toolchain. On macOS,
+GPUI compiles Metal shaders at launch, so Command Line Tools are sufficient.
+Run desktop integration and renderer tests with
+`cargo test --no-default-features --features gui-test --lib gui::`.
+On macOS and Linux, `cargo test --no-default-features --features gui-test --test gui_rendering`
+renders the production views into PNGs under the system temporary directory
+(`NOLE_REVIEW_DIR` selects an output directory).
+
 ## Workspace
 
 The UI is one responsive workspace with focused surfaces:
@@ -801,7 +854,7 @@ HTML embeds Mermaid.js, KaTeX, and highlight.js for offline rendering.
 
 ## Build and check
 
-Rust 1.92 or newer is required by the standalone Mermaid renderer.
+Rust 1.100 or newer is required.
 
 The default build runs the TUI. The core library owns workspace data, indexing,
 Agent sessions, filesystem watching, and standalone HTML export. Client-specific
