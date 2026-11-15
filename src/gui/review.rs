@@ -12,6 +12,7 @@ pub fn capture(storage: Storage, output: &Path) -> Result<()> {
         ("Reading", "# 阅读与写作\n\n为知识留出呼吸的空间。Nole 将每日记录、长篇笔记与 Agent 放在同一个工作区，让阅读与整理保持连贯。\n\n## 清晰的正文层级\n\n正文保持舒适的行宽，**重点内容**与 *补充说明* 形成层次。这里包含一个 [参考链接](https://example.com) 和 `inline code`。\n\n> 记录观察，建立联系，让想法逐渐清晰。\n\n### 下一步\n\n- [x] 统一阅读与编辑布局\n- [ ] 整理今天的笔记\n- [ ] 回顾本周的重要想法\n\n```rust\nfn main() {\n    println!(\"Hello, Nole\");\n}\n```\n\n| 内容 | 状态 | 说明 |\n| :--- | :---: | ---: |\n| 正文排版 | 完成 | 舒适行宽与清晰层级 |\n| 动画 | 完成 | 平滑衔接 |\n"),
         ("Weekend in Lisbon", "# Weekend in Lisbon\n\nTwo slow days, no laptop.\n\n## Sunday\n\n| Time | Where | Notes |\n| --- | --- | --- |\n| 09:00 | Miradouro da Graça | Best light before ten |\n| 11:00 | Tram 28 to Estrela | Avoid the crowded stop |\n| 13:00 | Time Out Market | Share small plates |\n\n> Take the long way home.\n\n## Small discoveries\n\n- A bookshop by the water\n- A quiet café for the afternoon\n- The view from the park\n"),
         ("Design review", "# Design review · week 6\n\n## What changed\n\nThis release rewrote Markdown export, and the numbers held up. Onboarding recovered image captions. The sync layer received a smaller, more consistent interface.\n\n| Metric | Last week | This week |\n| --- | --- | --- |\n| Avg. session | 9,058 | 5,066 |\n| Daily actives | 5,240 | 7,918 |\n\n## Next steps\n\n- [x] Review the reading view\n- [ ] Simplify the next interaction\n"),
+        ("Markdown rendering", "# 代码、图表与公式\n\n```rust\nfn main() {\n    println!(\"Hello, Nole\");\n}\n```\n\n行内公式 $E = mc^2$ 和 $\\frac{a^2+b^2}{c}$ 随正文排版。\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```mermaid\nflowchart LR\n A[开始] --> B[整理笔记] --> C[完成]\n```\n"),
         ("Reading notes", "# Reading notes\n\n## The Design of Everyday Things\n\nGood design helps us understand what we can do and what happened after we did it.\n\n> Make the next action clear.\n\n## Big ideas\n\n1. Visibility guides attention.\n2. Feedback closes the loop.\n3. Constraints make choices easier.\n\nSee also [[Reading]] #design\n"),
     ] {
         model.workspace.create_note(name)?;
@@ -74,6 +75,31 @@ pub fn capture(storage: Storage, output: &Path) -> Result<()> {
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
     cx.capture_screenshot(handle)?
         .save(output.join("reading.png"))?;
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.review_document("data/Markdown rendering.md".into(), window, cx)
+        });
+        window.render_frame(cx);
+    })?;
+    cx.advance_clock(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    cx.capture_screenshot(handle)?
+        .save(output.join("markdown-rendering.png"))?;
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| view.review_theme("default", cx));
+        window.render_frame(cx);
+    })?;
+    cx.advance_clock(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))?;
+    cx.capture_screenshot(handle)?
+        .save(output.join("markdown-rendering-dark.png"))?;
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.review_document("data/Reading.md".into(), window, cx)
+        });
+    })?;
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |view, cx| view.review_theme("default", cx));
         window.render_frame(cx);

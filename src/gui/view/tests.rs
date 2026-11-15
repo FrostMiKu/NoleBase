@@ -6,6 +6,7 @@ mod agent;
 mod completion;
 mod daily;
 mod file_actions;
+mod markdown_widgets;
 mod markup;
 mod scrolling;
 

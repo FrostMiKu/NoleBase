@@ -3,6 +3,7 @@ mod agent;
 mod home;
 mod icons;
 mod markdown;
+mod markdown_widgets;
 mod model;
 mod motion;
 mod presentation;

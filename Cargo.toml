@@ -25,7 +25,15 @@ required-features = ["gui"]
 
 [features]
 default = ["tui"]
-gui = ["dep:gpui-kit", "dep:data-url"]
+gui = [
+    "dep:gpui-kit",
+    "dep:data-url",
+    "dep:mermaid-rs-renderer",
+    "dep:ratex-parser",
+    "dep:ratex-layout",
+    "dep:ratex-types",
+    "dep:ratex-svg",
+]
 gui-test = ["gui", "gpui-kit/test-support"]
 tui = [
     "dep:ratatui",
@@ -40,6 +48,11 @@ tui = [
 ]
 
 [dependencies]
+mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
+ratex-parser = { version = "0.1.15", optional = true }
+ratex-layout = { version = "0.1.15", optional = true }
+ratex-types = { version = "0.1.15", optional = true }
+ratex-svg = { version = "0.1.15", features = ["embed-fonts"], optional = true }
 data-url = { version = "0.3.2", optional = true }
 gpui-kit = { version = "0.9.1", optional = true, features = ["tree-sitter-rust", "tree-sitter-markdown"] }
 ratatui = { version = "0.30.2", optional = true }

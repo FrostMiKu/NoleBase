@@ -1,6 +1,11 @@
 //! CommonMark/GFM parsing with Nole's semantic extensions and source spans.
 //! All consumers share these events, including indexing, export and the TUI.
 
+#[cfg(feature = "gui")]
+mod math;
+#[cfg(feature = "gui")]
+pub(crate) use math::normalize_math_delimiters;
+
 use crate::core::{attachment::AttachmentUri, model::LinkTarget};
 use pulldown_cmark::{CowStr, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use std::{borrow::Cow, ops::Range, path::Path};

@@ -4,8 +4,9 @@ use crate::core::{attachment::AttachmentUri, markup::Event, model::LinkTarget};
 use gpui_kit::base::TextView;
 
 pub(super) fn render_source(source: &str) -> String {
-    let mut output = source.to_owned();
-    for item in crate::core::markup::parse(source).into_iter().rev() {
+    let source = crate::core::markup::normalize_math_delimiters(source);
+    let mut output = source.to_string();
+    for item in crate::core::markup::parse(&source).into_iter().rev() {
         let replacement = match &item.event {
             Event::WikiLink(target) => Some(format!(
                 "[{}](<{}>)",
@@ -99,10 +100,13 @@ impl DesktopView {
     pub(super) fn markdown_view(&self, text: TextView, cx: &Context<Self>) -> TextView {
         let view = cx.entity().downgrade();
         let workspace = self.model.workspace.clone();
-        text.image_source(move |uri| image_source(&workspace, uri))
-            .on_link_click(move |url, _, window, cx| {
-                let _ = view.update(cx, |view, cx| view.activate_markdown_link(url, window, cx));
-            })
+        text.markdown_extensions(crate::gui::markdown_widgets::extensions(
+            self.model.theme.theme,
+        ))
+        .image_source(move |uri| image_source(&workspace, uri))
+        .on_link_click(move |url, _, window, cx| {
+            let _ = view.update(cx, |view, cx| view.activate_markdown_link(url, window, cx));
+        })
     }
 
     pub(super) fn markdown(

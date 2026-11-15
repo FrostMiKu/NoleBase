@@ -132,6 +132,18 @@ pub fn fonts(cx: &mut App) -> Fonts {
     fonts
 }
 
+pub fn code_block_style(tokens: Theme, fonts: &Fonts) -> StyleRefinement {
+    StyleRefinement::default()
+        .bg(color(tokens.markdown_code_block_background))
+        .text_color(color(tokens.markdown_code_block_text))
+        .border_1()
+        .border_color(color(tokens.ui_border_subtle))
+        .rounded(px(RADIUS_LG))
+        .font_family(fonts.mono.clone())
+        .text_size(px(CODE_SIZE))
+        .line_height(px(22.))
+}
+
 pub fn markdown_style(tokens: Theme, fonts: &Fonts, rem_size: f32) -> TextViewStyle {
     let serif = fonts.serif.clone();
     let headings = [
@@ -156,17 +168,7 @@ pub fn markdown_style(tokens: Theme, fonts: &Fonts, rem_size: f32) -> TextViewSt
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(color(headings[usize::from(level.clamp(1, 4)) - 1]))
         })
-        .with_code_block(
-            StyleRefinement::default()
-                .bg(color(tokens.markdown_code_block_background))
-                .text_color(color(tokens.markdown_code_block_text))
-                .border_1()
-                .border_color(color(tokens.ui_border_subtle))
-                .rounded(px(RADIUS_LG))
-                .font_family(fonts.mono.clone())
-                .text_size(px(CODE_SIZE))
-                .line_height(px(22.)),
-        )
+        .with_code_block(code_block_style(tokens, fonts))
         .with_inline_code(HighlightStyle {
             color: Some(color(tokens.markdown_code)),
             background_color: Some(color(tokens.surface_sunken)),
